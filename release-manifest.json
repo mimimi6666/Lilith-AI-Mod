@@ -1,0 +1,23 @@
+{
+    "version":  "0.1.0-rc1",
+    "packages":  {
+                     "core":  {
+                                  "file":  "core.zip",
+                                  "url":  "https://github.com/mimimi6666/Lilith-AI-Mod/releases/download/v0.1.0-rc1/core.zip",
+                                  "sha256":  "74263E1BC993EA7F98D795E6D9E0AB0C1E1DBBD81A2ADEBF1DC7B8390E057FF3",
+                                  "bytes":  41671598
+                              },
+                     "voicePack":  {
+                                       "file":  "voice-pack.zip",
+                                       "url":  "https://github.com/mimimi6666/Lilith-AI-Mod/releases/download/v0.1.0-rc1/voice-pack.zip",
+                                       "sha256":  "A3D4E2160FBDB8784E4D3E88843C24D39AD1A82E359140EAA95AB4512E07E8A0",
+                                       "bytes":  315142079
+                                   },
+                     "voiceRuntime":  {
+                                          "file":  "voice-runtime.zip",
+                                          "url":  "https://github.com/mimimi6666/Lilith-AI-Mod/releases/download/v0.1.0-rc1/voice-runtime.zip",
+                                          "sha256":  "3001FA762E960347C0F5B17E809D0977F156DC6109BC5125D025468031A928D4",
+                                          "bytes":  2073829105
+                                      }
+                 }
+}
