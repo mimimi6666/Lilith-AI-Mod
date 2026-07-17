@@ -1,0 +1,17 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+
+# Local configuration and credentials
+BepInEx/config/
+BepInEx/data/LilithTextInjector/memory/
+*.key
+*.secret
+.env
+
+# Release binaries belong in GitHub Releases, not repository history
+LilithAI-Mod-Setup.exe
+packages/
+*.zip
