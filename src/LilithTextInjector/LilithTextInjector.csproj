@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>LilithTextInjector</AssemblyName>
+    <GameInterop>C:\Program Files (x86)\Steam\steamapps\common\The NOexistenceN of Lilith\BepInEx\interop</GameInterop>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <Reference Include="BepInEx.Core" HintPath="..\bepinex-be780\BepInEx\core\BepInEx.Core.dll" />
+    <Reference Include="BepInEx.Unity.IL2CPP" HintPath="..\bepinex-be780\BepInEx\core\BepInEx.Unity.IL2CPP.dll" />
+    <Reference Include="Il2CppInterop.Runtime" HintPath="..\bepinex-be780\BepInEx\core\Il2CppInterop.Runtime.dll" />
+    <Reference Include="0Harmony" HintPath="..\bepinex-be780\BepInEx\core\0Harmony.dll" />
+    <Reference Include="Assembly-CSharp" HintPath="$(GameInterop)\Assembly-CSharp.dll" />
+    <Reference Include="Il2Cppmscorlib" HintPath="$(GameInterop)\Il2Cppmscorlib.dll" />
+    <Reference Include="UnityEngine" HintPath="$(GameInterop)\UnityEngine.dll" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(GameInterop)\UnityEngine.CoreModule.dll" />
+    <Reference Include="UnityEngine.InputLegacyModule" HintPath="$(GameInterop)\UnityEngine.InputLegacyModule.dll" />
+    <Reference Include="UnityEngine.IMGUIModule" HintPath="$(GameInterop)\UnityEngine.IMGUIModule.dll" />
+    <Reference Include="UnityEngine.AudioModule" HintPath="$(GameInterop)\UnityEngine.AudioModule.dll" />
+    <Reference Include="UnityEngine.UIModule" HintPath="$(GameInterop)\UnityEngine.UIModule.dll" />
+    <Reference Include="UnityEngine.UI" HintPath="$(GameInterop)\UnityEngine.UI.dll" />
+    <Reference Include="Unity.TextMeshPro" HintPath="$(GameInterop)\Unity.TextMeshPro.dll" />
+    <Reference Include="Unity.Localization" HintPath="$(GameInterop)\Unity.Localization.dll" />
+  </ItemGroup>
+</Project>
