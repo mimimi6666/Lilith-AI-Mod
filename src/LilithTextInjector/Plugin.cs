@@ -329,6 +329,11 @@ internal static class DialogueManagerUpdatePatch
     private static bool _apiKeyMissingViewLogged;
     private static GiftExchangeView? _apiKeyView;
     private static string _pendingApiKeyProvider = "Gemini";
+    private static readonly List<ApiKeyDialogLabelSnapshot> ApiKeyDialogLabels = new();
+    private static bool _apiKeyDialogStateCaptured;
+    private static TMP_InputField.ContentType _apiKeyOriginalContentType;
+    private static TMP_InputField.LineType _apiKeyOriginalLineType;
+    private static int _apiKeyOriginalCharacterLimit;
     private static bool _microphoneRecording;
     private static float _microphoneStartedAt;
     private static WasapiCapture? _wasapiCapture;
@@ -2534,11 +2539,12 @@ internal static class DialogueManagerUpdatePatch
                 throw new InvalidOperationException("A live GiftExchangeView was not found in the current scene.");
             _apiKeyView = liveView;
             liveView.Show(null!);
+            CaptureApiKeyDialogState(liveView);
             Plugin.PluginLog.LogInfo("Opened the native API key input window on Unity's main thread.");
         }
         catch (Exception exception)
         {
-            _apiKeyDialogMode = false;
+            EndApiKeyDialogMode(_apiKeyView);
             Plugin.PluginLog.LogWarning($"Could not open API key input window: {exception.Message}");
         }
     }
@@ -2549,7 +2555,7 @@ internal static class DialogueManagerUpdatePatch
             return;
         try
         {
-            var liveView = FindLiveGiftExchangeView();
+            var liveView = _apiKeyView;
             if (liveView == null)
             {
                 if (!_apiKeyMissingViewLogged && _apiKeyOpenRequestedAt >= 0f
@@ -2560,8 +2566,8 @@ internal static class DialogueManagerUpdatePatch
                 }
                 return;
             }
-            _apiKeyView = liveView;
-            var input = _apiKeyView._giftKeyInputField;
+            CaptureApiKeyDialogState(liveView);
+            var input = liveView._giftKeyInputField;
             if (input != null)
             {
                 input.contentType = TMP_InputField.ContentType.Password;
@@ -2570,7 +2576,7 @@ internal static class DialogueManagerUpdatePatch
             }
             foreach (var label in Resources.FindObjectsOfTypeAll<TMP_Text>())
             {
-                if (label == null || label.transform == null || !label.transform.IsChildOf(_apiKeyView.transform))
+                if (label == null || label.transform == null || !label.transform.IsChildOf(liveView.transform))
                     continue;
                 var current = label.text ?? string.Empty;
                 if (Regex.IsMatch(current, "兌換|兑换|redeem|exchange|コード", RegexOptions.IgnoreCase))
@@ -2595,9 +2601,73 @@ internal static class DialogueManagerUpdatePatch
         return null;
     }
 
+    private static void CaptureApiKeyDialogState(GiftExchangeView view)
+    {
+        if (_apiKeyDialogStateCaptured)
+            return;
+
+        ApiKeyDialogLabels.Clear();
+        var input = view._giftKeyInputField;
+        if (input != null)
+        {
+            _apiKeyOriginalContentType = input.contentType;
+            _apiKeyOriginalLineType = input.lineType;
+            _apiKeyOriginalCharacterLimit = input.characterLimit;
+        }
+
+        foreach (var label in Resources.FindObjectsOfTypeAll<TMP_Text>())
+        {
+            if (label == null || label.transform == null || !label.transform.IsChildOf(view.transform))
+                continue;
+            ApiKeyDialogLabels.Add(new ApiKeyDialogLabelSnapshot(label, label.text ?? string.Empty));
+        }
+        _apiKeyDialogStateCaptured = true;
+    }
+
+    private static void RestoreApiKeyDialogState(GiftExchangeView? view)
+    {
+        if (_apiKeyDialogStateCaptured)
+        {
+            foreach (var snapshot in ApiKeyDialogLabels)
+            {
+                if (snapshot.Label != null)
+                    snapshot.Label.text = snapshot.Text;
+            }
+
+            var input = view?._giftKeyInputField;
+            if (input != null)
+            {
+                input.text = string.Empty;
+                input.contentType = _apiKeyOriginalContentType;
+                input.lineType = _apiKeyOriginalLineType;
+                input.characterLimit = _apiKeyOriginalCharacterLimit;
+            }
+        }
+
+        ApiKeyDialogLabels.Clear();
+        _apiKeyDialogStateCaptured = false;
+    }
+
+    private static void EndApiKeyDialogMode(GiftExchangeView? view)
+    {
+        RestoreApiKeyDialogState(view);
+        _apiKeyDialogMode = false;
+        _apiKeyView = null;
+        _apiKeyOpenRequestedAt = -1f;
+        _apiKeyMissingViewLogged = false;
+    }
+
+    internal static void NotifyGiftExchangeViewHidden(GiftExchangeView view)
+    {
+        if (!_apiKeyDialogMode || _apiKeyView == null || view.Pointer != _apiKeyView.Pointer)
+            return;
+        EndApiKeyDialogMode(view);
+        Plugin.PluginLog.LogInfo("Closed API key mode and restored the native gift redemption window.");
+    }
+
     internal static bool TrySaveApiKey(GiftExchangeView view)
     {
-        if (!_apiKeyDialogMode)
+        if (!_apiKeyDialogMode || _apiKeyView == null || view.Pointer != _apiKeyView.Pointer)
             return false;
         try
         {
@@ -2625,8 +2695,8 @@ internal static class DialogueManagerUpdatePatch
             if (input != null)
                 input.text = string.Empty;
             view.Hide();
-            _apiKeyDialogMode = false;
-            _apiKeyView = null;
+            if (_apiKeyDialogMode)
+                EndApiKeyDialogMode(view);
             Plugin.PluginLog.LogInfo($"{_pendingApiKeyProvider} API key was saved and selected (value hidden).");
             return true;
         }
@@ -2635,6 +2705,18 @@ internal static class DialogueManagerUpdatePatch
             Plugin.PluginLog.LogWarning($"Could not save API key: {exception.Message}");
             return true;
         }
+    }
+
+    private sealed class ApiKeyDialogLabelSnapshot
+    {
+        internal ApiKeyDialogLabelSnapshot(TMP_Text label, string text)
+        {
+            Label = label;
+            Text = text;
+        }
+
+        internal TMP_Text Label { get; }
+        internal string Text { get; }
     }
 
     private static string ApiKeyText(string traditionalChinese, string simplifiedChinese, string japanese, string english)
@@ -5108,6 +5190,15 @@ internal static class GiftExchangeApiKeyPatch
     private static bool Prefix(GiftExchangeView __instance)
     {
         return !DialogueManagerUpdatePatch.TrySaveApiKey(__instance);
+    }
+}
+
+[HarmonyPatch(typeof(GiftExchangeView), "Hide")]
+internal static class GiftExchangeApiKeyHidePatch
+{
+    private static void Postfix(GiftExchangeView __instance)
+    {
+        DialogueManagerUpdatePatch.NotifyGiftExchangeViewHidden(__instance);
     }
 }
 
