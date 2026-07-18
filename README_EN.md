@@ -1,21 +1,27 @@
-# Lilith AI MOD 0.1.1 RC2
+# Lilith AI MOD 0.1.1 RC3
 
 This is an unofficial community MOD for the desktop companion game *The NOexistenceN of Lilith*. It adds AI conversations, text and voice input, Chinese and Japanese voice output, voice lines for previously unvoiced dialogue, weather features, and reviewed local computer controls.
 
-## RC2 Update
+## RC3 Update
 
 * Added compatibility with the categorized settings interface in official Build `24273498`.
 * MOD controls now appear only on the **Controls** tab and no longer overlap other settings pages.
 * Fixed F6/F7 working only once, keyboard rebinding, and Esc cancellation.
 * Chinese and Japanese built-in/supplemental voice selection remains fully separated.
+* Added tested Qwen chat and speech recognition, provider-native web search, and reliable local routing for explicit computer commands.
+* Installed applications can now be resolved from running processes, Windows Start apps, Store/MSIX registrations, and shortcuts without hard-coded player paths.
+* Fixed API-key dialogs retaining mouse/keyboard focus and kept the native entitlement redemption window separate from API-key entry.
+* The installer can optionally merge the privacy-minimized Lilith Codex bridge into existing Codex Hooks without replacing unrelated hooks.
 
 ## AI Provider Compatibility
 
-**Gemini is the recommended provider and the only provider tested and specifically optimized for version 0.1.1-RC2.** Personality behavior, context handling, multilingual output, Japanese display/voice separation, Google Search grounding, AI letters, and natural-language computer tool calls were developed around the Gemini API.
+**Gemini remains the recommended and most extensively optimized provider for version 0.1.1-RC3.** Personality behavior, context handling, multilingual output, Japanese display/voice separation, Google Search grounding, AI letters, and natural-language computer tools were primarily developed around the Gemini API.
+
+Qwen now has a tested integration using `qwen3.7-plus` for chat and `qwen3-asr-flash` for speech recognition. It supports provider-native web search for current information and deterministic local routing for explicit application, media, screenshot, and reviewed computer-control commands. Availability, free quota, and billing requirements depend on the player’s Alibaba Cloud Model Studio account and region.
 
 OpenAI and DeepSeek currently use an **experimental text-chat compatibility layer**. Basic requests are implemented, and local GPT-SoVITS may speak a reply that was returned successfully, but these providers have not been tested end to end across their available models, response formats, quotas, regional restrictions, or future API changes. Provider-native web search and function calling are not integrated for them; only some explicit local commands may still be recognized by the MOD itself.
 
-`F6` speech recognition currently always uses Gemini multimodal audio transcription. Even when OpenAI or DeepSeek is selected for chat, voice input still requires a separately saved Gemini API key. The recording is sent to Gemini for transcription and is not sent to OpenAI or DeepSeek.
+`F6` speech recognition follows the selected provider for Gemini and Qwen. OpenAI and DeepSeek currently use Gemini transcription and therefore still require a separately saved Gemini API key for voice input.
 
 ## One-Click Installation
 
@@ -24,6 +30,7 @@ OpenAI and DeepSeek currently use an **experimental text-chat compatibility laye
 3. Keep the required components selected, then click **Install / Update**.
 4. The first installation of AI dynamic voice generation will download a separate inference environment. This may take several minutes. It will not use or modify any Python installation already present on the player’s computer.
 5. After launching the game, right-click the Lilith icon in the lower-left corner, select **Add API Key** and a model provider, then enter the player’s own API key.
+6. If the optional Codex bridge was selected, Codex may ask you to review and activate the three Lilith hooks on its next launch. The installer merges them with existing hooks instead of replacing unrelated entries.
 
 The installer does not include the author’s API key, chat history, player name, logs, screenshots, training datasets, or development computer paths.
 
@@ -107,5 +114,5 @@ Contact: **[mimimi5206666@gmail.com]**
 Upon receiving a specific and verifiable rights-related notice, the creator will promptly review the matter and, where appropriate, suspend distribution, remove, or modify the relevant content.
 
 Publisher: MIMI
-Version: 0.1.1-RC2
+Version: 0.1.1-RC3
 Release Date: July 18, 2026

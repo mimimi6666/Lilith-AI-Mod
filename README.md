@@ -22,12 +22,15 @@ This unofficial AI extension for *The NOexistenceN of Lilith* keeps Lilith's qui
 > 「今天也要和我說說話嗎？」  
 > “Will you stay and talk with me today?”
 
-## ✦ 0.1.1-RC2 官方更新相容修正 / Official update compatibility
+## ✦ 0.1.1-RC3 更新內容 / What's new in 0.1.1-RC3
 
-- 相容官方 Build `24273498` 的分類式設定介面 / Compatible with the categorized settings UI in official Build `24273498`
-- MOD 控制項只顯示於「控制」分頁 / MOD controls now appear only on the **Controls** tab
-- 修復 F6／F7 只能使用一次、按鍵重綁與 Esc 取消失效 / Fixed one-time-only F6/F7 input, key rebinding, and Esc cancellation
-- 中／日語音切換與補充語音維持正常 / Chinese/Japanese voice switching and supplemental voices remain separated
+- 相容官方 Build `24273498` 的分類式設定介面，MOD 控制項只顯示於「控制」分頁 / Compatible with the categorized settings UI in official Build `24273498`; MOD controls now stay on the **Controls** tab
+- 修復 F6／F7 第二次無法觸發、文字輸入失焦、按鍵重綁與 Esc 取消失效 / Fixed one-time-only F6/F7 input, lost text focus, key rebinding, and Esc cancellation
+- 中文／日文內建與補充語音維持相互獨立 / Chinese and Japanese built-in and supplemental voices remain separated
+- 加入已測試的千問文字對話、`qwen3-asr-flash` 語音辨識與供應商原生聯網搜尋 / Added tested Qwen chat, `qwen3-asr-flash` speech recognition, and provider-native web search
+- 應用啟動會解析執行中程式、Windows 開始選單、Store／MSIX 與捷徑，不寫死玩家路徑 / App launching now resolves running processes, Start menu entries, Store/MSIX registrations, and shortcuts without hard-coded player paths
+- 修復 API Key 視窗的滑鼠／鍵盤焦點，並將原生權益兌換與 API Key 輸入完全分離 / Fixed API-key dialog focus and fully separated entitlement redemption from API-key entry
+- 安裝器可選擇合併莉莉絲 Codex Hooks，保留玩家現有 Hooks / The installer can optionally merge Lilith's Codex Hooks while preserving existing hooks
 
 ## ♡ 她能陪你做什麼？ / What can she do?
 
@@ -50,17 +53,20 @@ This unofficial AI extension for *The NOexistenceN of Lilith* keeps Lilith's qui
 
 ## ✦ AI 服務相容性 / AI provider compatibility
 
-> **目前建議使用 Gemini。Gemini 是 0.1.1-RC2 唯一完成實際測試與針對性優化的服務；OpenAI 與 DeepSeek 僅提供實驗性的文字聊天相容層，尚未完成端到端測試。**
+> **目前仍建議優先使用 Gemini；它是 0.1.1-RC3 測試最完整、針對性優化最多的服務。千問已完成文字對話、語音辨識、聯網搜尋與明確本機指令的實際接入測試。OpenAI 與 DeepSeek 仍是實驗性文字相容層。**
 
-> **Gemini is currently recommended. It is the only provider tested and specifically optimized for 0.1.1-RC2. OpenAI and DeepSeek currently use an experimental text-chat compatibility layer and have not been tested end to end.**
+> **Gemini remains the recommended and most extensively optimized provider in 0.1.1-RC3. Qwen has been tested for chat, speech recognition, web search, and explicit local commands. OpenAI and DeepSeek remain experimental text-chat compatibility layers.**
 
-| 功能 / Feature | Gemini | OpenAI / DeepSeek |
-|---|---|---|
-| 文字對話 / Text chat | ✅ 已測試並調整人格、上下文與多語言輸出 / Tested and tuned | 🧪 已實作基本相容，但未實測所有模型與回應格式 / Basic compatibility implemented; models and response formats not fully tested |
-| `F6` 語音辨識 / `F6` speech recognition | ✅ 使用 Gemini 多模態音訊辨識 / Uses Gemini multimodal audio transcription | ⚠️ 目前仍需要另外設定 Gemini API Key；錄音不會送到 OpenAI 或 DeepSeek / A Gemini API key is still required; recordings are not sent to OpenAI or DeepSeek |
-| 即時聯網搜尋 / Live web search | ✅ 使用 Gemini／Google Search grounding / Gemini with Google Search grounding | ❌ 尚未接入 / Not integrated |
-| 自然語言電腦工具 / Natural-language PC tools | ✅ 支援 Gemini function calling、多步驟與結果回報 / Gemini function calling, multi-step actions, and result reporting | ⚠️ 只保留部分明確關鍵句的本機處理；未接入供應商工具呼叫 / Some explicit local commands remain; provider tool calling is not integrated |
-| 日文顯示／語音分離與 AI 信件 / Split Japanese display/speech and AI letters | ✅ 以 Gemini 流程優化 / Optimized in the Gemini flow | 🧪 可能可用，但尚未驗證穩定性 / May work, but stability is unverified |
+| 功能 / Feature | Gemini | Qwen | OpenAI / DeepSeek |
+|---|---|---|---|
+| 文字對話 / Text chat | ✅ 已測試並完整調整 / Fully tested and tuned | ✅ `qwen3.7-plus` 已測試 / `qwen3.7-plus` tested | 🧪 基本相容，未完成端到端測試 / Basic compatibility only |
+| `F6` 語音辨識 / Speech recognition | ✅ Gemini 音訊辨識 | ✅ `qwen3-asr-flash` | ⚠️ 目前仍使用 Gemini 辨識 / Currently uses Gemini transcription |
+| 即時聯網搜尋 / Live web search | ✅ Google Search grounding | ✅ 千問原生聯網 / Qwen native web search | ❌ 尚未接入 / Not integrated |
+| 電腦工具 / PC tools | ✅ Function calling 與本機可靠路由 | ✅ 明確指令的本機可靠路由 | ⚠️ 僅部分明確本機指令 |
+
+千問的可用性、免費額度與計費要求依玩家的阿里雲模型服務帳戶及地區而定。OpenAI／DeepSeek 的模型名稱、回應格式、額度與地區限制尚未完整驗證。
+
+Qwen availability, free quotas, and billing requirements depend on the player's Alibaba Cloud Model Studio account and region. OpenAI/DeepSeek model names, response formats, quotas, and regional availability have not been fully validated.
 
 本機 GPT-SoVITS 語音合成可朗讀已成功取得的文字回覆，因此 OpenAI／DeepSeek 的文字聊天若正常回傳，仍可能播放合成語音；但這不代表該供應商的整體流程已完成測試。模型名稱、API 規格、地區限制或服務商更新也可能影響實驗性相容層。
 
@@ -70,20 +76,23 @@ Local GPT-SoVITS can speak a successfully returned text reply, so OpenAI/DeepSee
 
 ### 推薦下載 / Recommended download
 
-- **[Google Drive 完整包鏡像 / Full package mirror](https://drive.google.com/file/d/1UxynMsGJrl0nuA5b3JS2YFTsfRVafIG4/view?usp=sharing)**：RC2 最簡單、最可靠的安裝方式。下載 ZIP、完整解壓縮後，直接執行資料夾內的 `LilithAI-Mod-Setup.exe`。  
-  This is the easiest and most reliable way to install RC2. Download the ZIP, extract all files, and run `LilithAI-Mod-Setup.exe` from the extracted folder.
+- **[Google Drive 完整包鏡像 / Full package mirror](https://drive.google.com/file/d/1UxynMsGJrl0nuA5b3JS2YFTsfRVafIG4/view?usp=sharing)**
+- **[夸克網盤完整包 / Quark full package mirror](https://pan.quark.cn/s/6155fe5e3b95)**
+
+以上皆為 RC3 完整安裝包。下載 ZIP、完整解壓縮後，直接執行資料夾內的 `LilithAI-Mod-Setup.exe`。  
+Both links provide the complete RC3 package. Download the ZIP, extract all files, and run `LilithAI-Mod-Setup.exe` from the extracted folder.
 
 > ⚠️ **請勿使用首頁的 `Code → Download ZIP` 安裝 MOD；那裡只有原始碼，不是可安裝的發布包。**  
 > ⚠️ **Do not install the MOD through `Code → Download ZIP`; it contains source code, not the installable release.**
 
 ### GitHub Release 手動下載 / Manual GitHub Release download
 
-[GitHub Release](https://github.com/mimimi6666/Lilith-AI-Mod/releases/tag/v0.1.1-rc2) 的 Assets 會平鋪顯示，但 RC2 安裝器的本機套件必須放在 `packages` 子資料夾。若要手動下載所有附件，請整理成以下結構：
+[GitHub Release](https://github.com/mimimi6666/Lilith-AI-Mod/releases) 的 Assets 會平鋪顯示，但 RC3 安裝器的本機套件必須放在 `packages` 子資料夾。若要手動下載所有附件，請整理成以下結構：
 
-GitHub Release Assets are displayed as a flat list, while the RC2 installer expects local packages inside a `packages` subfolder. If you download the assets manually, arrange them like this:
+GitHub Release Assets are displayed as a flat list, while the RC3 installer expects local packages inside a `packages` subfolder. If you download the assets manually, arrange them like this:
 
 ```text
-Lilith-AI-Mod-0.1.1-RC2
+Lilith-AI-Mod-0.1.1-RC3
 ├─ LilithAI-Mod-Setup.exe
 ├─ release-manifest.json
 ├─ SHA256SUMS.txt
@@ -93,9 +102,9 @@ Lilith-AI-Mod-0.1.1-RC2
    └─ voice-runtime.zip
 ```
 
-只下載 EXE 時，安裝器會自動取得 RC2 清單與缺少的套件。RC2 的語音包內容沒有改變，因此清單會沿用 RC1 的既有語音下載，以免玩家重複下載約 2.4 GB。若網路、地區限制或大型檔案下載失敗，請改用上方的 Google Drive 完整包。
+只下載 EXE 時，安裝器會自動取得 RC3 清單與缺少的套件。RC3 的語音包內容沒有改變，因此清單會沿用 RC1 的既有語音下載，以免玩家重複下載約 2.4 GB。若網路、地區限制或大型檔案下載失敗，請改用上方的 Google Drive 或夸克網盤完整包。
 
-If only the EXE is downloaded, the installer retrieves the RC2 manifest and missing packages automatically. The voice files did not change, so RC2 reuses the existing RC1 voice downloads instead of making players download about 2.4 GB again. If networking, regional availability, or large-file downloads fail, use the complete Google Drive package above.
+If only the EXE is downloaded, the installer retrieves the RC3 manifest and missing packages automatically. The voice files did not change, so RC3 reuses the existing RC1 voice downloads instead of making players download about 2.4 GB again. If networking, regional availability, or large-file downloads fail, use the complete Google Drive or Quark package above.
 
 1. 完整解壓縮或整理好上述資料夾後，再執行安裝程式；它會自動尋找 Steam 遊戲路徑。  
    Extract the complete package or arrange the folders above before running the installer; it automatically searches your Steam libraries.
@@ -193,6 +202,6 @@ This is a free, non-commercial fan project. It is not authorized, endorsed, spon
 
 ### ✦ 「如果你願意，我就再陪你一會。」 ✦
 
-**Version 0.1.1-RC2 · Publisher: MIMI**
+**Version 0.1.1-RC3 · Publisher: MIMI**
 
 </div>
