@@ -54,6 +54,7 @@ internal sealed class InstalledManifest
 internal sealed class InstallerForm : Form
 {
     private const string AppId = "4643090";
+    private const string DefaultManifestUrl = "https://github.com/mimimi6666/Lilith-AI-Mod/releases/download/v0.1.0-rc1/release-manifest.json";
     private readonly bool _zhTraditional;
     private readonly bool _zhSimplified;
     private readonly bool _japanese;
@@ -146,28 +147,50 @@ internal sealed class InstallerForm : Form
         _close.Click += (_, _) => Close();
         Controls.AddRange([_install, _uninstall, _close]);
 
-        Load += (_, _) => InitializeInstaller();
+        Load += async (_, _) => await InitializeInstallerAsync();
     }
 
     private string L(string zhTw, string zhCn, string ja, string en)
         => _zhTraditional ? zhTw : _zhSimplified ? zhCn : _japanese ? ja : en;
 
-    private void InitializeInstaller()
+    private async Task InitializeInstallerAsync()
     {
+        var manifestReady = false;
+        SetBusy(true);
         try
         {
             var manifestPath = Path.Combine(_baseDirectory, "release-manifest.json");
+            string manifestJson;
             if (File.Exists(manifestPath))
-                _manifest = JsonSerializer.Deserialize<ReleaseManifest>(File.ReadAllText(manifestPath), JsonOptions()) ?? new ReleaseManifest();
+            {
+                manifestJson = await File.ReadAllTextAsync(manifestPath);
+            }
+            else
+            {
+                SetStatus(L("正在取得最新發佈資訊…", "正在获取最新发布信息…", "最新のリリース情報を取得中…", "Retrieving the latest release information…"));
+                using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+                manifestJson = await client.GetStringAsync(DefaultManifestUrl);
+            }
+
+            _manifest = JsonSerializer.Deserialize<ReleaseManifest>(manifestJson, JsonOptions()) ?? new ReleaseManifest();
+            if (_manifest.Packages.Count == 0)
+                throw new InvalidDataException("The release manifest does not contain any installable packages.");
+            manifestReady = true;
         }
         catch (Exception exception)
         {
             SetStatus(L("無法讀取發佈資訊：", "无法读取发布信息：", "リリース情報を読み込めません：", "Could not read release information: ") + exception.Message);
         }
-
-        _path.Text = SteamLocator.FindGameDirectory() ?? string.Empty;
-        if (string.IsNullOrWhiteSpace(_path.Text))
-            SetStatus(L("未自動找到遊戲，請按「瀏覽」。", "未自动找到游戏，请点击“浏览”。", "ゲームが見つかりません。［参照］で選択してください。", "Game not found automatically. Please use Browse."));
+        finally
+        {
+            _path.Text = SteamLocator.FindGameDirectory() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(_path.Text))
+                SetStatus(L("未自動找到遊戲，請按「瀏覽」。", "未自动找到游戏，请点击“浏览”。", "ゲームが見つかりません。［参照］で選択してください。", "Game not found automatically. Please use Browse."));
+            else if (manifestReady)
+                SetStatus(L("準備就緒", "准备就绪", "準備完了", "Ready"));
+            SetBusy(false);
+            _install.Enabled = manifestReady;
+        }
     }
 
     private void BrowseForGame()
