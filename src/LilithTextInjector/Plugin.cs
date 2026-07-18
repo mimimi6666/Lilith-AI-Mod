@@ -36,7 +36,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "community.lilith.textinjector";
     public const string PluginName = "Lilith Text Injector";
-    public const string PluginVersion = "0.2.0";
+    public const string PluginVersion = "0.2.1";
 
     internal static ManualLogSource PluginLog = null!;
     internal static ConfigEntry<string> GeminiApiKey = null!;
@@ -352,6 +352,12 @@ internal static class DialogueManagerUpdatePatch
     private static TMP_Text? _textInputKeyValue;
     private static TMP_Text? _voiceInputKeyValue;
     private static int _keyBindingTarget;
+    private static float _keyBindingStartedAt = -1f;
+    private static bool _textInputKeyWasDown;
+    private static bool _voiceInputKeyWasDown;
+    private static readonly HashSet<int> RebindingHeldVirtualKeys = new();
+    private static TraySettingView? _settingsView;
+    private static GameObject? _settingsVisibilityTemplateRow;
     private static float _nextForegroundWindowScanAt;
     private static IntPtr _lastExternalForegroundWindow;
     private static readonly List<LocalTimer> LocalTimers = new();
@@ -359,9 +365,7 @@ internal static class DialogueManagerUpdatePatch
 
     private static void Postfix(DialogueManager __instance)
     {
-        EnsureJapaneseVoiceOptionVisible();
-        EnsureAdvancedComputerActionsToggle();
-        EnsureKeyBindingSettings();
+        UpdateSettingsUiSafely();
         EnsureLocalVoiceHost();
         ObserveForegroundWindow();
         ProcessGeminiToolBatches();
@@ -459,9 +463,12 @@ internal static class DialogueManagerUpdatePatch
             SubmitAiInput(__instance, voiceText);
         }
 
-        if (_keyBindingTarget == 0 && Input.GetKeyDown(Plugin.TextInputKey.Value))
+        var textInputKeyDown = IsKeyCurrentlyDown(Plugin.TextInputKey.Value);
+        var textInputKeyPressed = textInputKeyDown && !_textInputKeyWasDown;
+        _textInputKeyWasDown = textInputKeyDown;
+        if (_keyBindingTarget == 0 && textInputKeyPressed)
         {
-            if (__instance.IsBusy || _requestInFlight || _aiPagesAwaitingAdvance)
+            if (_requestInFlight || _aiPagesAwaitingAdvance)
             {
                 Plugin.PluginLog.LogInfo($"Ignored {Plugin.TextInputKey.Value} text input hotkey because a dialogue or AI request is active.");
                 return;
@@ -1584,10 +1591,15 @@ internal static class DialogueManagerUpdatePatch
 
     private static void HandleVoiceInput(DialogueManager manager)
     {
+        var voiceInputKey = Plugin.VoiceInputKey.Value;
+        var voiceInputKeyDown = IsKeyCurrentlyDown(voiceInputKey);
+        var voiceInputKeyPressed = voiceInputKeyDown && !_voiceInputKeyWasDown;
+        var voiceInputKeyReleased = !voiceInputKeyDown && _voiceInputKeyWasDown;
+        _voiceInputKeyWasDown = voiceInputKeyDown;
+
         if (!Plugin.VoiceInputEnabled.Value || _keyBindingTarget != 0)
             return;
-        var voiceInputKey = Plugin.VoiceInputKey.Value;
-        if (Input.GetKeyDown(voiceInputKey))
+        if (voiceInputKeyPressed)
         {
             if (_microphoneRecording || _transcriptionInFlight || _requestInFlight)
             {
@@ -1626,7 +1638,7 @@ internal static class DialogueManagerUpdatePatch
 
         var reachedLimit = _microphoneRecording
             && Time.unscaledTime - _microphoneStartedAt >= Math.Clamp(Plugin.VoiceInputMaxSeconds.Value, 5, 90) - 0.1f;
-        if (_microphoneRecording && (Input.GetKeyUp(voiceInputKey) || reachedLimit))
+        if (_microphoneRecording && (voiceInputKeyReleased || reachedLimit))
             StopVoiceInputRecording(reachedLimit);
     }
 
@@ -1869,6 +1881,7 @@ internal static class DialogueManagerUpdatePatch
 
     private static void EnsureAdvancedComputerActionsToggle()
     {
+        SyncInjectedSettingsVisibility();
         if (Time.unscaledTime < _nextAdvancedActionsUiScanAt)
             return;
         _nextAdvancedActionsUiScanAt = Time.unscaledTime + 0.75f;
@@ -1879,6 +1892,7 @@ internal static class DialogueManagerUpdatePatch
                 SetAdvancedActionsLabel(_advancedActionsRow.transform);
                 if (_advancedActionsToggle.IsOn != Plugin.AdvancedComputerActionsEnabled.Value)
                     _advancedActionsToggle.SetValue(Plugin.AdvancedComputerActionsEnabled.Value, false);
+                SyncInjectedSettingsVisibility();
                 return;
             }
 
@@ -1898,6 +1912,9 @@ internal static class DialogueManagerUpdatePatch
             var templateRow = FindSettingRow(templateToggle.transform, view.transform);
             if (templateRow == null || templateRow.parent == null)
                 return;
+
+            _settingsView = view;
+            _settingsVisibilityTemplateRow = templateRow.gameObject;
 
             var clone = UnityEngine.Object.Instantiate(templateRow.gameObject, templateRow.parent);
             clone.name = "LilithAdvancedComputerActions";
@@ -1925,6 +1942,7 @@ internal static class DialogueManagerUpdatePatch
 
             _advancedActionsRow = clone;
             _advancedActionsToggle = clonedToggle;
+            SyncInjectedSettingsVisibility();
             Plugin.PluginLog.LogInfo($"Added the native-style advanced computer actions toggle at {GetTransformPath(clone.transform)} (default={Plugin.AdvancedComputerActionsEnabled.Value}).");
         }
         catch (Exception exception)
@@ -1933,6 +1951,37 @@ internal static class DialogueManagerUpdatePatch
             _advancedActionsRow = null;
             _advancedActionsToggle = null;
             _advancedActionsChanged = null;
+        }
+    }
+
+    private static void UpdateSettingsUiSafely()
+    {
+        try
+        {
+            EnsureJapaneseVoiceOptionVisible();
+        }
+        catch (Exception exception)
+        {
+            Plugin.PluginLog.LogWarning($"Could not update the game voice setting: {exception}");
+        }
+
+        try
+        {
+            EnsureAdvancedComputerActionsToggle();
+        }
+        catch (Exception exception)
+        {
+            Plugin.PluginLog.LogWarning($"Could not update the advanced actions setting: {exception}");
+        }
+
+        try
+        {
+            EnsureKeyBindingSettings();
+        }
+        catch (Exception exception)
+        {
+            Plugin.PluginLog.LogWarning($"Could not update key binding settings: {exception}");
+            ResetKeyBindingUiReferences();
         }
     }
 
@@ -2004,8 +2053,9 @@ internal static class DialogueManagerUpdatePatch
 
     private static void EnsureKeyBindingSettings()
     {
+        var controlsVisible = SyncInjectedSettingsVisibility();
         UpdateKeyBindingTexts();
-        if (ProcessKeyBindingInteraction())
+        if (controlsVisible && ProcessKeyBindingInteraction())
             return;
         if (_textInputKeyRow != null && _voiceInputKeyRow != null
             && _textInputKeyButtonRect != null && _voiceInputKeyButtonRect != null)
@@ -2032,6 +2082,9 @@ internal static class DialogueManagerUpdatePatch
             if (templateRow == null || templateRow.parent == null)
                 return;
 
+            _settingsView = view;
+            _settingsVisibilityTemplateRow = templateRow.gameObject;
+
             if (!CreateKeyBindingRow(templateRow, "LilithTextInputKey", 82f,
                     out _textInputKeyRow, out _textInputKeyButton, out _textInputKeyButtonRect, out _textInputKeyValue)
                 || !CreateKeyBindingRow(templateRow, "LilithVoiceInputKey", 41f,
@@ -2044,6 +2097,7 @@ internal static class DialogueManagerUpdatePatch
             }
 
             UpdateKeyBindingTexts();
+            SyncInjectedSettingsVisibility();
             Plugin.PluginLog.LogInfo("Added native-style text input and push-to-talk key binding controls.");
         }
         catch (Exception exception)
@@ -2141,20 +2195,40 @@ internal static class DialogueManagerUpdatePatch
     {
         if (_keyBindingTarget != 0)
         {
-            if (Input.GetKeyDown(KeyCode.Escape))
+            if (_keyBindingStartedAt >= 0f && Time.unscaledTime - _keyBindingStartedAt >= 15f)
             {
                 _keyBindingTarget = 0;
+                _keyBindingStartedAt = -1f;
+                RebindingHeldVirtualKeys.Clear();
                 UpdateKeyBindingTexts();
-                Plugin.PluginLog.LogInfo("Key rebinding cancelled.");
+                Plugin.PluginLog.LogInfo("Key rebinding timed out and was cancelled.");
                 return true;
             }
-
-            foreach (KeyCode key in Enum.GetValues(typeof(KeyCode)))
+            // Read the Windows keyboard state directly. The updated settings
+            // window no longer forwards keyboard events to Unity's legacy Input
+            // API while it is focused.
+            for (var code = (int)KeyCode.Backspace; code < (int)KeyCode.Mouse0; code++)
             {
-                if (key == KeyCode.None || key == KeyCode.Escape || (int)key >= (int)KeyCode.Mouse0)
+                var key = (KeyCode)code;
+                if (!TryGetWindowsVirtualKey(key, out var virtualKey))
                     continue;
-                if (!Input.GetKeyDown(key))
+                var down = IsVirtualKeyDown(virtualKey);
+                if (!down)
+                {
+                    RebindingHeldVirtualKeys.Remove(virtualKey);
                     continue;
+                }
+                if (!RebindingHeldVirtualKeys.Add(virtualKey))
+                    continue;
+                if (key == KeyCode.Escape)
+                {
+                    _keyBindingTarget = 0;
+                    _keyBindingStartedAt = -1f;
+                    RebindingHeldVirtualKeys.Clear();
+                    UpdateKeyBindingTexts();
+                    Plugin.PluginLog.LogInfo("Key rebinding cancelled.");
+                    return true;
+                }
                 ApplyKeyBinding(key);
                 return true;
             }
@@ -2167,17 +2241,62 @@ internal static class DialogueManagerUpdatePatch
             && RectTransformUtility.RectangleContainsScreenPoint(_textInputKeyButtonRect, Input.mousePosition, null))
         {
             _keyBindingTarget = 1;
+            _keyBindingStartedAt = Time.unscaledTime;
+            CaptureHeldRebindingKeys();
             UpdateKeyBindingTexts();
+            Plugin.PluginLog.LogInfo("Waiting for a new text input hotkey.");
             return true;
         }
         if (_voiceInputKeyButtonRect != null && _voiceInputKeyRow != null && _voiceInputKeyRow.activeInHierarchy
             && RectTransformUtility.RectangleContainsScreenPoint(_voiceInputKeyButtonRect, Input.mousePosition, null))
         {
             _keyBindingTarget = 2;
+            _keyBindingStartedAt = Time.unscaledTime;
+            CaptureHeldRebindingKeys();
             UpdateKeyBindingTexts();
+            Plugin.PluginLog.LogInfo("Waiting for a new push-to-talk hotkey.");
             return true;
         }
         return false;
+    }
+
+    private static bool SyncInjectedSettingsVisibility()
+    {
+        var controlsVisible = false;
+        try
+        {
+            controlsVisible = _settingsView != null
+                && _settingsView.gameObject != null
+                && _settingsView.gameObject.activeInHierarchy
+                && _settingsView._currentTab == TraySettingView.TabControls;
+        }
+        catch
+        {
+            // Older game builds do not expose tabs. Retain the legacy behavior
+            // there, while current builds use the official selected-tab state.
+            controlsVisible = _settingsVisibilityTemplateRow != null
+                && _settingsVisibilityTemplateRow.activeInHierarchy;
+        }
+
+        SetInjectedSettingsRowActive(_advancedActionsRow, controlsVisible);
+        SetInjectedSettingsRowActive(_textInputKeyRow, controlsVisible);
+        SetInjectedSettingsRowActive(_voiceInputKeyRow, controlsVisible);
+
+        if (!controlsVisible && _keyBindingTarget != 0)
+        {
+            _keyBindingTarget = 0;
+            _keyBindingStartedAt = -1f;
+            RebindingHeldVirtualKeys.Clear();
+            UpdateKeyBindingTexts();
+            Plugin.PluginLog.LogInfo("Key rebinding cancelled because the Controls settings tab was closed.");
+        }
+        return controlsVisible;
+    }
+
+    private static void SetInjectedSettingsRowActive(GameObject? row, bool active)
+    {
+        if (row != null && row.activeSelf != active)
+            row.SetActive(active);
     }
 
     private static void ApplyKeyBinding(KeyCode key)
@@ -2199,6 +2318,10 @@ internal static class DialogueManagerUpdatePatch
             Plugin.PluginLog.LogInfo($"Push-to-talk hotkey changed to {key}.");
         }
         _keyBindingTarget = 0;
+        _keyBindingStartedAt = -1f;
+        RebindingHeldVirtualKeys.Clear();
+        _textInputKeyWasDown = IsKeyCurrentlyDown(Plugin.TextInputKey.Value);
+        _voiceInputKeyWasDown = IsKeyCurrentlyDown(Plugin.VoiceInputKey.Value);
         UpdateKeyBindingTexts();
     }
 
@@ -2256,6 +2379,8 @@ internal static class DialogueManagerUpdatePatch
         _textInputKeyValue = null;
         _voiceInputKeyValue = null;
         _keyBindingTarget = 0;
+        _keyBindingStartedAt = -1f;
+        RebindingHeldVirtualKeys.Clear();
     }
 
     private static void EnsureJapaneseVoiceOptionVisible()
@@ -4308,6 +4433,9 @@ internal static class DialogueManagerUpdatePatch
     private static extern bool GetLastInputInfo(ref LastInputInfo info);
 
     [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int virtualKey);
+
+    [DllImport("user32.dll")]
     private static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
 
     [DllImport("user32.dll")]
@@ -4336,6 +4464,109 @@ internal static class DialogueManagerUpdatePatch
 
     [DllImport("PowrProf.dll", SetLastError = true)]
     private static extern bool SetSuspendState(bool hibernate, bool forceCritical, bool disableWakeEvent);
+
+    private static bool IsVirtualKeyDown(int virtualKey) =>
+        OperatingSystem.IsWindows() && (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+
+    private static bool IsKeyCurrentlyDown(KeyCode key)
+    {
+        if (TryGetWindowsVirtualKey(key, out var virtualKey))
+            return IsVirtualKeyDown(virtualKey);
+        try
+        {
+            return Input.GetKey(key);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void CaptureHeldRebindingKeys()
+    {
+        RebindingHeldVirtualKeys.Clear();
+        for (var code = (int)KeyCode.Backspace; code < (int)KeyCode.Mouse0; code++)
+        {
+            if (TryGetWindowsVirtualKey((KeyCode)code, out var virtualKey) && IsVirtualKeyDown(virtualKey))
+                RebindingHeldVirtualKeys.Add(virtualKey);
+        }
+    }
+
+    private static bool TryGetWindowsVirtualKey(KeyCode key, out int virtualKey)
+    {
+        virtualKey = 0;
+        if (!OperatingSystem.IsWindows())
+            return false;
+
+        var code = (int)key;
+        if (code >= (int)KeyCode.Alpha0 && code <= (int)KeyCode.Alpha9)
+        {
+            virtualKey = 0x30 + code - (int)KeyCode.Alpha0;
+            return true;
+        }
+        if (code >= (int)KeyCode.A && code <= (int)KeyCode.Z)
+        {
+            virtualKey = 0x41 + code - (int)KeyCode.A;
+            return true;
+        }
+        if (code >= (int)KeyCode.Keypad0 && code <= (int)KeyCode.Keypad9)
+        {
+            virtualKey = 0x60 + code - (int)KeyCode.Keypad0;
+            return true;
+        }
+        if (code >= (int)KeyCode.F1 && code <= (int)KeyCode.F15)
+        {
+            virtualKey = 0x70 + code - (int)KeyCode.F1;
+            return true;
+        }
+
+        virtualKey = key switch
+        {
+            KeyCode.Backspace => 0x08,
+            KeyCode.Tab => 0x09,
+            KeyCode.Clear => 0x0C,
+            KeyCode.Return => 0x0D,
+            KeyCode.Pause => 0x13,
+            KeyCode.Escape => 0x1B,
+            KeyCode.Space => 0x20,
+            KeyCode.PageUp => 0x21,
+            KeyCode.PageDown => 0x22,
+            KeyCode.End => 0x23,
+            KeyCode.Home => 0x24,
+            KeyCode.LeftArrow => 0x25,
+            KeyCode.UpArrow => 0x26,
+            KeyCode.RightArrow => 0x27,
+            KeyCode.DownArrow => 0x28,
+            KeyCode.Insert => 0x2D,
+            KeyCode.Delete => 0x2E,
+            KeyCode.KeypadMultiply => 0x6A,
+            KeyCode.KeypadPlus => 0x6B,
+            KeyCode.KeypadMinus => 0x6D,
+            KeyCode.KeypadPeriod => 0x6E,
+            KeyCode.KeypadDivide => 0x6F,
+            KeyCode.Numlock => 0x90,
+            KeyCode.ScrollLock => 0x91,
+            KeyCode.LeftShift => 0xA0,
+            KeyCode.RightShift => 0xA1,
+            KeyCode.LeftControl => 0xA2,
+            KeyCode.RightControl => 0xA3,
+            KeyCode.LeftAlt => 0xA4,
+            KeyCode.RightAlt => 0xA5,
+            KeyCode.Semicolon => 0xBA,
+            KeyCode.Equals => 0xBB,
+            KeyCode.Comma => 0xBC,
+            KeyCode.Minus => 0xBD,
+            KeyCode.Period => 0xBE,
+            KeyCode.Slash => 0xBF,
+            KeyCode.BackQuote => 0xC0,
+            KeyCode.LeftBracket => 0xDB,
+            KeyCode.Backslash => 0xDC,
+            KeyCode.RightBracket => 0xDD,
+            KeyCode.Quote => 0xDE,
+            _ => 0
+        };
+        return virtualKey != 0;
+    }
 
     private static void SendVirtualKey(byte virtualKey)
     {
