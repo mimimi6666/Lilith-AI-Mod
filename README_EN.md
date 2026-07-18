@@ -2,6 +2,14 @@
 
 This is an unofficial community MOD for the desktop companion game *The NOexistenceN of Lilith*. It adds AI conversations, text and voice input, Chinese and Japanese voice output, voice lines for previously unvoiced dialogue, weather features, and reviewed local computer controls.
 
+## AI Provider Compatibility
+
+**Gemini is the recommended provider and the only provider tested and specifically optimized for version 0.1.0-RC1.** Personality behavior, context handling, multilingual output, Japanese display/voice separation, Google Search grounding, AI letters, and natural-language computer tool calls were developed around the Gemini API.
+
+OpenAI and DeepSeek currently use an **experimental text-chat compatibility layer**. Basic requests are implemented, and local GPT-SoVITS may speak a reply that was returned successfully, but these providers have not been tested end to end across their available models, response formats, quotas, regional restrictions, or future API changes. Provider-native web search and function calling are not integrated for them; only some explicit local commands may still be recognized by the MOD itself.
+
+`F6` speech recognition currently always uses Gemini multimodal audio transcription. Even when OpenAI or DeepSeek is selected for chat, voice input still requires a separately saved Gemini API key. The recording is sent to Gemini for transcription and is not sent to OpenAI or DeepSeek.
+
 ## One-Click Installation
 
 1. Run `LilithAI-Mod-Setup.exe`.
