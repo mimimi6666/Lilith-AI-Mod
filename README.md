@@ -51,11 +51,47 @@ This unofficial AI extension for *The NOexistenceN of Lilith* keeps Lilith's qui
 - 按住 `F6`：錄音；放開後辨識並送出 / Hold to record; release to transcribe and send
 - 兩個按鍵皆可在遊戲設定中重新綁定 / Both keys can be reassigned in game settings
 
+## 🖥️ 電腦操作 / PC controls
+
+莉莉絲的電腦操作分成兩層。日常、低風險的功能可以直接使用；可能影響目前桌面狀態的功能，必須由玩家在遊戲設定中手動開啟「進階電腦操作」。這個開關**不會授予 Windows 系統管理員權限**。
+
+Lilith's PC controls have two levels. Routine, low-risk actions are available normally. Actions that can affect the current desktop require the player to manually enable **Advanced Computer Controls** in the game settings. This switch **does not grant Windows administrator privileges**.
+
+### ♡ 一般電腦操作 / Standard controls
+
+不需要開啟進階功能：
+
+Available without the advanced toggle:
+
+- 依照常用名稱開啟或切回已安裝的應用程式與遊戲，例如記事本、計算機、瀏覽器、Steam、Spotify、Discord、VALORANT 等；不接受任意路徑或指令  
+  Open or focus recognized applications and games by common name, such as Notepad, Calculator, a browser, Steam, Spotify, Discord, or VALORANT; arbitrary paths and commands are not accepted
+- 播放／暫停、上一首、下一首、停止、靜音及調整系統音量  
+  Play/pause, previous/next track, stop, mute, and system volume controls
+- 查看非個人的本機狀態：電池、記憶體、系統磁碟可用空間與網路連線  
+  Report non-personal local status: battery, memory, system-drive free space, and network availability
+
+### ✦ 進階電腦操作 / Advanced controls
+
+只有玩家主動開啟設定後才可使用：
+
+Available only after the player explicitly enables the setting:
+
+| 功能 / Feature | 可以做什麼 / What it can do |
+|---|---|
+| 📁 常用資料夾 / Known folders | 開啟下載、桌面、文件、圖片、音樂、影片、截圖、MOD 資料夾或資源回收筒；不接受任意檔案路徑 / Open Downloads, Desktop, Documents, Pictures, Music, Videos, Screenshots, the MOD folder, or Recycle Bin; arbitrary paths are not accepted |
+| 🪟 視窗 / Windows | 顯示桌面、工作檢視、切換上一個視窗、最小化、最大化、還原，以及靠左／靠右排列 / Show Desktop, Task View, switch to the previous window, minimize, maximize, restore, or snap left/right |
+| 📷 截圖 / Screenshots | 擷取所有螢幕並只存到 `圖片\Lilith Screenshots`；圖片不會回傳或上傳給模型 / Capture all monitors to `Pictures\Lilith Screenshots`; the image is not returned or uploaded to the model |
+| 📋 複製文字 / Copy text | 只把玩家明確指定、非敏感的文字寫入剪貼簿；無法讀取剪貼簿 / Write only player-specified, non-sensitive text to the clipboard; clipboard reading is unavailable |
+| 🔎 瀏覽器搜尋 / Browser search | 只有玩家明確要求時，才用預設瀏覽器開啟 Google 搜尋 / Open a Google search in the default browser only when explicitly requested |
+| ⌨️ 安全快捷鍵 / Safe shortcuts | 復原、重做、儲存、全選、尋找、重新整理、全螢幕與 Escape；不支援任意按鍵或任意輸入 / Undo, redo, save, select all, find, refresh, fullscreen, and Escape; arbitrary keys and typing are unavailable |
+| ⏲️ 計時器 / Timers | 建立或取消最長 24 小時的本機計時器，時間到由莉莉絲提醒 / Create or cancel local timers up to 24 hours, announced by Lilith |
+| 🔒 鎖定與睡眠 / Lock & sleep | 只有在玩家明確要求「鎖定電腦」或「讓電腦睡眠」時才執行，並可在等待期間取消 / Run only after an explicit request to lock or sleep the PC, with cancellation available during the pending period |
+
 ## 🖤 溫柔也需要邊界 / Gentle, with boundaries
 
-「進階電腦操作」預設關閉。即使開啟，MOD 也只執行經過檢查的白名單功能，不提供任意 PowerShell／CMD、密碼讀取、剪貼簿內容或檔案刪除能力。
+「進階電腦操作」預設關閉。即使開啟，MOD 也只執行經過檢查的白名單功能，不提供檔案刪除、清空資源回收筒、關機／重新啟動、關閉或強制結束程式、任意 PowerShell／CMD、系統管理員提權、密碼／API Key／OTP 讀取、剪貼簿讀取、任意打字或任意快捷鍵。
 
-“Advanced Computer Controls” are disabled by default. When enabled, only reviewed allowlisted actions are available—never unrestricted PowerShell/CMD, password access, clipboard reading, or file deletion.
+“Advanced Computer Controls” are disabled by default. When enabled, only reviewed allowlisted actions are available—never file deletion, emptying the Recycle Bin, shutdown/restart, closing or terminating apps, arbitrary PowerShell/CMD, privilege elevation, password/API key/OTP access, clipboard reading, arbitrary typing, or arbitrary shortcuts.
 
 AI 對話與語音辨識會依玩家選擇傳送至相應服務商；GPT-SoVITS 語音合成則在本機 `127.0.0.1` 運行。
 
