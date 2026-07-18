@@ -61,15 +61,37 @@ Local GPT-SoVITS can speak a successfully returned text reply, so OpenAI/DeepSee
 
 ## 🍓 一鍵安裝 / One-click setup
 
-### 下載方式 / Download options
+### 推薦下載 / Recommended download
 
-- **[Google Drive 完整包鏡像 / Full package mirror](https://drive.google.com/file/d/1JYdSjJSuSd_VUxsOPWL1niAB6354c-QR/view?usp=sharing)**：下載 ZIP、完整解壓縮後執行資料夾內的 `LilithAI-Mod-Setup.exe`。  
-  Download the ZIP, extract all files, and run `LilithAI-Mod-Setup.exe` from the extracted folder.
-- **[GitHub Release](https://github.com/mimimi6666/Lilith-AI-Mod/releases/tag/v0.1.0-rc1)**：也可以從 Assets 下載 `LilithAI-Mod-Setup.exe`，並查看版本資訊與校驗檔。  
-  You can also download `LilithAI-Mod-Setup.exe` from Assets and review the release notes and checksums.
+- **[Google Drive 完整包鏡像 / Full package mirror](https://drive.google.com/file/d/1JYdSjJSuSd_VUxsOPWL1niAB6354c-QR/view?usp=sharing)**：RC1 最簡單、最可靠的安裝方式。下載 ZIP、完整解壓縮後，直接執行資料夾內的 `LilithAI-Mod-Setup.exe`。  
+  This is the easiest and most reliable way to install RC1. Download the ZIP, extract all files, and run `LilithAI-Mod-Setup.exe` from the extracted folder.
 
-1. 執行安裝程式；它會自動尋找 Steam 遊戲路徑。  
-   Run the installer; it automatically searches your Steam libraries.
+> ⚠️ **請勿使用首頁的 `Code → Download ZIP` 安裝 MOD；那裡只有原始碼，不是可安裝的發布包。**  
+> ⚠️ **Do not install the MOD through `Code → Download ZIP`; it contains source code, not the installable release.**
+
+### GitHub Release 手動下載 / Manual GitHub Release download
+
+[GitHub Release](https://github.com/mimimi6666/Lilith-AI-Mod/releases/tag/v0.1.0-rc1) 的 Assets 會平鋪顯示，但 RC1 安裝器的本機套件必須放在 `packages` 子資料夾。若要手動下載所有附件，請整理成以下結構：
+
+GitHub Release Assets are displayed as a flat list, while the RC1 installer expects local packages inside a `packages` subfolder. If you download the assets manually, arrange them like this:
+
+```text
+Lilith-AI-Mod-0.1.0-RC1
+├─ LilithAI-Mod-Setup.exe
+├─ release-manifest.json
+├─ SHA256SUMS.txt
+└─ packages
+   ├─ core.zip
+   ├─ voice-pack.zip
+   └─ voice-runtime.zip
+```
+
+只下載 EXE 時，安裝器會嘗試從 GitHub 自動取得清單與缺少的套件；若網路、地區限制或大型檔案下載失敗，請改用上方的 Google Drive 完整包。
+
+If only the EXE is downloaded, the installer will try to retrieve the manifest and missing packages from GitHub. If networking, regional availability, or large-file downloads fail, use the complete Google Drive package above.
+
+1. 完整解壓縮或整理好上述資料夾後，再執行安裝程式；它會自動尋找 Steam 遊戲路徑。  
+   Extract the complete package or arrange the folders above before running the installer; it automatically searches your Steam libraries.
 2. 開啟遊戲後，在左下角莉莉絲圖示按右鍵，選擇 AI 服務並輸入自己的 API Key。  
    Launch the game, right-click Lilith's tray icon, choose an AI provider, and enter your own API key.
 
