@@ -2,6 +2,14 @@
 
 這是《The NOexistenceN of Lilith》桌寵的非官方社群 MOD。它加入 AI 對話、文字與語音輸入、中／日語音、補充無配音台詞、天氣與經過審核的本機電腦操作。
 
+## AI 服務相容性
+
+**目前建議使用 Gemini；Gemini 是 0.1.0-RC1 唯一完成實際測試與針對性優化的服務。** 角色人格、上下文、多語言輸出、日文顯示／語音分離、Google Search 聯網搜尋、AI 信件與自然語言電腦工具，皆以 Gemini API 為主要開發與測試對象。
+
+OpenAI 與 DeepSeek 目前僅提供**實驗性的文字聊天相容層**。基本請求已實作，正常取得的文字回覆也可能由本機 GPT-SoVITS 朗讀，但尚未針對各模型、回應格式、額度、地區限制及後續 API 變更做完整測試。這兩個服務目前沒有接入供應商原生的聯網搜尋與工具呼叫；只有部分明確指令仍可由 MOD 在本機直接辨識。
+
+`F6` 語音辨識目前固定使用 Gemini 的多模態音訊辨識。即使聊天選擇 OpenAI 或 DeepSeek，語音輸入仍需要另外儲存 Gemini API Key；錄音會送往 Gemini 轉成文字，不會送往 OpenAI 或 DeepSeek。
+
 ## 一鍵安裝
 
 1. 執行 `LilithAI-Mod-Setup.exe`。
