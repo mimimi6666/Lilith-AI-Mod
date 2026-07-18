@@ -32,7 +32,7 @@ internal static class Program
 
 internal sealed class ReleaseManifest
 {
-    public string Version { get; set; } = "0.1.0";
+    public string Version { get; set; } = "0.1.1-rc2";
     public Dictionary<string, PackageSpec> Packages { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
@@ -54,7 +54,7 @@ internal sealed class InstalledManifest
 internal sealed class InstallerForm : Form
 {
     private const string AppId = "4643090";
-    private const string DefaultManifestUrl = "https://github.com/mimimi6666/Lilith-AI-Mod/releases/download/v0.1.0-rc1/release-manifest.json";
+    private const string DefaultManifestUrl = "https://github.com/mimimi6666/Lilith-AI-Mod/releases/download/v0.1.1-rc2/release-manifest.json";
     private readonly bool _zhTraditional;
     private readonly bool _zhSimplified;
     private readonly bool _japanese;

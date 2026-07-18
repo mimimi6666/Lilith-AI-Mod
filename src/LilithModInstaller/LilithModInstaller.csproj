@@ -7,6 +7,9 @@
     <Nullable>enable</Nullable>
     <AssemblyName>LilithAI-Mod-Setup</AssemblyName>
     <RootNamespace>LilithModInstaller</RootNamespace>
+    <Version>0.1.1-rc2</Version>
+    <FileVersion>0.1.1.0</FileVersion>
+    <AssemblyVersion>0.1.1.0</AssemblyVersion>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
