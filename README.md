@@ -33,6 +33,24 @@ This unofficial AI extension for *The NOexistenceN of Lilith* keeps Lilith's qui
 | 💌 | 在重要對話後，偶爾收到她的信 | Receive occasional letters after meaningful conversations |
 | 🖥️ | 經你開啟後，執行白名單內的電腦操作 | Run reviewed, allowlisted computer actions after you enable them |
 
+## ✦ AI 服務相容性 / AI provider compatibility
+
+> **目前建議使用 Gemini。Gemini 是 0.1.0-RC1 唯一完成實際測試與針對性優化的服務；OpenAI 與 DeepSeek 僅提供實驗性的文字聊天相容層，尚未完成端到端測試。**
+
+> **Gemini is currently recommended. It is the only provider tested and specifically optimized for 0.1.0-RC1. OpenAI and DeepSeek currently use an experimental text-chat compatibility layer and have not been tested end to end.**
+
+| 功能 / Feature | Gemini | OpenAI / DeepSeek |
+|---|---|---|
+| 文字對話 / Text chat | ✅ 已測試並調整人格、上下文與多語言輸出 / Tested and tuned | 🧪 已實作基本相容，但未實測所有模型與回應格式 / Basic compatibility implemented; models and response formats not fully tested |
+| `F6` 語音辨識 / `F6` speech recognition | ✅ 使用 Gemini 多模態音訊辨識 / Uses Gemini multimodal audio transcription | ⚠️ 目前仍需要另外設定 Gemini API Key；錄音不會送到 OpenAI 或 DeepSeek / A Gemini API key is still required; recordings are not sent to OpenAI or DeepSeek |
+| 即時聯網搜尋 / Live web search | ✅ 使用 Gemini／Google Search grounding / Gemini with Google Search grounding | ❌ 尚未接入 / Not integrated |
+| 自然語言電腦工具 / Natural-language PC tools | ✅ 支援 Gemini function calling、多步驟與結果回報 / Gemini function calling, multi-step actions, and result reporting | ⚠️ 只保留部分明確關鍵句的本機處理；未接入供應商工具呼叫 / Some explicit local commands remain; provider tool calling is not integrated |
+| 日文顯示／語音分離與 AI 信件 / Split Japanese display/speech and AI letters | ✅ 以 Gemini 流程優化 / Optimized in the Gemini flow | 🧪 可能可用，但尚未驗證穩定性 / May work, but stability is unverified |
+
+本機 GPT-SoVITS 語音合成可朗讀已成功取得的文字回覆，因此 OpenAI／DeepSeek 的文字聊天若正常回傳，仍可能播放合成語音；但這不代表該供應商的整體流程已完成測試。模型名稱、API 規格、地區限制或服務商更新也可能影響實驗性相容層。
+
+Local GPT-SoVITS can speak a successfully returned text reply, so OpenAI/DeepSeek responses may still produce synthesized speech. This does not mean their complete workflows have been validated. Model names, API behavior, regional availability, or provider updates may also affect the experimental compatibility layer.
+
 ## 🍓 一鍵安裝 / One-click setup
 
 1. 從 [Releases](https://github.com/mimimi6666/Lilith-AI-Mod/releases) 下載 `LilithAI-Mod-Setup.exe`。  
