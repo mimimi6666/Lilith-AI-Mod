@@ -41,7 +41,7 @@ Any modification, packaging, configuration, or integration performed by this MOD
 Where an applicable open-source license requires the provision of corresponding source code, modifications, build scripts, relinking information, or other materials, users may obtain them from the following location:
 
 Source code / Corresponding source: https://github.com/mimimi6666/Lilith-AI-Mod
-Version or commit identifier: v0.1.0-rc1
+Version or commit identifier: v0.1.1-rc2
 Contact: **[mimimi5206666@gmail.com]**
 
 This notice applies only to software components and source code licensing. AI voice models, model weights, training data, reference audio, generated speech, and other content materials do not automatically become subject to the license of the open-source software used to create or operate them. The rights and usage restrictions applicable to such materials must be assessed separately according to their respective sources, licenses, and applicable law.

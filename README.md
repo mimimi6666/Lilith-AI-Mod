@@ -22,6 +22,13 @@ This unofficial AI extension for *The NOexistenceN of Lilith* keeps Lilith's qui
 > 「今天也要和我說說話嗎？」  
 > “Will you stay and talk with me today?”
 
+## ✦ 0.1.1-RC2 官方更新相容修正 / Official update compatibility
+
+- 相容官方 Build `24273498` 的分類式設定介面 / Compatible with the categorized settings UI in official Build `24273498`
+- MOD 控制項只顯示於「控制」分頁 / MOD controls now appear only on the **Controls** tab
+- 修復 F6／F7 只能使用一次、按鍵重綁與 Esc 取消失效 / Fixed one-time-only F6/F7 input, key rebinding, and Esc cancellation
+- 中／日語音切換與補充語音維持正常 / Chinese/Japanese voice switching and supplemental voices remain separated
+
 ## ♡ 她能陪你做什麼？ / What can she do?
 
 | | 繁體中文 | English |
@@ -43,9 +50,9 @@ This unofficial AI extension for *The NOexistenceN of Lilith* keeps Lilith's qui
 
 ## ✦ AI 服務相容性 / AI provider compatibility
 
-> **目前建議使用 Gemini。Gemini 是 0.1.0-RC1 唯一完成實際測試與針對性優化的服務；OpenAI 與 DeepSeek 僅提供實驗性的文字聊天相容層，尚未完成端到端測試。**
+> **目前建議使用 Gemini。Gemini 是 0.1.1-RC2 唯一完成實際測試與針對性優化的服務；OpenAI 與 DeepSeek 僅提供實驗性的文字聊天相容層，尚未完成端到端測試。**
 
-> **Gemini is currently recommended. It is the only provider tested and specifically optimized for 0.1.0-RC1. OpenAI and DeepSeek currently use an experimental text-chat compatibility layer and have not been tested end to end.**
+> **Gemini is currently recommended. It is the only provider tested and specifically optimized for 0.1.1-RC2. OpenAI and DeepSeek currently use an experimental text-chat compatibility layer and have not been tested end to end.**
 
 | 功能 / Feature | Gemini | OpenAI / DeepSeek |
 |---|---|---|
@@ -63,20 +70,20 @@ Local GPT-SoVITS can speak a successfully returned text reply, so OpenAI/DeepSee
 
 ### 推薦下載 / Recommended download
 
-- **[Google Drive 完整包鏡像 / Full package mirror](https://drive.google.com/file/d/1JYdSjJSuSd_VUxsOPWL1niAB6354c-QR/view?usp=sharing)**：RC1 最簡單、最可靠的安裝方式。下載 ZIP、完整解壓縮後，直接執行資料夾內的 `LilithAI-Mod-Setup.exe`。  
-  This is the easiest and most reliable way to install RC1. Download the ZIP, extract all files, and run `LilithAI-Mod-Setup.exe` from the extracted folder.
+- **[Google Drive 完整包鏡像 / Full package mirror](https://drive.google.com/file/d/1UxynMsGJrl0nuA5b3JS2YFTsfRVafIG4/view?usp=sharing)**：RC2 最簡單、最可靠的安裝方式。下載 ZIP、完整解壓縮後，直接執行資料夾內的 `LilithAI-Mod-Setup.exe`。  
+  This is the easiest and most reliable way to install RC2. Download the ZIP, extract all files, and run `LilithAI-Mod-Setup.exe` from the extracted folder.
 
 > ⚠️ **請勿使用首頁的 `Code → Download ZIP` 安裝 MOD；那裡只有原始碼，不是可安裝的發布包。**  
 > ⚠️ **Do not install the MOD through `Code → Download ZIP`; it contains source code, not the installable release.**
 
 ### GitHub Release 手動下載 / Manual GitHub Release download
 
-[GitHub Release](https://github.com/mimimi6666/Lilith-AI-Mod/releases/tag/v0.1.0-rc1) 的 Assets 會平鋪顯示，但 RC1 安裝器的本機套件必須放在 `packages` 子資料夾。若要手動下載所有附件，請整理成以下結構：
+[GitHub Release](https://github.com/mimimi6666/Lilith-AI-Mod/releases/tag/v0.1.1-rc2) 的 Assets 會平鋪顯示，但 RC2 安裝器的本機套件必須放在 `packages` 子資料夾。若要手動下載所有附件，請整理成以下結構：
 
-GitHub Release Assets are displayed as a flat list, while the RC1 installer expects local packages inside a `packages` subfolder. If you download the assets manually, arrange them like this:
+GitHub Release Assets are displayed as a flat list, while the RC2 installer expects local packages inside a `packages` subfolder. If you download the assets manually, arrange them like this:
 
 ```text
-Lilith-AI-Mod-0.1.0-RC1
+Lilith-AI-Mod-0.1.1-RC2
 ├─ LilithAI-Mod-Setup.exe
 ├─ release-manifest.json
 ├─ SHA256SUMS.txt
@@ -86,9 +93,9 @@ Lilith-AI-Mod-0.1.0-RC1
    └─ voice-runtime.zip
 ```
 
-只下載 EXE 時，安裝器會嘗試從 GitHub 自動取得清單與缺少的套件；若網路、地區限制或大型檔案下載失敗，請改用上方的 Google Drive 完整包。
+只下載 EXE 時，安裝器會自動取得 RC2 清單與缺少的套件。RC2 的語音包內容沒有改變，因此清單會沿用 RC1 的既有語音下載，以免玩家重複下載約 2.4 GB。若網路、地區限制或大型檔案下載失敗，請改用上方的 Google Drive 完整包。
 
-If only the EXE is downloaded, the installer will try to retrieve the manifest and missing packages from GitHub. If networking, regional availability, or large-file downloads fail, use the complete Google Drive package above.
+If only the EXE is downloaded, the installer retrieves the RC2 manifest and missing packages automatically. The voice files did not change, so RC2 reuses the existing RC1 voice downloads instead of making players download about 2.4 GB again. If networking, regional availability, or large-file downloads fail, use the complete Google Drive package above.
 
 1. 完整解壓縮或整理好上述資料夾後，再執行安裝程式；它會自動尋找 Steam 遊戲路徑。  
    Extract the complete package or arrange the folders above before running the installer; it automatically searches your Steam libraries.
@@ -145,46 +152,47 @@ Available only after the player explicitly enables the setting:
 | 📋 複製文字 / Copy text | 只把玩家明確指定、非敏感的文字寫入剪貼簿；無法讀取剪貼簿 / Write only player-specified, non-sensitive text to the clipboard; clipboard reading is unavailable |
 | 🔎 瀏覽器搜尋 / Browser search | 只有玩家明確要求時，才用預設瀏覽器開啟 Google 搜尋 / Open a Google search in the default browser only when explicitly requested |
 | ⌨️ 安全快捷鍵 / Safe shortcuts | 復原、重做、儲存、全選、尋找、重新整理、全螢幕與 Escape；不支援任意按鍵或任意輸入 / Undo, redo, save, select all, find, refresh, fullscreen, and Escape; arbitrary keys and typing are unavailable |
+| ⏲️ 計時器 / Timers | 建立或取消最長 24 小時的本機計時器，時間到由莉莉絲提醒 / Create or cancel local timers up to 24 hours, announced by Lilith |
+| 🔒 鎖定與睡眠 / Lock & sleep | 只有在玩家明確要求「鎖定電腦」或「讓電腦睡眠」時才執行，並可在等待期間取消 / Run only after an explicit request to lock or sleep the PC, with cancellation available during the pending period |
 
+## 🖤 溫柔也需要邊界 / Gentle, with boundaries
 
+「進階電腦操作」預設關閉。即使開啟，MOD 也只執行經過檢查的白名單功能，不提供檔案刪除、清空資源回收筒、關機／重新啟動、關閉或強制結束程式、任意 PowerShell／CMD、系統管理員提權、密碼／API Key／OTP 讀取、剪貼簿讀取、任意打字或任意快捷鍵。
 
+“Advanced Computer Controls” are disabled by default. When enabled, only reviewed allowlisted actions are available—never file deletion, emptying the Recycle Bin, shutdown/restart, closing or terminating apps, arbitrary PowerShell/CMD, privilege elevation, password/API key/OTP access, clipboard reading, arbitrary typing, or arbitrary shortcuts.
 
+AI 對話與語音辨識會依玩家選擇傳送至相應服務商；GPT-SoVITS 語音合成則在本機 `127.0.0.1` 運行。
 
+AI chat and speech recognition are sent to the provider selected by the player. GPT-SoVITS voice synthesis runs locally on `127.0.0.1`.
 
+## ✧ 系統需求 / Requirements
 
+- Windows 10/11 x64
+- AI 對話與語音辨識需要網路及玩家自己的 API Key  
+  AI chat and speech recognition require internet access and the player's own API key
+- 動態語音建議 NVIDIA GPU 8 GB VRAM 與 16 GB RAM；沒有相容顯示卡時可使用較慢的 CPU 模式  
+  An NVIDIA GPU with 8 GB VRAM and 16 GB RAM is recommended; a slower CPU mode is available
 
+## ♡ 完整說明 / Full guides
 
+- [繁體中文](README_繁體中文.md)
+- [简体中文](README_简体中文.md)
+- [日本語](README_日本語.md)
+- [English](README_EN.md)
+- [Third-party licenses](THIRD_PARTY_NOTICES.md)
 
+## ⚠ 非官方聲明 / Unofficial project notice
 
+本 MOD 是玩家獨立製作、免費且非商業的社群作品，未獲遊戲開發商、發行商、角色權利人或原配音員授權、認可或贊助。遊戲、角色、美術、原始台詞與錄音的相關權利均屬其合法權利人。請勿將 AI 生成內容冒充官方內容或原配音員的新錄音。
 
+This is a free, non-commercial fan project. It is not authorized, endorsed, sponsored by, or affiliated with the developer, publisher, character rights holders, or original voice actors. Rights to the game, characters, artwork, original dialogue, and recordings remain with their lawful owners. Do not present AI-generated material as official content or new recordings by the original performers.
 
+---
 
+<div align="center">
 
+### ✦ 「如果你願意，我就再陪你一會。」 ✦
 
+**Version 0.1.1-RC2 · Publisher: MIMI**
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+</div>

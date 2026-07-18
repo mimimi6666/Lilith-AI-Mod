@@ -1,10 +1,17 @@
-# Lilith AI MOD 0.1.0
+# Lilith AI MOD 0.1.1 RC2
 
 This is an unofficial community MOD for the desktop companion game *The NOexistenceN of Lilith*. It adds AI conversations, text and voice input, Chinese and Japanese voice output, voice lines for previously unvoiced dialogue, weather features, and reviewed local computer controls.
 
+## RC2 Update
+
+* Added compatibility with the categorized settings interface in official Build `24273498`.
+* MOD controls now appear only on the **Controls** tab and no longer overlap other settings pages.
+* Fixed F6/F7 working only once, keyboard rebinding, and Esc cancellation.
+* Chinese and Japanese built-in/supplemental voice selection remains fully separated.
+
 ## AI Provider Compatibility
 
-**Gemini is the recommended provider and the only provider tested and specifically optimized for version 0.1.0-RC1.** Personality behavior, context handling, multilingual output, Japanese display/voice separation, Google Search grounding, AI letters, and natural-language computer tool calls were developed around the Gemini API.
+**Gemini is the recommended provider and the only provider tested and specifically optimized for version 0.1.1-RC2.** Personality behavior, context handling, multilingual output, Japanese display/voice separation, Google Search grounding, AI letters, and natural-language computer tool calls were developed around the Gemini API.
 
 OpenAI and DeepSeek currently use an **experimental text-chat compatibility layer**. Basic requests are implemented, and local GPT-SoVITS may speak a reply that was returned successfully, but these providers have not been tested end to end across their available models, response formats, quotas, regional restrictions, or future API changes. Provider-native web search and function calling are not integrated for them; only some explicit local commands may still be recognized by the MOD itself.
 
@@ -100,5 +107,5 @@ Contact: **[mimimi5206666@gmail.com]**
 Upon receiving a specific and verifiable rights-related notice, the creator will promptly review the matter and, where appropriate, suspend distribution, remove, or modify the relevant content.
 
 Publisher: MIMI
-Version: 0.1.0-RC1
+Version: 0.1.1-RC2
 Release Date: July 18, 2026
