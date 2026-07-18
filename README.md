@@ -33,6 +33,14 @@ This unofficial AI extension for *The NOexistenceN of Lilith* keeps Lilith's qui
 | 💌 | 在重要對話後，偶爾收到她的信 | Receive occasional letters after meaningful conversations |
 | 🖥️ | 經你開啟後，執行白名單內的電腦操作 | Run reviewed, allowlisted computer actions after you enable them |
 
+<div align="center">
+
+<img src="docs/images/settings-and-voice-language.png" alt="Lilith AI MOD settings, key bindings, and Chinese or Japanese voice selection">
+
+<sub>設定、可自訂按鍵與中文／日文語音切換 · Settings, rebindable controls, and Chinese/Japanese voice selection</sub>
+
+</div>
+
 ## ✦ AI 服務相容性 / AI provider compatibility
 
 > **目前建議使用 Gemini。Gemini 是 0.1.0-RC1 唯一完成實際測試與針對性優化的服務；OpenAI 與 DeepSeek 僅提供實驗性的文字聊天相容層，尚未完成端到端測試。**
@@ -59,6 +67,14 @@ Local GPT-SoVITS can speak a successfully returned text reply, so OpenAI/DeepSee
    Run the installer; it automatically searches your Steam libraries.
 3. 開啟遊戲後，在左下角莉莉絲圖示按右鍵，選擇 AI 服務並輸入自己的 API Key。  
    Launch the game, right-click Lilith's tray icon, choose an AI provider, and enter your own API key.
+
+<div align="center">
+
+<img src="docs/images/api-provider-menu.png" alt="Choose Gemini, OpenAI, or DeepSeek from the Lilith tray menu">
+
+<sub>從工作列選單加入自己的 API Key · Add your own API key and choose a provider from the tray menu</sub>
+
+</div>
 
 > ✧ 安裝包不包含作者的 API Key、聊天記錄、玩家名稱或私人資料。  
 > ✧ The package contains no author API key, chat history, player name, or private data.
