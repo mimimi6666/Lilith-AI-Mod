@@ -61,11 +61,16 @@ Local GPT-SoVITS can speak a successfully returned text reply, so OpenAI/DeepSee
 
 ## 🍓 一鍵安裝 / One-click setup
 
-1. 從 [Releases](https://github.com/mimimi6666/Lilith-AI-Mod/releases) 下載 `LilithAI-Mod-Setup.exe`。  
-   Download `LilithAI-Mod-Setup.exe` from [Releases](https://github.com/mimimi6666/Lilith-AI-Mod/releases).
-2. 執行安裝程式；它會自動尋找 Steam 遊戲路徑。  
+### 下載方式 / Download options
+
+- **[Google Drive 完整包鏡像 / Full package mirror](https://drive.google.com/file/d/1JYdSjJSuSd_VUxsOPWL1niAB6354c-QR/view?usp=sharing)**：下載 ZIP、完整解壓縮後執行資料夾內的 `LilithAI-Mod-Setup.exe`。  
+  Download the ZIP, extract all files, and run `LilithAI-Mod-Setup.exe` from the extracted folder.
+- **[GitHub Release](https://github.com/mimimi6666/Lilith-AI-Mod/releases/tag/v0.1.0-rc1)**：也可以從 Assets 下載 `LilithAI-Mod-Setup.exe`，並查看版本資訊與校驗檔。  
+  You can also download `LilithAI-Mod-Setup.exe` from Assets and review the release notes and checksums.
+
+1. 執行安裝程式；它會自動尋找 Steam 遊戲路徑。  
    Run the installer; it automatically searches your Steam libraries.
-3. 開啟遊戲後，在左下角莉莉絲圖示按右鍵，選擇 AI 服務並輸入自己的 API Key。  
+2. 開啟遊戲後，在左下角莉莉絲圖示按右鍵，選擇 AI 服務並輸入自己的 API Key。  
    Launch the game, right-click Lilith's tray icon, choose an AI provider, and enter your own API key.
 
 <div align="center">
@@ -118,47 +123,46 @@ Available only after the player explicitly enables the setting:
 | 📋 複製文字 / Copy text | 只把玩家明確指定、非敏感的文字寫入剪貼簿；無法讀取剪貼簿 / Write only player-specified, non-sensitive text to the clipboard; clipboard reading is unavailable |
 | 🔎 瀏覽器搜尋 / Browser search | 只有玩家明確要求時，才用預設瀏覽器開啟 Google 搜尋 / Open a Google search in the default browser only when explicitly requested |
 | ⌨️ 安全快捷鍵 / Safe shortcuts | 復原、重做、儲存、全選、尋找、重新整理、全螢幕與 Escape；不支援任意按鍵或任意輸入 / Undo, redo, save, select all, find, refresh, fullscreen, and Escape; arbitrary keys and typing are unavailable |
-| ⏲️ 計時器 / Timers | 建立或取消最長 24 小時的本機計時器，時間到由莉莉絲提醒 / Create or cancel local timers up to 24 hours, announced by Lilith |
-| 🔒 鎖定與睡眠 / Lock & sleep | 只有在玩家明確要求「鎖定電腦」或「讓電腦睡眠」時才執行，並可在等待期間取消 / Run only after an explicit request to lock or sleep the PC, with cancellation available during the pending period |
 
-## 🖤 溫柔也需要邊界 / Gentle, with boundaries
 
-「進階電腦操作」預設關閉。即使開啟，MOD 也只執行經過檢查的白名單功能，不提供檔案刪除、清空資源回收筒、關機／重新啟動、關閉或強制結束程式、任意 PowerShell／CMD、系統管理員提權、密碼／API Key／OTP 讀取、剪貼簿讀取、任意打字或任意快捷鍵。
 
-“Advanced Computer Controls” are disabled by default. When enabled, only reviewed allowlisted actions are available—never file deletion, emptying the Recycle Bin, shutdown/restart, closing or terminating apps, arbitrary PowerShell/CMD, privilege elevation, password/API key/OTP access, clipboard reading, arbitrary typing, or arbitrary shortcuts.
 
-AI 對話與語音辨識會依玩家選擇傳送至相應服務商；GPT-SoVITS 語音合成則在本機 `127.0.0.1` 運行。
 
-AI chat and speech recognition are sent to the provider selected by the player. GPT-SoVITS voice synthesis runs locally on `127.0.0.1`.
 
-## ✧ 系統需求 / Requirements
 
-- Windows 10/11 x64
-- AI 對話與語音辨識需要網路及玩家自己的 API Key  
-  AI chat and speech recognition require internet access and the player's own API key
-- 動態語音建議 NVIDIA GPU 8 GB VRAM 與 16 GB RAM；沒有相容顯示卡時可使用較慢的 CPU 模式  
-  An NVIDIA GPU with 8 GB VRAM and 16 GB RAM is recommended; a slower CPU mode is available
 
-## ♡ 完整說明 / Full guides
 
-- [繁體中文](README_繁體中文.md)
-- [简体中文](README_简体中文.md)
-- [日本語](README_日本語.md)
-- [English](README_EN.md)
-- [Third-party licenses](THIRD_PARTY_NOTICES.md)
 
-## ⚠ 非官方聲明 / Unofficial project notice
 
-本 MOD 是玩家獨立製作、免費且非商業的社群作品，未獲遊戲開發商、發行商、角色權利人或原配音員授權、認可或贊助。遊戲、角色、美術、原始台詞與錄音的相關權利均屬其合法權利人。請勿將 AI 生成內容冒充官方內容或原配音員的新錄音。
 
-This is a free, non-commercial fan project. It is not authorized, endorsed, sponsored by, or affiliated with the developer, publisher, character rights holders, or original voice actors. Rights to the game, characters, artwork, original dialogue, and recordings remain with their lawful owners. Do not present AI-generated material as official content or new recordings by the original performers.
 
----
 
-<div align="center">
 
-### ✦ 「如果你願意，我就再陪你一會。」 ✦
 
-**Version 0.1.0-RC1 · Publisher: MIMI**
 
-</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
