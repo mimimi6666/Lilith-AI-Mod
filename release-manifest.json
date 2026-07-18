@@ -4,8 +4,8 @@
                      "core":  {
                                   "file":  "core.zip",
                                   "url":  "https://github.com/mimimi6666/Lilith-AI-Mod/releases/download/v0.1.1-rc2/core.zip",
-                                  "sha256":  "3893CEE59675BF497A72C91C852473C0C33EB797867FA1DECF81E48AD4CD9341",
-                                  "bytes":  41672943
+                                  "sha256":  "C3EA5CDF4C4F12B7E82679769B64B08B7EAAE6F774C59B4822D7BB1E2833026B",
+                                  "bytes":  41673611
                               },
                      "voicePack":  {
                                        "file":  "voice-pack.zip",
