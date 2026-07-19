@@ -1,8 +1,8 @@
-# Lilith AI MOD 0.1.1 RC3
+# Lilith AI MOD 0.1.1 RC4
 
 This is an unofficial community MOD for the desktop companion game *The NOexistenceN of Lilith*. It adds AI conversations, text and voice input, Chinese and Japanese voice output, voice lines for previously unvoiced dialogue, weather features, and reviewed local computer controls.
 
-## RC3 Update
+## RC4 Update
 
 * Added compatibility with the categorized settings interface in official Build `24273498`.
 * MOD controls now appear only on the **Controls** tab and no longer overlap other settings pages.
@@ -15,7 +15,7 @@ This is an unofficial community MOD for the desktop companion game *The NOexiste
 
 ## AI Provider Compatibility
 
-**Gemini remains the recommended and most extensively optimized provider for version 0.1.1-RC3.** Personality behavior, context handling, multilingual output, Japanese display/voice separation, Google Search grounding, AI letters, and natural-language computer tools were primarily developed around the Gemini API.
+**Gemini remains the recommended and most extensively optimized provider for version 0.1.1-RC4.** Personality behavior, context handling, multilingual output, Japanese display/voice separation, Google Search grounding, AI letters, and natural-language computer tools were primarily developed around the Gemini API.
 
 Qwen now has a tested integration using `qwen3.7-plus` for chat and `qwen3-asr-flash` for speech recognition. It supports provider-native web search for current information and deterministic local routing for explicit application, media, screenshot, and reviewed computer-control commands. Availability, free quota, and billing requirements depend on the player’s Alibaba Cloud Model Studio account and region.
 
@@ -114,5 +114,5 @@ Contact: **[mimimi5206666@gmail.com]**
 Upon receiving a specific and verifiable rights-related notice, the creator will promptly review the matter and, where appropriate, suspend distribution, remove, or modify the relevant content.
 
 Publisher: MIMI
-Version: 0.1.1-RC3
+Version: 0.1.1-RC4
 Release Date: July 18, 2026
