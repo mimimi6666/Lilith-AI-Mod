@@ -22,15 +22,14 @@ This unofficial AI extension for *The NOexistenceN of Lilith* keeps Lilith's qui
 > 「今天也要和我說說話嗎？」  
 > “Will you stay and talk with me today?”
 
-## ✦ 0.1.1-RC3 更新內容 / What's new in 0.1.1-RC3
+## ✦ 0.1.1-RC4 更新內容 / What's new in 0.1.1-RC4
 
-- 相容官方 Build `24273498` 的分類式設定介面，MOD 控制項只顯示於「控制」分頁 / Compatible with the categorized settings UI in official Build `24273498`; MOD controls now stay on the **Controls** tab
-- 修復 F6／F7 第二次無法觸發、文字輸入失焦、按鍵重綁與 Esc 取消失效 / Fixed one-time-only F6/F7 input, lost text focus, key rebinding, and Esc cancellation
-- 中文／日文內建與補充語音維持相互獨立 / Chinese and Japanese built-in and supplemental voices remain separated
-- 加入已測試的千問文字對話、`qwen3-asr-flash` 語音辨識與供應商原生聯網搜尋 / Added tested Qwen chat, `qwen3-asr-flash` speech recognition, and provider-native web search
-- 應用啟動會解析執行中程式、Windows 開始選單、Store／MSIX 與捷徑，不寫死玩家路徑 / App launching now resolves running processes, Start menu entries, Store/MSIX registrations, and shortcuts without hard-coded player paths
-- 修復 API Key 視窗的滑鼠／鍵盤焦點，並將原生權益兌換與 API Key 輸入完全分離 / Fixed API-key dialog focus and fully separated entitlement redemption from API-key entry
-- 安裝器可選擇合併莉莉絲 Codex Hooks，保留玩家現有 Hooks / The installer can optionally merge Lilith's Codex Hooks while preserving existing hooks
+- 啟動階段改為分項隔離；單一非必要 Hook 不相容時，其餘 MOD 功能仍可繼續載入，錯誤會寫入 `BepInEx/LogOutput.log` / Startup stages are isolated so one incompatible optional hook no longer prevents the remaining MOD features from loading
+- 安裝器會重試暫時性的檔案鎖定與覆寫失敗，顯示實際問題路徑，並在解壓後驗證 BepInEx 與 MOD DLL / The installer retries transient file locks, reports the exact failing path, and verifies the core installation after extraction
+- 修復重啟或開啟設定後語音按鈕回到中文、並把實際日文語音切回中文的問題 / Fixed the settings button reverting to Chinese and changing an active Japanese voice preference after restart
+- 本機語音主機只啟動目前選擇的語言服務，切換中文／日文時會乾淨重啟；相容官方 Build `24275097` 的語音切換回呼 / The local voice host starts only the selected language service, restarts cleanly on language changes, and supports the voice callback in official Build `24275097`
+- 千問即時語音辨識會使用設定的即時模型，HTTP 備援仍使用一般 ASR 模型 / Qwen realtime speech recognition now uses the configured realtime model while HTTP fallback keeps the regular ASR model
+- 已知舊版亂碼預設值會自動遷移，且不覆蓋玩家自行修改的提示詞與設定 / Known legacy mojibake defaults are migrated without overwriting player-customized prompts or settings
 
 ## ♡ 她能陪你做什麼？ / What can she do?
 
@@ -53,9 +52,9 @@ This unofficial AI extension for *The NOexistenceN of Lilith* keeps Lilith's qui
 
 ## ✦ AI 服務相容性 / AI provider compatibility
 
-> **目前仍建議優先使用 Gemini；它是 0.1.1-RC3 測試最完整、針對性優化最多的服務。千問已完成文字對話、語音辨識、聯網搜尋與明確本機指令的實際接入測試。OpenAI 與 DeepSeek 仍是實驗性文字相容層。**
+> **目前仍建議優先使用 Gemini；它是 0.1.1-RC4 測試最完整、針對性優化最多的服務。千問已完成文字對話、語音辨識、聯網搜尋與明確本機指令的實際接入測試。OpenAI 與 DeepSeek 仍是實驗性文字相容層。**
 
-> **Gemini remains the recommended and most extensively optimized provider in 0.1.1-RC3. Qwen has been tested for chat, speech recognition, web search, and explicit local commands. OpenAI and DeepSeek remain experimental text-chat compatibility layers.**
+> **Gemini remains the recommended and most extensively optimized provider in 0.1.1-RC4. Qwen has been tested for chat, speech recognition, web search, and explicit local commands. OpenAI and DeepSeek remain experimental text-chat compatibility layers.**
 
 | 功能 / Feature | Gemini | Qwen | OpenAI / DeepSeek |
 |---|---|---|---|
@@ -77,22 +76,22 @@ Local GPT-SoVITS can speak a successfully returned text reply, so OpenAI/DeepSee
 ### 推薦下載 / Recommended download
 
 - **[Google Drive 完整包鏡像 / Full package mirror](https://drive.google.com/file/d/1UxynMsGJrl0nuA5b3JS2YFTsfRVafIG4/view?usp=sharing)**
-- **[夸克網盤完整包 / Quark full package mirror](https://pan.quark.cn/s/6155fe5e3b95)**
+- **[百度網盤完整包 / Baidu full package mirror](https://pan.baidu.com/s/1UhlhNNqGOvHqpoparotbKg?pwd=iqgw)** — 提取碼 / Code: `iqgw`
 
-以上皆為 RC3 完整安裝包。下載 ZIP、完整解壓縮後，直接執行資料夾內的 `LilithAI-Mod-Setup.exe`。  
-Both links provide the complete RC3 package. Download the ZIP, extract all files, and run `LilithAI-Mod-Setup.exe` from the extracted folder.
+以上皆為 RC4 完整安裝包。壓縮檔解壓密碼為 `I love you, Lilith.`。完整解壓縮後，直接執行資料夾內的 `LilithAI-Mod-Setup.exe`。  
+Both links provide the complete RC4 package. The archive password is `I love you, Lilith.`. Extract all files, then run `LilithAI-Mod-Setup.exe` from the extracted folder.
 
 > ⚠️ **請勿使用首頁的 `Code → Download ZIP` 安裝 MOD；那裡只有原始碼，不是可安裝的發布包。**  
 > ⚠️ **Do not install the MOD through `Code → Download ZIP`; it contains source code, not the installable release.**
 
 ### GitHub Release 手動下載 / Manual GitHub Release download
 
-[GitHub Release](https://github.com/mimimi6666/Lilith-AI-Mod/releases) 的 Assets 會平鋪顯示，但 RC3 安裝器的本機套件必須放在 `packages` 子資料夾。若要手動下載所有附件，請整理成以下結構：
+[GitHub Release](https://github.com/mimimi6666/Lilith-AI-Mod/releases) 的 Assets 會平鋪顯示，但 RC4 安裝器的本機套件必須放在 `packages` 子資料夾。若要手動下載所有附件，請整理成以下結構：
 
-GitHub Release Assets are displayed as a flat list, while the RC3 installer expects local packages inside a `packages` subfolder. If you download the assets manually, arrange them like this:
+GitHub Release Assets are displayed as a flat list, while the RC4 installer expects local packages inside a `packages` subfolder. If you download the assets manually, arrange them like this:
 
 ```text
-Lilith-AI-Mod-0.1.1-RC3
+Lilith-AI-Mod-0.1.1-RC4
 ├─ LilithAI-Mod-Setup.exe
 ├─ release-manifest.json
 ├─ SHA256SUMS.txt
@@ -102,9 +101,9 @@ Lilith-AI-Mod-0.1.1-RC3
    └─ voice-runtime.zip
 ```
 
-只下載 EXE 時，安裝器會自動取得 RC3 清單與缺少的套件。RC3 的語音包內容沒有改變，因此清單會沿用 RC1 的既有語音下載，以免玩家重複下載約 2.4 GB。若網路、地區限制或大型檔案下載失敗，請改用上方的 Google Drive 或夸克網盤完整包。
+只下載 EXE 時，安裝器會自動取得 RC4 清單與缺少的套件。未變更的補充語音包沿用 RC1，更新後的語音執行環境則由 RC4 Release 下載。若網路、地區限制或大型檔案下載失敗，請改用上方的 Google Drive 或百度網盤完整包。
 
-If only the EXE is downloaded, the installer retrieves the RC3 manifest and missing packages automatically. The voice files did not change, so RC3 reuses the existing RC1 voice downloads instead of making players download about 2.4 GB again. If networking, regional availability, or large-file downloads fail, use the complete Google Drive or Quark package above.
+If only the EXE is downloaded, the installer retrieves the RC4 manifest and missing packages automatically. The unchanged supplemental voice pack is reused from RC1, while the updated voice runtime is downloaded from the RC4 release. If networking, regional availability, or large-file downloads fail, use the complete Google Drive or Baidu package above.
 
 1. 完整解壓縮或整理好上述資料夾後，再執行安裝程式；它會自動尋找 Steam 遊戲路徑。  
    Extract the complete package or arrange the folders above before running the installer; it automatically searches your Steam libraries.
@@ -202,6 +201,6 @@ This is a free, non-commercial fan project. It is not authorized, endorsed, spon
 
 ### ✦ 「如果你願意，我就再陪你一會。」 ✦
 
-**Version 0.1.1-RC3 · Publisher: MIMI**
+**Version 0.1.1-RC4 · Publisher: MIMI**
 
 </div>
