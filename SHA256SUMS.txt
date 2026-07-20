@@ -1,4 +1,5 @@
 5fa9980c40c8b336063e332ff5b9b2f5023956bca15fc87c45a6d8edf301aba8 *LilithAI-Mod-Setup.exe
-0a216588be5b5d2656da3e8912c04ea2bfcaf92669cd7d79d42bf779f32f6c3f *packages/core.zip
+155dc0bb1a1ddea003690bcd8a4edfe949526d46726dab6fd3afd4a3bed9fc73 *packages/core.zip
 a3d4e2160fbdb8784e4d3e88843c24d39ad1a82e359140eaa95ab4512e07e8a0 *packages/voice-pack.zip
 8aacbcd6b5595e1542d08d0b14b386cb3fb4eb46154aea9b5ff1da5484f42201 *packages/voice-runtime.zip
+
