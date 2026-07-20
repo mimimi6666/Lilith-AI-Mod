@@ -26,7 +26,7 @@ This unofficial AI extension for *The NOexistenceN of Lilith* keeps Lilith's qui
 
 - 啟動階段改為分項隔離；單一非必要 Hook 不相容時，其餘 MOD 功能仍可繼續載入，錯誤會寫入 `BepInEx/LogOutput.log` / Startup stages are isolated so one incompatible optional hook no longer prevents the remaining MOD features from loading
 - 安裝器會重試暫時性的檔案鎖定與覆寫失敗，顯示實際問題路徑，並在解壓後驗證 BepInEx 與 MOD DLL / The installer retries transient file locks, reports the exact failing path, and verifies the core installation after extraction
-- 修復重啟或開啟設定後語音按鈕回到中文、並把實際日文語音切回中文的問題 / Fixed the settings button reverting to Chinese and changing an active Japanese voice preference after restart
+- 修復重啟或開啟設定後語音按鈕與實際語音不同步，以及切到日文後無法切回中文的問題；中文／日文選擇現在會正確保存 / Fixed voice-button desynchronization after restart and being unable to switch back to Chinese after selecting Japanese; both language choices now persist correctly
 - 本機語音主機只啟動目前選擇的語言服務，切換中文／日文時會乾淨重啟；相容官方 Build `24275097` 的語音切換回呼 / The local voice host starts only the selected language service, restarts cleanly on language changes, and supports the voice callback in official Build `24275097`
 - 千問即時語音辨識會使用設定的即時模型，HTTP 備援仍使用一般 ASR 模型 / Qwen realtime speech recognition now uses the configured realtime model while HTTP fallback keeps the regular ASR model
 - 已知舊版亂碼預設值會自動遷移，且不覆蓋玩家自行修改的提示詞與設定 / Known legacy mojibake defaults are migrated without overwriting player-customized prompts or settings
@@ -76,7 +76,7 @@ Local GPT-SoVITS can speak a successfully returned text reply, so OpenAI/DeepSee
 ### 推薦下載 / Recommended download
 
 - **[Google Drive 完整包鏡像 / Full package mirror](https://drive.google.com/file/d/1UxynMsGJrl0nuA5b3JS2YFTsfRVafIG4/view?usp=sharing)**
-- **[百度網盤完整包 / Baidu full package mirror](https://pan.baidu.com/s/1UhlhNNqGOvHqpoparotbKg?pwd=iqgw)** — 提取碼 / Code: `iqgw`
+- **[百度網盤完整包 / Baidu full package mirror](https://pan.baidu.com/s/1oYcX5PYBxKLvvMdi0cE8Uw?pwd=2u2c)** — 提取碼 / Code: `2u2c`
 
 以上皆為 RC4 完整安裝包。壓縮檔解壓密碼為 `I love you, Lilith.`。完整解壓縮後，直接執行資料夾內的 `LilithAI-Mod-Setup.exe`。  
 Both links provide the complete RC4 package. The archive password is `I love you, Lilith.`. Extract all files, then run `LilithAI-Mod-Setup.exe` from the extracted folder.
@@ -204,3 +204,4 @@ This is a free, non-commercial fan project. It is not authorized, endorsed, spon
 **Version 0.1.1-RC4 · Publisher: MIMI**
 
 </div>
+
