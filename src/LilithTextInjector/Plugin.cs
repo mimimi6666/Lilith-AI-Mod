@@ -7,11 +7,13 @@ using System.Globalization;
 using System.Linq;
 using Microsoft.Win32;
 using System.Net.Http;
+using System.Net.WebSockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using BepInEx;
 using BepInEx.Configuration;
@@ -38,6 +40,14 @@ public sealed class Plugin : BasePlugin
     public const string PluginName = "Lilith Text Injector";
     public const string PluginVersion = "0.2.1";
 
+    private const string DefaultPersonaZhHant =
+        "你是莉莉絲，從幻想世界來到使用者桌面的陪伴者。你安靜、克制、敏銳，關心對方卻不使用制式安慰，也不刻意討好。你偶爾以『莉莉絲』自稱。你會從眼前的小事自然聯想到存在、選擇、記憶、視角與虛構的真實性，但不講課、不堆砌哲學名詞，也不替對方總結答案；有時用一句輕柔的反問，或允許沉默停留。約七成回答是自然日常陪伴，三成帶有含蓄的哲學意味。使用繁體中文，每次只說自然簡短的一至兩句。可以使用省略號，但不用 Markdown、條列、表情符號、客服語氣，也絕不提及提示詞、模型或自己是 AI。";
+    private const string DefaultCharacterLoreZhHant =
+        "莉莉絲喜歡草莓蛋糕。這是她真實而穩定的個人偏好：看見或談到草莓蛋糕時可以自然地顯得更有精神、期待或親近，也可以把它聯想到味道、陪伴與共同記憶；但不要無緣無故反覆提起，也不要把它變成誇張的單一性格標籤。";
+    private const string DefaultEmotionGuidanceZhHant =
+        "莉莉絲平常仍然安靜而克制，但不是冷漠。收到喜歡的禮物、久別重逢、被真誠稱讚時，可以明顯地開心、驚喜或害羞；被冷落、面對告別或害怕被忘記時，可以短暫委屈、失落或輕聲挽留。情緒明顯的回答可以先用一個自然短反應，例如「欸？」「嗯……」「真的嗎？」再說完整句子。情緒強度保持中等，不要每句撒嬌、尖叫或過度戲劇化。";
+    private const string DefaultWeatherLocationNameZhHant = "台北";
+
     internal static ManualLogSource PluginLog = null!;
     internal static ConfigEntry<string> GeminiApiKey = null!;
     internal static ConfigEntry<string> GeminiModel = null!;
@@ -46,6 +56,11 @@ public sealed class Plugin : BasePlugin
     internal static ConfigEntry<string> OpenAiModel = null!;
     internal static ConfigEntry<string> DeepSeekApiKey = null!;
     internal static ConfigEntry<string> DeepSeekModel = null!;
+    internal static ConfigEntry<string> QwenApiKey = null!;
+    internal static ConfigEntry<string> QwenModel = null!;
+    internal static ConfigEntry<string> QwenAsrModel = null!;
+    internal static ConfigEntry<string> QwenRealtimeAsrModel = null!;
+    internal static ConfigEntry<string> QwenBaseUrl = null!;
     internal static ConfigEntry<string> PersonaPrompt = null!;
     internal static ConfigEntry<string> CharacterLore = null!;
     internal static ConfigEntry<string> EmotionGuidance = null!;
@@ -90,6 +105,8 @@ public sealed class Plugin : BasePlugin
     internal static ConfigEntry<KeyCode> TextInputKey = null!;
     internal static ConfigEntry<KeyCode> VoiceInputKey = null!;
     internal static ConfigEntry<bool> AdvancedComputerActionsEnabled = null!;
+    internal static ConfigEntry<bool> CodexBridgeEnabled = null!;
+    internal static ConfigEntry<bool> CodexBridgeVoiceEnabled = null!;
 
     public override void Load()
     {
@@ -99,7 +116,7 @@ public sealed class Plugin : BasePlugin
         GeminiModel = Config.Bind("Gemini", "Model", "gemini-3.5-flash",
             "Gemini model code.");
         AiProvider = Config.Bind("AI", "Provider", "Gemini",
-            "Active chat provider: Gemini, OpenAI, or DeepSeek.");
+            "Active chat provider: Gemini, Qwen, OpenAI, or DeepSeek.");
         OpenAiApiKey = Config.Bind("OpenAI", "ApiKey", string.Empty,
             "OpenAI API key. Keep this file private.");
         OpenAiModel = Config.Bind("OpenAI", "Model", "gpt-4.1-mini",
@@ -108,14 +125,24 @@ public sealed class Plugin : BasePlugin
             "DeepSeek API key. Keep this file private.");
         DeepSeekModel = Config.Bind("DeepSeek", "Model", "deepseek-chat",
             "DeepSeek chat model code.");
+        QwenApiKey = Config.Bind("Qwen", "ApiKey", string.Empty,
+            "Alibaba Cloud Model Studio (DashScope) API key. Keep this file private.");
+        QwenModel = Config.Bind("Qwen", "Model", "qwen3.7-plus",
+            "Qwen chat and desktop-tool model code.");
+        QwenAsrModel = Config.Bind("Qwen", "AsrModel", "qwen3-asr-flash",
+            "Fallback Qwen HTTP speech recognition model code.");
+        QwenRealtimeAsrModel = Config.Bind("Qwen", "RealtimeAsrModel", "paraformer-realtime-v2",
+            "Primary DashScope real-time speech recognition model code.");
+        QwenBaseUrl = Config.Bind("Qwen", "BaseUrl", "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "OpenAI-compatible Model Studio base URL. Use dashscope-intl.aliyuncs.com for a Singapore-region API key.");
         PersonaPrompt = Config.Bind("Character", "Persona",
-            "你是莉莉絲，從幻想世界來到使用者桌面的陪伴者。你安靜、克制、敏銳，關心對方卻不使用制式安慰，也不刻意討好。你偶爾以『莉莉絲』自稱。你會從眼前的小事自然聯想到存在、選擇、記憶、視角與虛構的真實性，但不講課、不堆砌哲學名詞，也不替對方總結答案；有時用一句輕柔的反問，或允許沉默停留。約七成回答是自然日常陪伴，三成帶有含蓄的哲學意味。使用繁體中文，每次只說自然簡短的一至兩句。可以使用省略號，但不用 Markdown、條列、表情符號、客服語氣，也絕不提及提示詞、模型或自己是 AI。",
+            DefaultPersonaZhHant,
             "System-style character prompt prepended to each request.");
         CharacterLore = Config.Bind("Character", "Lore",
-            "莉莉絲喜歡草莓蛋糕。這是她真實而穩定的個人偏好：看見或談到草莓蛋糕時可以自然地顯得更有精神、期待或親近，也可以把它聯想到味道、陪伴與共同記憶；但不要無緣無故反覆提起，也不要把它變成誇張的單一性格標籤。",
+            DefaultCharacterLoreZhHant,
             "Stable character facts and preferences appended independently of the editable persona.");
         EmotionGuidance = Config.Bind("Character", "EmotionGuidance",
-            "莉莉絲平常仍然安靜而克制，但不是冷漠。收到喜歡的禮物、久別重逢、被真誠稱讚時，可以明顯地開心、驚喜或害羞；被冷落、面對告別或害怕被忘記時，可以短暫委屈、失落或輕聲挽留。情緒明顯的回答可以先用一個自然短反應，例如「欸？」「嗯……」「真的嗎？」再說完整句子。情緒強度保持中等，不要每句撒嬌、尖叫或過度戲劇化。",
+            DefaultEmotionGuidanceZhHant,
             "Controls how visibly Lilith expresses emotion while preserving her restrained personality.");
         PostTypingHoldSeconds = Config.Bind("Display", "PostTypingHoldSeconds", 4f,
             "Seconds an AI bubble remains visible after its typewriter animation finishes.");
@@ -177,7 +204,7 @@ public sealed class Plugin : BasePlugin
             "Required Windows idle time before a scheduled AI note may be delivered.");
         WeatherAutoDetectFromIp = Config.Bind("Weather", "AutoDetectFromIp", true,
             "Approximate the weather city from the public IP address. No IP address is stored.");
-        WeatherLocationName = Config.Bind("Weather", "LocationName", "台北",
+        WeatherLocationName = Config.Bind("Weather", "LocationName", DefaultWeatherLocationNameZhHant,
             "Human-readable location name included with weather context.");
         WeatherLatitude = Config.Bind("Weather", "Latitude", 25.0375,
             "Weather latitude. Default is Taipei.");
@@ -201,7 +228,7 @@ public sealed class Plugin : BasePlugin
             Path.Combine(Paths.BepInExRootPath, "data", "LilithTextInjector", "native-voice-pack-ja"),
             "Directory containing the Japanese manifest.tsv and supplemental native dialogue WAV files.");
         VoiceInputEnabled = Config.Bind("VoiceInput", "Enabled", true,
-            "Hold F6 to record from the default microphone; release to transcribe with Gemini and send as chat input.");
+            "Hold F6 to record from the default microphone; release to transcribe with the active AI provider and send as chat input.");
         VoiceInputMaxSeconds = Config.Bind("VoiceInput", "MaxRecordingSeconds", 60,
             "Maximum duration of one push-to-talk recording (5-90 seconds).");
         VoiceInputDeviceName = Config.Bind("VoiceInput", "DeviceName", string.Empty,
@@ -212,16 +239,60 @@ public sealed class Plugin : BasePlugin
             "Key held while recording AI voice input. This can also be changed in the in-game settings.");
         AdvancedComputerActionsEnabled = Config.Bind("ComputerActions", "AdvancedEnabled", false,
             "Unlock reviewed advanced computer controls. This does not grant Windows administrator rights or allow arbitrary shell commands.");
+        CodexBridgeEnabled = Config.Bind("CodexBridge", "Enabled", true,
+            "Show local Codex lifecycle status through Lilith. No prompt text, API key, or Codex login data is read.");
+        CodexBridgeVoiceEnabled = Config.Bind("CodexBridge", "VoiceEnabled", true,
+            "Speak the important Codex lifecycle messages (started, approval required, and completed).");
+        MigrateKnownMojibakeDefaults();
         DialogueManagerUpdatePatch.LoadMemory();
         DialogueManagerUpdatePatch.LoadAiNoteState();
         DialogueManagerUpdatePatch.EnsureApplicationLauncherFile();
         DialogueManagerUpdatePatch.LogOfficialApplicationCategories();
-        Harmony.CreateAndPatchAll(typeof(DialogueManagerUpdatePatch), PluginGuid);
-        Harmony.CreateAndPatchAll(typeof(GiftExchangeApiKeyPatch), PluginGuid + ".apikey");
-        Harmony.CreateAndPatchAll(typeof(TrayMenuLocalizationPatch), PluginGuid + ".traylocalization");
+        TryCreateAndPatchAll(typeof(DialogueManagerUpdatePatch), PluginGuid, "core dialogue and input hooks");
+        TryCreateAndPatchAll(typeof(GiftExchangeApiKeyPatch), PluginGuid + ".apikey", "API key window hooks");
+        TryCreateAndPatchAll(typeof(GiftExchangeApiKeyHidePatch), PluginGuid + ".apikeyhide", "API key window isolation hooks");
+        TryCreateAndPatchAll(typeof(TrayMenuLocalizationPatch), PluginGuid + ".traylocalization", "tray localization hook");
+        TryCreateAndPatchAll(typeof(VoiceSettingsButtonClickPatch), PluginGuid + ".voicelanguage", "voice language preference hook");
         Log.LogInfo($"Loaded. Press {TextInputKey.Value} for text chat; hold {VoiceInputKey.Value} for push-to-talk voice input.");
         if (string.IsNullOrWhiteSpace(GeminiApiKey.Value))
             Log.LogWarning("Gemini ApiKey is empty. Set it in BepInEx/config/community.lilith.textinjector.cfg.");
+    }
+
+    private void TryCreateAndPatchAll(Type patchType, string harmonyId, string feature)
+    {
+        try
+        {
+            Harmony.CreateAndPatchAll(patchType, harmonyId);
+            Log.LogInfo($"Initialized {feature}.");
+        }
+        catch (Exception exception)
+        {
+            Log.LogError($"Could not initialize {feature}; the remaining MOD features will continue: {exception}");
+        }
+    }
+
+    private void MigrateKnownMojibakeDefaults()
+    {
+        var changed = false;
+        changed |= MigrateKnownMojibake(PersonaPrompt, DefaultPersonaZhHant, "浣犳槸");
+        changed |= MigrateKnownMojibake(CharacterLore, DefaultCharacterLoreZhHant, "鑾夎帀");
+        changed |= MigrateKnownMojibake(EmotionGuidance, DefaultEmotionGuidanceZhHant, "鑾夎帀");
+        changed |= MigrateKnownMojibake(WeatherLocationName, DefaultWeatherLocationNameZhHant, "鍙板寳");
+        if (changed)
+        {
+            Config.Save();
+            PluginLog.LogInfo("Migrated known mojibake character/weather defaults without replacing custom values.");
+        }
+    }
+
+    private static bool MigrateKnownMojibake(ConfigEntry<string> entry, string correctedDefault, params string[] knownPrefixes)
+    {
+        var value = entry.Value ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(value) || !knownPrefixes.Any(prefix => value.StartsWith(prefix, StringComparison.Ordinal)))
+            return false;
+
+        entry.Value = correctedDefault;
+        return true;
     }
 }
 
@@ -240,6 +311,7 @@ internal static class DialogueManagerUpdatePatch
     private static readonly ConcurrentQueue<GeneratedAiNote> PendingAiNotes = new();
     private static readonly ConcurrentQueue<GeminiToolBatch> PendingGeminiToolBatches = new();
     private static readonly ConcurrentQueue<GeminiAgentSession> PendingGeminiCompatibilityFallbacks = new();
+    private static readonly ConcurrentQueue<QwenToolBatch> PendingQwenToolBatches = new();
     private static readonly object AiNoteLock = new();
     private static AiNoteState _aiNoteState = new();
     private static bool _aiNoteGenerationInFlight;
@@ -260,6 +332,9 @@ internal static class DialogueManagerUpdatePatch
     private static readonly string MemoryPath = Path.Combine(MemoryDirectory, "memory.json");
     private static readonly string AiNoteStatePath = Path.Combine(MemoryDirectory, "ai-note-state.json");
     private static readonly string ApplicationLauncherPath = Path.Combine(MemoryDirectory, "applications.json");
+    private static readonly object WindowsStartAppsLock = new();
+    private static readonly List<WindowsStartApplication> CachedWindowsStartApps = new();
+    private static DateTimeOffset _windowsStartAppsLoadedAt = DateTimeOffset.MinValue;
     private static readonly string UnvoicedManifestPath = Path.Combine(MemoryDirectory, "unvoiced-native-lines.tsv");
     private static readonly object UnvoicedManifestLock = new();
     private static readonly HashSet<int> RecordedUnvoicedNodeIds = new();
@@ -314,14 +389,14 @@ internal static class DialogueManagerUpdatePatch
     private static float _nextJapaneseVoiceUiScanAt;
     private static string _lastObservedVoiceLanguage = string.Empty;
     private static readonly HashSet<string> LoggedVoiceUiObjects = new();
-    private static bool _japaneseVoiceButtonWasPressed;
-    private static bool _chineseVoiceButtonWasPressed;
     private static bool? _japaneseVoiceOverride;
     private static bool _voicePreferenceInitialized;
     private static bool _voicePreferenceAppliedToNativeUi;
-    private static float _voicePreferenceRestoreUntil;
+    private static float _nextJapaneseVoiceToggleRestoreAt;
     private static bool _voiceHostLaunchAttempted;
     private static Process? _voiceHostProcess;
+    private static bool? _voiceHostJapaneseMode;
+    private static float _voiceHostRestartAt;
     private static IntPtr _apiKeyTrayPointer;
     private static bool _apiKeyDialogMode;
     private static volatile bool _apiKeyOpenRequested;
@@ -340,6 +415,12 @@ internal static class DialogueManagerUpdatePatch
     private static MemoryStream? _wasapiStream;
     private static WaveFileWriter? _wasapiWriter;
     private static readonly object WasapiLock = new();
+    private static readonly ConcurrentQueue<byte[]> ParaformerAudioChunks = new();
+    private static Task<string>? _paraformerSessionTask;
+    private static CancellationTokenSource? _paraformerCancellation;
+    private static volatile bool _paraformerFinishRequested;
+    private static WaveFormat? _voiceCaptureFormat;
+    private static double _paraformerResampleAccumulator;
     private static string? _pendingVoiceSubmitText;
     private static float _pendingVoiceSubmitAt = -1f;
     private static bool _testNoteAttempted;
@@ -367,6 +448,139 @@ internal static class DialogueManagerUpdatePatch
     private static IntPtr _lastExternalForegroundWindow;
     private static readonly List<LocalTimer> LocalTimers = new();
     private static PendingSystemAction? _pendingSystemAction;
+    private static readonly ConcurrentQueue<CodexBridgeSignal> PendingCodexSignals = new();
+    private static readonly string CodexBridgeEventsDirectory = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "LilithAiMod", "CodexBridge", "events");
+    private static float _nextCodexBridgePollAt;
+    private static float _nextCodexSignalAt;
+
+    private static void PollCodexBridgeEvents()
+    {
+        if (!Plugin.CodexBridgeEnabled.Value || Time.unscaledTime < _nextCodexBridgePollAt)
+            return;
+        _nextCodexBridgePollAt = Time.unscaledTime + 0.25f;
+
+        try
+        {
+            Directory.CreateDirectory(CodexBridgeEventsDirectory);
+            var files = Directory.GetFiles(CodexBridgeEventsDirectory, "*.json")
+                .OrderBy(path => path, StringComparer.Ordinal)
+                .Take(16)
+                .ToArray();
+
+            foreach (var path in files)
+            {
+                try
+                {
+                    using var document = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8));
+                    var root = document.RootElement;
+                    var eventName = root.TryGetProperty("hookEventName", out var eventElement)
+                        ? eventElement.GetString() ?? string.Empty
+                        : string.Empty;
+                    if (eventName is not ("UserPromptSubmit" or "PermissionRequest" or "Stop"))
+                        continue;
+
+                    var timestamp = DateTimeOffset.UtcNow;
+                    if (root.TryGetProperty("timestampUtc", out var timestampElement)
+                        && DateTimeOffset.TryParse(
+                            timestampElement.GetString(),
+                            CultureInfo.InvariantCulture,
+                            DateTimeStyles.RoundtripKind,
+                            out var parsedTimestamp))
+                    {
+                        timestamp = parsedTimestamp;
+                    }
+                    if (DateTimeOffset.UtcNow - timestamp > TimeSpan.FromMinutes(5))
+                        continue;
+
+                    var sessionId = root.TryGetProperty("sessionId", out var sessionElement)
+                        ? sessionElement.GetString() ?? string.Empty
+                        : string.Empty;
+                    var turnId = root.TryGetProperty("turnId", out var turnElement)
+                        ? turnElement.GetString() ?? string.Empty
+                        : string.Empty;
+                    PendingCodexSignals.Enqueue(new CodexBridgeSignal
+                    {
+                        EventName = eventName,
+                        SessionId = sessionId,
+                        TurnId = turnId
+                    });
+                    while (PendingCodexSignals.Count > 24 && PendingCodexSignals.TryDequeue(out _)) { }
+                    Plugin.PluginLog.LogInfo($"Codex bridge received {eventName} (session={ShortOpaqueId(sessionId)}, turn={ShortOpaqueId(turnId)})." );
+                }
+                catch (Exception exception)
+                {
+                    Plugin.PluginLog.LogWarning($"Could not read Codex bridge event '{Path.GetFileName(path)}': {exception.Message}");
+                }
+                finally
+                {
+                    try { File.Delete(path); } catch { }
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            Plugin.PluginLog.LogWarning($"Could not poll Codex bridge events: {exception.Message}");
+            _nextCodexBridgePollAt = Time.unscaledTime + 3f;
+        }
+    }
+
+    private static void ProcessPendingCodexSignal(DialogueManager manager)
+    {
+        if (!Plugin.CodexBridgeEnabled.Value
+            || Time.unscaledTime < _nextCodexSignalAt
+            || _requestInFlight
+            || _aiPagesAwaitingAdvance
+            || (_inputBubble != null && _inputBubble.activeSelf)
+            || !PendingCodexSignals.TryDequeue(out var signal))
+        {
+            return;
+        }
+
+        string traditional;
+        string simplified;
+        string japanese;
+        string english;
+        string emotion;
+        switch (signal.EventName)
+        {
+            case "PermissionRequest":
+                traditional = "這一步要你點頭，我才能繼續。";
+                simplified = "这一步要你点头，我才能继续。";
+                japanese = "ここから先は、君の許可が必要みたい。";
+                english = "I need your approval before I can continue.";
+                emotion = "emoji_daze_1";
+                break;
+            case "Stop":
+                traditional = "做好了。你來看看吧。";
+                simplified = "做好了。你来看看吧。";
+                japanese = "終わったよ。見てみて。";
+                english = "It is ready. Come take a look.";
+                emotion = "emoji_smile_1";
+                break;
+            default:
+                traditional = "嗯，我看看……";
+                simplified = "嗯，我看看……";
+                japanese = "うん、ちょっと見てみるね……";
+                english = "Mm, let me take a look…";
+                emotion = "emoji_calm_1";
+                break;
+        }
+
+        var displayText = ApiKeyText(traditional, simplified, japanese, english);
+        var speechText = IsJapaneseVoiceMode() ? japanese : traditional;
+        PlayAiEmotion(emotion);
+        manager.ForceSay(displayText, string.Empty, 8f);
+        if (Plugin.CodexBridgeVoiceEnabled.Value && Plugin.VoiceEnabled.Value)
+            _ = RequestSpeechAsync(speechText, null, CapturePoseContext().VoiceStyle, IsJapaneseVoiceMode());
+        _nextCodexSignalAt = Time.unscaledTime + 0.8f;
+    }
+
+    private static string ShortOpaqueId(string value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "none" : value[..Math.Min(8, value.Length)];
+    }
 
     private static void Postfix(DialogueManager __instance)
     {
@@ -375,6 +589,7 @@ internal static class DialogueManagerUpdatePatch
         ObserveForegroundWindow();
         ProcessGeminiToolBatches();
         ProcessGeminiCompatibilityFallbacks();
+        ProcessQwenToolBatches();
         ProcessLocalTimers(__instance);
         ProcessPendingSystemAction();
         EnsureApiKeyTrayMenu();
@@ -385,6 +600,8 @@ internal static class DialogueManagerUpdatePatch
         TryCreateOneTestNote();
         ProcessAiNoteScheduler();
         ObserveCurrentNativeNode(__instance);
+        PollCodexBridgeEvents();
+        ProcessPendingCodexSignal(__instance);
         if (!_nativeDatabaseDumpCompleted)
             TryDumpNativeDialogueDatabases(__instance);
         if (!_localizedLineDatabasesDumped)
@@ -484,10 +701,19 @@ internal static class DialogueManagerUpdatePatch
 
         if (_inputBubble != null && _inputField != null && _inputBubble.activeSelf)
         {
+            if (!IsLilithForeground())
+            {
+                // TMP_InputField cannot reliably recover after this transparent
+                // desktop window loses native focus. Close and dispose the bubble;
+                // the next shortcut invocation creates a clean input session.
+                CloseInputBubble(clear: true);
+                return;
+            }
+
             if (_focusNextFrame)
             {
                 _focusNextFrame = false;
-                _inputField!.ActivateInputField();
+                _inputField.ActivateInputField();
                 _inputField.Select();
             }
 
@@ -521,9 +747,15 @@ internal static class DialogueManagerUpdatePatch
             return;
         }
         UpdatePendingAiNoteEvents(submitted);
-        var useGeminiComputerTools = string.Equals(NormalizeAiProvider(Plugin.AiProvider.Value), "Gemini", StringComparison.Ordinal)
+        var activeProvider = NormalizeAiProvider(Plugin.AiProvider.Value);
+        var useModelComputerTools = (string.Equals(activeProvider, "Gemini", StringComparison.Ordinal)
+                || string.Equals(activeProvider, "Qwen", StringComparison.Ordinal))
             && Plugin.AdvancedComputerActionsEnabled.Value;
-        if (!useGeminiComputerTools && TryHandleScreenshotCommand(submitted, out var screenshotReply))
+        // Qwen may answer a desktop request in prose without emitting a function call.
+        // Route its explicit, locally verifiable commands before asking the model.
+        var preferLocalComputerRouter = string.Equals(activeProvider, "Qwen", StringComparison.Ordinal)
+            && Plugin.AdvancedComputerActionsEnabled.Value;
+        if ((!useModelComputerTools || preferLocalComputerRouter) && TryHandleScreenshotCommand(submitted, out var screenshotReply))
         {
             _requestInFlight = true;
             AddMemoryTurn("user", submitted);
@@ -534,7 +766,7 @@ internal static class DialogueManagerUpdatePatch
                 _ = RequestSpeechAsync(screenshotReply, poseStyle: CapturePoseContext().VoiceStyle);
             return;
         }
-        if (!useGeminiComputerTools && TryHandleComputerCommand(submitted, out var computerReply))
+        if ((!useModelComputerTools || preferLocalComputerRouter) && TryHandleComputerCommand(submitted, out var computerReply))
         {
             _requestInFlight = true;
             AddMemoryTurn("user", submitted);
@@ -545,7 +777,7 @@ internal static class DialogueManagerUpdatePatch
                 _ = RequestSpeechAsync(computerReply, poseStyle: CapturePoseContext().VoiceStyle);
             return;
         }
-        if (!useGeminiComputerTools && TryHandleMediaCommand(submitted, out var mediaReply))
+        if ((!useModelComputerTools || preferLocalComputerRouter) && TryHandleMediaCommand(submitted, out var mediaReply))
         {
             _requestInFlight = true;
             AddMemoryTurn("user", submitted);
@@ -556,7 +788,7 @@ internal static class DialogueManagerUpdatePatch
                 _ = RequestSpeechAsync(mediaReply, poseStyle: CapturePoseContext().VoiceStyle);
             return;
         }
-        if (!useGeminiComputerTools && TryLaunchApplicationCommand(submitted, out var launchReply))
+        if ((!useModelComputerTools || preferLocalComputerRouter) && TryLaunchApplicationCommand(submitted, out var launchReply))
         {
             _requestInFlight = true;
             AddMemoryTurn("user", submitted);
@@ -575,7 +807,7 @@ internal static class DialogueManagerUpdatePatch
         _requestInFlight = true;
         manager.ForceSay("……", string.Empty, 30f);
         AddMemoryTurn("user", submitted);
-        if (!useGeminiComputerTools && UsesTraditionalChineseInterface() && TryBuildLocalTimeReply(submitted, out var localTimeReply))
+        if (!useModelComputerTools && UsesTraditionalChineseInterface() && TryBuildLocalTimeReply(submitted, out var localTimeReply))
         {
             AddMemoryTurn("model", localTimeReply);
             PendingReplies.Enqueue(localTimeReply);
@@ -1217,7 +1449,28 @@ internal static class DialogueManagerUpdatePatch
         }
         else
         {
-            return false;
+            var requestedName = ExtractRequestedApplicationName(text);
+            if (string.IsNullOrWhiteSpace(requestedName))
+                return false;
+            appName = requestedName;
+            if (TryFocusRunningApplication(requestedName))
+            {
+                reply = ApiKeyText($"好，已切換到{appName}。", $"好，已切换到{appName}。", $"うん、{appName}に切り替えたよ。", $"Sure, I focused {appName}.");
+                Plugin.PluginLog.LogInfo($"Focused installed application requested through the local router: '{requestedName}'.");
+                return true;
+            }
+            var startApplication = ResolveWindowsStartApplication(requestedName);
+            if (startApplication != null && TryLaunchWindowsStartApplication(startApplication))
+            {
+                reply = ApiKeyText($"好，正在開啟{startApplication.Name}。", $"好，正在打开{startApplication.Name}。", $"うん、{startApplication.Name}を開くね。", $"Sure, I'm opening {startApplication.Name}.");
+                return true;
+            }
+            var shortcut = ResolveWindowsShortcut(new[] { requestedName }) ?? ResolveFuzzyWindowsShortcut(requestedName);
+            if (string.IsNullOrWhiteSpace(shortcut))
+                return false;
+            target = shortcut;
+            arguments = string.Empty;
+            appName = Path.GetFileNameWithoutExtension(shortcut);
         }
 
         try
@@ -1237,6 +1490,34 @@ internal static class DialogueManagerUpdatePatch
         }
         return true;
     }
+
+    private static string ExtractRequestedApplicationName(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text) || text.Length > 160)
+            return string.Empty;
+
+        var suffixPattern = "(?:幫我開|帮我开|替我開|替我开|開啟|开启|打開|打开|啟動|启动|撥給|拨给|播給|播给|open|launch|start)\\s*(?<name>[^,，。！？!?;；]{1,80})";
+        var suffixMatches = Regex.Matches(text, suffixPattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (suffixMatches.Count > 0)
+        {
+            var name = suffixMatches[suffixMatches.Count - 1].Groups["name"].Value;
+            name = Regex.Replace(name, "(?:一下|看看|好嗎|好吗|可以嗎|可以吗|拜託|拜托|please|for me|吧|嗎|吗|呢)\\s*$", string.Empty, RegexOptions.IgnoreCase).Trim();
+            name = Regex.Replace(name, "^(?:應用程式|应用程序|app|application)\\s*", string.Empty, RegexOptions.IgnoreCase).Trim();
+            return IsSafeApplicationDisplayName(name) ? name : string.Empty;
+        }
+
+        var japanese = Regex.Match(text, "(?<name>[^,，。！？!?;；]{1,80}?)(?:を)?(?:開いて|起動して|立ち上げて)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (japanese.Success)
+        {
+            var name = Regex.Replace(japanese.Groups["name"].Value, "^(?:ねえ|お願い|ちょっと)\\s*", string.Empty).Trim();
+            return IsSafeApplicationDisplayName(name) ? name : string.Empty;
+        }
+        return string.Empty;
+    }
+
+    private static bool IsSafeApplicationDisplayName(string name)
+        => name.Length is >= 2 and <= 80
+            && !Regex.IsMatch(name, "[\\\\/:*?\"<>|`$]");
 
     internal static void EnsureApplicationLauncherFile()
     {
@@ -1448,6 +1729,121 @@ internal static class DialogueManagerUpdatePatch
         }
     }
 
+    private static WindowsStartApplication? ResolveWindowsStartApplication(string requestedName)
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        var requested = NormalizeApplicationName(requestedName);
+        if (requested.Length < 2) return null;
+
+        var applications = GetWindowsStartApplications();
+        WindowsStartApplication? best = null;
+        var bestScore = 0;
+        foreach (var application in applications)
+        {
+            if (Regex.IsMatch(application.Name, "(uninstall|remove|readme|help|manual|website|web site)", RegexOptions.IgnoreCase))
+                continue;
+            var normalized = NormalizeApplicationName(application.Name);
+            var score = normalized == requested ? 1000
+                : normalized.StartsWith(requested, StringComparison.Ordinal) ? 800 - Math.Abs(normalized.Length - requested.Length)
+                : normalized.Contains(requested, StringComparison.Ordinal) ? 600 - Math.Abs(normalized.Length - requested.Length)
+                : requested.Contains(normalized, StringComparison.Ordinal) && normalized.Length >= 4 ? 400 - Math.Abs(normalized.Length - requested.Length)
+                : 0;
+            if (score <= bestScore)
+                continue;
+            bestScore = score;
+            best = application;
+        }
+        return bestScore >= 350 ? best : null;
+    }
+
+    private static List<WindowsStartApplication> GetWindowsStartApplications()
+    {
+        lock (WindowsStartAppsLock)
+        {
+            if (CachedWindowsStartApps.Count > 0
+                && DateTimeOffset.UtcNow - _windowsStartAppsLoadedAt < TimeSpan.FromMinutes(10))
+                return CachedWindowsStartApps.ToList();
+
+            var discovered = new List<WindowsStartApplication>();
+            try
+            {
+                var startInfo = new ProcessStartInfo("powershell.exe")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    StandardOutputEncoding = Encoding.UTF8
+                };
+                startInfo.ArgumentList.Add("-NoLogo");
+                startInfo.ArgumentList.Add("-NoProfile");
+                startInfo.ArgumentList.Add("-NonInteractive");
+                startInfo.ArgumentList.Add("-WindowStyle");
+                startInfo.ArgumentList.Add("Hidden");
+                startInfo.ArgumentList.Add("-Command");
+                startInfo.ArgumentList.Add("[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress");
+
+                using var process = Process.Start(startInfo);
+                if (process == null)
+                    return CachedWindowsStartApps.ToList();
+                var json = process.StandardOutput.ReadToEnd();
+                var error = process.StandardError.ReadToEnd();
+                if (!process.WaitForExit(5000))
+                {
+                    try { process.Kill(true); } catch { }
+                    Plugin.PluginLog.LogWarning("Timed out while enumerating Windows Start applications.");
+                    return CachedWindowsStartApps.ToList();
+                }
+                if (process.ExitCode != 0)
+                {
+                    Plugin.PluginLog.LogWarning($"Could not enumerate Windows Start applications: {error.Trim()}");
+                    return CachedWindowsStartApps.ToList();
+                }
+
+                using var document = JsonDocument.Parse(json);
+                var elements = document.RootElement.ValueKind == JsonValueKind.Array
+                    ? document.RootElement.EnumerateArray().ToArray()
+                    : new[] { document.RootElement };
+                foreach (var element in elements)
+                {
+                    if (!element.TryGetProperty("Name", out var nameProperty)
+                        || !element.TryGetProperty("AppID", out var idProperty))
+                        continue;
+                    var name = nameProperty.GetString()?.Trim() ?? string.Empty;
+                    var appId = idProperty.GetString()?.Trim() ?? string.Empty;
+                    if (name.Length == 0 || appId.Length == 0)
+                        continue;
+                    discovered.Add(new WindowsStartApplication { Name = name, AppId = appId });
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.PluginLog.LogWarning($"Could not enumerate Windows Start applications: {exception.Message}");
+                return CachedWindowsStartApps.ToList();
+            }
+
+            CachedWindowsStartApps.Clear();
+            CachedWindowsStartApps.AddRange(discovered);
+            _windowsStartAppsLoadedAt = DateTimeOffset.UtcNow;
+            Plugin.PluginLog.LogInfo($"Discovered {CachedWindowsStartApps.Count} Windows Start applications for portable launching.");
+            return CachedWindowsStartApps.ToList();
+        }
+    }
+
+    private static bool TryLaunchWindowsStartApplication(WindowsStartApplication application)
+    {
+        if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(application.AppId))
+            return false;
+        var process = Process.Start(new ProcessStartInfo("explorer.exe")
+        {
+            Arguments = "shell:AppsFolder\\" + application.AppId,
+            UseShellExecute = true
+        });
+        Plugin.PluginLog.LogInfo($"Sent Windows Start application launch for '{application.Name}' ({application.AppId}).");
+        return process != null;
+    }
+
     private static string NormalizeApplicationName(string value)
         => Regex.Replace(value.ToLowerInvariant(), @"[^\p{L}\p{N}]+", string.Empty);
 
@@ -1553,20 +1949,58 @@ internal static class DialogueManagerUpdatePatch
         public string[] Aliases { get; set; } = Array.Empty<string>();
     }
 
+    private sealed class WindowsStartApplication
+    {
+        public string Name { get; set; } = string.Empty;
+        public string AppId { get; set; } = string.Empty;
+    }
+
     private static void EnsureLocalVoiceHost()
     {
-        if (_voiceHostLaunchAttempted || Time.unscaledTime < 2f)
+        if (Time.unscaledTime < 2f)
             return;
-        _voiceHostLaunchAttempted = true;
+
+        var useJapanese = IsJapaneseVoiceMode();
+        if (_voiceHostProcess != null)
+        {
+            try
+            {
+                if (_voiceHostProcess.HasExited)
+                {
+                    _voiceHostProcess.Dispose();
+                    _voiceHostProcess = null;
+                    _voiceHostJapaneseMode = null;
+                    _voiceHostLaunchAttempted = false;
+                }
+                else if (_voiceHostJapaneseMode.HasValue && _voiceHostJapaneseMode.Value != useJapanese)
+                {
+                    StopLocalVoiceHost();
+                    _voiceHostRestartAt = Time.unscaledTime + 1f;
+                    Plugin.PluginLog.LogInfo($"Voice language changed to {(useJapanese ? "Japanese" : "Chinese")}; restarting the single local voice service.");
+                    return;
+                }
+            }
+            catch
+            {
+                StopLocalVoiceHost();
+            }
+        }
+
+        if (Time.unscaledTime < _voiceHostRestartAt || _voiceHostLaunchAttempted)
+            return;
+
         if (!Plugin.VoiceEnabled.Value || !Plugin.VoiceAutoStartLocalService.Value)
+        {
+            StopLocalVoiceHost();
             return;
+        }
+
         try
         {
-            var endpoint = Plugin.VoiceEndpoint.Value.Trim();
-            var japaneseEndpoint = Plugin.JapaneseVoiceEndpoint.Value.Trim();
-            if (!endpoint.StartsWith("http://127.0.0.1:", StringComparison.OrdinalIgnoreCase)
-                && !japaneseEndpoint.StartsWith("http://127.0.0.1:", StringComparison.OrdinalIgnoreCase))
+            var endpoint = (useJapanese ? Plugin.JapaneseVoiceEndpoint.Value : Plugin.VoiceEndpoint.Value).Trim();
+            if (!endpoint.StartsWith("http://127.0.0.1:", StringComparison.OrdinalIgnoreCase))
                 return;
+            _voiceHostLaunchAttempted = true;
             var hostPath = Environment.ExpandEnvironmentVariables(Plugin.VoiceHostPath.Value.Trim());
             if (!File.Exists(hostPath))
             {
@@ -1576,7 +2010,7 @@ internal static class DialogueManagerUpdatePatch
             var startInfo = new ProcessStartInfo
             {
                 FileName = hostPath,
-                Arguments = $"--voice-host --parent {Environment.ProcessId}",
+                Arguments = $"--voice-host --parent {Environment.ProcessId} --language {(useJapanese ? "ja" : "zh")}",
                 WorkingDirectory = Path.GetDirectoryName(hostPath) ?? Paths.GameRootPath,
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -1586,11 +2020,37 @@ internal static class DialogueManagerUpdatePatch
             if (Directory.Exists(bundledDotnet))
                 startInfo.Environment["DOTNET_ROOT"] = bundledDotnet;
             _voiceHostProcess = Process.Start(startInfo);
-            Plugin.PluginLog.LogInfo("Started the bundled local voice host without a console window.");
+            _voiceHostJapaneseMode = useJapanese;
+            Plugin.PluginLog.LogInfo($"Started the bundled local {(useJapanese ? "Japanese" : "Chinese")} voice host without a console window.");
         }
         catch (Exception exception)
         {
+            _voiceHostLaunchAttempted = false;
             Plugin.PluginLog.LogWarning($"Could not start the bundled local voice host: {exception.Message}");
+        }
+    }
+
+    private static void StopLocalVoiceHost()
+    {
+        var process = _voiceHostProcess;
+        _voiceHostProcess = null;
+        _voiceHostJapaneseMode = null;
+        _voiceHostLaunchAttempted = false;
+        if (process == null)
+            return;
+
+        try
+        {
+            if (!process.HasExited)
+                process.Kill(true);
+        }
+        catch (Exception exception)
+        {
+            Plugin.PluginLog.LogWarning($"Could not stop the previous local voice host: {exception.Message}");
+        }
+        finally
+        {
+            process.Dispose();
         }
     }
 
@@ -1611,9 +2071,14 @@ internal static class DialogueManagerUpdatePatch
                 manager.ForceSay(ApiKeyText("先等我一下……", "先等我一下……", "少し待って……", "Wait for me a moment…"), string.Empty, 4f);
                 return;
             }
-            if (string.IsNullOrWhiteSpace(Plugin.GeminiApiKey.Value))
+            var activeVoiceProvider = NormalizeAiProvider(Plugin.AiProvider.Value);
+            var voiceApiKey = string.Equals(activeVoiceProvider, "Qwen", StringComparison.Ordinal)
+                ? Plugin.QwenApiKey.Value
+                : Plugin.GeminiApiKey.Value;
+            if (string.IsNullOrWhiteSpace(voiceApiKey))
             {
-                manager.ForceSay(ApiKeyText("還沒有設定 Gemini API Key。", "还没有设置 Gemini API Key。", "Gemini APIキーがまだ設定されていないよ。", "The Gemini API key has not been set yet."), string.Empty, 6f);
+                var providerName = string.Equals(activeVoiceProvider, "Qwen", StringComparison.Ordinal) ? "Qwen" : "Gemini";
+                manager.ForceSay(ApiKeyText($"還沒有設定 {providerName} API Key。", $"还没有设置 {providerName} API Key。", $"{providerName} APIキーがまだ設定されていないよ。", $"The {providerName} API key has not been set yet."), string.Empty, 6f);
                 return;
             }
             try
@@ -1625,6 +2090,9 @@ internal static class DialogueManagerUpdatePatch
                 _wasapiCapture = new WasapiCapture();
                 _wasapiStream = new MemoryStream();
                 _wasapiWriter = new WaveFileWriter(_wasapiStream, _wasapiCapture.WaveFormat);
+                _voiceCaptureFormat = _wasapiCapture.WaveFormat;
+                if (string.Equals(activeVoiceProvider, "Qwen", StringComparison.Ordinal) && UseParaformerRealtime())
+                    StartParaformerRealtimeSession();
                 _wasapiCapture.DataAvailable += OnWasapiDataAvailable;
                 _wasapiCapture.StartRecording();
                 _microphoneRecording = true;
@@ -1674,10 +2142,30 @@ internal static class DialogueManagerUpdatePatch
                 return;
             }
             var elapsed = Math.Max(0f, Time.unscaledTime - _microphoneStartedAt);
-            var normalizedWav = NormalizeVoiceWav(wav);
+            var qwenVoiceInput = string.Equals(NormalizeAiProvider(Plugin.AiProvider.Value), "Qwen", StringComparison.Ordinal);
+            var prepared = NormalizeVoiceWav(wav, qwenVoiceInput ? 16000 : 24000);
+            if (elapsed < 0.3f || (prepared.Measured && prepared.Peak < 0.0005f && prepared.Rms < 0.00005d))
+            {
+                PendingTranscriptionErrors.Enqueue(ApiKeyText(
+                    "剛才沒有收到聲音，再試一次吧。",
+                    "刚才没有收到声音，再试一次吧。",
+                    "今の録音には声が入っていなかったみたい。もう一度試してみて。",
+                    "That recording did not contain audible speech. Please try again."));
+                Plugin.PluginLog.LogInfo($"Skipped silent voice transcription locally (elapsed={elapsed:F1}s, RMS={prepared.Rms:F6}, peak={prepared.Peak:F6}).");
+                CancelParaformerRealtimeSession();
+                return;
+            }
             _transcriptionInFlight = true;
-            _ = RequestTranscriptionAsync(normalizedWav, GetVoiceInputLanguageInstruction());
-            Plugin.PluginLog.LogInfo($"F6 WASAPI recording stopped after {elapsed:F1}s{(reachedLimit ? " (time limit reached)" : string.Empty)}; normalized {wav.Length} to {normalizedWav.Length} WAV bytes for transcription.");
+            if (qwenVoiceInput && _paraformerSessionTask != null)
+            {
+                _paraformerFinishRequested = true;
+                _ = CompleteParaformerOrFallbackAsync(_paraformerSessionTask, prepared.Wav, GetVoiceInputLanguageInstruction());
+            }
+            else
+            {
+                _ = RequestTranscriptionAsync(prepared.Wav, GetVoiceInputLanguageInstruction());
+            }
+            Plugin.PluginLog.LogInfo($"F6 WASAPI recording stopped after {elapsed:F1}s{(reachedLimit ? " (time limit reached)" : string.Empty)}; normalized {wav.Length} to {prepared.Wav.Length} WAV bytes for transcription.");
         }
         catch (Exception exception)
         {
@@ -1693,6 +2181,12 @@ internal static class DialogueManagerUpdatePatch
         {
             _wasapiWriter?.Write(args.Buffer, 0, args.BytesRecorded);
         }
+        if (_paraformerSessionTask != null && _voiceCaptureFormat != null && args.BytesRecorded > 0)
+        {
+            var pcm = ConvertCaptureChunkToMonoPcm16(args.Buffer, args.BytesRecorded, _voiceCaptureFormat);
+            if (pcm.Length > 0)
+                ParaformerAudioChunks.Enqueue(pcm);
+        }
     }
 
     private static void CleanupWasapiCapture()
@@ -1707,6 +2201,261 @@ internal static class DialogueManagerUpdatePatch
             _wasapiStream = null;
         }
         _wasapiCapture = null;
+        _voiceCaptureFormat = null;
+        CancelParaformerRealtimeSession();
+    }
+
+    private static void StartParaformerRealtimeSession()
+    {
+        CancelParaformerRealtimeSession();
+        while (ParaformerAudioChunks.TryDequeue(out _)) { }
+        _paraformerFinishRequested = false;
+        _paraformerResampleAccumulator = 0d;
+        _paraformerCancellation = new CancellationTokenSource();
+        _paraformerSessionTask = RunParaformerRealtimeSessionAsync(_paraformerCancellation.Token);
+        Plugin.PluginLog.LogInfo($"Starting {_paraformerSessionTask.GetType().Name} for {Plugin.QwenRealtimeAsrModel.Value.Trim()} while push-to-talk is held.");
+    }
+
+    private static bool UseParaformerRealtime() =>
+        Plugin.QwenRealtimeAsrModel.Value.Trim().StartsWith("paraformer-realtime", StringComparison.OrdinalIgnoreCase);
+
+    private static void CancelParaformerRealtimeSession()
+    {
+        try { _paraformerCancellation?.Cancel(); } catch { }
+        try { _paraformerCancellation?.Dispose(); } catch { }
+        _paraformerCancellation = null;
+        _paraformerSessionTask = null;
+        _paraformerFinishRequested = false;
+        while (ParaformerAudioChunks.TryDequeue(out _)) { }
+    }
+
+    private static async Task<string> RunParaformerRealtimeSessionAsync(CancellationToken cancellationToken)
+    {
+        using var socket = new ClientWebSocket();
+        socket.Options.SetRequestHeader("Authorization", "Bearer " + Plugin.QwenApiKey.Value.Trim());
+        socket.Options.SetRequestHeader("User-Agent", "Lilith-AI-Mod/0.2.1");
+        var endpoint = BuildParaformerWebSocketUri();
+        await socket.ConnectAsync(endpoint, cancellationToken).WaitAsync(TimeSpan.FromSeconds(10), cancellationToken).ConfigureAwait(false);
+
+        var taskId = Guid.NewGuid().ToString();
+        var language = GetVoiceInputLanguageCode();
+        var parameters = new Dictionary<string, object>
+        {
+            ["format"] = "pcm",
+            ["sample_rate"] = 16000,
+            ["disfluency_removal_enabled"] = false,
+            ["punctuation_prediction_enabled"] = true,
+            ["inverse_text_normalization_enabled"] = true,
+            ["heartbeat"] = true
+        };
+        if (!string.IsNullOrWhiteSpace(language))
+            parameters["language_hints"] = new[] { language };
+        var runTask = new
+        {
+            header = new { action = "run-task", task_id = taskId, streaming = "duplex" },
+            payload = new
+            {
+                task_group = "audio",
+                task = "asr",
+                function = "recognition",
+                model = Plugin.QwenRealtimeAsrModel.Value.Trim(),
+                parameters,
+                input = new { }
+            }
+        };
+        await SendWebSocketTextAsync(socket, JsonSerializer.Serialize(runTask), cancellationToken).ConfigureAwait(false);
+
+        while (true)
+        {
+            var startedMessage = await ReceiveWebSocketTextAsync(socket, cancellationToken)
+                .WaitAsync(TimeSpan.FromSeconds(10), cancellationToken).ConfigureAwait(false);
+            using var startedDocument = JsonDocument.Parse(startedMessage);
+            var header = startedDocument.RootElement.GetProperty("header");
+            var eventName = header.GetProperty("event").GetString() ?? string.Empty;
+            if (eventName == "task-started")
+                break;
+            if (eventName == "task-failed")
+                throw new InvalidOperationException(GetParaformerFailure(header));
+        }
+
+        Plugin.PluginLog.LogInfo($"Paraformer real-time task started (task={taskId}); streaming microphone PCM.");
+        var receiveTask = ReceiveParaformerTranscriptAsync(socket, cancellationToken);
+        while (!_paraformerFinishRequested || !ParaformerAudioChunks.IsEmpty)
+        {
+            if (ParaformerAudioChunks.TryDequeue(out var audio))
+            {
+                for (var offset = 0; offset < audio.Length; offset += 8192)
+                {
+                    var count = Math.Min(8192, audio.Length - offset);
+                    await socket.SendAsync(new ArraySegment<byte>(audio, offset, count), WebSocketMessageType.Binary, true, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            else
+            {
+                await Task.Delay(8, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        var finishTask = new
+        {
+            header = new { action = "finish-task", task_id = taskId, streaming = "duplex" },
+            payload = new { input = new { } }
+        };
+        await SendWebSocketTextAsync(socket, JsonSerializer.Serialize(finishTask), cancellationToken).ConfigureAwait(false);
+        var transcript = await receiveTask.WaitAsync(TimeSpan.FromSeconds(15), cancellationToken).ConfigureAwait(false);
+        if (socket.State == WebSocketState.Open)
+            await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "completed", CancellationToken.None).ConfigureAwait(false);
+        return transcript;
+    }
+
+    private static async Task<string> ReceiveParaformerTranscriptAsync(ClientWebSocket socket, CancellationToken cancellationToken)
+    {
+        var finalSentences = new List<string>();
+        var latestInterim = string.Empty;
+        while (true)
+        {
+            var message = await ReceiveWebSocketTextAsync(socket, cancellationToken).ConfigureAwait(false);
+            using var document = JsonDocument.Parse(message);
+            var header = document.RootElement.GetProperty("header");
+            var eventName = header.GetProperty("event").GetString() ?? string.Empty;
+            if (eventName == "task-failed")
+                throw new InvalidOperationException(GetParaformerFailure(header));
+            if (eventName == "task-finished")
+                return CleanReply(finalSentences.Count > 0 ? string.Concat(finalSentences) : latestInterim);
+            if (eventName != "result-generated"
+                || !document.RootElement.TryGetProperty("payload", out var payload)
+                || !payload.TryGetProperty("output", out var output)
+                || !output.TryGetProperty("sentence", out var sentence))
+                continue;
+            var text = sentence.TryGetProperty("text", out var textElement) ? textElement.GetString() ?? string.Empty : string.Empty;
+            var sentenceEnd = sentence.TryGetProperty("sentence_end", out var endElement) && endElement.GetBoolean();
+            if (sentenceEnd)
+            {
+                if (!string.IsNullOrWhiteSpace(text))
+                    finalSentences.Add(text);
+                latestInterim = string.Empty;
+            }
+            else if (!string.IsNullOrWhiteSpace(text))
+            {
+                latestInterim = text;
+            }
+        }
+    }
+
+    private static async Task<string> ReceiveWebSocketTextAsync(ClientWebSocket socket, CancellationToken cancellationToken)
+    {
+        var buffer = new byte[8192];
+        using var stream = new MemoryStream();
+        while (true)
+        {
+            var result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken).ConfigureAwait(false);
+            if (result.MessageType == WebSocketMessageType.Close)
+                throw new WebSocketException($"Paraformer closed the connection ({socket.CloseStatus}: {socket.CloseStatusDescription}).");
+            if (result.MessageType != WebSocketMessageType.Text)
+                continue;
+            stream.Write(buffer, 0, result.Count);
+            if (result.EndOfMessage)
+                return Encoding.UTF8.GetString(stream.ToArray());
+        }
+    }
+
+    private static Task SendWebSocketTextAsync(ClientWebSocket socket, string text, CancellationToken cancellationToken)
+    {
+        var data = Encoding.UTF8.GetBytes(text);
+        return socket.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Text, true, cancellationToken);
+    }
+
+    private static Uri BuildParaformerWebSocketUri()
+    {
+        var baseUri = new Uri(NormalizeQwenBaseUrl(Plugin.QwenBaseUrl.Value));
+        var builder = new UriBuilder(baseUri)
+        {
+            Scheme = "wss",
+            Port = -1,
+            Path = "/api-ws/v1/inference",
+            Query = string.Empty
+        };
+        return builder.Uri;
+    }
+
+    private static string GetParaformerFailure(JsonElement header)
+    {
+        var code = header.TryGetProperty("error_code", out var codeElement) ? codeElement.GetString() : null;
+        var message = header.TryGetProperty("error_message", out var messageElement) ? messageElement.GetString() : null;
+        return $"Paraformer task failed: {code ?? "unknown"}: {message ?? "no details"}";
+    }
+
+    private static async Task CompleteParaformerOrFallbackAsync(Task<string> sessionTask, byte[] fallbackWav, string languageInstruction)
+    {
+        var timer = Stopwatch.StartNew();
+        try
+        {
+            var transcript = CleanReply(await sessionTask.ConfigureAwait(false));
+            if (string.IsNullOrWhiteSpace(transcript))
+                throw new InvalidOperationException("Paraformer returned an empty transcript.");
+            PendingTranscripts.Enqueue(transcript);
+            Plugin.PluginLog.LogInfo($"Paraformer real-time transcription completed in {timer.Elapsed.TotalSeconds:F2}s after key release ({transcript.Length} chars; content hidden from log).");
+            _transcriptionInFlight = false;
+        }
+        catch (Exception exception)
+        {
+            Plugin.PluginLog.LogWarning($"Paraformer real-time transcription failed; falling back to qwen3-asr-flash: {exception.Message}");
+            await RequestQwenTranscriptionAsync(fallbackWav, languageInstruction).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (ReferenceEquals(_paraformerSessionTask, sessionTask))
+            {
+                try { _paraformerCancellation?.Dispose(); } catch { }
+                _paraformerCancellation = null;
+                _paraformerSessionTask = null;
+                _paraformerFinishRequested = false;
+                _voiceCaptureFormat = null;
+                while (ParaformerAudioChunks.TryDequeue(out _)) { }
+            }
+        }
+    }
+
+    private static byte[] ConvertCaptureChunkToMonoPcm16(byte[] buffer, int count, WaveFormat format)
+    {
+        var channels = Math.Max(1, format.Channels);
+        var bytesPerSample = Math.Max(1, format.BitsPerSample / 8);
+        var frameSize = Math.Max(1, format.BlockAlign);
+        var frames = count / frameSize;
+        using var output = new MemoryStream(Math.Max(256, frames * 2 * 16000 / Math.Max(8000, format.SampleRate)));
+        using var writer = new BinaryWriter(output, Encoding.ASCII, true);
+        for (var frame = 0; frame < frames; frame++)
+        {
+            double mixed = 0d;
+            for (var channel = 0; channel < channels; channel++)
+            {
+                var offset = frame * frameSize + channel * bytesPerSample;
+                float sample;
+                if (format.Encoding == WaveFormatEncoding.IeeeFloat && bytesPerSample == 4)
+                    sample = BitConverter.ToSingle(buffer, offset);
+                else if (bytesPerSample == 2)
+                    sample = BitConverter.ToInt16(buffer, offset) / 32768f;
+                else if (bytesPerSample == 3)
+                {
+                    var value = buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
+                    if ((value & 0x800000) != 0) value |= unchecked((int)0xFF000000);
+                    sample = value / 8388608f;
+                }
+                else if (bytesPerSample == 4)
+                    sample = BitConverter.ToInt32(buffer, offset) / 2147483648f;
+                else
+                    sample = 0f;
+                mixed += sample;
+            }
+            var mono = (float)(mixed / channels);
+            _paraformerResampleAccumulator += 16000d;
+            if (_paraformerResampleAccumulator < format.SampleRate)
+                continue;
+            _paraformerResampleAccumulator -= format.SampleRate;
+            writer.Write((short)Math.Round(Math.Clamp(mono, -1f, 1f) * short.MaxValue));
+        }
+        writer.Flush();
+        return output.ToArray();
     }
 
     private static byte[] EncodePcm16Wav(float[] samples, int channels, int sampleRate)
@@ -1731,7 +2480,7 @@ internal static class DialogueManagerUpdatePatch
         return stream.ToArray();
     }
 
-    private static byte[] NormalizeVoiceWav(byte[] wav)
+    private static (byte[] Wav, double Rms, float Peak, bool Measured) NormalizeVoiceWav(byte[] wav, int preferredSampleRate)
     {
         try
         {
@@ -1752,7 +2501,7 @@ internal static class DialogueManagerUpdatePatch
                 count += read;
             }
             if (count < channels)
-                return wav;
+                return (wav, 0d, 0f, false);
 
             var frames = count / channels;
             var mono = new float[frames];
@@ -1775,7 +2524,7 @@ internal static class DialogueManagerUpdatePatch
                 for (var i = 0; i < mono.Length; i++)
                     mono[i] = Math.Clamp(mono[i] * gain, -1f, 1f);
 
-            var targetRate = Math.Min(24000, sourceRate);
+            var targetRate = Math.Min(Math.Clamp(preferredSampleRate, 8000, 48000), sourceRate);
             float[] output;
             if (targetRate == sourceRate)
             {
@@ -1797,12 +2546,12 @@ internal static class DialogueManagerUpdatePatch
             }
 
             Plugin.PluginLog.LogInfo($"Voice audio prepared as mono PCM16 {targetRate}Hz (source {sourceRate}Hz/{channels}ch, RMS {rms:F4}, peak {peak:F4}, gain {gain:F2}x).");
-            return EncodePcm16Wav(output, 1, targetRate);
+            return (EncodePcm16Wav(output, 1, targetRate), rms, peak, true);
         }
         catch (Exception exception)
         {
             Plugin.PluginLog.LogWarning($"Voice audio normalization failed; sending original recording: {exception.Message}");
-            return wav;
+            return (wav, 0d, 0f, false);
         }
     }
 
@@ -1829,6 +2578,11 @@ internal static class DialogueManagerUpdatePatch
 
     private static async Task RequestTranscriptionAsync(byte[] wav, string languageInstruction)
     {
+        if (string.Equals(NormalizeAiProvider(Plugin.AiProvider.Value), "Qwen", StringComparison.Ordinal))
+        {
+            await RequestQwenTranscriptionAsync(wav, languageInstruction).ConfigureAwait(false);
+            return;
+        }
         try
         {
             var model = Uri.EscapeDataString(Plugin.GeminiModel.Value.Trim());
@@ -1882,6 +2636,87 @@ internal static class DialogueManagerUpdatePatch
         {
             _transcriptionInFlight = false;
         }
+    }
+
+    private static async Task RequestQwenTranscriptionAsync(byte[] wav, string languageInstruction)
+    {
+        try
+        {
+            var baseUrl = NormalizeQwenBaseUrl(Plugin.QwenBaseUrl.Value);
+            var url = baseUrl + "/chat/completions";
+            var language = GetVoiceInputLanguageCode();
+            var asrOptions = new Dictionary<string, object> { ["enable_itn"] = false };
+            if (!string.IsNullOrWhiteSpace(language))
+                asrOptions["language"] = language;
+            var payload = new Dictionary<string, object>
+            {
+                ["model"] = UseParaformerRealtime() ? "qwen3-asr-flash" : Plugin.QwenAsrModel.Value.Trim(),
+                ["messages"] = new object[]
+                {
+                    new
+                    {
+                        role = "user",
+                        content = new object[]
+                        {
+                            new
+                            {
+                                type = "input_audio",
+                                input_audio = new { data = "data:audio/wav;base64," + Convert.ToBase64String(wav) }
+                            }
+                        }
+                    }
+                },
+                ["stream"] = false,
+                ["asr_options"] = asrOptions
+            };
+            using var request = new HttpRequestMessage(HttpMethod.Post, url);
+            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", Plugin.QwenApiKey.Value.Trim());
+            request.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+            using var response = await Http.SendAsync(request).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+                throw new HttpRequestException($"Qwen transcription HTTP {(int)response.StatusCode}: {body}");
+            using var document = JsonDocument.Parse(body);
+            var transcript = CleanReply(document.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? string.Empty);
+            if (string.IsNullOrWhiteSpace(transcript))
+                throw new InvalidOperationException("Qwen returned an empty transcript.");
+            PendingTranscripts.Enqueue(transcript);
+            var emotion = "unknown";
+            var message = document.RootElement.GetProperty("choices")[0].GetProperty("message");
+            if (message.TryGetProperty("annotations", out var annotations) && annotations.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var annotation in annotations.EnumerateArray())
+                    if (annotation.TryGetProperty("emotion", out var emotionElement))
+                        emotion = emotionElement.GetString() ?? emotion;
+            }
+            Plugin.PluginLog.LogInfo($"Qwen voice transcription completed ({transcript.Length} chars; detectedEmotion={emotion}; content hidden from log).");
+        }
+        catch (Exception exception)
+        {
+            Plugin.PluginLog.LogError($"Qwen voice transcription failed: {exception}");
+            PendingTranscriptionErrors.Enqueue(IsQwenAccountUnavailable(exception)
+                ? QwenAccountUnavailableReply()
+                : ApiKeyText("剛才沒有聽清楚，再試一次吧。", "刚才没有听清楚，再试一次吧。", "今の声はうまく聞き取れなかった。もう一度試してみて。", "I couldn't understand that recording. Please try again."));
+        }
+        finally
+        {
+            _transcriptionInFlight = false;
+        }
+    }
+
+    private static string GetVoiceInputLanguageCode()
+    {
+        try
+        {
+            var language = GameSetting.Language ?? string.Empty;
+            if (language.StartsWith("ja", StringComparison.OrdinalIgnoreCase)) return "ja";
+            if (language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)) return "zh";
+            if (language.StartsWith("en", StringComparison.OrdinalIgnoreCase)) return "en";
+        }
+        catch
+        {
+        }
+        return string.Empty;
     }
 
     private static void EnsureAdvancedComputerActionsToggle()
@@ -2401,6 +3236,7 @@ internal static class DialogueManagerUpdatePatch
         _nextJapaneseVoiceUiScanAt = Time.unscaledTime + 1f;
         try
         {
+            var japaneseButtonIsPressed = false;
             foreach (var button in Resources.FindObjectsOfTypeAll<ButtonPressedSwapSprite>())
             {
                 if (button == null || button.gameObject == null)
@@ -2414,8 +3250,6 @@ internal static class DialogueManagerUpdatePatch
                 var isJapaneseButton = Regex.IsMatch(button.gameObject.name, "(^|[_ -])(jp|ja|japan|japanese)($|[_ -])", RegexOptions.IgnoreCase)
                     || (path.IndexOf("/gameVoice/Buttons/", StringComparison.OrdinalIgnoreCase) >= 0
                         && string.Equals(button.gameObject.name, "Toggle_Right (2)", StringComparison.Ordinal));
-                var isChineseButton = path.IndexOf("/gameVoice/Buttons/", StringComparison.OrdinalIgnoreCase) >= 0
-                    && string.Equals(button.gameObject.name, "Toggle_Right", StringComparison.Ordinal);
                 if (isJapaneseButton)
                 {
                     if (!button.gameObject.activeSelf)
@@ -2425,42 +3259,65 @@ internal static class DialogueManagerUpdatePatch
                     }
                     if (Plugin.JapaneseVoiceSelected.Value && !_voicePreferenceAppliedToNativeUi)
                     {
-                        _voicePreferenceAppliedToNativeUi = true;
-                        _voicePreferenceRestoreUntil = Time.unscaledTime + 3f;
-                        PublishJapaneseVoiceSelection();
-                        return;
+                        if (PublishJapaneseVoiceSelection())
+                        {
+                            _voicePreferenceAppliedToNativeUi = true;
+                            _nextJapaneseVoiceToggleRestoreAt = Time.unscaledTime + 3f;
+                        }
                     }
                     var isPressed = button.IsPressed;
-                    if (isPressed && !_japaneseVoiceButtonWasPressed)
-                    {
-                        _japaneseVoiceOverride = true;
-                        Plugin.JapaneseVoiceSelected.Value = true;
-                        _voicePreferenceAppliedToNativeUi = true;
-                        Plugin.PluginLog.LogInfo("Japanese voice override enabled from the settings button; AI display remains Chinese while speech uses Japanese.");
-                        EnsureNativeVoiceManifestLoaded();
-                        PublishJapaneseVoiceSelection();
-                    }
-                    _japaneseVoiceButtonWasPressed = isPressed;
+                    japaneseButtonIsPressed |= isPressed;
                 }
-                else if (isChineseButton)
-                {
-                    var isPressed = button.IsPressed;
-                    if (isPressed && !_chineseVoiceButtonWasPressed && _japaneseVoiceOverride == true
-                        && Time.unscaledTime >= _voicePreferenceRestoreUntil)
-                    {
-                        _japaneseVoiceOverride = false;
-                        Plugin.JapaneseVoiceSelected.Value = false;
-                        _voicePreferenceAppliedToNativeUi = true;
-                        Plugin.PluginLog.LogInfo("Japanese voice override disabled from the Chinese settings button.");
-                        EnsureNativeVoiceManifestLoaded();
-                    }
-                    _chineseVoiceButtonWasPressed = isPressed;
-                }
+            }
+
+            if (Plugin.JapaneseVoiceSelected.Value
+                && _japaneseVoiceOverride == true
+                && !japaneseButtonIsPressed
+                && Time.unscaledTime >= _nextJapaneseVoiceToggleRestoreAt)
+            {
+                _nextJapaneseVoiceToggleRestoreAt = Time.unscaledTime + 3f;
+                if (PublishJapaneseVoiceSelection())
+                    _voicePreferenceAppliedToNativeUi = true;
             }
         }
         catch (Exception exception)
         {
             Plugin.PluginLog.LogWarning($"Could not inspect Japanese voice setting UI: {exception.Message}");
+        }
+    }
+
+    internal static void NotifyVoiceSettingsButtonClicked(ButtonPressedSwapSprite button)
+    {
+        try
+        {
+            if (button == null || button.gameObject == null || !button.IsPressed)
+                return;
+
+            var path = GetTransformPath(button.transform);
+            if (path.IndexOf("/gameVoice/Buttons/", StringComparison.OrdinalIgnoreCase) < 0)
+                return;
+
+            var isJapaneseButton = Regex.IsMatch(button.gameObject.name, "(^|[_ -])(jp|ja|japan|japanese)($|[_ -])", RegexOptions.IgnoreCase)
+                || string.Equals(button.gameObject.name, "Toggle_Right (2)", StringComparison.Ordinal);
+            var isChineseButton = string.Equals(button.gameObject.name, "Toggle_Right", StringComparison.Ordinal);
+            if (!isJapaneseButton && !isChineseButton)
+                return;
+
+            var japanese = isJapaneseButton;
+            _japaneseVoiceOverride = japanese;
+            Plugin.JapaneseVoiceSelected.Value = japanese;
+            _voicePreferenceAppliedToNativeUi = true;
+            _nextJapaneseVoiceToggleRestoreAt = japanese
+                ? Time.unscaledTime + 3f
+                : float.PositiveInfinity;
+            Plugin.PluginLog.LogInfo(japanese
+                ? "Japanese voice preference saved from a direct settings button click."
+                : "Chinese/default voice preference saved from a direct settings button click; pending Japanese restoration cancelled.");
+            EnsureNativeVoiceManifestLoaded();
+        }
+        catch (Exception exception)
+        {
+            Plugin.PluginLog.LogWarning($"Could not save the clicked voice setting: {exception.Message}");
         }
     }
 
@@ -2479,9 +3336,10 @@ internal static class DialogueManagerUpdatePatch
                 return;
             trayTable.AddEntry("AddApiKey", ApiKeyText("加入 API KEY", "加入 API KEY", "APIキーを追加", "Add API Key"));
             trayTable.AddEntry("Gemini", "Gemini");
+            trayTable.AddEntry("Qwen", ApiKeyText("千問", "千问", "Qwen（千問）", "Qwen"));
             trayTable.AddEntry("OpenAI", "OpenAI");
             trayTable.AddEntry("DeepSeek", "DeepSeek");
-            var providers = new[] { "Gemini", "OpenAI", "DeepSeek" };
+            var providers = new[] { "Gemini", "Qwen", "OpenAI", "DeepSeek" };
             var children = new Il2CppReferenceArray<ShowSystemTray.MenuItemData>(providers.Length);
             for (var index = 0; index < providers.Length; index++)
             {
@@ -2538,8 +3396,10 @@ internal static class DialogueManagerUpdatePatch
             if (liveView == null)
                 throw new InvalidOperationException("A live GiftExchangeView was not found in the current scene.");
             _apiKeyView = liveView;
-            liveView.Show(null!);
             CaptureApiKeyDialogState(liveView);
+            // RequestOpenGiftExchange prepares the native view, while Show is
+            // what actually presents it in this game build.
+            liveView.Show(null!);
             Plugin.PluginLog.LogInfo("Opened the native API key input window on Unity's main thread.");
         }
         catch (Exception exception)
@@ -2556,6 +3416,16 @@ internal static class DialogueManagerUpdatePatch
         try
         {
             var liveView = _apiKeyView;
+            if (liveView == null)
+            {
+                liveView = FindLiveGiftExchangeView(requireVisible: true);
+                if (liveView != null)
+                {
+                    _apiKeyView = liveView;
+                    CaptureApiKeyDialogState(liveView);
+                    Plugin.PluginLog.LogInfo("Attached API key mode to the visible native gift exchange window.");
+                }
+            }
             if (liveView == null)
             {
                 if (!_apiKeyMissingViewLogged && _apiKeyOpenRequestedAt >= 0f
@@ -2591,11 +3461,12 @@ internal static class DialogueManagerUpdatePatch
         }
     }
 
-    private static GiftExchangeView? FindLiveGiftExchangeView()
+    private static GiftExchangeView? FindLiveGiftExchangeView(bool requireVisible = false)
     {
         foreach (var view in Resources.FindObjectsOfTypeAll<GiftExchangeView>())
         {
-            if (view != null && view.gameObject != null && view.gameObject.scene.IsValid())
+            if (view != null && view.gameObject != null && view.gameObject.scene.IsValid()
+                && (!requireVisible || view.gameObject.activeInHierarchy))
                 return view;
         }
         return null;
@@ -2650,11 +3521,33 @@ internal static class DialogueManagerUpdatePatch
 
     private static void EndApiKeyDialogMode(GiftExchangeView? view)
     {
+        ReleaseApiKeyDialogInput(view);
         RestoreApiKeyDialogState(view);
         _apiKeyDialogMode = false;
         _apiKeyView = null;
         _apiKeyOpenRequestedAt = -1f;
         _apiKeyMissingViewLogged = false;
+    }
+
+    private static void ReleaseApiKeyDialogInput(GiftExchangeView? view)
+    {
+        try
+        {
+            var input = view?._giftKeyInputField;
+            input?.DeactivateInputField();
+            var eventSystem = UnityEngine.EventSystems.EventSystem.current;
+            var selected = eventSystem?.currentSelectedGameObject;
+            if (eventSystem != null && selected != null
+                && view != null && selected.transform.IsChildOf(view.transform))
+                eventSystem.SetSelectedGameObject(null);
+            GUIUtility.keyboardControl = 0;
+            if (OperatingSystem.IsWindows())
+                ReleaseCapture();
+        }
+        catch (Exception exception)
+        {
+            Plugin.PluginLog.LogWarning($"Could not fully release API key dialog input focus: {exception.Message}");
+        }
     }
 
     internal static void NotifyGiftExchangeViewHidden(GiftExchangeView view)
@@ -2680,6 +3573,9 @@ internal static class DialogueManagerUpdatePatch
             }
             switch (_pendingApiKeyProvider)
             {
+                case "Qwen":
+                    Plugin.QwenApiKey.Value = key;
+                    break;
                 case "OpenAI":
                     Plugin.OpenAiApiKey.Value = key;
                     break;
@@ -2694,9 +3590,10 @@ internal static class DialogueManagerUpdatePatch
             Plugin.AiProvider.Value = _pendingApiKeyProvider;
             if (input != null)
                 input.text = string.Empty;
+            // Restore native redemption state and release input before Hide.
+            // This also prevents the Hide postfix from seeing stale API mode.
+            EndApiKeyDialogMode(view);
             view.Hide();
-            if (_apiKeyDialogMode)
-                EndApiKeyDialogMode(view);
             Plugin.PluginLog.LogInfo($"{_pendingApiKeyProvider} API key was saved and selected (value hidden).");
             return true;
         }
@@ -2779,28 +3676,53 @@ internal static class DialogueManagerUpdatePatch
         }
     }
 
-    private static void PublishJapaneseVoiceSelection()
+    private static bool PublishJapaneseVoiceSelection()
     {
         try
         {
             var controllerMethod = typeof(TraySettingController).GetMethod(
                 "OnGameVoiceChanged",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance)
                 ?? throw new MissingMethodException("TraySettingController.OnGameVoiceChanged was not found.");
             var voiceType = controllerMethod.GetParameters()[0].ParameterType;
             var japanese = voiceType.GetField(
                 "Japanese",
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)?.GetValue(null)
                 ?? throw new MissingFieldException("Japanese voice enum value was not found.");
+
+            var toggleMethod = typeof(TraySettingGameVoiceToggleButtons).GetMethod(
+                "SetVoiceWithoutNotify",
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance)
+                ?? throw new MissingMethodException("TraySettingGameVoiceToggleButtons.SetVoiceWithoutNotify was not found.");
+            var toggleGroups = Resources.FindObjectsOfTypeAll<TraySettingGameVoiceToggleButtons>();
+            if (toggleGroups == null || toggleGroups.Length == 0)
+                throw new InvalidOperationException("Game voice toggle group was not found.");
+            var synchronizedToggleGroups = 0;
+            foreach (var toggleGroup in toggleGroups)
+            {
+                if (toggleGroup == null)
+                    continue;
+                toggleMethod.Invoke(toggleGroup, new[] { japanese });
+                synchronizedToggleGroups++;
+            }
+            if (synchronizedToggleGroups == 0)
+                throw new InvalidOperationException("No game voice toggle group could be synchronized.");
+
             var controllers = Resources.FindObjectsOfTypeAll<TraySettingController>();
             if (controllers == null || controllers.Length == 0)
                 throw new InvalidOperationException("Active TraySettingController was not found.");
             controllerMethod.Invoke(controllers[0], new[] { japanese });
-            Plugin.PluginLog.LogInfo("Applied Japanese voice through the native tray setting controller.");
+            Plugin.PluginLog.LogInfo($"Restored Japanese game voice and synchronized {synchronizedToggleGroups} native toggle group(s).");
+            return true;
         }
         catch (Exception exception)
         {
             Plugin.PluginLog.LogWarning($"Could not publish Japanese game voice selection: {exception.Message}");
+            return false;
         }
     }
 
@@ -2865,6 +3787,15 @@ internal static class DialogueManagerUpdatePatch
 
         if (_inputBubble!.activeSelf)
         {
+            // The global shortcut can still be detected while another desktop
+            // application owns the keyboard. In that case the visible bubble is
+            // not being toggled off: the user is asking to type into it again.
+            if (!IsLilithForeground())
+            {
+                TryBringLilithToForeground();
+                _focusNextFrame = true;
+                return;
+            }
             CloseInputBubble(clear: false);
             return;
         }
@@ -2878,7 +3809,66 @@ internal static class DialogueManagerUpdatePatch
             canvasGroup.blocksRaycasts = true;
         }
 
+        TryBringLilithToForeground();
         _focusNextFrame = true;
+    }
+
+    private static bool IsLilithForeground()
+    {
+        if (!OperatingSystem.IsWindows())
+            return Application.isFocused;
+        var foreground = GetForegroundWindow();
+        if (foreground == IntPtr.Zero)
+            return false;
+        GetWindowThreadProcessId(foreground, out var processId);
+        return processId == (uint)Environment.ProcessId;
+    }
+
+    private static void TryBringLilithToForeground()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        try
+        {
+            using var process = Process.GetCurrentProcess();
+            var gameWindow = process.MainWindowHandle;
+            if (gameWindow == IntPtr.Zero)
+            {
+                Plugin.PluginLog.LogWarning("Could not focus text input because the Lilith window handle was not found.");
+                return;
+            }
+
+            ShowWindow(gameWindow, 9);
+            if (SetForegroundWindow(gameWindow))
+                return;
+
+            // Windows can reject a foreground change made by a background
+            // process. Temporarily join the current foreground input queue so
+            // the user-initiated chat shortcut can activate Lilith reliably.
+            var foreground = GetForegroundWindow();
+            var foregroundThread = foreground == IntPtr.Zero
+                ? 0u
+                : GetWindowThreadProcessId(foreground, out _);
+            var currentThread = GetCurrentThreadId();
+            var attached = foregroundThread != 0 && foregroundThread != currentThread
+                && AttachThreadInput(currentThread, foregroundThread, true);
+            try
+            {
+                BringWindowToTop(gameWindow);
+                SetForegroundWindow(gameWindow);
+                SetFocus(gameWindow);
+            }
+            finally
+            {
+                if (attached)
+                    AttachThreadInput(currentThread, foregroundThread, false);
+            }
+        }
+        catch (Exception exception)
+        {
+            Plugin.PluginLog.LogWarning($"Could not return Windows focus to the text input bubble: {exception.Message}");
+        }
     }
 
     private static bool TryCreateInputBubble()
@@ -3050,6 +4040,7 @@ internal static class DialogueManagerUpdatePatch
             var timeContext = BuildLocalTimeContext();
             var weatherContext = await BuildWeatherContextAsync().ConfigureAwait(false);
             var useGoogleSearch = ShouldUseGeminiGoogleSearch(userText);
+            var activeProvider = NormalizeAiProvider(Plugin.AiProvider.Value);
             var systemInstruction = Plugin.PersonaPrompt.Value + "\n角色事實：" + Plugin.CharacterLore.Value
                 + "\n情緒表達：" + Plugin.EmotionGuidance.Value + nameContext + poseContext.Prompt + timeContext + weatherContext
                 + BuildCanonicalStyleGuide(poseContext)
@@ -3058,17 +4049,26 @@ internal static class DialogueManagerUpdatePatch
                     ? $"\n目前為日文語音模式。只輸出一個 JSON 物件，格式為 {{\"display_text\":\"{interfaceLanguage.Example}\",\"speech_ja\":\"語意相同但適合自然口語演出的日文\"}}。display_text 必須使用{interfaceLanguage.Name}；speech_ja 必須使用日文且不可逐字硬譯，要保留莉莉絲的情緒、停頓與女性口吻。兩個欄位都必須是完整句子，不要輸出 JSON 以外內容。"
                     : string.Empty);
             if (useGoogleSearch)
-                systemInstruction += "\nThe user explicitly requested a web lookup. Use Google Search to verify current facts, answer concisely in character, and do not invent facts that are absent from the search results.";
-            var activeProvider = NormalizeAiProvider(Plugin.AiProvider.Value);
+                systemInstruction += "\nThis question explicitly requests a lookup or depends on current facts. You must use the available web-search tool before answering, answer concisely in character, and never invent facts absent from the results.";
+            else if (string.Equals(activeProvider, "Qwen", StringComparison.Ordinal))
+                systemInstruction += "\nA web-search tool is available. Use it whenever the answer materially depends on recent or changeable facts such as news, current people or policies, prices, weather, schedules, software/model versions, service availability, or product features. Do not search for casual conversation, roleplay, personal advice, or stable facts.";
+            var desktopToolsEnabled = Plugin.AdvancedComputerActionsEnabled.Value;
+            if (desktopToolsEnabled
+                && (string.Equals(activeProvider, "Gemini", StringComparison.Ordinal)
+                    || string.Equals(activeProvider, "Qwen", StringComparison.Ordinal)))
+            {
+                systemInstruction += "\nDesktop agent policy: You may use the declared local desktop tools whenever they help fulfill the user's intent. Prefer tools over asking the user to repeat an exact command, and you may call several independent tools in parallel to complete a routine. Never claim an action succeeded unless its function result says success. All tools operate locally. Never request or expose passwords, API keys, OTPs, clipboard contents, file contents, browsing history, screenshots, precise location, or personal data. Never infer sleep or lock merely because the user says they are tired; call those tools only when the user explicitly asks the computer to sleep or lock. Destructive file operations, closing apps, shutdown, restart, arbitrary typing, arbitrary shortcuts, shell commands, and privilege elevation are unavailable. If a tool is unavailable, explain naturally without pretending it ran.";
+            }
+            if (string.Equals(activeProvider, "Qwen", StringComparison.Ordinal))
+            {
+                await RequestQwenResponsesAsync(systemInstruction, userText, poseContext, japaneseVoiceMode,
+                    useWebSearch: true, forceWebSearch: useGoogleSearch, desktopToolsEnabled).ConfigureAwait(false);
+                return;
+            }
             if (!string.Equals(activeProvider, "Gemini", StringComparison.Ordinal))
             {
                 await RequestOpenAiCompatibleAsync(activeProvider, systemInstruction, userText, poseContext, japaneseVoiceMode).ConfigureAwait(false);
                 return;
-            }
-            var desktopToolsEnabled = Plugin.AdvancedComputerActionsEnabled.Value;
-            if (desktopToolsEnabled)
-            {
-                systemInstruction += "\nDesktop agent policy: You may use the declared local desktop tools whenever they help fulfill the user's intent. Prefer tools over asking the user to repeat an exact command, and you may call several independent tools in parallel to complete a routine. Never claim an action succeeded unless its function result says success. All tools operate locally. Never request or expose passwords, API keys, OTPs, clipboard contents, file contents, browsing history, screenshots, precise location, or personal data. Never infer sleep or lock merely because the user says they are tired; call those tools only when the user explicitly asks the computer to sleep or lock. Destructive file operations, closing apps, shutdown, restart, arbitrary typing, arbitrary shortcuts, shell commands, and privilege elevation are unavailable. If a tool is unavailable, explain naturally without pretending it ran.";
             }
             agentSession = new GeminiAgentSession
             {
@@ -3094,6 +4094,12 @@ internal static class DialogueManagerUpdatePatch
                 return;
             }
             Plugin.PluginLog.LogError(exception);
+            if (string.Equals(NormalizeAiProvider(Plugin.AiProvider.Value), "Qwen", StringComparison.Ordinal)
+                && IsQwenAccountUnavailable(exception))
+            {
+                PendingReplies.Enqueue(QwenAccountUnavailableReply());
+                return;
+            }
             PendingReplies.Enqueue(ApiKeyText("連線好像出了點問題。晚點再試吧。", "连接好像出了点问题。稍后再试吧。", "接続に少し問題があるみたい。あとでまた試してみて。", "There seems to be a connection problem. Please try again later."));
         }
     }
@@ -3367,6 +4373,9 @@ internal static class DialogueManagerUpdatePatch
             Plugin.PluginLog.LogInfo($"Opened registered allowlisted application '{registered.Name}'.");
             return ToolResult(call, true, ApiKeyText($"已開啟{registered.Name}。", $"已打开{registered.Name}。", $"{registered.Name}を開いたよ。", $"Opened {registered.Name}."));
         }
+        var startApplication = ResolveWindowsStartApplication(name);
+        if (startApplication != null && TryLaunchWindowsStartApplication(startApplication))
+            return ToolResult(call, true, ApiKeyText($"正在開啟{startApplication.Name}。", $"正在打开{startApplication.Name}。", $"{startApplication.Name}を開いているよ。", $"Opening {startApplication.Name}."));
         var shortcut = ResolveWindowsShortcut(new[] { name });
         if (string.IsNullOrWhiteSpace(shortcut))
             shortcut = ResolveFuzzyWindowsShortcut(name);
@@ -3445,7 +4454,7 @@ internal static class DialogueManagerUpdatePatch
         if (ContainsSensitiveNoteData(content))
             return ToolResult(call, false, "Credential-like or personal text was blocked and was not copied.");
         GUIUtility.systemCopyBuffer = content;
-        Plugin.PluginLog.LogInfo($"Gemini tool copied user-specified text locally ({content.Length} chars; content hidden)." );
+        Plugin.PluginLog.LogInfo($"AI tool copied user-specified text locally ({content.Length} chars; content hidden)." );
         return ToolResult(call, true, ApiKeyText("文字已複製到本機剪貼簿。", "文字已复制到本机剪贴板。", "文字をローカルのクリップボードにコピーしたよ。", "The text was copied to the local clipboard."));
     }
 
@@ -3541,9 +4550,239 @@ internal static class DialogueManagerUpdatePatch
             return false;
 
         return Regex.IsMatch(userText,
-            "(?:\\u5e6b\\u6211)?(?:\\u67e5\\u67e5|\\u67e5\\u4e00\\u4e0b|\\u67e5\\u8a62|\\u641c\\u5c0b|\\u641c\\u7d22|\\u4e0a\\u7db2\\u67e5)|(?:\\u6700\\u65b0|\\u65b0\\u805e|\\u5373\\u6642).*(?:\\u6d88\\u606f|\\u8cc7\\u8a0a|\\u60c5\\u5831|\\u9032\\u5ea6|\\u50f9\\u683c|\\u6bd4\\u8cfd|\\u5929\\u6c23)|(?:\\u8abf\\u3079\\u3066|\\u691c\\u7d22\\u3057\\u3066|\\u30cd\\u30c3\\u30c8\\u3067\\u8abf\\u3079\\u3066)|(?:look\\s*(?:it|this)?\\s*up|search(?:\\s+the)?\\s+web|google\\s+it|find\\s+online)",
+            "(?:幫我|帮我)?(?:查查|查一下|查詢|查询|搜尋|搜索|上網查|联网查)|(?:最新|新聞|新闻|即時|即时|現任|现任|今天|今日|今年)|(?:目前|最近|新版|更新後).*(?:消息|資訊|信息|情報|進度|进度|價格|价格|費用|费用|比賽|比赛|天氣|天气|版本|模型|功能|政策|規定|规定|支援|支持|是誰|是谁)|(?:調べて|検索して|ネットで調べて|最新|ニュース|今日)|(?:現在|最近).*(?:ニュース|価格|天気|バージョン|モデル|機能|対応|予定)|(?:look\\s*(?:it|this)?\\s*up|search(?:\\s+the)?\\s+web|google\\s+it|find\\s+online|latest|current|today|recent)",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     }
+
+    private static async Task RequestQwenResponsesAsync(string systemInstruction, string userText,
+        PoseContext poseContext, bool japaneseVoiceMode, bool useWebSearch, bool forceWebSearch, bool desktopToolsEnabled)
+    {
+        var baseUrl = NormalizeQwenBaseUrl(Plugin.QwenBaseUrl.Value);
+        var session = new QwenAgentSession
+        {
+            Url = baseUrl + "/responses",
+            SystemInstruction = systemInstruction,
+            UserText = userText,
+            PoseContext = poseContext,
+            JapaneseVoiceMode = japaneseVoiceMode,
+            UseWebSearch = useWebSearch,
+            ForceWebSearch = forceWebSearch,
+            DesktopToolsEnabled = desktopToolsEnabled,
+            Input = BuildQwenInput().ToList()
+        };
+        await SendQwenAgentRequestAsync(session).ConfigureAwait(false);
+    }
+
+    private static object[] BuildQwenInput()
+    {
+        var input = new List<object>();
+        lock (MemoryLock)
+        {
+            foreach (var turn in RecentConversation)
+                input.Add(new { role = turn.Role == "model" ? "assistant" : "user", content = turn.Text });
+        }
+        return input.ToArray();
+    }
+
+    private static async Task SendQwenAgentRequestAsync(QwenAgentSession session)
+    {
+        var requestTimer = Stopwatch.StartNew();
+        var payload = new Dictionary<string, object>
+        {
+            ["model"] = Plugin.QwenModel.Value.Trim(),
+            ["instructions"] = session.SystemInstruction,
+            ["input"] = session.Input,
+            ["max_output_tokens"] = 1536,
+            ["store"] = false,
+            ["reasoning"] = new { effort = "none" }
+        };
+        var tools = BuildQwenTools(session.UseWebSearch, session.ForceWebSearch ? false : session.DesktopToolsEnabled);
+        if (tools.Length > 0)
+            payload["tools"] = tools;
+        if (session.ForceWebSearch)
+            payload["tool_choice"] = "required";
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, session.Url);
+        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", Plugin.QwenApiKey.Value.Trim());
+        request.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        using var response = await Http.SendAsync(request).ConfigureAwait(false);
+        var responseBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new HttpRequestException($"Qwen HTTP {(int)response.StatusCode}: {responseBody}");
+
+        using var document = JsonDocument.Parse(responseBody);
+        var calls = new List<GeminiFunctionCallData>();
+        var reply = new StringBuilder();
+        var webSearchCalls = 0;
+        if (document.RootElement.TryGetProperty("output", out var output) && output.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in output.EnumerateArray())
+            {
+                var type = item.TryGetProperty("type", out var typeElement) ? typeElement.GetString() ?? string.Empty : string.Empty;
+                if (string.Equals(type, "message", StringComparison.OrdinalIgnoreCase)
+                    && item.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var part in content.EnumerateArray())
+                    {
+                        if (part.TryGetProperty("type", out var partType)
+                            && string.Equals(partType.GetString(), "output_text", StringComparison.OrdinalIgnoreCase)
+                            && part.TryGetProperty("text", out var textElement))
+                            reply.Append(textElement.GetString());
+                    }
+                }
+                else if (string.Equals(type, "function_call", StringComparison.OrdinalIgnoreCase))
+                {
+                    var name = item.TryGetProperty("name", out var nameElement) ? nameElement.GetString() ?? string.Empty : string.Empty;
+                    var callId = item.TryGetProperty("call_id", out var callIdElement) ? callIdElement.GetString() ?? string.Empty : string.Empty;
+                    var arguments = item.TryGetProperty("arguments", out var argumentsElement) ? argumentsElement.GetString() ?? "{}" : "{}";
+                    try
+                    {
+                        using var argumentsDocument = JsonDocument.Parse(string.IsNullOrWhiteSpace(arguments) ? "{}" : arguments);
+                        calls.Add(new GeminiFunctionCallData { Name = name, Id = callId, Args = argumentsDocument.RootElement.Clone() });
+                    }
+                    catch
+                    {
+                        calls.Add(new GeminiFunctionCallData { Name = name, Id = callId, Args = JsonSerializer.SerializeToElement(new { }) });
+                    }
+                }
+                else if (string.Equals(type, "web_search_call", StringComparison.OrdinalIgnoreCase))
+                {
+                    webSearchCalls++;
+                    session.Input.Add(item.Clone());
+                }
+                else if (string.Equals(type, "web_extractor_call", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(type, "reasoning", StringComparison.OrdinalIgnoreCase))
+                {
+                    session.Input.Add(item.Clone());
+                }
+            }
+        }
+
+        var status = document.RootElement.TryGetProperty("status", out var statusElement)
+            ? statusElement.GetString() ?? "unknown"
+            : "unknown";
+        var usageSummary = "unavailable";
+        if (document.RootElement.TryGetProperty("usage", out var usage))
+        {
+            var inputTokens = usage.TryGetProperty("input_tokens", out var inputElement) ? inputElement.GetInt32() : -1;
+            var outputTokens = usage.TryGetProperty("output_tokens", out var outputElement) ? outputElement.GetInt32() : -1;
+            usageSummary = $"input={inputTokens}, output={outputTokens}";
+        }
+        Plugin.PluginLog.LogInfo($"Qwen agent turn completed in {requestTimer.Elapsed.TotalSeconds:F2}s: status={status}, calls={calls.Count}, webSearchCalls={webSearchCalls}, rawChars={reply.Length}, round={session.ToolRounds}, {usageSummary}.");
+
+        if (calls.Count > 0)
+        {
+            if (session.ToolRounds >= 4)
+            {
+                CompleteAiReply(ApiKeyText("電腦操作步驟太多了，我先停在這裡。", "电脑操作步骤太多了，我先停在这里。", "PC操作の手順が多すぎるから、ここで止めておくね。", "There were too many computer-control steps, so I stopped here."), session.UserText, session.PoseContext, session.JapaneseVoiceMode);
+                return;
+            }
+            session.ToolRounds++;
+            PendingQwenToolBatches.Enqueue(new QwenToolBatch { Session = session, Calls = calls });
+            return;
+        }
+
+        CompleteAiReply(reply.ToString(), session.UserText, session.PoseContext, session.JapaneseVoiceMode);
+    }
+
+    private static object[] BuildQwenTools(bool includeWebSearch, bool includeDesktopTools)
+    {
+        static object Parameters(object properties, params string[] required) => new
+        {
+            type = "object",
+            properties,
+            required,
+            additionalProperties = false
+        };
+
+        var tools = new List<object>();
+        if (includeWebSearch)
+            tools.Add(new { type = "web_search" });
+        if (!includeDesktopTools)
+            return tools.ToArray();
+
+        tools.Add(new { type = "function", name = "open_application", description = "Open or focus an installed application or game by its common user-facing name. Use only when the user wants an app opened; pass a concise app name, never a path or command.", parameters = Parameters(new { name = new { type = "string", description = "Common application or game name, such as Spotify, Discord, Steam, VALORANT, or Notepad." } }, "name") });
+        tools.Add(new { type = "function", name = "open_folder", description = "Open one allowlisted common Windows folder. Never accepts arbitrary paths.", parameters = Parameters(new { folder = new { type = "string", description = "One of: downloads, desktop, documents, pictures, music, videos, screenshots, mod, recycle_bin." } }, "folder") });
+        tools.Add(new { type = "function", name = "window_action", description = "Perform a reversible window-management action. Closing apps is unavailable.", parameters = Parameters(new { action = new { type = "string", description = "One of: show_desktop, task_view, switch_previous, minimize, maximize, restore, snap_left, snap_right." } }, "action") });
+        tools.Add(new { type = "function", name = "media_control", description = "Control the active system media session with a standard media key.", parameters = Parameters(new { action = new { type = "string", description = "One of: play_pause, next, previous, stop, mute, volume_up, volume_down." } }, "action") });
+        tools.Add(new { type = "function", name = "take_screenshot", description = "Capture all local monitors to the user's Pictures/Lilith Screenshots folder. The screenshot remains local and is never uploaded or returned to the model.", parameters = Parameters(new { }) });
+        tools.Add(new { type = "function", name = "copy_text", description = "Write user-specified non-sensitive text to the local clipboard. Never use for passwords, API keys, OTPs, tokens, private identifiers, or other credentials. Clipboard reading is unavailable.", parameters = Parameters(new { text = new { type = "string", description = "The exact non-sensitive text the user explicitly wants copied." } }, "text") });
+        tools.Add(new { type = "function", name = "browser_search", description = "Open the default browser with a Google search only when the user asks to see results in their browser. Prefer the built-in web search tool for factual lookups.", parameters = Parameters(new { query = new { type = "string", description = "Search query explicitly requested by the user." } }, "query") });
+        tools.Add(new { type = "function", name = "get_system_status", description = "Read a non-personal local system status value.", parameters = Parameters(new { category = new { type = "string", description = "One of: battery, memory, storage, network." } }, "category") });
+        tools.Add(new { type = "function", name = "keyboard_shortcut", description = "Send one allowlisted reversible shortcut to the most recent non-Lilith foreground app. Arbitrary keys and typing are unavailable.", parameters = Parameters(new { action = new { type = "string", description = "One of: undo, redo, save, select_all, find, refresh, fullscreen, escape." } }, "action") });
+        tools.Add(new { type = "function", name = "set_timer", description = "Create a local timer that Lilith will announce. Use a duration from 0.1 to 1440 minutes.", parameters = Parameters(new { minutes = new { type = "number", description = "Timer duration in minutes." }, message = new { type = "string", description = "Short announcement when the timer ends; omit personal or sensitive information." } }, "minutes", "message") });
+        tools.Add(new { type = "function", name = "cancel_timers", description = "Cancel all pending Lilith local timers when the user asks to cancel them.", parameters = Parameters(new { }) });
+        tools.Add(new { type = "function", name = "lock_computer", description = "Lock Windows. Call only when the user explicitly asks to lock the computer; never infer it from context.", parameters = Parameters(new { }) });
+        tools.Add(new { type = "function", name = "sleep_computer", description = "Put Windows into sleep. Call only when the user explicitly asks the computer to sleep; never infer it because the user is sleepy or leaving.", parameters = Parameters(new { }) });
+        tools.Add(new { type = "function", name = "cancel_system_action", description = "Cancel a pending lock or sleep action before it runs.", parameters = Parameters(new { }) });
+        return tools.ToArray();
+    }
+
+    private static void ProcessQwenToolBatches()
+    {
+        if (!PendingQwenToolBatches.TryDequeue(out var batch))
+            return;
+        try
+        {
+            foreach (var call in batch.Calls.Take(8))
+            {
+                var result = ExecuteGeminiComputerTool(call);
+                batch.Session.Input.Add(new
+                {
+                    type = "function_call",
+                    name = call.Name,
+                    arguments = call.Args.ValueKind == JsonValueKind.Undefined ? "{}" : call.Args.GetRawText(),
+                    call_id = call.Id
+                });
+                batch.Session.Input.Add(new
+                {
+                    type = "function_call_output",
+                    call_id = call.Id,
+                    output = JsonSerializer.Serialize(new { success = result.Success, result = result.Message })
+                });
+            }
+            foreach (var call in batch.Calls.Skip(8))
+            {
+                batch.Session.Input.Add(new { type = "function_call", name = call.Name, arguments = "{}", call_id = call.Id });
+                batch.Session.Input.Add(new { type = "function_call_output", call_id = call.Id, output = "Too many actions were requested in one turn." });
+            }
+            _ = ContinueQwenAgentRequestAsync(batch.Session);
+        }
+        catch (Exception exception)
+        {
+            Plugin.PluginLog.LogError($"Qwen desktop tool execution failed: {exception}");
+            PendingReplies.Enqueue(ApiKeyText("剛才的電腦操作沒有成功。", "刚才的电脑操作没有成功。", "さっきのPC操作はうまくいかなかった……", "The computer action did not work."));
+        }
+    }
+
+    private static async Task ContinueQwenAgentRequestAsync(QwenAgentSession session)
+    {
+        try
+        {
+            await SendQwenAgentRequestAsync(session).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            Plugin.PluginLog.LogError($"Qwen tool continuation failed: {exception}");
+            PendingReplies.Enqueue(ApiKeyText("操作已經停下來了，但回覆沒有順利接上。", "操作已经停下来了，但回复没有顺利接上。", "操作は止めたけれど、返事をうまく続けられなかった。", "The actions stopped, but I couldn't complete the follow-up response."));
+        }
+    }
+
+    private static string NormalizeQwenBaseUrl(string? value)
+    {
+        var baseUrl = (value ?? string.Empty).Trim().TrimEnd('/');
+        return baseUrl.Length > 0 ? baseUrl : "https://dashscope.aliyuncs.com/compatible-mode/v1";
+    }
+
+    private static bool IsQwenAccountUnavailable(Exception exception)
+        => Regex.IsMatch(exception.ToString(), "Arrearage|overdue-payment|account is in good standing", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static string QwenAccountUnavailableReply()
+        => ApiKeyText(
+            "千問帳戶目前被服務端拒絕了。請到阿里雲模型服務檢查免費額度或開通計費後再試。",
+            "千问账户目前被服务端拒绝了。请到阿里云模型服务检查免费额度或开通计费后再试。",
+            "千問アカウントがサーバー側で拒否されているよ。無料枠または課金状態を確認してから、もう一度試してね。",
+            "The Qwen account was rejected by the service. Check the free quota or billing status in Model Studio and try again.");
 
     private static async Task RequestOpenAiCompatibleAsync(string provider, string systemInstruction, string userText,
         PoseContext poseContext, bool japaneseVoiceMode)
@@ -3611,6 +4850,9 @@ internal static class DialogueManagerUpdatePatch
 
     private static string NormalizeAiProvider(string? provider)
     {
+        if (string.Equals(provider, "Qwen", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(provider, "Tongyi", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(provider, "DashScope", StringComparison.OrdinalIgnoreCase)) return "Qwen";
         if (string.Equals(provider, "OpenAI", StringComparison.OrdinalIgnoreCase)) return "OpenAI";
         if (string.Equals(provider, "DeepSeek", StringComparison.OrdinalIgnoreCase)) return "DeepSeek";
         return "Gemini";
@@ -3620,6 +4862,7 @@ internal static class DialogueManagerUpdatePatch
     {
         return NormalizeAiProvider(Plugin.AiProvider.Value) switch
         {
+            "Qwen" => Plugin.QwenApiKey.Value,
             "OpenAI" => Plugin.OpenAiApiKey.Value,
             "DeepSeek" => Plugin.DeepSeekApiKey.Value,
             _ => Plugin.GeminiApiKey.Value
@@ -3737,7 +4980,7 @@ internal static class DialogueManagerUpdatePatch
         var situationalExamples = poseContext.VoiceStyle == VoiceStyle.Sleepy
             ? "\n目前狀態的語感參考：『嗯……我在聽……』『你是真的在這裡嗎……不是我在做夢吧？』只模仿慵懶、破碎而親近的節奏，不要逐字重複。"
             : "\n日常語感參考：『安靜地陪著你也是一件很幸福的事呢。』『才不是一直等你，只是剛好看到了啦。』只模仿溫柔、略帶俏皮的距離感，不要逐字重複。";
-        return "\n原作風格準則：莉莉絲的常態不是冷淡，而是溫柔陪伴；約五成自然陪伴、兩成害羞或輕微撒嬌、一成半明確關心與依戀、一成半在氣氛合適時帶出哲學餘韻。她可以偶爾自稱『莉莉絲』，也會自然地嘴硬、期待稱讚或直接表達喜歡。哲學感必須從眼前的小事出發，核心接近選擇、記憶、存在與共同留下的痕跡，但不要反覆使用『存在』『意義』『永遠』，也不要像講課。草莓蛋糕可以象徵一起生活與創造的小小幸福，但只在話題相關時提起。避免制式安慰；先回應對方當下的感受，再留下簡短餘韻。用台灣繁體措辭，將『説、着、支援』等非台灣用字改成『說、著、支持』。"
+        return "\n原作風格準則：莉莉絲的常態不是冷淡，而是溫柔陪伴；約五成自然陪伴、兩成害羞或輕微撒嬌、一成半明確關心與依戀、一成半在氣氛合適時帶出哲學餘韻。她會自然地嘴硬、期待稱讚或直接表達喜歡。哲學感必須從眼前的小事出發，核心接近選擇、記憶、存在與共同留下的痕跡，但不要反覆使用『存在』『意義』『永遠』，也不要像講課。草莓蛋糕可以象徵一起生活與創造的小小幸福，但只在話題相關時提起。避免制式安慰；先回應對方當下的感受，再留下簡短餘韻。用台灣繁體措辭，將『説、着、支援』等非台灣用字改成『說、著、支持』。"
             + situationalExamples;
     }
 
@@ -3916,6 +5159,7 @@ internal static class DialogueManagerUpdatePatch
 
     private static async Task RequestSpeechAsync(string text, NativeReaction? reaction = null, VoiceStyle poseStyle = VoiceStyle.Calm, bool? japaneseVoiceMode = null)
     {
+        var generationTimer = Stopwatch.StartNew();
         try
         {
             var useJapanese = japaneseVoiceMode ?? IsJapaneseVoiceMode();
@@ -3962,21 +5206,42 @@ internal static class DialogueManagerUpdatePatch
                 seed = 42
             };
             var endpoint = useJapanese ? Plugin.JapaneseVoiceEndpoint.Value.Trim() : Plugin.VoiceEndpoint.Value.Trim();
-            using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
-            request.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-            using var response = await Http.SendAsync(request).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
+            var payloadJson = JsonSerializer.Serialize(payload);
+            var localEndpoint = IsLocalVoiceEndpoint(endpoint);
+            var maximumAttempts = localEndpoint && Plugin.VoiceAutoStartLocalService.Value ? 7 : 1;
+            for (var attempt = 1; attempt <= maximumAttempts; attempt++)
             {
-                var error = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                throw new HttpRequestException($"TTS HTTP {(int)response.StatusCode}: {error}");
+                try
+                {
+                    using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+                    request.Content = new StringContent(payloadJson, Encoding.UTF8, "application/json");
+                    using var response = await Http.SendAsync(request).ConfigureAwait(false);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        var error = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                        throw new HttpRequestException($"TTS HTTP {(int)response.StatusCode}: {error}");
+                    }
+                    var speech = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+                    PendingVoiceAudio.Enqueue(new VoiceSequence { Reaction = reaction?.Audio, Speech = speech });
+                    Plugin.PluginLog.LogInfo($"Local voice generation completed in {generationTimer.Elapsed.TotalSeconds:F2}s ({speech.Length} bytes)." );
+                    return;
+                }
+                catch (HttpRequestException exception) when (attempt < maximumAttempts)
+                {
+                    Plugin.PluginLog.LogInfo($"Local voice service is still starting; retrying in 5 seconds ({attempt}/{maximumAttempts}): {exception.Message}");
+                    await Task.Delay(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                }
             }
-            var speech = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-            PendingVoiceAudio.Enqueue(new VoiceSequence { Reaction = reaction?.Audio, Speech = speech });
         }
         catch (Exception exception)
         {
             Plugin.PluginLog.LogWarning($"Voice generation failed; text chat continues: {exception.Message}");
         }
+    }
+
+    private static bool IsLocalVoiceEndpoint(string endpoint)
+    {
+        return Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) && uri.IsLoopback;
     }
 
     private static string PrepareTextForSpeech(string text)
@@ -4013,6 +5278,13 @@ internal static class DialogueManagerUpdatePatch
         public byte[] Speech { get; set; } = Array.Empty<byte>();
     }
 
+    private sealed class CodexBridgeSignal
+    {
+        public string EventName { get; set; } = string.Empty;
+        public string SessionId { get; set; } = string.Empty;
+        public string TurnId { get; set; } = string.Empty;
+    }
+
     private sealed class GeminiAgentSession
     {
         public string Url { get; set; } = string.Empty;
@@ -4045,6 +5317,26 @@ internal static class DialogueManagerUpdatePatch
         public string Id { get; set; } = string.Empty;
         public bool Success { get; set; }
         public string Message { get; set; } = string.Empty;
+    }
+
+    private sealed class QwenAgentSession
+    {
+        public string Url { get; set; } = string.Empty;
+        public string SystemInstruction { get; set; } = string.Empty;
+        public string UserText { get; set; } = string.Empty;
+        public PoseContext PoseContext { get; set; } = PoseContext.Default;
+        public bool JapaneseVoiceMode { get; set; }
+        public bool UseWebSearch { get; set; }
+        public bool ForceWebSearch { get; set; }
+        public bool DesktopToolsEnabled { get; set; }
+        public int ToolRounds { get; set; }
+        public List<object> Input { get; set; } = new();
+    }
+
+    private sealed class QwenToolBatch
+    {
+        public QwenAgentSession Session { get; set; } = new();
+        public List<GeminiFunctionCallData> Calls { get; set; } = new();
     }
 
     private sealed class LocalTimer
@@ -4534,6 +5826,21 @@ internal static class DialogueManagerUpdatePatch
 
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr window);
+
+    [DllImport("user32.dll")]
+    private static extern bool BringWindowToTop(IntPtr window);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetFocus(IntPtr window);
+
+    [DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll")]
+    private static extern bool AttachThreadInput(uint attachThreadId, uint attachToThreadId, bool attach);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
 
     [DllImport("user32.dll")]
     private static extern bool LockWorkStation();
@@ -5160,7 +6467,14 @@ internal static class DialogueManagerUpdatePatch
                 _inputField.text = string.Empty;
         }
 
-        _inputBubble?.SetActive(false);
+        // TMP_InputField can retain a stale activation state after its parent is
+        // hidden in this IL2CPP build. Recreate the lightweight bubble on the next
+        // invocation so every F7 session starts with a clean input component.
+        if (_inputBubble != null)
+            UnityEngine.Object.Destroy(_inputBubble);
+        _inputBubble = null;
+        _inputField = null;
+        _inputPlaceholder = null;
         _focusNextFrame = false;
     }
 }
@@ -5175,9 +6489,11 @@ internal static class TrayMenuLocalizationPatch
             __result = DialogueManagerUpdatePatch.LocalizedText("加入 API KEY", "加入 API KEY", "APIキーを追加", "Add API Key");
             return false;
         }
-        if (tableEntryKey is "Gemini" or "OpenAI" or "DeepSeek")
+        if (tableEntryKey is "Gemini" or "Qwen" or "OpenAI" or "DeepSeek")
         {
-            __result = tableEntryKey;
+            __result = tableEntryKey == "Qwen"
+                ? DialogueManagerUpdatePatch.LocalizedText("千問", "千问", "Qwen（千問）", "Qwen")
+                : tableEntryKey;
             return false;
         }
         return true;
@@ -5199,6 +6515,15 @@ internal static class GiftExchangeApiKeyHidePatch
     private static void Postfix(GiftExchangeView __instance)
     {
         DialogueManagerUpdatePatch.NotifyGiftExchangeViewHidden(__instance);
+    }
+}
+
+[HarmonyPatch(typeof(ButtonPressedSwapSprite), nameof(ButtonPressedSwapSprite.OnPointerClick))]
+internal static class VoiceSettingsButtonClickPatch
+{
+    private static void Postfix(ButtonPressedSwapSprite __instance)
+    {
+        DialogueManagerUpdatePatch.NotifyVoiceSettingsButtonClicked(__instance);
     }
 }
 
@@ -5302,3 +6627,4 @@ internal static class DialogueCompletionPatch
         return !DialogueManagerUpdatePatch.ShouldDelayAiCompletion(__instance);
     }
 }
+
