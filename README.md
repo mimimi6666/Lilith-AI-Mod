@@ -9,6 +9,8 @@
 
 [繁體中文說明](README_繁體中文.md) · [简体中文说明](README_简体中文.md) · [日本語ガイド](README_日本語.md) · [English Guide](README_EN.md)
 
+- **[Discord](https://discord.gg/JGAHnxjbj)**
+
 </div>
 
 ---
