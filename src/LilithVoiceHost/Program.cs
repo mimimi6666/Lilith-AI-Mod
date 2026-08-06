@@ -39,7 +39,7 @@ internal static class Program
                 if (await PortOpenAsync(service.Port, 300)) continue;
                 var config = Path.Combine(root, "config", $"{service.Name}-{device}.yaml");
                 if (!File.Exists(config)) throw new FileNotFoundException("Voice configuration is missing.", config);
-                var process = Process.Start(new ProcessStartInfo
+                var startInfo = new ProcessStartInfo
                 {
                     FileName = python,
                     Arguments = $"\"{api}\" -a 127.0.0.1 -p {service.Port} -c \"{config}\"",
@@ -49,7 +49,13 @@ internal static class Program
                     WindowStyle = ProcessWindowStyle.Hidden,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true
-                }) ?? throw new InvalidOperationException("Could not start the voice service.");
+                };
+                // Force Python's UTF-8 mode (PEP 540). With output redirected to pipes,
+                // Windows Python encodes prints using the locale's ANSI code page, which
+                // cannot represent the Chinese/Japanese TTS text on non-CJK locales
+                // (cp1252/cp1251/etc.) and crashes with "'charmap' codec can't encode".
+                startInfo.Environment["PYTHONUTF8"] = "1";
+                var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Could not start the voice service.");
                 process.OutputDataReceived += async (_, e) => { if (e.Data != null) await LogAsync(log, $"[{service.Name}] {e.Data}"); };
                 process.ErrorDataReceived += async (_, e) => { if (e.Data != null) await LogAsync(log, $"[{service.Name}:err] {e.Data}"); };
                 process.BeginOutputReadLine();
