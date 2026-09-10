@@ -8,6 +8,7 @@ using System.Linq;
 using Microsoft.Win32;
 using System.Net.Http;
 using System.Net.WebSockets;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Encodings.Web;
@@ -30,6 +31,8 @@ using UnityEngine.Localization.Settings;
 using UnityEngine.UI;
 using UI.Common;
 using UI.TraySetting;
+using UI.TraySettingNew;
+using UI.TraySettingNew.SettingItems;
 
 namespace LilithTextInjector;
 
@@ -253,6 +256,7 @@ public sealed class Plugin : BasePlugin
         TryCreateAndPatchAll(typeof(GiftExchangeApiKeyHidePatch), PluginGuid + ".apikeyhide", "API key window isolation hooks");
         TryCreateAndPatchAll(typeof(TrayMenuLocalizationPatch), PluginGuid + ".traylocalization", "tray localization hook");
         TryCreateAndPatchAll(typeof(VoiceSettingsButtonClickPatch), PluginGuid + ".voicelanguage", "voice language preference hook");
+        TryCreateAndPatchAll(typeof(NewTraySettingsCompatibilityPatches), PluginGuid + ".newtraysettings", "new tray settings compatibility hooks");
         Log.LogInfo($"Loaded. Press {TextInputKey.Value} for text chat; hold {VoiceInputKey.Value} for push-to-talk voice input.");
         if (string.IsNullOrWhiteSpace(GeminiApiKey.Value))
             Log.LogWarning("Gemini ApiKey is empty. Set it in BepInEx/config/community.lilith.textinjector.cfg.");
@@ -293,6 +297,81 @@ public sealed class Plugin : BasePlugin
 
         entry.Value = correctedDefault;
         return true;
+    }
+}
+
+internal static class NewTraySettingsCompatibilityPatches
+{
+    private const string JapaneseVoiceLocalizationKey = "LilithModJapaneseVoice";
+    private static bool _japaneseOptionLogged;
+
+    [HarmonyPatch(typeof(TraySettingNewView), "BindAndInitItem")]
+    [HarmonyPostfix]
+    private static void RecordNativeSettingRow(
+        TraySettingNewView __instance, GameObject go, TraySettingConfig.SettingItemEntry entry)
+    {
+        NewTraySettingsAdapter.RecordBoundItem(__instance, go, entry);
+    }
+
+    [HarmonyPatch(typeof(TraySettingNewView), "ResolveToggleOptions")]
+    [HarmonyPostfix]
+    private static void RestoreJapaneseGameVoiceOption(
+        string itemId,
+        ref Il2CppReferenceArray<Il2CppSystem.ValueTuple<string, string, int>> __result)
+    {
+        if (!string.Equals(itemId, TraySettingModel.Keys.GameVoice, StringComparison.Ordinal))
+            return;
+
+        var japaneseValue = (int)TraySettingChanged.GameLocalizationVoiceType.Japanese;
+        if (__result != null)
+        {
+            for (var index = 0; index < __result.Length; index++)
+            {
+                if (__result[index] != null && __result[index].Item3 == japaneseValue)
+                    return;
+            }
+        }
+
+        var existingLength = __result?.Length ?? 0;
+        var tableName = existingLength > 0 && __result![0] != null
+            ? __result[0].Item1
+            : SettingToggleItem.TrayUiTable;
+        EnsureJapaneseVoiceLocalization(tableName);
+        var options = new Il2CppReferenceArray<Il2CppSystem.ValueTuple<string, string, int>>(existingLength + 1);
+        for (var index = 0; index < existingLength; index++)
+            options[index] = __result![index];
+        options[existingLength] = new Il2CppSystem.ValueTuple<string, string, int>(
+            tableName,
+            JapaneseVoiceLocalizationKey,
+            japaneseValue);
+        __result = options;
+        if (!_japaneseOptionLogged)
+        {
+            _japaneseOptionLogged = true;
+            Plugin.PluginLog.LogInfo("Restored Japanese in the native GameVoice option array.");
+        }
+    }
+
+    private static void EnsureJapaneseVoiceLocalization(string tableName)
+    {
+        if (string.IsNullOrWhiteSpace(tableName))
+            throw new InvalidOperationException("The native GameVoice option did not provide a localization table.");
+        foreach (var locale in LocalizationSettings.AvailableLocales.Locales)
+        {
+            if (locale == null)
+                continue;
+            var code = locale.Identifier.Code ?? string.Empty;
+            var label = code.StartsWith("zh-CN", StringComparison.OrdinalIgnoreCase)
+                || code.StartsWith("zh-Hans", StringComparison.OrdinalIgnoreCase)
+                    ? "日语"
+                    : code.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
+                        ? "日語"
+                        : code.StartsWith("ja", StringComparison.OrdinalIgnoreCase)
+                            ? "日本語"
+                            : "Japanese";
+            LocalizationSettings.StringDatabase.GetTable(tableName, locale)
+                ?.AddEntry(JapaneseVoiceLocalizationKey, label);
+        }
     }
 }
 
@@ -392,6 +471,7 @@ internal static class DialogueManagerUpdatePatch
     private static bool? _japaneseVoiceOverride;
     private static bool _voicePreferenceInitialized;
     private static bool _voicePreferenceAppliedToNativeUi;
+    private static bool? _legacyTraySettingsAvailable;
     private static float _nextJapaneseVoiceToggleRestoreAt;
     private static bool _voiceHostLaunchAttempted;
     private static Process? _voiceHostProcess;
@@ -442,7 +522,7 @@ internal static class DialogueManagerUpdatePatch
     private static bool _textInputKeyWasDown;
     private static bool _voiceInputKeyWasDown;
     private static readonly HashSet<int> RebindingHeldVirtualKeys = new();
-    private static TraySettingView? _settingsView;
+    private static Component? _settingsView;
     private static GameObject? _settingsVisibilityTemplateRow;
     private static float _nextForegroundWindowScanAt;
     private static IntPtr _lastExternalForegroundWindow;
@@ -2736,19 +2816,10 @@ internal static class DialogueManagerUpdatePatch
                 return;
             }
 
-            TraySettingView? view = null;
-            foreach (var candidate in Resources.FindObjectsOfTypeAll<TraySettingView>())
-            {
-                if (candidate != null && candidate.gameObject != null && candidate._crossScreenDragToggle != null)
-                {
-                    view = candidate;
-                    break;
-                }
-            }
-            if (view == null)
+            if (!TryFindLegacySettingsView(out var view, out var templateToggle)
+                || view == null || templateToggle == null)
                 return;
 
-            var templateToggle = view._crossScreenDragToggle;
             var templateRow = FindSettingRow(templateToggle.transform, view.transform);
             if (templateRow == null || templateRow.parent == null)
                 return;
@@ -2796,6 +2867,18 @@ internal static class DialogueManagerUpdatePatch
 
     private static void UpdateSettingsUiSafely()
     {
+        // The August 2026 game update replaced UI.TraySetting.TraySettingView
+        // with UI.TraySettingNew.TraySettingNewView. Do not enter methods whose
+        // IL references the removed legacy type: doing so throws TypeLoadException
+        // every frame and can grow the BepInEx log by several megabytes per minute.
+        _legacyTraySettingsAvailable ??= Type.GetType(
+            "UI.TraySetting.TraySettingView, Assembly-CSharp", throwOnError: false) != null;
+        if (_legacyTraySettingsAvailable != true)
+        {
+            NewTraySettingsAdapter.Update();
+            return;
+        }
+
         try
         {
             EnsureJapaneseVoiceOptionVisible();
@@ -2835,6 +2918,34 @@ internal static class DialogueManagerUpdatePatch
             current = current.parent;
         }
         return start.parent;
+    }
+
+    private static bool TryFindLegacySettingsView(out Component? view, out ButtonToggle? crossScreenDragToggle)
+    {
+        view = null;
+        crossScreenDragToggle = null;
+        var viewType = Type.GetType("UI.TraySetting.TraySettingView, Assembly-CSharp", throwOnError: false);
+        if (viewType == null)
+            return false;
+
+        var toggleField = viewType.GetField("_crossScreenDragToggle",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        if (toggleField == null)
+            return false;
+
+        foreach (var candidate in Resources.FindObjectsOfTypeAll(Il2CppType.From(viewType)))
+        {
+            if (candidate is not Component component || component.gameObject == null)
+                continue;
+            var toggle = toggleField.GetValue(component) as ButtonToggle;
+            if (toggle == null)
+                continue;
+            view = component;
+            crossScreenDragToggle = toggle;
+            return true;
+        }
+
+        return false;
     }
 
     private static TMP_Text? FindFirstText(Transform root)
@@ -2906,19 +3017,11 @@ internal static class DialogueManagerUpdatePatch
 
         try
         {
-            TraySettingView? view = null;
-            foreach (var candidate in Resources.FindObjectsOfTypeAll<TraySettingView>())
-            {
-                if (candidate != null && candidate.gameObject != null && candidate._crossScreenDragToggle != null)
-                {
-                    view = candidate;
-                    break;
-                }
-            }
-            if (view == null)
+            if (!TryFindLegacySettingsView(out var view, out var templateToggle)
+                || view == null || templateToggle == null)
                 return;
 
-            var templateRow = FindSettingRow(view._crossScreenDragToggle.transform, view.transform);
+            var templateRow = FindSettingRow(templateToggle.transform, view.transform);
             if (templateRow == null || templateRow.parent == null)
                 return;
 
@@ -3105,10 +3208,14 @@ internal static class DialogueManagerUpdatePatch
         var controlsVisible = false;
         try
         {
-            controlsVisible = _settingsView != null
+            if (_settingsView != null
                 && _settingsView.gameObject != null
-                && _settingsView.gameObject.activeInHierarchy
-                && _settingsView._currentTab == TraySettingView.TabControls;
+                && _settingsView.gameObject.activeInHierarchy)
+            {
+                var currentTab = _settingsView.GetType().GetField("_currentTab",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(_settingsView);
+                controlsVisible = string.Equals(currentTab?.ToString(), "Controls", StringComparison.OrdinalIgnoreCase);
+            }
         }
         catch
         {
@@ -3122,14 +3229,8 @@ internal static class DialogueManagerUpdatePatch
         SetInjectedSettingsRowActive(_textInputKeyRow, controlsVisible);
         SetInjectedSettingsRowActive(_voiceInputKeyRow, controlsVisible);
 
-        if (!controlsVisible && _keyBindingTarget != 0)
-        {
-            _keyBindingTarget = 0;
-            _keyBindingStartedAt = -1f;
-            RebindingHeldVirtualKeys.Clear();
-            UpdateKeyBindingTexts();
-            Plugin.PluginLog.LogInfo("Key rebinding cancelled because the Controls settings tab was closed.");
-        }
+        if (!controlsVisible)
+            CancelSettingsKeyBinding("the Controls settings tab was closed");
         return controlsVisible;
     }
 
@@ -3207,6 +3308,39 @@ internal static class DialogueManagerUpdatePatch
             .Replace("RightAlt", "R Alt", StringComparison.Ordinal)
             .Replace("Keypad", "Num ", StringComparison.Ordinal);
     }
+
+    internal static void UpdateNewSettingsKeyBindingCapture()
+    {
+        ProcessKeyBindingInteraction();
+    }
+
+    internal static void BeginNewSettingsKeyBinding(int target)
+    {
+        if (target is not (1 or 2))
+            return;
+        _keyBindingTarget = target;
+        _keyBindingStartedAt = Time.unscaledTime;
+        CaptureHeldRebindingKeys();
+        Plugin.PluginLog.LogInfo(target == 1
+            ? "Waiting for a new text input hotkey from the new settings UI."
+            : "Waiting for a new push-to-talk hotkey from the new settings UI.");
+    }
+
+    internal static void CancelSettingsKeyBinding(string reason)
+    {
+        var wasCapturing = _keyBindingTarget != 0;
+        _keyBindingTarget = 0;
+        _keyBindingStartedAt = -1f;
+        RebindingHeldVirtualKeys.Clear();
+        UpdateKeyBindingTexts();
+        if (wasCapturing)
+            Plugin.PluginLog.LogInfo($"Key rebinding cancelled because {reason}.");
+    }
+
+    internal static bool IsNewSettingsKeyBindingActive(int target) => _keyBindingTarget == target;
+
+    internal static string GetNewSettingsKeyBindingText(int target) =>
+        FormatKeyCode(target == 1 ? Plugin.TextInputKey.Value : Plugin.VoiceInputKey.Value);
 
     private static void ResetKeyBindingUiReferences()
     {
@@ -3680,25 +3814,27 @@ internal static class DialogueManagerUpdatePatch
     {
         try
         {
-            var controllerMethod = typeof(TraySettingController).GetMethod(
+            var controllerType = Type.GetType(
+                "UI.TraySetting.TraySettingController, Assembly-CSharp", throwOnError: false)
+                ?? throw new TypeLoadException("Legacy TraySettingController is unavailable.");
+            var toggleType = Type.GetType(
+                "UI.TraySetting.TraySettingGameVoiceToggleButtons, Assembly-CSharp", throwOnError: false)
+                ?? throw new TypeLoadException("Legacy TraySettingGameVoiceToggleButtons is unavailable.");
+            var controllerMethod = controllerType.GetMethod(
                 "OnGameVoiceChanged",
-                System.Reflection.BindingFlags.Public |
-                System.Reflection.BindingFlags.NonPublic |
-                System.Reflection.BindingFlags.Instance)
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
                 ?? throw new MissingMethodException("TraySettingController.OnGameVoiceChanged was not found.");
             var voiceType = controllerMethod.GetParameters()[0].ParameterType;
             var japanese = voiceType.GetField(
                 "Japanese",
-                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)?.GetValue(null)
+                BindingFlags.Public | BindingFlags.Static)?.GetValue(null)
                 ?? throw new MissingFieldException("Japanese voice enum value was not found.");
 
-            var toggleMethod = typeof(TraySettingGameVoiceToggleButtons).GetMethod(
+            var toggleMethod = toggleType.GetMethod(
                 "SetVoiceWithoutNotify",
-                System.Reflection.BindingFlags.Public |
-                System.Reflection.BindingFlags.NonPublic |
-                System.Reflection.BindingFlags.Instance)
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
                 ?? throw new MissingMethodException("TraySettingGameVoiceToggleButtons.SetVoiceWithoutNotify was not found.");
-            var toggleGroups = Resources.FindObjectsOfTypeAll<TraySettingGameVoiceToggleButtons>();
+            var toggleGroups = Resources.FindObjectsOfTypeAll(Il2CppType.From(toggleType));
             if (toggleGroups == null || toggleGroups.Length == 0)
                 throw new InvalidOperationException("Game voice toggle group was not found.");
             var synchronizedToggleGroups = 0;
@@ -3712,7 +3848,7 @@ internal static class DialogueManagerUpdatePatch
             if (synchronizedToggleGroups == 0)
                 throw new InvalidOperationException("No game voice toggle group could be synchronized.");
 
-            var controllers = Resources.FindObjectsOfTypeAll<TraySettingController>();
+            var controllers = Resources.FindObjectsOfTypeAll(Il2CppType.From(controllerType));
             if (controllers == null || controllers.Length == 0)
                 throw new InvalidOperationException("Active TraySettingController was not found.");
             controllerMethod.Invoke(controllers[0], new[] { japanese });
@@ -3743,6 +3879,17 @@ internal static class DialogueManagerUpdatePatch
         try
         {
             var language = LocalizationConfig.GetCurrentVoiceLanguage() ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(language))
+            {
+                // TraySettingNewView owns the native Chinese/Japanese selector.
+                // Mirror that selection into the MOD instead of adding a second
+                // voice-language control to the Sound tab.
+                var japanese = language.StartsWith("ja", StringComparison.OrdinalIgnoreCase);
+                _voicePreferenceInitialized = true;
+                _japaneseVoiceOverride = japanese;
+                if (Plugin.JapaneseVoiceSelected.Value != japanese)
+                    Plugin.JapaneseVoiceSelected.Value = japanese;
+            }
             if (string.Equals(language, _lastObservedVoiceLanguage, StringComparison.OrdinalIgnoreCase))
                 return;
             _lastObservedVoiceLanguage = language;
@@ -6479,6 +6626,438 @@ internal static class DialogueManagerUpdatePatch
     }
 }
 
+internal static class NewTraySettingsAdapter
+{
+    // The checked-in legacy settings reference uses two compact columns. Keep
+    // those centers relative to the game-owned ViewPanel so the design scales
+    // with the updated Canvas instead of relying on screen pixels.
+    private const float LegacyLeftLabelCenter = 0.13f;
+    private const float LegacyLeftControlCenter = 0.335f;
+    private const float LegacyRightLabelCenter = LegacyLeftLabelCenter + 0.5f;
+    private const float LegacyRightControlCenter = LegacyLeftControlCenter + 0.5f;
+    private static readonly Vector2 LegacyHotkeyButtonSize = new(82f, 28f);
+
+    private static TraySettingNewView? _view;
+    private static TraySettingNewView? _boundView;
+    private static TraySettingTab? _tab;
+    private static readonly Dictionary<string, GameObject> BoundNativeRows = new(StringComparer.Ordinal);
+    private static GameObject? _advancedRow;
+    private static SettingSwitchItems? _advancedSwitch;
+    private static GameObject? _textHotkeyRow;
+    private static SettingSwitchItems? _textHotkeySwitch;
+    private static TMP_Text? _textHotkeyOnValue;
+    private static TMP_Text? _textHotkeyOffValue;
+    private static GameObject? _voiceHotkeyRow;
+    private static SettingSwitchItems? _voiceHotkeySwitch;
+    private static TMP_Text? _voiceHotkeyOnValue;
+    private static TMP_Text? _voiceHotkeyOffValue;
+    private static Il2CppSystem.Action<bool>? _advancedChanged;
+    private static Il2CppSystem.Action<bool>? _textHotkeyClicked;
+    private static Il2CppSystem.Action<bool>? _voiceHotkeyClicked;
+    private static bool _readyLogged;
+    private static TraySettingNewView? _layoutLoggedView;
+    private static float _nextScanAt;
+
+    internal static void RecordBoundItem(
+        TraySettingNewView view, GameObject row, TraySettingConfig.SettingItemEntry entry)
+    {
+        if (view == null || row == null || entry == null || string.IsNullOrWhiteSpace(entry.itemId))
+            return;
+        if (_boundView != view)
+        {
+            _boundView = view;
+            BoundNativeRows.Clear();
+        }
+        BoundNativeRows[entry.itemId] = row;
+        if (entry.tab == TraySettingTab.Controls)
+            ConfigureLegacyColumnRow(view, row.GetComponent<SettingSwitchItems>(), false, false);
+    }
+
+    internal static void Update()
+    {
+        try
+        {
+            if (IsControlsViewVisible(_view))
+                DialogueManagerUpdatePatch.UpdateNewSettingsKeyBindingCapture();
+            else
+                DialogueManagerUpdatePatch.CancelSettingsKeyBinding("the new Controls settings view is not visible");
+
+            if (Time.unscaledTime < _nextScanAt)
+            {
+                RefreshVisibleRows();
+                return;
+            }
+            _nextScanAt = Time.unscaledTime + 0.25f;
+
+            var view = FindView();
+            if (view == null)
+            {
+                ResetView();
+                return;
+            }
+
+            if (_view != view)
+            {
+                ResetView();
+                _view = view;
+            }
+            if (!view.IsVisible)
+                return;
+            if (_tab != view._currentTab)
+            {
+                ResetRows();
+                _tab = view._currentTab;
+                Plugin.PluginLog.LogInfo($"New tray settings tab selected: {view._currentTab}.");
+            }
+
+            switch (view._currentTab)
+            {
+                case TraySettingTab.Controls:
+                    EnsureAdvancedActionsRow(view);
+                    EnsureHotkeyRows(view);
+                    PlaceOriginalControlRows(view);
+                    break;
+            }
+
+            RefreshVisibleRows();
+            if (!_readyLogged)
+            {
+                _readyLogged = true;
+                Plugin.PluginLog.LogInfo("New tray settings UI compatibility active: the original MOD controls are available on the Controls tab.");
+            }
+        }
+        catch (Exception exception)
+        {
+            DialogueManagerUpdatePatch.CancelSettingsKeyBinding("the new settings UI became unavailable");
+            Plugin.PluginLog.LogWarning($"Could not update the new tray settings UI: {exception.Message}");
+            _nextScanAt = Time.unscaledTime + 3f;
+        }
+    }
+
+    private static bool IsControlsViewVisible(TraySettingNewView? view)
+    {
+        return view != null
+            && view.gameObject != null
+            && view.IsVisible
+            && view._currentTab == TraySettingTab.Controls;
+    }
+
+    private static TraySettingNewView? FindView()
+    {
+        TraySettingNewView? fallback = null;
+        foreach (var candidate in Resources.FindObjectsOfTypeAll<TraySettingNewView>())
+        {
+            if (candidate != null && candidate.gameObject != null
+                && candidate.gameObject.activeInHierarchy)
+            {
+                if (candidate.IsVisible)
+                    return candidate;
+                if (candidate == _view)
+                    fallback = candidate;
+                else if (fallback == null)
+                    fallback = candidate;
+            }
+        }
+        return fallback;
+    }
+
+    private static void EnsureAdvancedActionsRow(TraySettingNewView view)
+    {
+        if (_advancedRow != null && _advancedSwitch != null)
+            return;
+        _advancedChanged = DelegateSupport.ConvertDelegate<Il2CppSystem.Action<bool>>(
+            new System.Action<bool>(enabled =>
+            {
+                Plugin.AdvancedComputerActionsEnabled.Value = enabled;
+                Plugin.PluginLog.LogInfo($"Advanced computer actions {(enabled ? "enabled" : "disabled")} from the new settings UI.");
+            }));
+        (_advancedRow, _advancedSwitch) = CreateSwitchRow(
+            view, "LilithModAdvancedComputerActions", Plugin.AdvancedComputerActionsEnabled.Value, _advancedChanged!);
+    }
+
+    private static void EnsureHotkeyRows(TraySettingNewView view)
+    {
+        if (_textHotkeyRow == null || _textHotkeySwitch == null)
+        {
+            _textHotkeyClicked = DelegateSupport.ConvertDelegate<Il2CppSystem.Action<bool>>(
+                new System.Action<bool>(_ => DialogueManagerUpdatePatch.BeginNewSettingsKeyBinding(1)));
+            (_textHotkeyRow, _textHotkeySwitch, _textHotkeyOnValue, _textHotkeyOffValue) =
+                CreateHotkeyRow(view, "LilithModTextInputHotkey", _textHotkeyClicked!);
+        }
+        if (_voiceHotkeyRow == null || _voiceHotkeySwitch == null)
+        {
+            _voiceHotkeyClicked = DelegateSupport.ConvertDelegate<Il2CppSystem.Action<bool>>(
+                new System.Action<bool>(_ => DialogueManagerUpdatePatch.BeginNewSettingsKeyBinding(2)));
+            (_voiceHotkeyRow, _voiceHotkeySwitch, _voiceHotkeyOnValue, _voiceHotkeyOffValue) =
+                CreateHotkeyRow(view, "LilithModVoiceInputHotkey", _voiceHotkeyClicked!);
+        }
+    }
+
+    private static (GameObject Row, SettingSwitchItems Item) CreateSwitchRow(
+        TraySettingNewView view, string name, bool value, Il2CppSystem.Action<bool> callback)
+    {
+        var prefab = FindPrefab<SettingSwitchItems>(view)
+            ?? throw new InvalidOperationException("SettingSwitchItems prefab was not found in TraySettingConfig.");
+        var row = UnityEngine.Object.Instantiate(prefab, view._settingItemRoot);
+        row.name = name;
+        IgnoreParentLayout(row.transform);
+        row.SetActive(true);
+        var item = row.GetComponent<SettingSwitchItems>()
+            ?? throw new InvalidOperationException("Cloned switch row has no SettingSwitchItems component.");
+        item.OnValueChanged = null;
+        item.OnValueChanged = callback;
+        item.Init(name, value, null);
+        view._spawnedSettingItems.Add(row);
+        return (row, item);
+    }
+
+    private static (GameObject Row, SettingSwitchItems Item, TMP_Text OnValue, TMP_Text OffValue) CreateHotkeyRow(
+        TraySettingNewView view, string name, Il2CppSystem.Action<bool> callback)
+    {
+        var prefab = FindPrefab<SettingSwitchItems>(view)
+            ?? throw new InvalidOperationException("SettingSwitchItems prefab was not found in TraySettingConfig.");
+        var row = UnityEngine.Object.Instantiate(prefab, view._settingItemRoot);
+        row.name = name;
+        IgnoreParentLayout(row.transform);
+        row.SetActive(true);
+        var item = row.GetComponent<SettingSwitchItems>()
+            ?? throw new InvalidOperationException("Cloned hotkey row has no SettingSwitchItems component.");
+        item.OnValueChanged = null;
+        item.OnValueChanged = callback;
+        item.Init(name, false, null);
+        var onValue = CreateHotkeyValueText(item._nameText, item._onButton);
+        var offValue = CreateHotkeyValueText(item._nameText, item._offButton);
+        view._spawnedSettingItems.Add(row);
+        return (row, item, onValue, offValue);
+    }
+
+    private static TMP_Text CreateHotkeyValueText(TMP_Text label, Button button)
+    {
+        for (var index = 0; index < button.transform.childCount; index++)
+            button.transform.GetChild(index).gameObject.SetActive(false);
+
+        var buttonRect = button.gameObject.GetComponent<RectTransform>();
+        if (buttonRect != null)
+            buttonRect.sizeDelta = LegacyHotkeyButtonSize;
+
+        var valueObject = UnityEngine.Object.Instantiate(label.gameObject, button.transform);
+        valueObject.name = "LilithHotkeyValue";
+        valueObject.SetActive(true);
+        var value = valueObject.GetComponent<TMP_Text>()
+            ?? throw new InvalidOperationException("Could not create the hotkey value label.");
+        var valueRect = valueObject.GetComponent<RectTransform>()
+            ?? throw new InvalidOperationException("The hotkey value label has no RectTransform.");
+        valueRect.anchorMin = Vector2.zero;
+        valueRect.anchorMax = Vector2.one;
+        valueRect.offsetMin = Vector2.zero;
+        valueRect.offsetMax = Vector2.zero;
+        valueRect.anchoredPosition = Vector2.zero;
+        value.alignment = TextAlignmentOptions.Center;
+        value.raycastTarget = false;
+        value.enableWordWrapping = false;
+        return value;
+    }
+
+    private static void PlaceOriginalControlRows(TraySettingNewView view)
+    {
+        var textAnchor = FindOfficialControlRow(view, TraySettingModel.Keys.StartupAutolaunch);
+        var voiceAnchor = FindOfficialControlRow(view, TraySettingModel.Keys.CloseMovement);
+        var advancedAnchor = FindOfficialControlRow(view, TraySettingModel.Keys.CrossScreenDrag);
+        if (textAnchor == null || voiceAnchor == null || advancedAnchor == null)
+            return;
+
+        ConfigureOfficialControlRows(view);
+        OverlayOnOfficialControlRow(_textHotkeyRow, textAnchor);
+        OverlayOnOfficialControlRow(_voiceHotkeyRow, voiceAnchor);
+        OverlayOnOfficialControlRow(_advancedRow, advancedAnchor);
+        ConfigureLegacyColumnRow(view, _textHotkeySwitch, true, true);
+        ConfigureLegacyColumnRow(view, _voiceHotkeySwitch, true, true);
+        ConfigureLegacyColumnRow(view, _advancedSwitch, true, false);
+        if (_layoutLoggedView != view)
+        {
+            _layoutLoggedView = view;
+            Plugin.PluginLog.LogInfo("Restored the compact legacy two-column Controls grid on the native setting rows.");
+        }
+    }
+
+    private static void ConfigureOfficialControlRows(TraySettingNewView view)
+    {
+        if (_boundView != view)
+            return;
+        foreach (var row in BoundNativeRows.Values)
+        {
+            if (row != null && row.activeInHierarchy)
+                ConfigureLegacyColumnRow(view, row.GetComponent<SettingSwitchItems>(), false, false);
+        }
+    }
+
+    private static RectTransform? FindOfficialControlRow(TraySettingNewView view, string itemId)
+    {
+        if (_boundView != view || !BoundNativeRows.TryGetValue(itemId, out var row)
+            || row == null || !row.activeInHierarchy)
+            return null;
+        return row.GetComponent<RectTransform>();
+    }
+
+    private static void OverlayOnOfficialControlRow(GameObject? row, RectTransform anchor)
+    {
+        if (row == null)
+            return;
+        var rowRect = row.GetComponent<RectTransform>();
+        if (rowRect == null)
+            return;
+        IgnoreParentLayout(row.transform);
+        row.transform.SetSiblingIndex(row.transform.parent.childCount - 1);
+        rowRect.anchorMin = anchor.anchorMin;
+        rowRect.anchorMax = anchor.anchorMax;
+        rowRect.pivot = anchor.pivot;
+        rowRect.sizeDelta = anchor.sizeDelta;
+        rowRect.anchoredPosition = anchor.anchoredPosition;
+        rowRect.localScale = anchor.localScale;
+        rowRect.localRotation = anchor.localRotation;
+    }
+
+    private static void ConfigureLegacyColumnRow(
+        TraySettingNewView view, SettingSwitchItems? item, bool rightColumn, bool hotkey)
+    {
+        if (item == null)
+            return;
+        var rowRect = item.GetComponent<RectTransform>();
+        var panelRect = FindViewPanel(view);
+        if (rowRect == null || panelRect == null)
+            return;
+
+        var labelCenter = rightColumn ? LegacyRightLabelCenter : LegacyLeftLabelCenter;
+        var controlCenter = rightColumn ? LegacyRightControlCenter : LegacyLeftControlCenter;
+        if (item._nameText != null)
+        {
+            PositionAtPanelCenter(item._nameText.rectTransform, rowRect, panelRect, labelCenter);
+            item._nameText.alignment = TextAlignmentOptions.Center;
+        }
+        ConfigureLegacyControlButton(item._onButton, rowRect, panelRect, controlCenter, hotkey);
+        ConfigureLegacyControlButton(item._offButton, rowRect, panelRect, controlCenter, hotkey);
+    }
+
+    private static RectTransform? FindViewPanel(TraySettingNewView view)
+    {
+        var panel = view.transform.Find("ViewPanel");
+        return panel == null ? null : panel.GetComponent<RectTransform>();
+    }
+
+    private static void ConfigureLegacyControlButton(
+        Button? button, RectTransform rowRect, RectTransform panelRect, float normalizedCenter, bool hotkey)
+    {
+        if (button == null)
+            return;
+        var rect = button.GetComponent<RectTransform>();
+        if (rect == null)
+            return;
+        if (hotkey)
+            rect.sizeDelta = LegacyHotkeyButtonSize;
+        PositionAtPanelCenter(rect, rowRect, panelRect, normalizedCenter);
+    }
+
+    private static void PositionAtPanelCenter(
+        RectTransform rect, RectTransform rowRect, RectTransform panelRect, float normalizedCenter)
+    {
+        var panelX = panelRect.rect.xMin + panelRect.rect.width * normalizedCenter;
+        var worldPosition = panelRect.TransformPoint(new Vector3(panelX, 0f, 0f));
+        var rowPosition = rowRect.InverseTransformPoint(worldPosition);
+        var originalY = rect.anchoredPosition.y;
+        rect.anchorMin = new Vector2(0.5f, 0.5f);
+        rect.anchorMax = new Vector2(0.5f, 0.5f);
+        rect.pivot = new Vector2(0.5f, 0.5f);
+        rect.anchoredPosition = new Vector2(rowPosition.x, originalY);
+    }
+
+    private static void IgnoreParentLayout(Transform row)
+    {
+        var layoutElement = row.gameObject.GetComponent<LayoutElement>();
+        if (layoutElement == null)
+            layoutElement = row.gameObject.AddComponent<LayoutElement>();
+        layoutElement.ignoreLayout = true;
+    }
+
+    private static GameObject? FindPrefab<T>(TraySettingNewView view) where T : Component
+    {
+        if (view._config == null || view._config._uiTypes == null)
+            return null;
+        foreach (var entry in view._config._uiTypes)
+        {
+            if (entry?.uiObject != null && entry.uiObject.GetComponent<T>() != null)
+                return entry.uiObject;
+        }
+        return null;
+    }
+
+    private static void RefreshVisibleRows()
+    {
+        RefreshSwitch(_advancedSwitch, Plugin.AdvancedComputerActionsEnabled.Value,
+            DialogueManagerUpdatePatch.LocalizedText("進階電腦操作", "高级电脑操作", "高度なPC操作", "Advanced PC controls"));
+        RefreshHotkeyRow(_textHotkeySwitch, _textHotkeyOnValue, _textHotkeyOffValue, 1);
+        RefreshHotkeyRow(_voiceHotkeySwitch, _voiceHotkeyOnValue, _voiceHotkeyOffValue, 2);
+    }
+
+    private static void RefreshSwitch(SettingSwitchItems? item, bool value, string label)
+    {
+        if (item == null)
+            return;
+        if (item._currentValue != value)
+            item.ApplyValue(value, false);
+        if (item._nameText != null && !string.Equals(item._nameText.text, label, StringComparison.Ordinal))
+            item._nameText.text = label;
+    }
+
+    private static void RefreshHotkeyRow(
+        SettingSwitchItems? item, TMP_Text? onValue, TMP_Text? offValue, int target)
+    {
+        if (item == null)
+            return;
+        if (item._currentValue)
+            item.ApplyValue(false, false);
+        var label = target == 1
+            ? DialogueManagerUpdatePatch.LocalizedText("文字輸入按鍵", "文字输入按键", "文字入力キー", "Text input key")
+            : DialogueManagerUpdatePatch.LocalizedText("按住說話按鍵", "按住说话按键", "プッシュ・トゥ・トークキー", "Push-to-talk key");
+        if (item._nameText != null && !string.Equals(item._nameText.text, label, StringComparison.Ordinal))
+            item._nameText.text = label;
+        var value = BuildHotkeyValue(target);
+        if (onValue != null)
+            onValue.text = value;
+        if (offValue != null)
+            offValue.text = value;
+    }
+
+    private static string BuildHotkeyValue(int target)
+    {
+        var waiting = DialogueManagerUpdatePatch.IsNewSettingsKeyBindingActive(target);
+        return waiting
+            ? DialogueManagerUpdatePatch.LocalizedText("等待按鍵…（Esc 取消）", "等待按键…（Esc 取消）", "キー入力待ち…（Escで取消）", "Press a key… (Esc cancels)")
+            : DialogueManagerUpdatePatch.GetNewSettingsKeyBindingText(target);
+    }
+
+    private static void ResetView()
+    {
+        DialogueManagerUpdatePatch.CancelSettingsKeyBinding("the new settings view was reset");
+        _view = null;
+        _tab = null;
+        ResetRows();
+    }
+
+    private static void ResetRows()
+    {
+        _advancedRow = null;
+        _advancedSwitch = null;
+        _textHotkeyRow = null;
+        _textHotkeySwitch = null;
+        _textHotkeyOnValue = null;
+        _textHotkeyOffValue = null;
+        _voiceHotkeyRow = null;
+        _voiceHotkeySwitch = null;
+        _voiceHotkeyOnValue = null;
+        _voiceHotkeyOffValue = null;
+    }
+}
+
 [HarmonyPatch(typeof(ShowSystemTray), "GetFallbackMenuText")]
 internal static class TrayMenuLocalizationPatch
 {
@@ -6627,4 +7206,3 @@ internal static class DialogueCompletionPatch
         return !DialogueManagerUpdatePatch.ShouldDelayAiCompletion(__instance);
     }
 }
-
