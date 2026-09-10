@@ -303,7 +303,7 @@ internal static class DialogueManagerUpdatePatch
     private static TMP_InputField? _inputField;
     private static TextMeshProUGUI? _inputPlaceholder;
     private static bool _focusNextFrame;
-    private static readonly ConcurrentQueue<string> PendingReplies = new();
+    private static readonly ConcurrentQueue<PendingAiReply> PendingReplies = new();
     private static readonly ConcurrentQueue<string> PendingAiEmotions = new();
     private static readonly ConcurrentQueue<string> PendingTranscripts = new();
     private static readonly ConcurrentQueue<string> PendingTranscriptionErrors = new();
@@ -607,6 +607,8 @@ internal static class DialogueManagerUpdatePatch
         if (!_localizedLineDatabasesDumped)
             TryDumpLocalizedLineDatabases();
 
+        TryDisplayPendingAiReply(__instance);
+
         if (_voicePitchResetAt >= 0f && Time.unscaledTime >= _voicePitchResetAt)
         {
             SetVoicePitch(1f);
@@ -629,40 +631,34 @@ internal static class DialogueManagerUpdatePatch
             _delayedSpeechAudio = null;
             _delayedSpeechPlayAt = -1f;
         }
-        else if (_delayedSpeechAudio == null && PendingVoiceAudio.TryDequeue(out var sequence))
+        else if (_delayedSpeechAudio == null && PendingVoiceAudio.TryPeek(out var sequence))
         {
-            try
+            var textDisplayed = sequence.PendingReply == null
+                || Volatile.Read(ref sequence.PendingReply.TextDisplayed) != 0;
+            if (textDisplayed && PendingVoiceAudio.TryDequeue(out sequence))
             {
-                if (sequence.Reaction != null)
+                try
                 {
-                    SetVoicePitch(1f);
-                    var reactionClip = PlayWav(sequence.Reaction, "native reaction");
-                    _delayedSpeechAudio = sequence.Speech;
-                    _delayedSpeechPlayAt = Time.unscaledTime + reactionClip.length + 0.03f;
+                    if (sequence.Reaction != null)
+                    {
+                        SetVoicePitch(1f);
+                        var reactionClip = PlayWav(sequence.Reaction, "native reaction");
+                        _delayedSpeechAudio = sequence.Speech;
+                        _delayedSpeechPlayAt = Time.unscaledTime + reactionClip.length + 0.03f;
+                    }
+                    else
+                    {
+                        SetVoicePitch(1f);
+                        PlayWav(sequence.Speech, "generated speech");
+                    }
                 }
-                else
+                catch (Exception exception)
                 {
-                    SetVoicePitch(1f);
-                    PlayWav(sequence.Speech, "generated speech");
+                    Plugin.PluginLog.LogError($"Could not play voice sequence: {exception}");
+                    _delayedSpeechAudio = null;
+                    _delayedSpeechPlayAt = -1f;
                 }
             }
-            catch (Exception exception)
-            {
-                Plugin.PluginLog.LogError($"Could not play voice sequence: {exception}");
-                _delayedSpeechAudio = null;
-                _delayedSpeechPlayAt = -1f;
-            }
-        }
-
-        if (_requestInFlight && PendingReplies.TryDequeue(out var pendingReply))
-        {
-            _requestInFlight = false;
-            _aiPagesAwaitingAdvance = !PendingReplies.IsEmpty;
-            _currentAiPageText = pendingReply;
-            _aiTypingFinishedAt = -1f;
-            if (PendingAiEmotions.TryDequeue(out var emotion))
-                PlayAiEmotion(emotion);
-            __instance.ForceSay(pendingReply, string.Empty, 30f);
         }
 
         HandleVoiceInput(__instance);
@@ -736,6 +732,84 @@ internal static class DialogueManagerUpdatePatch
         }
     }
 
+    private static void TryDisplayPendingAiReply(DialogueManager manager)
+    {
+        if (!_requestInFlight || !PendingReplies.TryPeek(out var pendingReply))
+            return;
+
+        var voiceState = Volatile.Read(ref pendingReply.VoiceState);
+        var nowTimestamp = Stopwatch.GetTimestamp();
+        var waitedSeconds = AiVoiceTurnPolicy.ElapsedSeconds(
+            pendingReply.QueuedAtTimestamp,
+            nowTimestamp,
+            Stopwatch.Frequency);
+        if (!AiVoiceTurnPolicy.ShouldDisplay(
+                voiceState,
+                pendingReply.QueuedAtTimestamp,
+                nowTimestamp,
+                Stopwatch.Frequency))
+            return;
+        if (!PendingReplies.TryDequeue(out pendingReply))
+            return;
+
+        _requestInFlight = false;
+        _aiPagesAwaitingAdvance = !PendingReplies.IsEmpty;
+        _currentAiPageText = pendingReply.Text;
+        _aiTypingFinishedAt = -1f;
+        Volatile.Write(ref pendingReply.TextDisplayed, 1);
+        if (voiceState == AiVoiceTurnPolicy.Generating)
+        {
+            Plugin.PluginLog.LogInfo(
+                $"AI voice exceeded {AiVoiceTurnPolicy.WaitSeconds:0}s; displaying text first.");
+        }
+        else if (voiceState == AiVoiceTurnPolicy.Ready)
+        {
+            Plugin.PluginLog.LogInfo(
+                $"AI voice was ready after {waitedSeconds:F2}s; displaying text and starting voice together.");
+        }
+        if (PendingAiEmotions.TryDequeue(out var emotion))
+            PlayAiEmotion(emotion);
+        manager.ForceSay(pendingReply.Text, string.Empty, 30f);
+    }
+
+    private static void QueueAiReplyWithVoice(
+        string displayText,
+        string speechText,
+        NativeReaction? reaction = null,
+        VoiceStyle poseStyle = VoiceStyle.Calm,
+        bool? japaneseVoiceMode = null)
+    {
+        if (!Plugin.VoiceEnabled.Value)
+        {
+            QueueTextOnlyAiReply(displayText);
+            return;
+        }
+
+        var pendingReply = new PendingAiReply
+        {
+            Text = displayText,
+            VoiceState = AiVoiceTurnPolicy.Generating,
+            QueuedAtTimestamp = Stopwatch.GetTimestamp()
+        };
+        PendingReplies.Enqueue(pendingReply);
+        _ = RequestSpeechAsync(
+            speechText,
+            reaction,
+            poseStyle,
+            japaneseVoiceMode,
+            pendingReply);
+    }
+
+    private static void QueueTextOnlyAiReply(string text)
+    {
+        PendingReplies.Enqueue(new PendingAiReply
+        {
+            Text = text,
+            VoiceState = AiVoiceTurnPolicy.Unavailable,
+            QueuedAtTimestamp = Stopwatch.GetTimestamp()
+        });
+    }
+
     private static void SubmitAiInput(DialogueManager manager, string submitted)
     {
         submitted = submitted.Trim();
@@ -761,9 +835,7 @@ internal static class DialogueManagerUpdatePatch
             AddMemoryTurn("user", submitted);
             AddMemoryTurn("model", screenshotReply);
             PendingAiEmotions.Enqueue("emoji_smile_1");
-            PendingReplies.Enqueue(screenshotReply);
-            if (Plugin.VoiceEnabled.Value)
-                _ = RequestSpeechAsync(screenshotReply, poseStyle: CapturePoseContext().VoiceStyle);
+            QueueAiReplyWithVoice(screenshotReply, screenshotReply, poseStyle: CapturePoseContext().VoiceStyle);
             return;
         }
         if ((!useModelComputerTools || preferLocalComputerRouter) && TryHandleComputerCommand(submitted, out var computerReply))
@@ -772,9 +844,7 @@ internal static class DialogueManagerUpdatePatch
             AddMemoryTurn("user", submitted);
             AddMemoryTurn("model", computerReply);
             PendingAiEmotions.Enqueue("emoji_smile_1");
-            PendingReplies.Enqueue(computerReply);
-            if (Plugin.VoiceEnabled.Value)
-                _ = RequestSpeechAsync(computerReply, poseStyle: CapturePoseContext().VoiceStyle);
+            QueueAiReplyWithVoice(computerReply, computerReply, poseStyle: CapturePoseContext().VoiceStyle);
             return;
         }
         if ((!useModelComputerTools || preferLocalComputerRouter) && TryHandleMediaCommand(submitted, out var mediaReply))
@@ -783,9 +853,7 @@ internal static class DialogueManagerUpdatePatch
             AddMemoryTurn("user", submitted);
             AddMemoryTurn("model", mediaReply);
             PendingAiEmotions.Enqueue("emoji_smile_1");
-            PendingReplies.Enqueue(mediaReply);
-            if (Plugin.VoiceEnabled.Value)
-                _ = RequestSpeechAsync(mediaReply, poseStyle: CapturePoseContext().VoiceStyle);
+            QueueAiReplyWithVoice(mediaReply, mediaReply, poseStyle: CapturePoseContext().VoiceStyle);
             return;
         }
         if ((!useModelComputerTools || preferLocalComputerRouter) && TryLaunchApplicationCommand(submitted, out var launchReply))
@@ -794,9 +862,7 @@ internal static class DialogueManagerUpdatePatch
             AddMemoryTurn("user", submitted);
             AddMemoryTurn("model", launchReply);
             PendingAiEmotions.Enqueue("emoji_smile_1");
-            PendingReplies.Enqueue(launchReply);
-            if (Plugin.VoiceEnabled.Value)
-                _ = RequestSpeechAsync(launchReply, poseStyle: CapturePoseContext().VoiceStyle);
+            QueueAiReplyWithVoice(launchReply, launchReply, poseStyle: CapturePoseContext().VoiceStyle);
             return;
         }
         if (string.IsNullOrWhiteSpace(GetActiveChatApiKey()))
@@ -810,9 +876,7 @@ internal static class DialogueManagerUpdatePatch
         if (!useModelComputerTools && UsesTraditionalChineseInterface() && TryBuildLocalTimeReply(submitted, out var localTimeReply))
         {
             AddMemoryTurn("model", localTimeReply);
-            PendingReplies.Enqueue(localTimeReply);
-            if (Plugin.VoiceEnabled.Value)
-                _ = RequestSpeechAsync(localTimeReply);
+            QueueAiReplyWithVoice(localTimeReply, localTimeReply);
             Plugin.PluginLog.LogInfo("Answered time/date question from the local system clock.");
         }
         else
@@ -4097,10 +4161,10 @@ internal static class DialogueManagerUpdatePatch
             if (string.Equals(NormalizeAiProvider(Plugin.AiProvider.Value), "Qwen", StringComparison.Ordinal)
                 && IsQwenAccountUnavailable(exception))
             {
-                PendingReplies.Enqueue(QwenAccountUnavailableReply());
+                QueueTextOnlyAiReply(QwenAccountUnavailableReply());
                 return;
             }
-            PendingReplies.Enqueue(ApiKeyText("連線好像出了點問題。晚點再試吧。", "连接好像出了点问题。稍后再试吧。", "接続に少し問題があるみたい。あとでまた試してみて。", "There seems to be a connection problem. Please try again later."));
+            QueueTextOnlyAiReply(ApiKeyText("連線好像出了點問題。晚點再試吧。", "连接好像出了点问题。稍后再试吧。", "接続に少し問題があるみたい。あとでまた試してみて。", "There seems to be a connection problem. Please try again later."));
         }
     }
 
@@ -4249,7 +4313,7 @@ internal static class DialogueManagerUpdatePatch
         catch (Exception exception)
         {
             Plugin.PluginLog.LogError($"Gemini desktop tool execution failed: {exception}");
-            PendingReplies.Enqueue(ApiKeyText("剛才的電腦操作沒有成功。", "刚才的电脑操作没有成功。", "さっきのPC操作はうまくいかなかった……", "The computer action did not work."));
+            QueueTextOnlyAiReply(ApiKeyText("剛才的電腦操作沒有成功。", "刚才的电脑操作没有成功。", "さっきのPC操作はうまくいかなかった……", "The computer action did not work."));
         }
     }
 
@@ -4268,9 +4332,7 @@ internal static class DialogueManagerUpdatePatch
             {
                 AddMemoryTurn("model", reply);
                 PendingAiEmotions.Enqueue("emoji_smile_1");
-                PendingReplies.Enqueue(reply);
-                if (Plugin.VoiceEnabled.Value)
-                    _ = RequestSpeechAsync(reply, poseStyle: session.PoseContext.VoiceStyle);
+                QueueAiReplyWithVoice(reply, reply, poseStyle: session.PoseContext.VoiceStyle);
                 Plugin.PluginLog.LogInfo("Completed a desktop command through the compatibility fallback router.");
                 return;
             }
@@ -4282,7 +4344,7 @@ internal static class DialogueManagerUpdatePatch
         catch (Exception exception)
         {
             Plugin.PluginLog.LogError($"Gemini compatibility fallback failed: {exception}");
-            PendingReplies.Enqueue(ApiKeyText("這個模型目前不能使用電腦工具。", "这个模型目前不能使用电脑工具。", "このモデルでは今、PCツールを使えないみたい。", "This model cannot use the computer tools right now."));
+            QueueTextOnlyAiReply(ApiKeyText("這個模型目前不能使用電腦工具。", "这个模型目前不能使用电脑工具。", "このモデルでは今、PCツールを使えないみたい。", "This model cannot use the computer tools right now."));
         }
     }
 
@@ -4295,7 +4357,7 @@ internal static class DialogueManagerUpdatePatch
         catch (Exception exception)
         {
             Plugin.PluginLog.LogError($"Gemini tool continuation failed: {exception}");
-            PendingReplies.Enqueue(ApiKeyText("操作已經停下來了，但回覆沒有順利接上。", "操作已经停下来了，但回复没有顺利接上。", "操作は止めたけれど、返事をうまく続けられなかった。", "The actions stopped, but I couldn't complete the follow-up response."));
+            QueueTextOnlyAiReply(ApiKeyText("操作已經停下來了，但回覆沒有順利接上。", "操作已经停下来了，但回复没有顺利接上。", "操作は止めたけれど、返事をうまく続けられなかった。", "The actions stopped, but I couldn't complete the follow-up response."));
         }
     }
 
@@ -4751,7 +4813,7 @@ internal static class DialogueManagerUpdatePatch
         catch (Exception exception)
         {
             Plugin.PluginLog.LogError($"Qwen desktop tool execution failed: {exception}");
-            PendingReplies.Enqueue(ApiKeyText("剛才的電腦操作沒有成功。", "刚才的电脑操作没有成功。", "さっきのPC操作はうまくいかなかった……", "The computer action did not work."));
+            QueueTextOnlyAiReply(ApiKeyText("剛才的電腦操作沒有成功。", "刚才的电脑操作没有成功。", "さっきのPC操作はうまくいかなかった……", "The computer action did not work."));
         }
     }
 
@@ -4764,7 +4826,7 @@ internal static class DialogueManagerUpdatePatch
         catch (Exception exception)
         {
             Plugin.PluginLog.LogError($"Qwen tool continuation failed: {exception}");
-            PendingReplies.Enqueue(ApiKeyText("操作已經停下來了，但回覆沒有順利接上。", "操作已经停下来了，但回复没有顺利接上。", "操作は止めたけれど、返事をうまく続けられなかった。", "The actions stopped, but I couldn't complete the follow-up response."));
+            QueueTextOnlyAiReply(ApiKeyText("操作已經停下來了，但回覆沒有順利接上。", "操作已经停下来了，但回复没有顺利接上。", "操作は止めたけれど、返事をうまく続けられなかった。", "The actions stopped, but I couldn't complete the follow-up response."));
         }
     }
 
@@ -4837,15 +4899,28 @@ internal static class DialogueManagerUpdatePatch
         if (reply.Length > 0)
             ConsiderAiNoteEvent(userText, reply);
         PendingAiEmotions.Enqueue(ChooseAiEmotion(userText, reply, poseContext));
-        foreach (var page in SplitIntoBubblePages(reply.Length > 0 ? reply : "……"))
-            PendingReplies.Enqueue(page);
-        if (reply.Length == 0 || !Plugin.VoiceEnabled.Value)
+        var pages = SplitIntoBubblePages(reply.Length > 0 ? reply : "……");
+        if (pages.Length == 0)
             return;
+        if (reply.Length == 0 || !Plugin.VoiceEnabled.Value)
+        {
+            QueueTextOnlyAiReply(pages[0]);
+            foreach (var page in pages.Skip(1))
+                QueueTextOnlyAiReply(page);
+            return;
+        }
         var reaction = japaneseVoiceMode ? null : GetNativeReaction(userText, reply);
         var speechText = reaction == null ? reply : RemoveLeadingReactionText(reply);
         if (japaneseVoiceMode && !string.IsNullOrWhiteSpace(japaneseSpeech))
             speechText = japaneseSpeech;
-        _ = RequestSpeechAsync(speechText.Length > 0 ? speechText : reply, reaction, poseContext.VoiceStyle, japaneseVoiceMode);
+        QueueAiReplyWithVoice(
+            pages[0],
+            speechText.Length > 0 ? speechText : reply,
+            reaction,
+            poseContext.VoiceStyle,
+            japaneseVoiceMode);
+        foreach (var page in pages.Skip(1))
+            QueueTextOnlyAiReply(page);
     }
 
     private static string NormalizeAiProvider(string? provider)
@@ -5157,9 +5232,15 @@ internal static class DialogueManagerUpdatePatch
         return cleaned;
     }
 
-    private static async Task RequestSpeechAsync(string text, NativeReaction? reaction = null, VoiceStyle poseStyle = VoiceStyle.Calm, bool? japaneseVoiceMode = null)
+    private static async Task RequestSpeechAsync(
+        string text,
+        NativeReaction? reaction = null,
+        VoiceStyle poseStyle = VoiceStyle.Calm,
+        bool? japaneseVoiceMode = null,
+        PendingAiReply? pendingReply = null)
     {
         var generationTimer = Stopwatch.StartNew();
+        var voiceReady = false;
         try
         {
             var useJapanese = japaneseVoiceMode ?? IsJapaneseVoiceMode();
@@ -5222,8 +5303,17 @@ internal static class DialogueManagerUpdatePatch
                         throw new HttpRequestException($"TTS HTTP {(int)response.StatusCode}: {error}");
                     }
                     var speech = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-                    PendingVoiceAudio.Enqueue(new VoiceSequence { Reaction = reaction?.Audio, Speech = speech });
-                    Plugin.PluginLog.LogInfo($"Local voice generation completed in {generationTimer.Elapsed.TotalSeconds:F2}s ({speech.Length} bytes)." );
+                    PendingVoiceAudio.Enqueue(new VoiceSequence
+                    {
+                        PendingReply = pendingReply,
+                        Reaction = reaction?.Audio,
+                        Speech = speech
+                    });
+                    if (pendingReply != null)
+                        Volatile.Write(ref pendingReply.VoiceState, AiVoiceTurnPolicy.Ready);
+                    voiceReady = true;
+                    Plugin.PluginLog.LogInfo(
+                        $"Local voice generation completed in {generationTimer.Elapsed.TotalSeconds:F2}s ({speech.Length} bytes)." );
                     return;
                 }
                 catch (HttpRequestException exception) when (attempt < maximumAttempts)
@@ -5236,6 +5326,16 @@ internal static class DialogueManagerUpdatePatch
         catch (Exception exception)
         {
             Plugin.PluginLog.LogWarning($"Voice generation failed; text chat continues: {exception.Message}");
+        }
+        finally
+        {
+            if (!voiceReady && pendingReply != null)
+            {
+                Interlocked.CompareExchange(
+                    ref pendingReply.VoiceState,
+                    AiVoiceTurnPolicy.Unavailable,
+                    AiVoiceTurnPolicy.Generating);
+            }
         }
     }
 
@@ -5272,8 +5372,17 @@ internal static class DialogueManagerUpdatePatch
         return clip;
     }
 
+    private sealed class PendingAiReply
+    {
+        public string Text { get; set; } = string.Empty;
+        public long QueuedAtTimestamp { get; set; }
+        public int VoiceState;
+        public int TextDisplayed;
+    }
+
     private sealed class VoiceSequence
     {
+        public PendingAiReply? PendingReply { get; set; }
         public byte[]? Reaction { get; set; }
         public byte[] Speech { get; set; } = Array.Empty<byte>();
     }
@@ -6156,9 +6265,9 @@ internal static class DialogueManagerUpdatePatch
             return false;
         }
         _aiPagesAwaitingAdvance = !PendingReplies.IsEmpty;
-        _currentAiPageText = page;
+        _currentAiPageText = page.Text;
         _aiTypingFinishedAt = -1f;
-        manager.ForceSay(page, string.Empty, 30f);
+        manager.ForceSay(page.Text, string.Empty, 30f);
         return true;
     }
 
