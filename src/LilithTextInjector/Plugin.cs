@@ -26,10 +26,12 @@ using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using TMPro;
 using UnityEngine;
+using UnityEngine.Events;
 using UnityEngine.Localization.Settings;
 using UnityEngine.UI;
 using UI.Common;
 using UI.TraySetting;
+using UI.TraySettingNew;
 
 namespace LilithTextInjector;
 
@@ -302,6 +304,22 @@ internal static class DialogueManagerUpdatePatch
     private static GameObject? _inputBubble;
     private static TMP_InputField? _inputField;
     private static TextMeshProUGUI? _inputPlaceholder;
+    private static GameObject? _historyButton;
+    private static TextMeshProUGUI? _historyButtonText;
+    private static GameObject? _historyPanelRoot;
+    private static ScrollRect? _historyScrollRect;
+    private static RectTransform? _historyPanelRect;
+    private static RectTransform? _historyViewport;
+    private static RectTransform? _historyContent;
+    private static TextMeshProUGUI? _historyText;
+    private static TextMeshProUGUI? _historyTitleText;
+    private static UiPointerDrag? _historyPointerDrag;
+    private static UnityAction? _historyButtonClicked;
+    private static Il2CppSystem.Action? _historyDragBegan;
+    private static Il2CppSystem.Action<Vector2>? _historyDragMoved;
+    private static Vector2 _historyDragStartAnchored;
+    private static float _nextHistoryRefreshAt;
+    private static string _lastHistoryText = string.Empty;
     private static bool _focusNextFrame;
     private static readonly ConcurrentQueue<string> PendingReplies = new();
     private static readonly ConcurrentQueue<string> PendingAiEmotions = new();
@@ -716,6 +734,8 @@ internal static class DialogueManagerUpdatePatch
                 _inputField.ActivateInputField();
                 _inputField.Select();
             }
+
+            RefreshInputHistoryPanel(false);
 
             if (Input.GetKeyDown(KeyCode.Escape))
             {
@@ -3801,6 +3821,8 @@ internal static class DialogueManagerUpdatePatch
         }
 
         _inputBubble.SetActive(true);
+        if (_historyButton != null)
+            _historyButton.SetActive(true);
         var canvasGroup = _inputBubble.GetComponent<CanvasGroup>();
         if (canvasGroup != null)
         {
@@ -3965,6 +3987,15 @@ internal static class DialogueManagerUpdatePatch
             _inputField.lineType = TMP_InputField.LineType.SingleLine;
             _inputField.characterLimit = 240;
 
+            try
+            {
+                CreateInputHistoryUi();
+            }
+            catch (Exception historyException)
+            {
+                DestroyInputHistoryUiObjects();
+                Plugin.PluginLog.LogWarning($"Could not create the AI history entry; F7 text input will remain available: {historyException}");
+            }
             _inputBubble.SetActive(false);
             Plugin.PluginLog.LogInfo("Created input field from the native dialogue bubble.");
             return true;
@@ -3974,23 +4005,433 @@ internal static class DialogueManagerUpdatePatch
             Plugin.PluginLog.LogError(exception);
             if (_inputBubble != null)
                 UnityEngine.Object.Destroy(_inputBubble);
-            _inputBubble = null;
-            _inputField = null;
-            _inputPlaceholder = null;
-            _focusNextFrame = false;
+            ResetInputBubbleReferences();
             return false;
         }
     }
 
+    private static string BuildHistoryButtonLabel(bool close) =>
+        ApiKeyText(
+            close ? "關閉 AI 對話歷史" : "AI 對話歷史",
+            close ? "关闭 AI 对话历史" : "AI 对话历史",
+            close ? "AI会話履歴を閉じる" : "AI会話履歴",
+            close ? "Close AI conversation history" : "AI conversation history");
+
+    private static void CreateInputHistoryUi()
+    {
+        // The history entry is intentionally a clone of the F7 input bubble.
+        // Keeping the complete native-looking hierarchy avoids the subtly
+        // different dimensions, border and text placement of a rebuilt button.
+        var inputParent = _inputBubble!.transform.parent
+            ?? throw new InvalidOperationException("The F7 input bubble has no parent transform.");
+        var inputRect = _inputBubble.GetComponent<RectTransform>()
+            ?? throw new InvalidOperationException("The F7 input bubble has no RectTransform.");
+        // Clone as a sibling first. Instantiating a GameObject directly beneath
+        // itself is unreliable in this IL2CPP Unity build and caused the complete
+        // F7 input creation path to abort with NullReferenceException.
+        _historyButton = UnityEngine.Object.Instantiate(_inputBubble, inputParent);
+        if (_historyButton == null)
+            throw new InvalidOperationException("Unity returned no clone for the AI history entry.");
+        _historyButton.name = "LilithAiHistoryButton";
+        var buttonRect = _historyButton.GetComponent<RectTransform>()
+            ?? throw new InvalidOperationException("The cloned history entry has no RectTransform.");
+        buttonRect.anchorMin = inputRect.anchorMin;
+        buttonRect.anchorMax = inputRect.anchorMax;
+        buttonRect.pivot = inputRect.pivot;
+        buttonRect.sizeDelta = inputRect.sizeDelta;
+        buttonRect.anchoredPosition = inputRect.anchoredPosition + new Vector2(0f, 45f);
+        buttonRect.localScale = Vector3.one;
+        buttonRect.localRotation = Quaternion.identity;
+
+        var clonedInput = _historyButton.GetComponent<TMP_InputField>()
+            ?? throw new InvalidOperationException("The cloned history entry has no TMP_InputField.");
+        clonedInput.interactable = false;
+        clonedInput.enabled = false;
+        if (clonedInput.placeholder != null)
+            clonedInput.placeholder.gameObject.SetActive(false);
+        _historyButtonText = clonedInput.textComponent as TextMeshProUGUI
+            ?? _historyButton.GetComponentInChildren<TextMeshProUGUI>();
+        if (_historyButtonText == null)
+            throw new InvalidOperationException("The cloned history entry has no TextMeshProUGUI label.");
+        _historyButtonText.text = BuildHistoryButtonLabel(false);
+        _historyButtonText.alignment = TextAlignmentOptions.Center;
+        _historyButtonText.enableWordWrapping = false;
+        _historyButtonText.overflowMode = TextOverflowModes.Masking;
+        _historyButtonText.raycastTarget = false;
+
+        var buttonImage = _historyButton.GetComponent<Image>()
+            ?? throw new InvalidOperationException("The cloned history entry has no Image background.");
+        buttonImage.raycastTarget = true;
+
+        // TMP_InputField and Button are both Selectable components and cannot
+        // coexist on the same GameObject. Keep the complete bubble clone for its
+        // visuals, then place a transparent full-size Button above it.
+        var clickObject = new GameObject(
+            "ClickArea",
+            Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>(),
+            Il2CppInterop.Runtime.Il2CppType.Of<CanvasRenderer>(),
+            Il2CppInterop.Runtime.Il2CppType.Of<Image>(),
+            Il2CppInterop.Runtime.Il2CppType.Of<Button>());
+        clickObject.transform.SetParent(_historyButton.transform, false);
+        var clickRect = clickObject.GetComponent<RectTransform>()
+            ?? throw new InvalidOperationException("The AI history click area has no RectTransform.");
+        SetFullRect(clickRect, Vector2.zero, Vector2.zero);
+        var clickImage = clickObject.GetComponent<Image>()
+            ?? throw new InvalidOperationException("The AI history click area has no Image.");
+        clickImage.color = Color.clear;
+        clickImage.raycastTarget = true;
+        var button = clickObject.GetComponent<Button>()
+            ?? throw new InvalidOperationException("The AI history click area has no Button.");
+        button.targetGraphic = clickImage;
+        _historyButtonClicked = DelegateSupport.ConvertDelegate<UnityAction>(new System.Action(ToggleInputHistoryPanel));
+        if (button.onClick == null)
+            button.onClick = new Button.ButtonClickedEvent();
+        button.onClick.AddListener(_historyButtonClicked!);
+        _historyButton.SetActive(false);
+
+        _nextHistoryRefreshAt = 0f;
+        _lastHistoryText = string.Empty;
+    }
+
+    private static bool TryCreateSettingsHistoryPanel()
+    {
+        if (_historyPanelRoot != null)
+            return true;
+        if (_inputBubble == null)
+            return false;
+        if (!TryFindSettingsUiTemplates(
+                out var panelImageTemplate, out var panelRawImageTemplate,
+                out var textTemplate))
+        {
+            Plugin.PluginLog.LogWarning("Could not open AI history because the native settings panel template is not available yet.");
+            return false;
+        }
+
+        // Settings objects are disabled until their window opens, so their world
+        // coordinates are not a reliable placement source. Reuse only their
+        // visual assets and place this independent panel on the active canvas.
+        var panelParent = _inputBubble.transform.parent?.GetComponent<RectTransform>();
+        if (panelParent == null)
+        {
+            Plugin.PluginLog.LogWarning("Could not open AI history because the active dialogue canvas is unavailable.");
+            return false;
+        }
+
+        _historyPanelRoot = new GameObject(
+            "LilithAiHistoryPanel",
+            Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>(),
+            Il2CppInterop.Runtime.Il2CppType.Of<CanvasRenderer>(),
+            Il2CppInterop.Runtime.Il2CppType.Of<UiPointerDrag>());
+        _historyPanelRoot.transform.SetParent(panelParent, false);
+        _historyPanelRoot.transform.SetAsLastSibling();
+        var panelRect = _historyPanelRoot.GetComponent<RectTransform>()
+            ?? throw new InvalidOperationException("The AI history panel has no RectTransform.");
+        _historyPanelRect = panelRect;
+        panelRect.anchorMin = new Vector2(0.5f, 0.5f);
+        panelRect.anchorMax = new Vector2(0.5f, 0.5f);
+        panelRect.pivot = new Vector2(0.5f, 0.5f);
+        panelRect.sizeDelta = new Vector2(560f, 320f);
+        panelRect.anchoredPosition = Vector2.zero;
+        panelRect.localScale = Vector3.one;
+        panelRect.localRotation = Quaternion.identity;
+
+        _historyPointerDrag = _historyPanelRoot.GetComponent<UiPointerDrag>()
+            ?? throw new InvalidOperationException("The AI history panel has no native drag component.");
+        _historyPointerDrag.SetCoordinateSpace(panelParent);
+        _historyPointerDrag.SetClampTarget(panelRect);
+        _historyPointerDrag.SetClampToScreen(true);
+        _historyDragBegan = DelegateSupport.ConvertDelegate<Il2CppSystem.Action>(
+            new System.Action(BeginHistoryPanelDrag));
+        _historyDragMoved = DelegateSupport.ConvertDelegate<Il2CppSystem.Action<Vector2>>(
+            new System.Action<Vector2>(MoveHistoryPanel));
+        _historyPointerDrag.add_Began(_historyDragBegan);
+        _historyPointerDrag.add_Moved(_historyDragMoved);
+
+        if (panelImageTemplate != null)
+        {
+            var image = _historyPanelRoot.AddComponent<Image>();
+            image.sprite = panelImageTemplate.sprite;
+            image.overrideSprite = panelImageTemplate.overrideSprite;
+            image.type = panelImageTemplate.type;
+            image.preserveAspect = panelImageTemplate.preserveAspect;
+            image.fillCenter = panelImageTemplate.fillCenter;
+            image.color = panelImageTemplate.color;
+            image.material = panelImageTemplate.material;
+            image.raycastTarget = true;
+        }
+        else if (panelRawImageTemplate != null)
+        {
+            var rawImage = _historyPanelRoot.AddComponent<RawImage>();
+            rawImage.texture = panelRawImageTemplate.texture;
+            rawImage.uvRect = panelRawImageTemplate.uvRect;
+            rawImage.color = panelRawImageTemplate.color;
+            rawImage.material = panelRawImageTemplate.material;
+            rawImage.raycastTarget = true;
+        }
+
+        _historyTitleText = CloneSettingsText(
+            "Title", _historyPanelRoot.transform, textTemplate!, BuildHistoryButtonLabel(false),
+            20f, TextAlignmentOptions.Center, Color.white, false);
+        SetTopRect(_historyTitleText.rectTransform, 34f, 34f, 16f, 30f);
+
+        var scrollObject = new GameObject(
+            "Scroll",
+            Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>(),
+            Il2CppInterop.Runtime.Il2CppType.Of<CanvasRenderer>(),
+            Il2CppInterop.Runtime.Il2CppType.Of<Image>(),
+            Il2CppInterop.Runtime.Il2CppType.Of<ScrollRect>());
+        scrollObject.transform.SetParent(_historyPanelRoot.transform, false);
+        var scrollRectTransform = scrollObject.GetComponent<RectTransform>();
+        SetFullRect(scrollRectTransform, new Vector2(30f, 24f), new Vector2(-30f, -58f));
+        var scrollImage = scrollObject.GetComponent<Image>();
+        scrollImage.color = new Color(0f, 0f, 0f, 0.18f);
+        scrollImage.raycastTarget = true;
+
+        var viewportObject = new GameObject(
+            "Viewport",
+            Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>(),
+            Il2CppInterop.Runtime.Il2CppType.Of<RectMask2D>());
+        viewportObject.transform.SetParent(scrollObject.transform, false);
+        _historyViewport = viewportObject.GetComponent<RectTransform>();
+        SetFullRect(_historyViewport, Vector2.zero, Vector2.zero);
+
+        var contentObject = new GameObject("Content", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+        contentObject.transform.SetParent(_historyViewport, false);
+        _historyContent = contentObject.GetComponent<RectTransform>();
+        _historyContent.anchorMin = new Vector2(0f, 1f);
+        _historyContent.anchorMax = new Vector2(1f, 1f);
+        _historyContent.pivot = new Vector2(0.5f, 1f);
+        _historyContent.anchoredPosition = Vector2.zero;
+        _historyContent.sizeDelta = Vector2.zero;
+
+        _historyText = CloneSettingsText(
+            "Messages", contentObject.transform, textTemplate!, string.Empty,
+            15f, TextAlignmentOptions.TopLeft, Color.white, true);
+        _historyText.rectTransform.anchorMin = new Vector2(0f, 1f);
+        _historyText.rectTransform.anchorMax = new Vector2(1f, 1f);
+        _historyText.rectTransform.pivot = new Vector2(0.5f, 1f);
+        _historyText.rectTransform.anchoredPosition = Vector2.zero;
+        _historyText.rectTransform.sizeDelta = new Vector2(-14f, 0f);
+
+        var scrollRect = scrollObject.GetComponent<ScrollRect>();
+        _historyScrollRect = scrollRect;
+        scrollRect.viewport = _historyViewport;
+        scrollRect.content = _historyContent;
+        scrollRect.horizontal = false;
+        scrollRect.vertical = true;
+        scrollRect.movementType = ScrollRect.MovementType.Clamped;
+        scrollRect.inertia = true;
+        scrollRect.scrollSensitivity = 24f;
+
+        _historyPanelRoot.SetActive(false);
+        _nextHistoryRefreshAt = 0f;
+        _lastHistoryText = string.Empty;
+        Plugin.PluginLog.LogInfo("Created independent AI history panel on the active dialogue canvas.");
+        return true;
+    }
+
+    private static bool TryFindSettingsUiTemplates(
+        out Image? panelImage, out RawImage? panelRawImage,
+        out TextMeshProUGUI? textTemplate)
+    {
+        panelImage = null;
+        panelRawImage = null;
+        textTemplate = null;
+        TraySettingNewView? selectedView = null;
+        RectTransform? selectedPanel = null;
+
+        foreach (var view in Resources.FindObjectsOfTypeAll<TraySettingNewView>())
+        {
+            if (view == null || view.gameObject == null)
+                continue;
+            var panel = view.transform.Find("ViewPanel")?.GetComponent<RectTransform>();
+            if (panel == null)
+                continue;
+            if (selectedPanel == null || view.gameObject.activeInHierarchy)
+            {
+                selectedView = view;
+                selectedPanel = panel;
+                if (view.gameObject.activeInHierarchy)
+                    break;
+            }
+        }
+
+        if (selectedView == null || selectedPanel == null)
+            return false;
+
+        panelImage = selectedPanel.GetComponent<Image>()
+            ?? selectedPanel.GetComponentInChildren<Image>(true);
+        if (panelImage == null)
+        {
+            panelRawImage = selectedPanel.GetComponent<RawImage>()
+                ?? selectedPanel.GetComponentInChildren<RawImage>(true);
+        }
+
+        if (selectedView._settingItemRoot != null)
+            textTemplate = selectedView._settingItemRoot.GetComponentInChildren<TextMeshProUGUI>(true);
+        if (textTemplate == null && selectedView._config != null && selectedView._config._uiTypes != null)
+        {
+            foreach (var entry in selectedView._config._uiTypes)
+            {
+                if (entry?.uiObject == null)
+                    continue;
+                textTemplate = entry.uiObject.GetComponentInChildren<TextMeshProUGUI>(true);
+                if (textTemplate != null)
+                    break;
+            }
+        }
+        if (textTemplate == null)
+            textTemplate = selectedView.GetComponentInChildren<TextMeshProUGUI>(true);
+
+        return (panelImage != null || panelRawImage != null) && textTemplate != null;
+    }
+
+    private static void BeginHistoryPanelDrag()
+    {
+        if (_historyPanelRect != null)
+            _historyDragStartAnchored = _historyPanelRect.anchoredPosition;
+    }
+
+    private static void MoveHistoryPanel(Vector2 delta)
+    {
+        if (_historyPanelRect != null)
+            _historyPanelRect.anchoredPosition = _historyDragStartAnchored + delta;
+    }
+
+    private static TextMeshProUGUI CloneSettingsText(
+        string name, Transform parent, TextMeshProUGUI source, string value, float fontSize,
+        TextAlignmentOptions alignment, Color color, bool wordWrapping)
+    {
+        var textObject = UnityEngine.Object.Instantiate(source.gameObject, parent);
+        textObject.name = name;
+        textObject.SetActive(true);
+        var text = textObject.GetComponent<TextMeshProUGUI>()
+            ?? throw new InvalidOperationException("The cloned settings text has no TextMeshProUGUI component.");
+        text.text = value;
+        text.enableAutoSizing = false;
+        text.fontSize = fontSize;
+        text.richText = true;
+        text.color = color;
+        text.alignment = alignment;
+        text.enableWordWrapping = wordWrapping;
+        text.overflowMode = wordWrapping ? TextOverflowModes.Overflow : TextOverflowModes.Masking;
+        text.raycastTarget = false;
+        return text;
+    }
+
+    private static void SetFullRect(RectTransform rect, Vector2 offsetMin, Vector2 offsetMax)
+    {
+        rect.anchorMin = Vector2.zero;
+        rect.anchorMax = Vector2.one;
+        rect.offsetMin = offsetMin;
+        rect.offsetMax = offsetMax;
+        rect.anchoredPosition = Vector2.zero;
+    }
+
+    private static void SetTopRect(
+        RectTransform rect, float left, float right, float top, float height)
+    {
+        rect.anchorMin = new Vector2(0f, 1f);
+        rect.anchorMax = new Vector2(1f, 1f);
+        rect.pivot = new Vector2(0.5f, 1f);
+        rect.offsetMin = new Vector2(left, -top - height);
+        rect.offsetMax = new Vector2(-right, -top);
+        rect.anchoredPosition = Vector2.zero;
+    }
+
+    private static void ToggleInputHistoryPanel()
+    {
+        try
+        {
+            if (_historyPanelRoot == null && !TryCreateSettingsHistoryPanel())
+                return;
+            var visible = !_historyPanelRoot!.activeSelf;
+            _historyPanelRoot.SetActive(visible);
+            Plugin.PluginLog.LogInfo($"AI history panel {(visible ? "opened" : "closed")}.");
+            if (_historyButtonText != null)
+                _historyButtonText.text = BuildHistoryButtonLabel(visible);
+            if (visible)
+                RefreshInputHistoryPanel(true);
+        }
+        catch (Exception exception)
+        {
+            Plugin.PluginLog.LogWarning($"Could not toggle the AI history panel: {exception}");
+        }
+    }
+
+    private static void RefreshInputHistoryPanel(bool scrollToBottom)
+    {
+        if (_historyPanelRoot == null || !_historyPanelRoot.activeSelf
+            || _historyText == null || _historyContent == null
+            || _historyViewport == null || _historyScrollRect == null)
+            return;
+        if (!scrollToBottom && Time.unscaledTime < _nextHistoryRefreshAt)
+            return;
+        _nextHistoryRefreshAt = Time.unscaledTime + 0.25f;
+
+        var turns = GetRememberedConversationSnapshot();
+        var formatted = FormatHistory(turns);
+        if (!scrollToBottom && string.Equals(formatted, _lastHistoryText, StringComparison.Ordinal))
+            return;
+        _lastHistoryText = formatted;
+        _historyText.text = formatted;
+
+        Canvas.ForceUpdateCanvases();
+        var preferredHeight = Math.Max(_historyViewport.rect.height, _historyText.preferredHeight + 8f);
+        _historyContent.sizeDelta = new Vector2(0f, preferredHeight);
+        _historyText.rectTransform.sizeDelta = new Vector2(-4f, preferredHeight);
+        Canvas.ForceUpdateCanvases();
+        if (scrollToBottom)
+            _historyScrollRect.verticalNormalizedPosition = 0f;
+    }
+
+    private static string FormatHistory(IReadOnlyList<ChatTurn> turns)
+    {
+        if (turns.Count == 0)
+        {
+            return ApiKeyText(
+                "還沒有 AI 對話記錄。", "还没有 AI 对话记录。",
+                "AI会話の履歴はまだありません。", "There is no AI conversation history yet.");
+        }
+
+        var builder = new StringBuilder();
+        foreach (var turn in turns)
+        {
+            var model = string.Equals(turn.Role, "model", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(turn.Role, "assistant", StringComparison.OrdinalIgnoreCase);
+            var role = model
+                ? ApiKeyText("莉莉絲", "莉莉丝", "リリス", "Lilith")
+                : ApiKeyText("你", "你", "あなた", "You");
+            if (builder.Length > 0)
+                builder.Append("\n\n");
+            builder.Append("<color=").Append(model ? "#FF8FA8" : "#FFFFFF").Append("><b>")
+                .Append(EscapeTmpText(role)).Append("</b></color>\n")
+                .Append(EscapeTmpText((turn.Text ?? string.Empty).Trim()));
+        }
+        return builder.ToString();
+    }
+
+    private static string EscapeTmpText(string text) =>
+        text.Replace("&", "&amp;", StringComparison.Ordinal)
+            .Replace("<", "&lt;", StringComparison.Ordinal)
+            .Replace(">", "&gt;", StringComparison.Ordinal);
+
     private static void UpdateInputPlaceholderLocalization()
     {
-        if (_inputPlaceholder == null)
-            return;
-        _inputPlaceholder.text = ApiKeyText(
-            "想對莉莉絲說什麼……",
-            "想对莉莉丝说什么……",
-            "リリスに何を話そう……",
-            "What would you like to say to Lilith…");
+        if (_inputPlaceholder != null)
+        {
+            _inputPlaceholder.text = ApiKeyText(
+                "想對莉莉絲說什麼……",
+                "想对莉莉丝说什么……",
+                "リリスに何を話そう……",
+                "What would you like to say to Lilith…");
+        }
+        if (_historyButtonText != null)
+        {
+            _historyButtonText.text = BuildHistoryButtonLabel(_historyPanelRoot != null && _historyPanelRoot.activeSelf);
+        }
+        if (_historyTitleText != null)
+            _historyTitleText.text = BuildHistoryButtonLabel(false);
     }
 
     private static void TryCreateOneTestNote()
@@ -6109,6 +6550,20 @@ internal static class DialogueManagerUpdatePatch
         }
     }
 
+    internal static List<ChatTurn> GetRememberedConversationSnapshot()
+    {
+        lock (MemoryLock)
+        {
+            return RecentConversation
+                .Select(turn => new ChatTurn
+                {
+                    Role = turn.Role ?? string.Empty,
+                    Text = turn.Text ?? string.Empty
+                })
+                .ToList();
+        }
+    }
+
     private static void AddMemoryTurn(string role, string text)
     {
         lock (MemoryLock)
@@ -6470,11 +6925,64 @@ internal static class DialogueManagerUpdatePatch
         // TMP_InputField can retain a stale activation state after its parent is
         // hidden in this IL2CPP build. Recreate the lightweight bubble on the next
         // invocation so every F7 session starts with a clean input component.
+        DestroyInputHistoryUiObjects();
         if (_inputBubble != null)
             UnityEngine.Object.Destroy(_inputBubble);
+        ResetInputBubbleReferences();
+    }
+
+    private static void DestroyInputHistoryUiObjects()
+    {
+        if (_historyPointerDrag != null)
+        {
+            if (_historyDragBegan != null)
+                _historyPointerDrag.remove_Began(_historyDragBegan);
+            if (_historyDragMoved != null)
+                _historyPointerDrag.remove_Moved(_historyDragMoved);
+        }
+        if (_historyPanelRoot != null)
+            UnityEngine.Object.Destroy(_historyPanelRoot);
+        if (_historyButton != null)
+            UnityEngine.Object.Destroy(_historyButton);
+        _historyButton = null;
+        _historyButtonText = null;
+        _historyPanelRoot = null;
+        _historyScrollRect = null;
+        _historyPanelRect = null;
+        _historyViewport = null;
+        _historyContent = null;
+        _historyText = null;
+        _historyTitleText = null;
+        _historyPointerDrag = null;
+        _historyButtonClicked = null;
+        _historyDragBegan = null;
+        _historyDragMoved = null;
+        _historyDragStartAnchored = Vector2.zero;
+        _nextHistoryRefreshAt = 0f;
+        _lastHistoryText = string.Empty;
+    }
+
+    private static void ResetInputBubbleReferences()
+    {
         _inputBubble = null;
         _inputField = null;
         _inputPlaceholder = null;
+        _historyButton = null;
+        _historyButtonText = null;
+        _historyPanelRoot = null;
+        _historyScrollRect = null;
+        _historyPanelRect = null;
+        _historyViewport = null;
+        _historyContent = null;
+        _historyText = null;
+        _historyTitleText = null;
+        _historyPointerDrag = null;
+        _historyButtonClicked = null;
+        _historyDragBegan = null;
+        _historyDragMoved = null;
+        _historyDragStartAnchored = Vector2.zero;
+        _nextHistoryRefreshAt = 0f;
+        _lastHistoryText = string.Empty;
         _focusNextFrame = false;
     }
 }
@@ -6627,4 +7135,3 @@ internal static class DialogueCompletionPatch
         return !DialogueManagerUpdatePatch.ShouldDelayAiCompletion(__instance);
     }
 }
-
