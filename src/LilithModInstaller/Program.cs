@@ -32,7 +32,7 @@ internal static class Program
 
 internal sealed class ReleaseManifest
 {
-    public string Version { get; set; } = "0.1.1-rc2";
+    public string Version { get; set; } = "0.1.1-rc4";
     public Dictionary<string, PackageSpec> Packages { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
@@ -54,7 +54,8 @@ internal sealed class InstalledManifest
 internal sealed class InstallerForm : Form
 {
     private const string AppId = "4643090";
-    private const string DefaultManifestUrl = "https://github.com/mimimi6666/Lilith-AI-Mod/releases/download/v0.1.1-rc2/release-manifest.json";
+    private const string DefaultManifestUrl = "https://github.com/mimimi6666/Lilith-AI-Mod/releases/download/v0.1.1-rc4/release-manifest.json";
+    private const string VoiceRuntimeReadySchema = "voice-runtime-v2";
     private readonly bool _zhTraditional;
     private readonly bool _zhSimplified;
     private readonly bool _japanese;
@@ -238,6 +239,7 @@ internal sealed class InstallerForm : Form
             }
 
             DisableBepInExConsole(game);
+            EnsureDoorstopRestartCompatibility(game);
 
             if (_dynamicVoice.Checked)
             {
@@ -310,6 +312,45 @@ internal sealed class InstallerForm : Form
                 lines[enabledIndex] = "Enabled = false";
             else
                 lines.Insert(sectionIndex + 1, "Enabled = false");
+        }
+
+        File.WriteAllLines(path, lines, new UTF8Encoding(false));
+    }
+
+    private static void EnsureDoorstopRestartCompatibility(string game)
+    {
+        var path = Path.Combine(game, "doorstop_config.ini");
+        if (!File.Exists(path))
+            throw new FileNotFoundException("The core package does not contain doorstop_config.ini.", path);
+
+        var lines = File.ReadAllLines(path).ToList();
+        var sectionIndex = lines.FindIndex(line =>
+            string.Equals(line.Trim(), "[General]", StringComparison.OrdinalIgnoreCase));
+        if (sectionIndex < 0)
+        {
+            if (lines.Count > 0 && !string.IsNullOrWhiteSpace(lines[^1])) lines.Add(string.Empty);
+            lines.Add("[General]");
+            lines.Add("ignore_disable_switch = true");
+        }
+        else
+        {
+            var nextSection = lines.FindIndex(sectionIndex + 1, line =>
+                line.TrimStart().StartsWith("[", StringComparison.Ordinal));
+            if (nextSection < 0) nextSection = lines.Count;
+            var settingIndex = -1;
+            for (var index = sectionIndex + 1; index < nextSection; index++)
+            {
+                if (Regex.IsMatch(lines[index], @"^\s*ignore_disable_switch\s*=", RegexOptions.IgnoreCase))
+                {
+                    settingIndex = index;
+                    break;
+                }
+            }
+
+            if (settingIndex >= 0)
+                lines[settingIndex] = "ignore_disable_switch = true";
+            else
+                lines.Insert(sectionIndex + 1, "ignore_disable_switch = true");
         }
 
         File.WriteAllLines(path, lines, new UTF8Encoding(false));
@@ -419,25 +460,130 @@ internal sealed class InstallerForm : Form
     private async Task PrepareVoiceRuntimeAsync(string runtime)
     {
         var ready = Path.Combine(runtime, ".ready");
-        if (File.Exists(ready)) return;
+        var temporaryReady = ready + ".tmp";
         var uv = Path.Combine(runtime, "uv.exe");
         var requirements = Path.Combine(runtime, "requirements-inference.txt");
+        var pythonDirectory = Path.Combine(runtime, "python");
+        var python = Path.Combine(pythonDirectory, "Scripts", "python.exe");
+        if (File.Exists(temporaryReady))
+            File.Delete(temporaryReady);
+        if (await IsVoiceRuntimeReadyAsync(runtime, ready, uv, requirements, python))
+            return;
+        if (File.Exists(ready))
+            File.Delete(ready);
         if (!File.Exists(uv) || !File.Exists(requirements))
             throw new FileNotFoundException("The dynamic voice package is incomplete (uv.exe or requirements-inference.txt is missing).");
-        var pythonDirectory = Path.Combine(runtime, "python");
         SetStatus(L("正在準備獨立 Python 語音環境…", "正在准备独立 Python 语音环境…", "独立Python音声環境を準備中…", "Preparing the isolated Python voice environment…"));
-        await RunProcessAsync(uv, $"venv \"{pythonDirectory}\" --python 3.10 --python-preference managed --relocatable", runtime);
-        var python = Path.Combine(pythonDirectory, "Scripts", "python.exe");
+        if (!File.Exists(python))
+            await RunProcessWithRetryAsync(uv, $"venv \"{pythonDirectory}\" --python 3.10 --python-preference managed --relocatable", runtime);
+        if (!File.Exists(python))
+            throw new FileNotFoundException("uv did not create the embedded Python environment.", python);
         var nvidia = VoiceHost.HasNvidiaGpu();
         File.WriteAllText(Path.Combine(runtime, "device.txt"), nvidia ? "cuda" : "cpu");
         var torchIndex = nvidia ? "https://download.pytorch.org/whl/cu124" : "https://download.pytorch.org/whl/cpu";
         SetStatus(nvidia
             ? L("偵測到 NVIDIA 顯示卡，正在下載 GPU 語音元件…", "检测到 NVIDIA 显卡，正在下载 GPU 语音组件…", "NVIDIA GPUを検出。GPU音声コンポーネントを取得中…", "NVIDIA GPU detected; downloading GPU voice components…")
             : L("未偵測到相容 NVIDIA 顯示卡，正在下載 CPU 語音元件…", "未检测到兼容 NVIDIA 显卡，正在下载 CPU 语音组件…", "対応NVIDIA GPUなし。CPU音声コンポーネントを取得中…", "No compatible NVIDIA GPU detected; downloading CPU voice components…"));
-        await RunProcessAsync(uv, $"pip install --python \"{python}\" torch==2.6.0 torchaudio==2.6.0 --index-url {torchIndex}", runtime);
+        await RunProcessWithRetryAsync(uv, $"pip install --link-mode copy --python \"{python}\" torch==2.6.0 torchaudio==2.6.0 --index-url {torchIndex}", runtime);
         SetStatus(L("正在安裝語音辨識與合成相依元件…", "正在安装语音识别与合成依赖组件…", "音声合成の依存コンポーネントをインストール中…", "Installing voice synthesis dependencies…"));
-        await RunProcessAsync(uv, $"pip install --python \"{python}\" -r \"{requirements}\"", runtime);
-        File.WriteAllText(ready, DateTimeOffset.Now.ToString("O"));
+        await RunProcessWithRetryAsync(uv, $"pip install --link-mode copy --python \"{python}\" -r \"{requirements}\"", runtime);
+        SetStatus(L("正在下載語音文字處理資料…", "正在下载语音文本处理数据…", "音声テキスト処理データを取得中…", "Downloading voice text-processing data…"));
+        var nltkData = Path.Combine(pythonDirectory, "nltk_data");
+        Directory.CreateDirectory(nltkData);
+        await RunProcessWithRetryAsync(python, $"-m nltk.downloader -d \"{nltkData}\" averaged_perceptron_tagger_eng cmudict", runtime);
+        await ValidateVoiceRuntimeDependenciesAsync(runtime, uv, python);
+        WriteVoiceRuntimeReadyMarker(ready, temporaryReady);
+    }
+
+    private static async Task<bool> IsVoiceRuntimeReadyAsync(
+        string runtime, string ready, string uv, string requirements, string python)
+    {
+        if (!File.Exists(ready))
+            return false;
+        try
+        {
+            var missingFiles = new[] { uv, requirements, python }
+                .Where(path => !File.Exists(path))
+                .Select(Path.GetFileName)
+                .ToArray();
+            if (missingFiles.Length > 0)
+            {
+                await LogVoiceRuntimeRepairReasonAsync(runtime,
+                    $"required file(s) missing: {string.Join(", ", missingFiles)}");
+                return false;
+            }
+            var markerLines = File.ReadAllLines(ready, Encoding.UTF8);
+            if (markerLines.Length != 2
+                || !string.Equals(markerLines[0].Trim(), VoiceRuntimeReadySchema, StringComparison.Ordinal)
+                || !DateTimeOffset.TryParseExact(markerLines[1].Trim(), "O", CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind, out _))
+            {
+                await LogVoiceRuntimeRepairReasonAsync(runtime, "the readiness marker is obsolete or malformed");
+                return false;
+            }
+            await ValidateVoiceRuntimeDependenciesAsync(runtime, uv, python);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            await LogVoiceRuntimeRepairReasonAsync(runtime, exception.Message);
+            return false;
+        }
+    }
+
+    private static Task LogVoiceRuntimeRepairReasonAsync(string runtime, string reason)
+    {
+        var log = Path.Combine(runtime, "voice-runtime-install.log");
+        return File.AppendAllTextAsync(log,
+            $"Existing voice runtime validation failed; repairing because {reason}.\n",
+            new UTF8Encoding(false));
+    }
+
+    private static async Task ValidateVoiceRuntimeDependenciesAsync(string runtime, string uv, string python)
+    {
+        await RunProcessAsync(uv, $"pip check --python \"{python}\"", runtime);
+        const string script = "import torch, torchaudio, nltk; nltk.data.find('taggers/averaged_perceptron_tagger_eng'); nltk.data.find('corpora/cmudict')";
+        await RunProcessAsync(python, $"-c \"{script}\"", runtime);
+    }
+
+    private static void WriteVoiceRuntimeReadyMarker(string ready, string temporaryReady)
+    {
+        try
+        {
+            File.WriteAllText(temporaryReady,
+                $"{VoiceRuntimeReadySchema}{Environment.NewLine}{DateTimeOffset.Now:O}{Environment.NewLine}",
+                new UTF8Encoding(false));
+            File.Move(temporaryReady, ready, true);
+        }
+        finally
+        {
+            if (File.Exists(temporaryReady))
+                File.Delete(temporaryReady);
+        }
+    }
+
+    private static async Task RunProcessWithRetryAsync(string file, string arguments, string workingDirectory, int maxAttempts = 3)
+    {
+        Exception? lastError = null;
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                await RunProcessAsync(file, arguments, workingDirectory);
+                return;
+            }
+            catch (Exception exception) when (attempt < maxAttempts)
+            {
+                lastError = exception;
+                var log = Path.Combine(workingDirectory, "voice-runtime-install.log");
+                await File.AppendAllTextAsync(log,
+                    $"Attempt {attempt} of {maxAttempts} failed; retrying in {attempt * 3} seconds.\n{exception.Message}\n",
+                    new UTF8Encoding(false));
+                await Task.Delay(TimeSpan.FromSeconds(attempt * 3));
+            }
+        }
+
+        throw lastError ?? new InvalidOperationException("Voice dependency installer failed.");
     }
 
     private static async Task RunProcessAsync(string file, string arguments, string workingDirectory)
@@ -453,9 +599,12 @@ internal sealed class InstallerForm : Form
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,
-                RedirectStandardError = true
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
             }
         };
+        process.StartInfo.Environment["PYTHONUTF8"] = "1";
         process.Start();
         var outputTask = process.StandardOutput.ReadToEndAsync();
         var errorTask = process.StandardError.ReadToEndAsync();
