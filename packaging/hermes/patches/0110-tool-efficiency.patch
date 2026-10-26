@@ -1,0 +1,845 @@
+diff --git a/agent/background_context.py b/agent/background_context.py
+new file mode 100644
+--- /dev/null
++++ b/agent/background_context.py
+@@ -0,0 +1,48 @@
++"""Data-only summary handoff; no parent agent, compressor or write authority."""
++from dataclasses import dataclass
++from agent.history_context import summary_scope
++
++
++@dataclass(frozen=True)
++class SummarySnapshot:
++    key: tuple
++    covered: tuple[str, ...]
++    summary: str
++    origin_id: str
++
++
++def freeze_summary(agent):
++    from agent.usage_budget_runtime import capture_origin
++    origin = capture_origin()
++    if origin is None or origin.ledger.snapshot().stopped:
++        return None
++    spec = origin.ledger.policy.information_strategy
++    state = getattr(agent, "_information_summary", None)
++    if (spec.history_turns is None or not isinstance(state, dict)
++            or state.get("key") != summary_scope(agent, origin, spec)
++            or state.get("last") != origin.origin_id
++            or not isinstance(state.get("summary"), str) or not state["summary"].strip()
++            or not isinstance(state.get("covered"), tuple) or not state["covered"]
++            or not all(isinstance(k, str) and len(k) == 64 for k in state["covered"])):
++        return None
++    return SummarySnapshot(state["key"], state["covered"], state["summary"], origin.origin_id)
++
++
++def attach_summary(agent, snapshot):
++    # Even without a reusable checkpoint the background fork retains originals;
++    # it must not spend a second auxiliary call rebuilding the historical summary.
++    agent._background_context_readonly = True
++    from agent.usage_budget_runtime import capture_origin
++    origin = capture_origin()
++    if (type(snapshot) is not SummarySnapshot or origin is None
++            or origin.origin_id != snapshot.origin_id or origin.ledger.snapshot().stopped):
++        return False
++    spec = origin.ledger.policy.information_strategy
++    if spec.history_turns is None or snapshot.key != summary_scope(agent, origin, spec):
++        return False
++    # A new dict, with immutable values only. project_context independently
++    # verifies complete exchange coverage against the CHILD's actual send.
++    agent._information_summary = {"key": snapshot.key, "covered": snapshot.covered,
++        "summary": snapshot.summary, "last": snapshot.origin_id,
++        "attempt_count": len(snapshot.covered)}
++    return True
+diff --git a/agent/background_review.py b/agent/background_review.py
+index aa3efd8..50c95b4 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -672,6 +672,7 @@ def _run_review_in_thread(
+     *,
+     completion_callback: Any = ...,
+     origin_turn_id: str = "",
++    summary_snapshot: Any = None,
+ ) -> None:
+     """Worker function executed in the background-review daemon thread.
+ 
+@@ -951,6 +952,8 @@ def _run_review_in_thread(
+                 # if a future code path bypasses the cache.
+                 review_agent.session_start = agent.session_start
+             review_agent.session_id = agent.session_id
++            from agent.background_context import attach_summary
++            attach_summary(review_agent, summary_snapshot)
+             # The fork shares the parent's live session_id (pinned above for
+             # prefix-cache parity). It is single-lifecycle and calls close()
+             # right after this run_conversation(); without opting out, close()
+@@ -1218,6 +1221,10 @@ def spawn_background_review_thread(
+         )
+ 
+     completion_callback = getattr(agent, "background_review_callback", None)
++    # Freeze before a later foreground turn can replace the parent's checkpoint.
++    # The child rechecks route/identity and full source coverage independently.
++    from agent.background_context import freeze_summary
++    summary_snapshot = freeze_summary(agent)
+     origin_turn_id = str(
+         getattr(completion_callback, "_hermes_turn_id", "")
+         or getattr(agent, "_current_turn_id", "")
+@@ -1231,6 +1238,7 @@ def spawn_background_review_thread(
+             prompt,
+             completion_callback=completion_callback,
+             origin_turn_id=origin_turn_id,
++            summary_snapshot=summary_snapshot,
+         )
+ 
+     return _target, prompt
+diff --git a/agent/tool_result_projection.py b/agent/tool_result_projection.py
+new file mode 100644
+--- /dev/null
++++ b/agent/tool_result_projection.py
+@@ -0,0 +1,188 @@
++"""Request-only projection for known verbose schemas; never transcript writes.
++
++No model call/quota. Unknown tools/shapes pass through. Match native call ID and
++tool name, not text. Keep all candidates/order/pagination and unknown fields.
++"""
++from copy import deepcopy
++import json
++import logging
++
++logger = logging.getLogger(__name__)
++_MIN_CHARS = 2000
++_MAX_CHARS = 2_000_000
++_GROUPS = {"tracks": "track", "artists": "artist", "albums": "album",
++           "playlists": "playlist", "shows": "show", "episodes": "episode",
++           "audiobooks": "audiobook"}
++_MEDIA_TYPES = set(_GROUPS.values())
++# Exact repeated metadata is stored once, not discarded. Keep the action
++# locators readable inline; all remaining fields (including artwork, errors,
++# availability and unknown future fields) remain in the shared metadata table.
++_INLINE = {"id", "name", "uri", "type", "external_urls"}
++_NOTICE = "Compact lossless metadata view. Merge each _metadata_ref from _shared_metadata with its inline fields. Original full result remains in chat history."
++
++
++def _media(value, expected=None, depth=0):
++    if not isinstance(value, dict) or depth > 8:
++        return value
++    kind = value.get("type")
++    if kind not in _MEDIA_TYPES or (expected is not None and expected != kind):
++        return value
++    if "error" in value or not isinstance(value.get("id"), str) or not isinstance(value.get("name"), str):
++        return value
++    result = deepcopy(value)
++    for key in ("album", "show", "audiobook"):
++        if key in result:
++            result[key] = _media(result[key], key, depth + 1)
++    if isinstance(result.get("artists"), list):
++        result["artists"] = [_media(a, "artist", depth + 1) for a in result["artists"]]
++    return result
++
++
++def _intern_metadata(payload):
++    """Factor exact repeated media objects; never fuzzy-deduplicate outcomes."""
++    counts = {}
++    def identity(node):
++        if (not isinstance(node, dict) or node.get("type") not in _MEDIA_TYPES
++                or not isinstance(node.get("id"), str) or not isinstance(node.get("name"), str)
++                or "error" in node):
++            return None
++        key = json.dumps(node, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
++        return key if len(key) > 250 else None
++    def visit(node, depth=0):
++        if depth > 24:
++            raise ValueError("result_depth_exceeded")
++        if isinstance(node, dict):
++            # Do not collide with native/future provider fields of this name.
++            if any(k in node for k in ("_metadata_ref", "_shared_metadata", "_model_view")):
++                raise ValueError("projection_field_collision")
++            key = identity(node)
++            if key is not None:
++                counts[key] = counts.get(key, 0) + 1
++            for value in node.values(): visit(value, depth + 1)
++        elif isinstance(node, list):
++            for value in node: visit(value, depth + 1)
++    visit(payload)
++    shared, names = {}, {}
++    def render(node):
++        if isinstance(node, dict):
++            key = identity(node)
++            if key is not None and counts[key] > 1:
++                if key not in names:
++                    ref = "m" + str(len(names) + 1)
++                    names[key] = ref
++                    shared[ref] = {k: render(v) for k, v in node.items() if k not in _INLINE}
++                return dict({k: deepcopy(v) for k, v in node.items() if k in _INLINE}, _metadata_ref=names[key])
++            return {k: render(v) for k, v in node.items()}
++        if isinstance(node, list):
++            return [render(v) for v in node]
++        return node
++    result = render(payload)
++    if shared:
++        result["_shared_metadata"] = shared
++    return result
++
++
++def _spotify_search(payload):
++    if not isinstance(payload, dict) or "error" in payload or payload.get("success") is False:
++        return None
++    groups = [key for key in _GROUPS if key in payload]
++    if not groups:
++        return None
++    result = deepcopy(payload)
++    for key in groups:
++        group = payload[key]
++        if not isinstance(group, dict) or not isinstance(group.get("items"), list):
++            return None
++        if len(group["items"]) > 100:
++            return None
++        # Page href/next/previous are actionable pagination: keep them.
++        items = [_media(item, _GROUPS[key]) for item in group["items"]]
++        result[key]["items"] = items
++    return _intern_metadata(result)
++
++
++def _spotify_playback(payload):
++    if (not isinstance(payload, dict) or "error" in payload or payload.get("success") is False
++            or type(payload.get("is_playing")) is not bool or not isinstance(payload.get("item"), dict)):
++        return None
++    item = _media(payload["item"])
++    result = deepcopy(payload)
++    result["item"] = item
++    return _intern_metadata(result)
++
++
++_REDUCERS = {"spotify_search": _spotify_search, "spotify_playback": _spotify_playback}
++
++
++def project_tool_results(rows):
++    """Return (copy with reduced results, changed indices); malformed unchanged.
++
++    Only complete assistant call/result groups qualify, including the fresh
++    completed group in the active turn. Do not rewrite partial/multimodal data,
++    arguments, reasoning signatures, the user request or primary responses.
++    """
++    calls, results, duplicates = {}, {}, set()
++    for index, row in enumerate(rows):
++        if not isinstance(row, dict):
++            continue
++        if row.get("role") == "assistant":
++            group = row.get("tool_calls")
++            if not isinstance(group, list) or not group:
++                continue
++            ids = []
++            for call in group:
++                if not isinstance(call, dict) or not isinstance(call.get("id"), str):
++                    ids = []
++                    break
++                ids.append(call["id"])
++            if not ids:
++                continue
++            for call in group:
++                key = call["id"]
++                if key in calls:
++                    duplicates.add(key)
++                calls[key] = (index, call.get("function"), tuple(ids))
++        elif row.get("role") == "tool" and isinstance(row.get("tool_call_id"), str):
++            key = row["tool_call_id"]
++            if key in results:
++                duplicates.add(key)
++            results[key] = index
++    output = list(rows)
++    changed = set()
++    for key, (call_index, function, group) in calls.items():
++        if (not isinstance(function, dict) or function.get("name") not in _REDUCERS
++                or any(i in duplicates or i not in results or results[i] <= call_index for i in group)):
++            continue
++        if any(not isinstance(row, dict) or row.get("role") != "tool"
++               or row.get("tool_call_id") not in group
++               for row in rows[call_index + 1:max(results[i] for i in group) + 1]):
++            continue
++        index = results[key]
++        text = rows[index].get("content")
++        if not isinstance(text, str) or not _MIN_CHARS <= len(text) <= _MAX_CHARS:
++            continue
++        try:
++            payload = json.loads(text)
++            reduced = _REDUCERS[function["name"]](payload)
++            if reduced is None or "_model_view" in reduced:
++                continue
++            reduced["_model_view"] = _NOTICE
++            content = json.dumps(reduced, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
++        except (TypeError, ValueError, RecursionError):
++            continue
++        if len(content) >= len(text):
++            continue
++        row = deepcopy(rows[index])
++        row["content"] = content
++        output[index] = row
++        changed.add(index)
++    return output, changed
++
++
++def project_request_results(rows):
++    result, changed = project_tool_results(rows)
++    if changed:
++        logger.info("[tool_result_projection] results=%d before_chars=%d after_chars=%d measurement=text_characters",
++                    len(changed), sum(len(rows[i]["content"]) for i in changed),
++                    sum(len(result[i]["content"]) for i in changed))
++    return result
+diff --git a/agent/usage_budget_context.py b/agent/usage_budget_context.py
+index d14ff1e..c7babaa 100644
+--- a/agent/usage_budget_context.py
++++ b/agent/usage_budget_context.py
+@@ -350,8 +350,10 @@ def prepare_budget_context(agent, projected, source, history, *, history_offset,
+             try:
+                 units = _strategy_projection_units(agent, history, source, projected, history_offset,
+                                                    normalize_tool_calls=normalize_tool_calls)
+-                return project_context(agent, projected, units, ledger.policy.information_strategy, origin,
+-                                       source=source, history_offset=history_offset)
++                result = project_context(agent, projected, units, ledger.policy.information_strategy, origin,
++                                         source=source, history_offset=history_offset)
++                from agent.tool_result_projection import project_request_results
++                return project_request_results(result)
+             except Exception:
+                 agent._usage_budget_context_status = {"strategy": "projection_unavailable_originals_retained"}
+                 return projected
+diff --git a/agent/usage_strategy_context.py b/agent/usage_strategy_context.py
+index 2db19da..f50f881 100644
+--- a/agent/usage_strategy_context.py
++++ b/agent/usage_strategy_context.py
+@@ -18,17 +18,20 @@ def compact_results(rows, chars):
+     result = deepcopy(rows)
+     if chars is None:
+         return result
++    from agent.tool_result_projection import project_tool_results
++    result, structured = project_tool_results(result)
+     # Keep call IDs, arguments, order, errors and result boundaries. Dedup text
+     # only, never actions; latest duplicate remains the authoritative full one.
+     seen = set()
+-    for row in reversed(result):
++    for index in reversed(range(len(result))):
++        row = result[index]
+         if row.get("role") != "tool" or not isinstance(row.get("content"), str):
+             continue
+         text = row["content"]
+         key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+         if key in seen and len(text) > 200:
+             row["content"] = "[Repeated historical tool result; same text appears later.]"
+-        elif len(text) > chars:
++        elif len(text) > chars and index not in structured:
+             # A visible tail preserves terminal failures/outcomes often printed
+             # after long logs. This is labelled truncation, not invented summary.
+             head = chars * 2 // 3
+@@ -74,7 +77,8 @@ def project_context(agent, projected, units, spec, origin, *, source=None, histo
+     if new_origin:
+         state["last"] = origin.origin_id
+     due = state["attempt_count"] is None or len(keys) - state["attempt_count"] >= spec.summary_every
+-    if (new_origin and len(keys) > len(covered) and due
++    if (not getattr(agent, "_background_context_readonly", False)
++            and new_origin and len(keys) > len(covered) and due
+             and not origin.ledger.snapshot().stopped):
+         # Cadence advances with newly completed exchanges, not failed attempts,
+         # model/tool iterations or multiple requests in the same human turn.
+@@ -126,5 +130,6 @@ def _record_projection(agent, before, after, spec, covered, uncovered, deduped,
+         "before": content_counts(before), "after": content_counts(after),
+         "deduplicated_sidecars": deduped, "sidecar_chars_saved": saved,
+         "summary_attempted": attempted, "summary_new_turns": added,
++        "background_readonly": getattr(agent, "_background_context_readonly", False) is True,
+     }
+     logger.info("[context_projection] %s", json.dumps(agent._usage_budget_context_status, sort_keys=True))
+diff --git a/tests/test_tool_efficiency.py b/tests/test_tool_efficiency.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_tool_efficiency.py
+@@ -0,0 +1,258 @@
++from copy import deepcopy
++import json
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++from agent.usage_budget import NormalBudget, VerifiedModelLimits, resolve_policy, TurnBudgetLedger
++from agent.usage_strategy import strategy_for_level
++from agent.usage_strategy_context import project_context, compact_results
++from agent.background_context import freeze_summary, attach_summary
++from agent.tool_result_projection import project_tool_results
++from tools.computer_use.windows_app_catalog import parse_start_apps, merge_catalog, valid_aumid, process_aumid
++
++
++def search_fixture(count=10):
++    artist = {"id": "artist-1", "name": "Fixture Artist", "type": "artist", "uri": "spotify:artist:fixture",
++              "external_urls": {"spotify": "https://example.test/artist"},
++              "images": [{"url": "https://example.test/" + "a" * 160, "width": 640, "height": 640}] * 3,
++              "href": "https://example.test/api/artist"}
++    album = {"id": "album-1", "name": "Fixture Album", "type": "album", "uri": "spotify:album:fixture",
++             "images": artist["images"], "artists": [artist], "release_date": "2001", "album_type": "album"}
++    return {"tracks": {"items": [dict(id=f"track-{i}", name=f"Track {i}", type="track",
++        uri=f"spotify:track:fixture{i}", artists=[artist], album=album, is_playable=i != 2,
++        restrictions={"reason": "market"} if i == 2 else {}, explicit=False, duration_ms=180000,
++        unknown_future={"value": "retain"}) for i in range(count)],
++        "offset": 0, "limit": count, "total": 101, "next": "https://example.test/page/2", "previous": None}}
++
++
++def result_rows(payload=None, name="spotify_search"):
++    return [{"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
++             "extra_content": {"signature": "synthetic"},
++             "function": {"name": name, "arguments": '{"query":"fixture"}'}}]},
++            {"role": "tool", "tool_call_id": "c1", "content": json.dumps(payload or search_fixture(), indent=2)}]
++
++
++class ToolResultTests(unittest.TestCase):
++    def test_search_reduced_with_candidates_actions_limits_and_pagination_intact(self):
++        rows = result_rows()
++        before = deepcopy(rows)
++        output, changed = project_tool_results(rows)
++        self.assertEqual(changed, {1})
++        self.assertEqual(rows, before)
++        self.assertEqual(output[0], before[0])
++        original = json.loads(rows[1]["content"])
++        reduced = json.loads(output[1]["content"])
++        self.assertLess(len(output[1]["content"]), len(rows[1]["content"]) * .6)
++        self.assertEqual(len(reduced["tracks"]["items"]), 10)
++        for old, new in zip(original["tracks"]["items"], reduced["tracks"]["items"]):
++            for key in ("id", "name", "uri", "is_playable", "restrictions", "explicit", "duration_ms", "unknown_future"):
++                self.assertEqual(new[key], old[key])
++            self.assertEqual(new["artists"][0]["external_urls"], old["artists"][0]["external_urls"])
++        for key in ("offset", "limit", "total", "next", "previous"):
++            self.assertEqual(original["tracks"][key], reduced["tracks"][key])
++        table = reduced.pop("_shared_metadata")
++        reduced.pop("_model_view")
++        def expand(node):
++            if isinstance(node, dict):
++                raw = dict(table[node["_metadata_ref"]], **{k: v for k, v in node.items() if k != "_metadata_ref"}) if "_metadata_ref" in node else node
++                return {k: expand(v) for k, v in raw.items()}
++            return [expand(v) for v in node] if isinstance(node, list) else node
++        self.assertEqual(expand(reduced), original, "projection lost provider fields")
++
++    def test_playback_status_device_and_actions_preserved(self):
++        payload = {"is_playing": False, "item": search_fixture()["tracks"]["items"][0],
++                   "device": {"id": "fixture-device", "is_restricted": True}, "actions": {"disallows": {"resuming": True}}}
++        rows, changed = project_tool_results(result_rows(payload, "spotify_playback"))
++        value = json.loads(rows[1]["content"])
++        self.assertEqual(changed, {1})
++        for key in ("device", "actions", "is_playing"):
++            self.assertEqual(value[key], payload[key])
++
++    def test_error_and_unknown_tools_not_reinterpreted(self):
++        for payload, name in [(dict(search_fixture(), error={"status": 403}), "spotify_search"),
++                              (dict(search_fixture(), success=False), "spotify_search"),
++                              (search_fixture(), "third_party_search")]:
++            rows = result_rows(payload, name)
++            self.assertEqual(project_tool_results(rows), (rows, set()))
++
++    def test_malformed_unknown_shapes_multimodal_and_small_results_unchanged(self):
++        for value in ("{bad" * 1000, "short", [{"type": "image_url", "image_url": "fixture"}],
++                      json.dumps({"unknown": "x" * 3000}), json.dumps({"tracks": {"items": "x" * 3000}})):
++            rows = result_rows()
++            rows[1]["content"] = value
++            self.assertEqual(project_tool_results(rows), (rows, set()))
++
++    def test_all_parallel_results_required(self):
++        rows = result_rows()
++        rows[0]["tool_calls"].append({"id": "c2", "function": {"name": "other", "arguments": "{}"}})
++        self.assertEqual(project_tool_results(rows), (rows, set()))
++        rows.append({"role": "tool", "tool_call_id": "c2", "content": "error: retained"})
++        output, changed = project_tool_results(rows)
++        self.assertEqual(changed, {1})
++        self.assertEqual(output[-1], rows[-1])
++
++    def test_missing_and_duplicate_call_ids_do_not_project(self):
++        for variant in ("missing", "duplicate_result", "duplicate_call", "reversed"):
++            rows = result_rows()
++            if variant == "missing": rows[1]["tool_call_id"] = "unknown"
++            elif variant == "duplicate_result": rows.append(deepcopy(rows[1]))
++            elif variant == "duplicate_call": rows[0]["tool_calls"] *= 2
++            else: rows.reverse()
++            self.assertEqual(project_tool_results(rows), (rows, set()))
++
++    def test_projection_idempotent(self):
++        output, _ = project_tool_results(result_rows())
++        self.assertEqual(project_tool_results(output), (output, set()))
++
++    def test_old_structured_results_do_not_become_broken_json_excerpts(self):
++        rows = result_rows()
++        output = compact_results(rows, 1200)
++        payload = json.loads(output[1]["content"])
++        self.assertEqual(len(payload["tracks"]["items"]), 10)
++        self.assertEqual(rows, result_rows())
++
++    def test_no_cap_keeps_fifth_sixth_behavior(self):
++        rows = result_rows()
++        self.assertEqual(compact_results(rows, None), rows)
++
++
++class CatalogTests(unittest.TestCase):
++    def test_localized_current_user_names_and_non_default_app_ids(self):
++        rows = parse_start_apps(json.dumps([{"Name": "範例音樂", "AppID": "Example.Music_abc!Player"},
++            {"Name": "Other", "AppID": "Other.App_def!DesktopClient"}, {"Name": "Win32", "AppID": "OpaqueDesktopId"}]))
++        self.assertEqual([r["aumid"] for r in rows], ["Example.Music_abc!Player", "Other.App_def!DesktopClient"])
++        self.assertEqual(rows[0]["name"], "範例音樂")
++        self.assertTrue(all("launch_path" not in row for row in rows))
++
++    def test_untrusted_launch_paths_scripts_and_malformed_ids_not_admitted(self):
++        for value in (None, "", "file.exe", "shell:appsfolder\\Example!App", "x!App;exit", "x!App\n", "x!A B", "x"*513+"!A"):
++            self.assertFalse(valid_aumid(value))
++
++    def test_parse_rejects_non_list_overflow_and_malformed_rows(self):
++        for value in ({}, [None], [{"Name": "bad\nname", "AppID": "Example!App"}], [{}] * 4097):
++            with self.assertRaises(ValueError): parse_start_apps(json.dumps(value))
++
++    def test_exact_duplicate_registration_deduped_not_same_names(self):
++        rows = parse_start_apps(json.dumps([{"Name": "App", "AppID": "One!App"}] * 2 + [{"Name": "App", "AppID": "Two!App"}]))
++        self.assertEqual(len(rows), 2)
++
++    def test_supplements_missing_catalog_and_joins_only_exact_running_aumid(self):
++        desktop = [{"name": "Desktop", "kind": "desktop", "launch_path": "synthetic.exe"}]
++        start = parse_start_apps('[{"Name":"App","AppID":"Vendor.Family!Client"}]')
++        output = merge_catalog(desktop, start, {101: "Vendor.Family!Client", 102: "Other!Client"})
++        self.assertEqual(output[1]["pid"], 101)
++        self.assertEqual(desktop, [{"name": "Desktop", "kind": "desktop", "launch_path": "synthetic.exe"}])
++
++    def test_existing_driver_identity_keeps_locator_and_gains_local_name(self):
++        driver = [{"name": "Generic Name", "launch_path": "shell:AppsFolder\\Vendor.Family!Client", "kind": "uwp"}]
++        start = parse_start_apps('[{"Name":"Localized Name","AppID":"Vendor.Family!Client"}]')
++        output = merge_catalog(driver, start, {})
++        self.assertEqual(len(output), 1)
++        self.assertEqual(output[0]["display_name"], "Localized Name")
++        self.assertEqual(output[0]["launch_path"], driver[0]["launch_path"])
++
++    def test_same_name_different_identity_not_merged(self):
++        start = parse_start_apps('[{"Name":"App","AppID":"Vendor.Two!Client"}]')
++        output = merge_catalog([{"name": "App", "aumid": "Vendor.One!Client"}], start, {})
++        self.assertEqual(len(output), 2)
++
++    def test_ambiguous_running_identity_does_not_fabricate_one_pid(self):
++        start = parse_start_apps('[{"Name":"App","AppID":"Vendor!Client"}]')
++        output = merge_catalog([], start, {10: "Vendor!Client", 11: "Vendor!Client"})
++        self.assertNotIn("pid", output[0])
++
++    def test_non_windows_and_invalid_pid_never_query_os(self):
++        with patch("sys.platform", "linux"):
++            self.assertIsNone(process_aumid(123))
++        for pid in (None, -1, 0, True, "12", 0x100000000):
++            self.assertIsNone(process_aumid(pid))
++
++
++class BackgroundTests(unittest.TestCase):
++    def setUp(self):
++        policy = resolve_policy(4, NormalBudget(max_iterations=90), VerifiedModelLimits(), version=1)
++        self.origin = SimpleNamespace(origin_id="origin-one", ledger=TurnBudgetLedger("origin-one", policy))
++        self.agent = SimpleNamespace(session_id="synthetic", model="model", provider="provider", api_mode="chat_completions")
++        self.calls = []
++        def summarize(rows):
++            self.calls.append(deepcopy(rows))
++            return "Summary of synthetic old facts."
++        self.agent.context_compressor = SimpleNamespace(_generate_summary=summarize)
++        self.rows = [r for i in range(40) for r in ({"role": "user", "content": f"question-{i}"},
++                                                      {"role": "assistant", "content": f"answer-{i}"})]
++        self.units = tuple((i, i+1) for i in range(0, 78, 2))
++        self.spec = strategy_for_level(4)
++        project_context(self.agent, self.rows, self.units, self.spec, self.origin)
++        self.capture = patch("agent.usage_budget_runtime.capture_origin", return_value=self.origin)
++        self.capture.start()
++        self.addCleanup(self.capture.stop)
++
++    def child(self):
++        return SimpleNamespace(session_id="synthetic", model="model", provider="provider", api_mode="chat_completions",
++                               context_compressor=self.agent.context_compressor)
++
++    def test_child_reuses_summary_without_second_auxiliary_call(self):
++        snapshot = freeze_summary(self.agent)
++        child = self.child()
++        self.assertTrue(attach_summary(child, snapshot))
++        output = project_context(child, self.rows, self.units, self.spec, self.origin)
++        self.assertEqual(len(self.calls), 1)
++        self.assertLess(len(output), len(self.rows))
++        self.assertIsNot(child._information_summary, self.agent._information_summary)
++        self.assertEqual(output[-1], self.rows[-1])
++
++    def test_child_retains_new_uncovered_turn_without_regenerating(self):
++        snapshot = freeze_summary(self.agent)
++        child = self.child()
++        attach_summary(child, snapshot)
++        rows = self.rows + [{"role": "user", "content": "new"}, {"role": "assistant", "content": "new answer"}]
++        output = project_context(child, rows, self.units + ((78, 79),), self.spec, self.origin)
++        self.assertEqual(len(self.calls), 1)
++        self.assertEqual(output[-4:], rows[-4:])
++
++    def test_missing_snapshot_keeps_originals_without_summary_call(self):
++        child = self.child()
++        self.assertFalse(attach_summary(child, None))
++        output = project_context(child, self.rows, self.units, self.spec, self.origin)
++        self.assertEqual(output, self.rows)
++        self.assertEqual(len(self.calls), 1)
++
++    def test_snapshot_freezes_before_parent_advances(self):
++        snapshot = freeze_summary(self.agent)
++        self.agent._information_summary["summary"] = "later foreground summary"
++        child = self.child()
++        self.assertTrue(attach_summary(child, snapshot))
++        self.assertEqual(child._information_summary["summary"], "Summary of synthetic old facts.")
++
++    def test_route_session_and_identity_mismatches_cannot_reuse(self):
++        snapshot = freeze_summary(self.agent)
++        for key in ("session_id", "model", "provider", "api_mode", "base_url", "fingerprint"):
++            child = self.child()
++            setattr(child, key, "different")
++            self.assertFalse(attach_summary(child, snapshot), key)
++
++    def test_changed_originals_invalidate_without_rebuilding(self):
++        child = self.child()
++        attach_summary(child, freeze_summary(self.agent))
++        rows = deepcopy(self.rows)
++        rows[0]["content"] = "corrected fact"
++        output = project_context(child, rows, self.units, self.spec, self.origin)
++        self.assertEqual(output, rows)
++        self.assertEqual(len(self.calls), 1)
++
++    def test_wrong_origin_rejected(self):
++        snapshot = freeze_summary(self.agent)
++        self.origin.origin_id = "next"
++        self.assertFalse(attach_summary(self.child(), snapshot))
++        self.assertIsNone(freeze_summary(self.agent))
++
++    def test_stop_rejects_capture_and_attachment(self):
++        snapshot = freeze_summary(self.agent)
++        self.origin.ledger.stop()
++        self.assertIsNone(freeze_summary(self.agent))
++        self.assertFalse(attach_summary(self.child(), snapshot))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/computer_use/cua_backend.py b/tools/computer_use/cua_backend.py
+index 10e7a26..481495b 100644
+--- a/tools/computer_use/cua_backend.py
++++ b/tools/computer_use/cua_backend.py
+@@ -2861,6 +2861,34 @@ class CuaDriverBackend(ComputerUseBackend):
+ 
+     # ── Introspection ──────────────────────────────────────────────
+     def list_apps(self) -> List[Dict[str, Any]]:
++        apps = self._driver_apps()
++        if sys.platform != "win32":
++            return apps
++        from tools.computer_use.windows_app_catalog import read_start_apps, process_aumid, merge_catalog
++        try:
++            registered = read_start_apps()
++        except Exception:
++            # Do not describe a partial catalog as a definitive 'not installed'.
++            raise RuntimeError("windows_registered_app_catalog_unavailable") from None
++        try:
++            windows = self.list_windows()
++            pids = {row.get("pid") for row in windows[:4096] if isinstance(row, dict)
++                    and type(row.get("pid")) is int and row["pid"] > 0}
++            running = {pid: value for pid in pids if (value := process_aumid(pid))}
++        except Exception:
++            running = {}  # No PID proof is safer than a name-based guess.
++        return merge_catalog(apps, registered, running)
++
++    def verify_packaged_pid(self, app_id: str, pid: int) -> bool:
++        if sys.platform != "win32":
++            return False
++        from tools.computer_use.windows_app_catalog import process_aumid, valid_aumid
++        if not valid_aumid(app_id):
++            return False
++        actual = process_aumid(pid)
++        return isinstance(actual, str) and actual.casefold() == app_id.casefold()
++
++    def _driver_apps(self) -> List[Dict[str, Any]]:
+         out = self._session.call_tool("list_apps", {"session": self._session_id})
+         structured = out.get("structuredContent")
+         data = out.get("data")
+diff --git a/tools/computer_use/tool.py b/tools/computer_use/tool.py
+index 91650e1..dcf0edf 100644
+--- a/tools/computer_use/tool.py
++++ b/tools/computer_use/tool.py
+@@ -1036,23 +1036,28 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
+         for attempt in range(_LAUNCH_VERIFY_ATTEMPTS):
+             if attempt:
+                 time.sleep(_LAUNCH_VERIFY_DELAY_SECONDS)
+-            try:
+-                post_apps = backend.list_apps()
+-            except Exception:
+-                post_apps = []
++            verify_package = getattr(backend, "verify_packaged_pid", None)
++            if expected_app_id and callable(verify_package):
++                try:
++                    pid_observed = verify_package(expected_app_id, receipt_pid) is True
++                except Exception:
++                    pid_observed = False
++            else:
++                try:
++                    post_apps = backend.list_apps()
++                except Exception:
++                    post_apps = []
++                pid_observed = _selected_catalog_row_observes_pid(
++                    post_apps, receipt_pid, name=name, app_id=app_id,
++                )
+             try:
+                 post_windows = backend.list_windows()
+             except Exception:
+                 post_windows = []
+-            pid_observed = _selected_catalog_row_observes_pid(
+-                post_apps,
+-                receipt_pid,
+-                name=name,
+-                app_id=app_id,
+-            )
+             observed_windows = _bounded_windows_for_pid(post_windows, receipt_pid)
+-            if pid_observed and "catalog_pid" not in verified_by:
+-                verified_by.append("catalog_pid")
++            pid_proof = "process_aumid" if expected_app_id and callable(verify_package) else "catalog_pid"
++            if pid_observed and pid_proof not in verified_by:
++                verified_by.append(pid_proof)
+             if observed_windows and "window" not in verified_by:
+                 verified_by.append("window")
+             if pid_observed and observed_windows:
+diff --git a/tools/computer_use/windows_app_catalog.py b/tools/computer_use/windows_app_catalog.py
+new file mode 100644
+--- /dev/null
++++ b/tools/computer_use/windows_app_catalog.py
+@@ -0,0 +1,146 @@
++"""Read-only, current-user Windows catalog supplement for the local CUA driver.
++
++Some driver WinRT scans return an incomplete packaged-app catalog on timeout.
++StartApps supplies OS-registered names/AUMIDs, never paths or activation code.
++The existing driver remains the only launcher and native approval owner.
++"""
++import json
++import os
++import re
++import subprocess
++import sys
++from copy import deepcopy
++
++_AUMID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*![A-Za-z0-9][A-Za-z0-9._-]*\Z")
++_MAX_ROWS = 4096
++_SCRIPT = """$ErrorActionPreference = 'Stop'
++[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
++$apps = @(Get-StartApps | Select-Object -First 4097 -Property Name,AppID)
++ConvertTo-Json -InputObject $apps -Compress -Depth 3
++"""
++
++
++def valid_aumid(value):
++    return isinstance(value, str) and len(value) <= 512 and _AUMID.fullmatch(value) is not None
++
++
++def parse_start_apps(text):
++    if not isinstance(text, str) or len(text) > 2_000_000:
++        raise ValueError("windows_app_catalog_too_large")
++    rows = json.loads(text.lstrip("\ufeff"))
++    if not isinstance(rows, list) or len(rows) > _MAX_ROWS:
++        raise ValueError("windows_app_catalog_invalid")
++    result, seen = [], set()
++    for row in rows:
++        if not isinstance(row, dict):
++            raise ValueError("windows_app_catalog_invalid")
++        name, app_id = row.get("Name"), row.get("AppID")
++        # Desktop activation records remain owned by the driver's shortcut
++        # resolver. An opaque Win32 StartAppID is NOT an executable path.
++        if not valid_aumid(app_id):
++            continue
++        if (not isinstance(name, str) or not name.strip() or len(name) > 512
++                or any(c in name for c in "\x00\r\n")):
++            raise ValueError("windows_app_catalog_invalid")
++        identity = (name.strip().casefold(), app_id.casefold())
++        if identity not in seen:
++            seen.add(identity)
++            result.append({"name": name.strip(), "aumid": app_id, "kind": "packaged",
++                           "catalog_source": "windows_start_apps"})
++    return result
++
++
++def read_start_apps():
++    if sys.platform != "win32":
++        return []
++    # Resolve the system executable via Windows, not PATH, an app name, or
++    # model-supplied command text. No user profile scripts/credentials loaded.
++    import ctypes
++    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
++    kernel.GetSystemDirectoryW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
++    kernel.GetSystemDirectoryW.restype = ctypes.c_uint
++    directory = ctypes.create_unicode_buffer(32768)
++    count = kernel.GetSystemDirectoryW(directory, len(directory))
++    if not 0 < count < len(directory):
++        raise OSError("windows_system_directory_unavailable")
++    executable = os.path.join(directory.value, "WindowsPowerShell", "v1.0", "powershell.exe")
++    environment = {k: v for k, v in os.environ.items()
++                   if k.upper() in {"SYSTEMROOT", "WINDIR", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA"}}
++    completed = subprocess.run(
++        [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", _SCRIPT],
++        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        timeout=8, check=True, creationflags=subprocess.CREATE_NO_WINDOW,
++        env=environment, encoding="utf-8", errors="strict")
++    return parse_start_apps(completed.stdout)
++
++
++def process_aumid(pid):
++    """Fresh identity from a query-only process handle; no privilege changes."""
++    if sys.platform != "win32" or type(pid) is not int or not 0 < pid <= 0xFFFFFFFF:
++        return None
++    import ctypes
++    from ctypes import wintypes
++    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
++    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
++    kernel.OpenProcess.restype = wintypes.HANDLE
++    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
++    kernel.CloseHandle.restype = wintypes.BOOL
++    get_id = kernel.GetApplicationUserModelId
++    get_id.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.UINT), wintypes.LPWSTR]
++    get_id.restype = wintypes.LONG
++    handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
++    if not handle:
++        return None
++    try:
++        length = wintypes.UINT(0)
++        if get_id(handle, ctypes.byref(length), None) != 122 or not 1 < length.value <= 513:
++            return None
++        value = ctypes.create_unicode_buffer(length.value)
++        if get_id(handle, ctypes.byref(length), value) != 0:
++            return None
++        return value.value if valid_aumid(value.value) else None
++    finally:
++        kernel.CloseHandle(handle)
++
++
++def row_aumid(row):
++    if not isinstance(row, dict):
++        return None
++    for key in ("aumid", "app_id", "bundle_id", "bundleId"):
++        if valid_aumid(row.get(key)):
++            return row[key]
++    path = row.get("launch_path")
++    prefix = "shell:appsfolder\\"
++    if isinstance(path, str) and path.casefold().startswith(prefix) and valid_aumid(path[len(prefix):]):
++        return path[len(prefix):]
++    return None
++
++
++def merge_catalog(driver_rows, start_rows, running):
++    """Join only exact AUMIDs. Same-name/different-app ambiguity stays visible."""
++    if not isinstance(driver_rows, list) or len(driver_rows) > _MAX_ROWS:
++        raise ValueError("windows_driver_catalog_invalid")
++    result = deepcopy(driver_rows)
++    for entry in start_rows:
++        app_id = row_aumid(entry)
++        matches = [row for row in result if row_aumid(row) and row_aumid(row).casefold() == app_id.casefold()]
++        if matches:
++            # Do not silently collapse pre-existing ambiguity or override an
++            # existing OS name. Expose localized Start-menu names as aliases.
++            for row in matches:
++                if row.get("name") != entry["name"] and not row.get("display_name"):
++                    row["display_name"] = entry["name"]
++        else:
++            row = deepcopy(entry)
++            result.append(row)
++            matches = [row]
++        pids = [pid for pid, observed in running.items() if observed.casefold() == app_id.casefold()]
++        for row in matches:
++            if len(pids) == 1:
++                row.update(pid=pids[0], running=True)
++            elif row.get("pid") not in pids:
++                row.pop("pid", None)
++                row["running"] = False
++    if len(result) > _MAX_ROWS:
++        raise ValueError("windows_app_catalog_too_large")
++    return result

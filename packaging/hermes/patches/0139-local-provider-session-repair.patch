@@ -1,0 +1,226 @@
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 847c348..5bf59cf 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -2647,7 +2647,18 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
+         # Invalidate transport cache — new api_mode may need a different transport
+         if hasattr(agent, "_transport_cache"):
+             agent._transport_cache.clear()
+-        if api_key:
++        # Empty is an explicit credential only for an exact managed local
++        # auth-none route. Do not inherit the previous provider's cloud key
++        # when switching there. None/omitted generic credentials retain their
++        # existing semantics; route/key checks below remain fail-closed.
++        managed_empty_key = False
++        if isinstance(api_key, str) and api_key == "":
++            from hermes_cli.provider_setup import allows_empty_key, normalize_setup_identity
++
++            managed_empty_key = allows_empty_key(
++                normalize_setup_identity(new_provider), agent.base_url, api_key
++            )
++        if api_key or managed_empty_key:
+             agent.api_key = api_key
+ 
+         # ── Reload credential pool for the new provider (issue #52727) ──
+@@ -2732,7 +2743,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
+             agent.client = None
+             agent._client_kwargs = {}
+         else:
+-            effective_key = api_key or agent.api_key
++            effective_key = api_key if managed_empty_key else (api_key or agent.api_key)
+             effective_base = base_url or agent.base_url
+             agent._client_kwargs = {
+                 "api_key": effective_key,
+diff --git a/tests/test_local_provider_session_repair.py b/tests/test_local_provider_session_repair.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_local_provider_session_repair.py
+@@ -0,0 +1,188 @@
++"""Managed explicit-empty API-key switching, retaining exact native route guards."""
++import copy
++import logging
++from pathlib import Path
++import tempfile
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++from agent import agent_runtime_helpers as runtime
++from hermes_cli import config
++from hermes_cli import provider_setup as setup
++import openai
++import httpx
++
++ID = "custom:" + "c" * 32
++URL = "http://127.0.0.1:1234/v1"
++OLD_KEY = "synthetic-prior-cloud-key"
++NEW_KEY = "synthetic-managed-cloud-key"
++
++
++class ManagedSwitchTests(unittest.TestCase):
++    def setUp(self):
++        from hermes_constants import set_hermes_home_override
++        self.home = Path(tempfile.mkdtemp(prefix="case-", dir=FIXTURE))
++        self.token = set_hermes_home_override(self.home)
++        (self.home / "config.yaml").write_text(
++            "model:\n  provider: deepseek\n  default: deepseek-chat\nproviders: {}\ntoolsets: []\n", encoding="utf-8")
++        config.invalidate_env_cache()
++        self.save()
++        self.clients = []
++        self.patches = [
++            patch.object(runtime, "_ra", return_value=SimpleNamespace(OpenAI=openai.OpenAI, logger=logging.getLogger("fixture"))),
++            patch.object(runtime, "sync_credential_pool_entry_id", lambda agent: None),
++            patch("agent.credential_pool.load_pool", return_value=None),
++        ]
++        for item in self.patches:
++            item.start()
++
++    def tearDown(self):
++        for client in self.clients:
++            client.close()
++        for item in reversed(self.patches):
++            item.stop()
++        from hermes_constants import reset_hermes_home_override
++        reset_hermes_home_override(self.token)
++        config.invalidate_env_cache()
++
++    def save(self, **changes):
++        request = {"authority": setup.AUTHORITY, "expected_config_sha256": setup.config_sha256(),
++            "operation_id": "synthetic-switch-fixture", "provider_id": ID,
++            "label": "Synthetic local", "preset_id": "lmstudio", "kind": "local",
++            "base_url": URL, "model_id": "synthetic-model", "auth_mode": "none",
++            "key_action": "clear", "api_key": ""}
++        request.update(changes)
++        return setup.mutate("save", request, finalize=lambda before, after: None)
++
++    def agent(self, key=OLD_KEY, provider="deepseek"):
++        agent = SimpleNamespace(model="old-model", provider=provider, requested_provider=provider,
++            base_url="https://synthetic.invalid/v1", api_mode="chat_completions", api_key=key,
++            client=object(), _client_kwargs={"api_key": key, "base_url": "https://synthetic.invalid/v1"},
++            _credential_pool=None, _credential_pool_entry_id=None, context_compressor=None,
++            _config_context_length=1234, _primary_runtime={"sentinel": "unchanged"})
++        agent._apply_client_headers_for_base_url = lambda base: None
++        agent._ensure_lmstudio_runtime_loaded = lambda context: None
++        agent._lmstudio_load_was_unverified = lambda context: False
++        agent._effective_lmstudio_context_length = lambda desired, actual: desired
++        agent._anthropic_prompt_cache_policy = lambda **kwargs: (False, False)
++        agent._build_keepalive_http_client = lambda *args, **kwargs: httpx.Client(trust_env=False, follow_redirects=False)
++        agent._client_log_context = lambda: "synthetic"
++        def make_client(kwargs, **options):
++            result = runtime.create_openai_client(agent, kwargs, **options)
++            self.clients.append(result)
++            return result
++        agent._create_openai_client = make_client
++        return agent
++
++    def switch(self, agent, **changes):
++        args = dict(new_model="synthetic-model", new_provider=ID, api_key="", base_url=URL,
++                    api_mode="chat_completions")
++        args.update(changes)
++        runtime.switch_model(agent, **args)
++
++    def snapshot(self, agent):
++        return (agent.model, agent.provider, agent.requested_provider, agent.base_url,
++                agent.api_mode, agent.api_key, agent.client, dict(agent._client_kwargs),
++                copy.deepcopy(agent._primary_runtime), agent._config_context_length)
++
++    def test_cloud_key_to_managed_local_explicit_empty_is_not_reused(self):
++        agent = self.agent()
++        before_config = (self.home / "config.yaml").read_bytes()
++        self.switch(agent)
++        self.assertEqual((ID, "", ""), (agent.provider, agent.api_key, agent.client.api_key))
++        self.assertEqual({}, agent.client.auth_headers)
++        self.assertNotIn("Authorization", agent.client.default_headers)
++        self.assertEqual("", agent._client_kwargs["api_key"])
++        self.assertEqual("", agent._primary_runtime["api_key"])
++        self.assertEqual("", agent._primary_runtime["client_kwargs"]["api_key"])
++        self.assertFalse(agent.client._client._trust_env)
++        self.assertFalse(agent.client._client.follow_redirects)
++        self.assertEqual(before_config, (self.home / "config.yaml").read_bytes())
++
++    def test_same_managed_noauth_switch_preserves_explicit_empty(self):
++        agent = self.agent(key="", provider=ID)
++        self.switch(agent)
++        self.assertEqual({}, agent.client.auth_headers)
++        self.assertEqual("", agent._primary_runtime["api_key"])
++
++    def test_equivalent_sdk_trailing_slash_still_accepts_owned_empty_key(self):
++        agent = self.agent()
++        self.switch(agent, base_url=URL + "/")
++        self.assertEqual("", agent.client.api_key)
++        self.assertEqual({}, agent.client.auth_headers)
++
++    def test_injected_foreign_key_is_rejected_and_old_agent_is_unchanged(self):
++        agent = self.agent()
++        before = self.snapshot(agent)
++        with self.assertRaisesRegex(setup.SetupError, "key_required"):
++            self.switch(agent, api_key="synthetic-foreign-key")
++        self.assertEqual(before, self.snapshot(agent))
++
++    def test_foreign_endpoint_is_rejected_and_old_agent_is_unchanged(self):
++        agent = self.agent()
++        before = self.snapshot(agent)
++        with self.assertRaisesRegex(setup.SetupError, "stale_config"):
++            self.switch(agent, base_url="http://127.0.0.1:1235/v1")
++        self.assertEqual(before, self.snapshot(agent))
++
++    def test_none_is_not_silently_promoted_to_explicit_owned_empty_key(self):
++        agent = self.agent()
++        before = self.snapshot(agent)
++        with self.assertRaisesRegex(setup.SetupError, "key_required"):
++            self.switch(agent, api_key=None)
++        self.assertEqual(before, self.snapshot(agent))
++        # None still means reuse the existing credential. It is valid when
++        # that credential is already the route's exact owned empty value.
++        agent = self.agent(key="", provider=ID)
++        self.switch(agent, api_key=None)
++        self.assertEqual("", agent.api_key)
++        self.assertEqual({}, agent.client.auth_headers)
++        self.assertEqual("", agent._primary_runtime["api_key"])
++
++    def test_sdk_failure_rolls_back_the_old_key_and_client(self):
++        agent = self.agent()
++        before = self.snapshot(agent)
++        with patch.object(runtime, "_ra", return_value=SimpleNamespace(
++            OpenAI=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("synthetic-construction-failed")))):
++            with self.assertRaisesRegex(RuntimeError, "synthetic-construction-failed"):
++                self.switch(agent)
++        self.assertEqual(before, self.snapshot(agent))
++
++    def test_managed_keyed_route_uses_only_exact_new_key(self):
++        self.save(auth_mode="api_key", key_action="replace", api_key=NEW_KEY)
++        agent = self.agent()
++        self.switch(agent, api_key=NEW_KEY)
++        self.assertEqual(NEW_KEY, agent.client.api_key)
++        self.assertEqual(NEW_KEY, agent._primary_runtime["api_key"])
++        for key in ("", None):
++            with self.subTest(omitted_credential_value=key):
++                own_agent = self.agent(key=NEW_KEY, provider=ID)
++                self.switch(own_agent, api_key=key)
++                self.assertEqual(NEW_KEY, own_agent.client.api_key)
++                foreign_agent = self.agent()
++                before = self.snapshot(foreign_agent)
++                with self.assertRaisesRegex(setup.SetupError, "key_required"):
++                    self.switch(foreign_agent, api_key=key)
++                self.assertEqual(before, self.snapshot(foreign_agent))
++
++    def test_generic_omitted_or_none_key_semantics_remain_unchanged(self):
++        for key in ("", None):
++            with self.subTest(key=key):
++                agent = self.agent()
++                self.switch(agent, new_provider="custom:legacy", base_url="https://synthetic.invalid/v1", api_key=key)
++                self.assertEqual(OLD_KEY, agent.api_key)
++                self.assertEqual(OLD_KEY, agent.client.api_key)
++        # Do not pass api_key at all: pin the actual signature default too.
++        agent = self.agent()
++        runtime.switch_model(agent, new_model="synthetic-model", new_provider="custom:legacy",
++                             base_url="https://synthetic.invalid/v1", api_mode="chat_completions")
++        self.assertEqual(OLD_KEY, agent.api_key)
++        self.assertEqual(OLD_KEY, agent.client.api_key)
++
++    def test_missing_reserved_entry_does_not_fall_back_to_cloud_key(self):
++        agent = self.agent()
++        before = self.snapshot(agent)
++        with self.assertRaisesRegex(setup.SetupError, "not_found"):
++            self.switch(agent, new_provider="custom:" + "d" * 32)
++        self.assertEqual(before, self.snapshot(agent))

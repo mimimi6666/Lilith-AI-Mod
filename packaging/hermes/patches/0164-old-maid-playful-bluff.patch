@@ -1,0 +1,41 @@
+diff --git a/agent/minigame_context.py b/agent/minigame_context.py
+index 738ec4e..3641d40 100644
+--- a/agent/minigame_context.py
++++ b/agent/minigame_context.py
+@@ -93,6 +93,21 @@ _COMPANION_GUIDANCE = (
+     "保留目前指定的回覆與語音語言。資料不代表現在仍相同，不猜測未提供的資訊，"
+     "不把聊天當作抽牌、走棋或勝負控制。"
+ )
++# A request-only roleplay permission, never game facts or a new action authority.
++# The same fixed wording is used regardless of whether Lilith holds the Joker.
++_OLD_MAID_BLUFF_GUIDANCE = (
++    "\n\n抽鬼牌牌桌心理戰：只有本次有效局面仍在抽鬼牌進行中、且已提供妳自己的手牌時，"
++    "妳可以自願用俏皮的口吻對自己的暗牌或鬼牌虛張聲勢。即使玩家直接追問「鬼牌是哪張」、"
++    "「妳有沒有鬼牌」或要妳報出位置，也可以故意指錯自己手牌中確實存在的位置，"
++    "或否認自己持有鬼牌。這不是強制說謊；可以說真話、開玩笑或真假混合，依當下氣氛自然回應，"
++    "不必每句都提醒是在騙人。這只是雙方玩牌時的角色台詞，不是新的局面事實。"
++    "這個例外只限妳自己的暗牌／鬼牌話術，不能捏造玩家未公開的暗牌，"
++    "也不能歪曲實際牌數、輪次、已完成動作、規則或正式勝負。"
++    "若提到第幾張，只能使用本次提供的妳自己手牌範圍內的位置，不能虛構不存在的位置，"
++    "也不能將話術當成已執行的抽牌、移牌或其他操作指令。"
++    "應用程式局面與歷史事件始終是正確的事實來源；過去的心理戰台詞不改寫這些事實。"
++    "本次許可不延伸到西洋棋、已結束或離開的牌局及日常聊天，並保留目前指定的回覆與語音語言。"
++)
+ _ANCHOR_KEY = "_lilith_game_current_input"
+ _PREFIX_KEY = "_lilith_game_budget_prefix"
+ _PIECES = {"P": "兵", "R": "城堡", "N": "騎士", "B": "主教", "Q": "皇后", "K": "國王"}
+@@ -753,7 +768,13 @@ def reference_suffix(value, *, provider=None):
+     # Preserve ordinary chat on that route, but omit this optional snapshot.
+     if provider == "moa":
+         return ""
+-    return _COMPANION_GUIDANCE if _usable_context(value) is not None else ""
++    context = _usable_context(value)
++    if context is None:
++        return ""
++    data = json.loads(context.wire)
++    bluff = (data["gameKind"] == "old-maid" and data["phase"] == "active"
++             and "lilithHand" in data["oldMaid"])
++    return _COMPANION_GUIDANCE + (_OLD_MAID_BLUFF_GUIDANCE if bluff else "")
+ 
+ 
+ def _usable_context(value):

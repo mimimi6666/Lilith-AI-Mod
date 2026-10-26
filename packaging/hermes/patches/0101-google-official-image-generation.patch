@@ -1,0 +1,967 @@
+diff --git a/hermes_cli/tools_config.py b/hermes_cli/tools_config.py
+index ce99094..b16cd1f 100644
+--- a/hermes_cli/tools_config.py
++++ b/hermes_cli/tools_config.py
+@@ -3388,9 +3388,27 @@ def provider_readiness_status(
+     compatibility only: selection never proves an installation completed.
+     """
+     env_vars = provider.get("env_vars", [])
+-    if env_vars:
+-        if not all(get_env_value(e["key"]) for e in env_vars):
+-            return "needs_keys"
++    image_plugin = provider.get("image_gen_plugin_name")
++    local_readiness = None
++    if image_plugin:
++        # An optional backend-owned, strictly local readiness projection can
++        # resolve shared native credential aliases/pools. Do not invoke every
++        # legacy is_available() here: some backends refresh remote entitlement.
++        # This does not add a credential store or alter the selected provider.
++        try:
++            from agent.image_gen_registry import get_provider
++            backend = get_provider(image_plugin)
++            inspect_local = getattr(backend, "get_readiness_status", None)
++            if callable(inspect_local):
++                local_readiness = inspect_local()
++                if local_readiness not in {"ready", "needs_keys", "needs_setup", "needs_auth"}:
++                    return "needs_setup"
++        except Exception:
++            return "needs_setup"
++        if local_readiness is not None and local_readiness != "ready":
++            return local_readiness
++    if local_readiness is None and env_vars and not all(get_env_value(e["key"]) for e in env_vars):
++        return "needs_keys"
+ 
+     managed_feature = provider.get("managed_nous_feature")
+     if provider.get("requires_nous_auth") or managed_feature:
+diff --git a/plugins/image_gen/google/__init__.py b/plugins/image_gen/google/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/plugins/image_gen/google/__init__.py
+@@ -0,0 +1,298 @@
++"""Official Google Gemini image generation; no FAL route or credential copy.
++
++The documented stateless generateContent REST endpoint is used deliberately:
++no remote Interaction session, SDK installation, model fallback or retry.
++Official catalog/API reference checked 2026-09-26:
++https://ai.google.dev/gemini-api/docs/generate-content/image-generation
++https://ai.google.dev/gemini-api/docs/image-generation
++"""
++from __future__ import annotations
++
++import asyncio
++import base64
++import io
++import json
++import time
++import warnings
++from typing import Any
++
++from agent.image_gen_provider import (
++    DEFAULT_ASPECT_RATIO, ImageGenProvider, error_response,
++    resolve_aspect_ratio, save_b64_image, success_response,
++)
++
++DEFAULT_MODEL = "gemini-3.1-flash-image"
++_MODELS = {
++    DEFAULT_MODEL: ("Nano Banana 2 — Gemini 3.1 Flash Image", 14),
++    "gemini-3.1-flash-lite-image": ("Nano Banana 2 Lite — Gemini 3.1 Flash Lite Image", 1),
++    "gemini-3-pro-image": ("Nano Banana Pro — Gemini 3 Pro Image", 14),
++    "gemini-2.5-flash-image": ("Nano Banana — Gemini 2.5 Flash Image (legacy)", 3),
++}
++_ENDPOINT = "https://generativelanguage.googleapis.com/v1/models/"
++_ASPECTS = {"landscape": "16:9", "square": "1:1", "portrait": "9:16"}
++_MIME = {"image/png": ("PNG", "png"), "image/jpeg": ("JPEG", "jpg"),
++         "image/webp": ("WEBP", "webp")}
++_MAX_INPUT = 12 * 1024 * 1024  # Leaves room in the official 20 MB inline request cap.
++_MAX_RESPONSE = 40 * 1024 * 1024
++_MAX_IMAGE = 25 * 1024 * 1024
++_MAX_PROMPT = 32000
++
++
++def _key() -> str:
++    """Read the existing Gemini owner, including tombstones and profile scope.
++
++    Do not use generic tool-helper fallback to custom:gemini, config.api_key,
++    FAL_KEY or another provider. A broken authority read means unconfigured.
++    """
++    try:
++        from agent.secret_scope import get_secret, is_multiplex_active
++        from hermes_cli.auth import (
++            PROVIDER_REGISTRY, has_usable_secret, is_source_suppressed,
++            resolve_api_key_provider_credentials,
++        )
++        if is_multiplex_active():
++            # With no scope, get_secret raises; never borrow process-global
++            # .env or a pool belonging to another profile.
++            for name in PROVIDER_REGISTRY["gemini"].api_key_env_vars:
++                if is_source_suppressed("gemini", "env:" + name):
++                    continue
++                value = get_secret(name, "")
++                if isinstance(value, str) and has_usable_secret(value):
++                    return value.strip()
++            return ""
++        credentials = resolve_api_key_provider_credentials("gemini")
++        value = credentials.get("api_key", "")
++        return value.strip() if isinstance(value, str) and has_usable_secret(value) else ""
++    except Exception:
++        return ""
++
++
++def _model(explicit=None) -> str:
++    if explicit is None:
++        from hermes_cli.config import load_config
++        config = load_config()
++        section = config.get("image_gen", {})
++        if not isinstance(section, dict):
++            raise ValueError("invalid image configuration")
++        explicit = section.get("model") or DEFAULT_MODEL
++    if not isinstance(explicit, str) or explicit not in _MODELS:
++        raise ValueError("model not in Google image catalog")
++    return explicit
++
++
++def _validate_image(data: bytes, mime: str) -> str:
++    """Only bounded, decodable still images can become a success receipt."""
++    from PIL import Image
++    if mime not in _MIME or not data or len(data) > _MAX_IMAGE:
++        raise ValueError("invalid image")
++    with warnings.catch_warnings():
++        warnings.simplefilter("error", Image.DecompressionBombWarning)
++        with Image.open(io.BytesIO(data)) as picture:
++            if (picture.format != _MIME[mime][0] or
++                    picture.width * picture.height > 64 * 1024 * 1024 or
++                    picture.width < 1 or picture.height < 1 or
++                    getattr(picture, "is_animated", False)):
++                raise ValueError("invalid image format or dimensions")
++            picture.verify()
++        # verify() checks container structure but may accept a truncated JPEG
++        # scan. Decode after reopening so success means usable image pixels,
++        # still under the same format/dimension budget checked above.
++        with Image.open(io.BytesIO(data)) as picture:
++            picture.load()
++    return _MIME[mime][1]
++
++
++def _references(image_url, reference_image_urls, limit: int) -> list[dict]:
++    """Reuse native URL/website policy, sandbox confinement and secret guard."""
++    from tools.image_source import ResolveContext, resolve_image_source
++    if image_url is not None and (not isinstance(image_url, str) or not image_url.strip()):
++        raise ValueError("invalid reference")
++    if reference_image_urls is not None and not isinstance(reference_image_urls, (list, tuple)):
++        raise ValueError("invalid references")
++    refs = ([image_url] if image_url else []) + list(reference_image_urls or [])
++    if len(refs) > limit or any(not isinstance(ref, str) or not ref.strip() for ref in refs):
++        raise ValueError("invalid reference count")
++    result, total = [], 0
++    for ref in refs:
++        # Base64 preflight avoids allocating a giant caller-supplied payload.
++        if ref.startswith("data:") and len(ref) > (_MAX_INPUT * 4 // 3 + 128):
++            raise ValueError("reference too large")
++        from tools.interrupt import is_interrupted
++        if is_interrupted():
++            raise InterruptedError()
++        resolved = asyncio.run(resolve_image_source(ref, ResolveContext()))
++        total += len(resolved.data)
++        if total > _MAX_INPUT:
++            raise ValueError("reference budget exceeded")
++        _validate_image(resolved.data, resolved.mime)
++        result.append({"inlineData": {"mimeType": resolved.mime,
++                                     "data": base64.b64encode(resolved.data).decode("ascii")}})
++    return result
++
++
++def _read_response(response, deadline: float) -> dict:
++    raw = bytearray()
++    for chunk in response.iter_content(chunk_size=65536):
++        if time.monotonic() > deadline:
++            raise TimeoutError()
++        if chunk:
++            raw.extend(chunk)
++            if len(raw) > _MAX_RESPONSE:
++                raise ValueError("response too large")
++    value = json.loads(raw)
++    if not isinstance(value, dict):
++        raise ValueError("invalid response")
++    return value
++
++
++def _output(response: dict) -> tuple[str, str]:
++    if response.get("promptFeedback", {}).get("blockReason"):
++        raise PermissionError()
++    candidates = response.get("candidates")
++    if not isinstance(candidates, list) or len(candidates) != 1:
++        raise ValueError("missing candidate")
++    candidate = candidates[0]
++    if not isinstance(candidate, dict):
++        raise ValueError("invalid candidate")
++    if candidate.get("finishReason") in {"SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY", "RECITATION"}:
++        raise PermissionError()
++    if candidate.get("finishReason") != "STOP":
++        raise ValueError("generation did not finish")
++    parts = candidate.get("content", {}).get("parts")
++    if not isinstance(parts, list) or len(parts) > 128:
++        raise ValueError("missing image parts")
++    images = [part.get("inlineData") for part in parts
++              if isinstance(part, dict) and part.get("thought") is not True and "inlineData" in part]
++    # Never silently discard extra generated images; this interface returns one.
++    if len(images) != 1 or not isinstance(images[0], dict):
++        raise ValueError("expected one final image")
++    data, mime = images[0].get("data"), images[0].get("mimeType")
++    if not isinstance(data, str) or len(data) > (_MAX_IMAGE * 4 // 3 + 8):
++        raise ValueError("invalid image data")
++    decoded = base64.b64decode(data, validate=True)
++    extension = _validate_image(decoded, mime)
++    return data, extension
++
++
++class GoogleImageGenProvider(ImageGenProvider):
++    @property
++    def name(self):
++        return "google"
++
++    @property
++    def display_name(self):
++        return "Google AI Studio"
++
++    def is_available(self):
++        return self.get_readiness_status() == "ready"
++
++    def get_readiness_status(self):
++        # Structural readiness only: never a network probe or billing claim.
++        if not _key():
++            return "needs_keys"
++        try:
++            import requests  # noqa: F401
++            from PIL import Image  # noqa: F401
++            return "ready"
++        except ImportError:
++            return "needs_setup"
++
++    def get_setup_schema(self):
++        return {"name": self.display_name, "badge": "paid",
++                "tag": "Official Google API; uses the Google AI Studio key from model settings. No FAL account needed.",
++                "env_vars": [{"key": "GOOGLE_API_KEY", "prompt": "Google AI Studio API key (model settings)",
++                              "url": "https://aistudio.google.com/apikey"}]}
++
++    def list_models(self):
++        return [{"id": name, "display": meta[0]} for name, meta in _MODELS.items()]
++
++    def default_model(self):
++        return DEFAULT_MODEL
++
++    def capabilities(self):
++        try:
++            limit = _MODELS[_model()][1]
++        except Exception:
++            limit = 0
++        return {"modalities": ["text", "image"] if limit else ["text"], "max_reference_images": limit}
++
++    def generate(self, prompt, aspect_ratio=DEFAULT_ASPECT_RATIO, *, image_url=None,
++                 reference_image_urls=None, **kwargs: Any):
++        aspect, model = resolve_aspect_ratio(aspect_ratio), ""
++
++        def fail(kind, message, *, dispatched=False):
++            # No raw exceptions, response bodies, keys, URLs or input image data.
++            return {**error_response(error=message, error_type=kind, provider=self.name,
++                                     model=model, aspect_ratio=aspect),
++                    "retryable": False, "effect_disposition": "unknown" if dispatched else "none"}
++
++        try:
++            valid_prompt = isinstance(prompt, str) and prompt.strip() and len(prompt.encode("utf-8")) <= _MAX_PROMPT
++        except UnicodeError:
++            valid_prompt = False
++        if not valid_prompt:
++            return fail("invalid_argument", "A non-empty bounded image prompt is required.")
++        try:
++            model = _model(kwargs.get("model"))
++        except Exception:
++            return fail("invalid_model", "Select a model from the Google image-generation catalog.")
++        key = _key()
++        if not key:
++            return fail("auth_required", "Configure Google AI Studio in the existing model API-key settings. No FAL key is used.")
++        try:
++            import requests
++            parts = [{"text": prompt.strip()}] + _references(image_url, reference_image_urls, _MODELS[model][1])
++        except ImportError:
++            return fail("missing_dependency", "The packaged image HTTP or image-validation component is unavailable.")
++        except InterruptedError:
++            return fail("cancelled", "Cancelled before Google submission; no generation was started.")
++        except Exception:
++            return fail("invalid_reference", "A reference image is unavailable, blocked, invalid or exceeds the image limit.")
++        from tools.interrupt import is_interrupted
++        if is_interrupted():
++            return fail("cancelled", "Cancelled before Google submission; no generation was started.")
++        # Re-resolve after reference loading: deletion/rotation must take effect
++        # before submission, without retaining a key in a provider instance.
++        key = _key()
++        if not key:
++            return fail("auth_required", "The Google AI Studio credential is no longer available.")
++        image_config = {"aspectRatio": _ASPECTS[aspect]}
++        if model != "gemini-2.5-flash-image":
++            image_config["imageSize"] = "1K"
++        payload = {"contents": [{"role": "user", "parts": parts}],
++                   "generationConfig": {"candidateCount": 1, "responseModalities": ["TEXT", "IMAGE"],
++                                        "responseFormat": {"image": image_config}}}
++        deadline = time.monotonic() + 120
++        try:
++            # Fixed official host + no redirects: config/env cannot redirect a
++            # Google key. requests does not retry POST by default.
++            with requests.post(_ENDPOINT + model + ":generateContent", json=payload,
++                               headers={"x-goog-api-key": key, "Content-Type": "application/json"},
++                               timeout=(10, 120), stream=True, allow_redirects=False) as response:
++                if response.status_code != 200:
++                    kind = {401: "auth_failed", 403: "access_denied", 404: "model_unavailable",
++                            429: "quota_or_rate_limit"}.get(response.status_code, "api_error")
++                    return fail(kind, "Google did not complete image generation. Check access, model availability and quota; no automatic retry was sent.", dispatched=True)
++                output = _read_response(response, deadline)
++        except (requests.Timeout, TimeoutError):
++            return fail("timeout", "The Google request timed out. Its remote outcome and charges are unknown; do not retry automatically.", dispatched=True)
++        except Exception:
++            return fail("transport_error", "The Google response could not be received or validated. Its remote outcome is unknown; no automatic retry was sent.", dispatched=True)
++        try:
++            encoded, extension = _output(output)
++        except PermissionError:
++            return fail("content_blocked", "Google declined this image request under its content policy.", dispatched=True)
++        except Exception:
++            return fail("invalid_response", "Google returned no valid completed image. Text or reasoning is not an image result.", dispatched=True)
++        if is_interrupted():
++            return fail("cancelled", "The local wait was cancelled after submission. Remote generation may be billable; no image was published.", dispatched=True)
++        try:
++            path = save_b64_image(encoded, prefix="google_image", extension=extension)
++        except Exception:
++            return fail("io_error", "Google generated an image but it could not be saved locally. Do not regenerate automatically.", dispatched=True)
++        return success_response(image=str(path), model=model, prompt=prompt.strip(), aspect_ratio=aspect,
++                                provider=self.name, modality="image" if len(parts) > 1 else "text")
++
++
++def register(ctx):
++    ctx.register_image_gen_provider(GoogleImageGenProvider())
+diff --git a/plugins/image_gen/google/plugin.yaml b/plugins/image_gen/google/plugin.yaml
+new file mode 100644
+--- /dev/null
++++ b/plugins/image_gen/google/plugin.yaml
+@@ -0,0 +1,5 @@
++name: google
++version: 1.0.0
++description: "Google AI Studio native Nano Banana image generation. Reuses the native Gemini credential authority."
++author: Lilith
++kind: backend
+diff --git a/tests/tools/test_google_native_image.py b/tests/tools/test_google_native_image.py
+new file mode 100644
+--- /dev/null
++++ b/tests/tools/test_google_native_image.py
+@@ -0,0 +1,491 @@
++"""Synthetic profiles and mocked HTTP only; never a paid Google/FAL request."""
++import base64
++import importlib.util
++import io
++import json
++import os
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++SOURCE = Path(os.environ["LILITH_TEST_SOURCE"])
++spec = importlib.util.spec_from_file_location("google_image_test_backend", SOURCE / "plugins/image_gen/google/__init__.py")
++google = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(google)
++REAL_MODEL = google._model
++KEY = "fixture-google-secret-0A9z"
++
++
++@pytest.fixture(autouse=True)
++def isolated(monkeypatch, tmp_path):
++    import requests
++    import hermes_constants
++    from agent import secret_scope
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_LILITH_BOUND_HOME", str(tmp_path))
++    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
++    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
++    monkeypatch.delenv("FAL_KEY", raising=False)
++    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", False)
++    token = secret_scope.set_secret_scope(None)
++    monkeypatch.setattr(requests, "post", lambda *a, **kw: pytest.fail("unmocked generation request"))
++    monkeypatch.setattr(requests, "get", lambda *a, **kw: pytest.fail("unmocked reference request"))
++    monkeypatch.setattr(google, "_model", lambda explicit=None: explicit or google.DEFAULT_MODEL)
++    from tools import interrupt
++    monkeypatch.setattr(interrupt, "is_interrupted", lambda: False)
++    yield
++    secret_scope.reset_secret_scope(token)
++
++
++def png():
++    from PIL import Image
++    output = io.BytesIO()
++    Image.new("RGB", (2, 3), "blue").save(output, format="PNG")
++    return output.getvalue()
++
++
++def good_response():
++    return {"candidates": [{"finishReason": "STOP", "content": {"parts": [
++        {"text": "untrusted answer not used as image"},
++        {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(png()).decode()}}
++    ]}}]}
++
++
++def truncated_jpeg():
++    from PIL import Image
++    output = io.BytesIO()
++    Image.new("RGB", (64, 64), "blue").save(output, format="JPEG")
++    return output.getvalue()[:-50]
++
++
++class Response:
++    def __init__(self, value=None, status=200, chunks=None):
++        self.status_code, self.value, self.chunks = status, value, chunks
++        self.closed = False
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *args):
++        self.closed = True
++
++    def iter_content(self, chunk_size):
++        yield from self.chunks if self.chunks is not None else [json.dumps(self.value).encode()]
++
++
++def mocked_call(monkeypatch, response=None, error=None):
++    import requests
++    monkeypatch.setattr(google, "_key", lambda: KEY)
++    calls = []
++    def post(*args, **kwargs):
++        calls.append((args, kwargs))
++        if error:
++            raise error
++        return response if response is not None else Response(good_response())
++    monkeypatch.setattr(requests, "post", post)
++    return calls
++
++
++def test_metadata_and_native_catalog(monkeypatch):
++    from agent import image_gen_registry
++    from hermes_cli import tools_config, plugins
++    from tui_gateway.native_media_setup import model_metadata, validate_model, apply_model
++    provider = google.GoogleImageGenProvider()
++    registered = []
++    google.register(SimpleNamespace(register_image_gen_provider=registered.append))
++    assert [p.name for p in registered] == ["google"]
++    monkeypatch.setattr(image_gen_registry, "list_providers", lambda: [provider])
++    monkeypatch.setattr(image_gen_registry, "get_provider", lambda name: provider if name == "google" else None)
++    monkeypatch.setattr(plugins, "_ensure_plugins_discovered", lambda **kw: None)
++    row, = tools_config._plugin_image_gen_providers()
++    assert row["image_gen_plugin_name"] == "google"
++    assert row["name"] == "Google AI Studio"
++    assert row["env_vars"][0]["key"] == "GOOGLE_API_KEY"
++    assert "FAL_KEY" not in json.dumps(row)
++    models, selected = model_metadata("image_gen", row, {})
++    assert models == list(google._MODELS)
++    assert selected == google.DEFAULT_MODEL
++    cfg = {"image_gen": {"provider": "google"}}
++    selection = {"toolset": "image_gen", "provider": row["name"], "model": "gemini-3-pro-image"}
++    validate_model(selection, row, cfg)
++    apply_model(selection, row, cfg)
++    assert cfg["image_gen"] == {"provider": "google", "model": "gemini-3-pro-image"}
++    with pytest.raises(ValueError):
++        validate_model({**selection, "model": "fal-ai/nano-banana-2"}, row, cfg)
++
++
++@pytest.mark.parametrize("alias", ["GOOGLE_API_KEY", "GEMINI_API_KEY"])
++def test_existing_native_credential_alias(monkeypatch, alias):
++    monkeypatch.setenv(alias, KEY)
++    assert google._key() == KEY
++
++
++def test_native_pool_not_fal_or_custom_provider(monkeypatch):
++    from hermes_cli import auth
++    from agent import credential_pool
++    seen = []
++    monkeypatch.setenv("FAL_KEY", "fixture-fal-unrelated")
++    def load(name):
++        seen.append(name)
++        return SimpleNamespace(has_credentials=lambda: True, peek=lambda: SimpleNamespace(access_token=KEY))
++    monkeypatch.setattr(credential_pool, "load_pool", load)
++    assert google._key() == KEY
++    assert seen == ["gemini"]
++
++
++def test_native_dotenv_rotation_preferred_to_stale_environment(monkeypatch, tmp_path):
++    monkeypatch.setenv("GOOGLE_API_KEY", "fixture-stale-launcher-key")
++    (tmp_path / ".env").write_text("GOOGLE_API_KEY=" + KEY + "\n", encoding="utf-8")
++    assert google._key() == KEY
++    (tmp_path / ".env").write_text("GOOGLE_API_KEY=fixture-new-rotation-key\n", encoding="utf-8")
++    assert google._key() == "fixture-new-rotation-key"
++
++
++def test_native_suppression_and_delete_do_not_revive_key(monkeypatch):
++    from hermes_cli import auth
++    from agent import credential_pool
++    monkeypatch.setenv("GOOGLE_API_KEY", KEY)
++    monkeypatch.setenv("GEMINI_API_KEY", KEY)
++    monkeypatch.setattr(auth, "is_source_suppressed", lambda provider, source: provider == "gemini")
++    monkeypatch.setattr(credential_pool, "load_pool", lambda name: None)
++    assert google._key() == ""
++    assert google.GoogleImageGenProvider().is_available() is False
++    assert google.GoogleImageGenProvider().generate("a tree")["error_type"] == "auth_required"
++
++
++def test_real_native_replace_remove_lifecycle_on_synthetic_profile(monkeypatch, tmp_path):
++    from hermes_cli import credential_lifecycle as lifecycle
++    from hermes_cli.config import invalidate_env_cache
++    (tmp_path / "config.yaml").write_text("model:\n  provider: gemini\n  default: gemini-fixture\n", encoding="utf-8")
++    invalidate_env_cache()
++    lifecycle.replace_provider_api_key("gemini", KEY, "google-fixture-replace-a")
++    assert google._key() == KEY
++    lifecycle.replace_provider_api_key("gemini", "fixture-rotated-google-key", "google-fixture-replace-b")
++    assert google._key() == "fixture-rotated-google-key"
++    lifecycle.remove_provider_api_key("gemini", "google-fixture-remove-c")
++    assert google._key() == ""
++    # A launcher cannot resurrect an explicitly removed alias.
++    monkeypatch.setenv("GOOGLE_API_KEY", KEY)
++    assert google._key() == ""
++
++
++def test_legacy_readiness_does_not_invoke_remote_backend(monkeypatch):
++    from agent import image_gen_registry
++    from hermes_cli import tools_config as tc
++    monkeypatch.setattr(image_gen_registry, "get_provider", lambda name: SimpleNamespace(
++        is_available=lambda: pytest.fail("legacy entitlement probe must not run")))
++    monkeypatch.setattr(tc, "get_env_value", lambda name: "")
++    assert tc.provider_readiness_status({"image_gen_plugin_name": "legacy", "env_vars": [{"key": "FAKE_KEY"}]}, {}) == "needs_keys"
++
++
++@pytest.mark.parametrize("scope,expected", [(None, ""), ({}, ""), ({"GOOGLE_API_KEY": "fixture-profile-only"}, "fixture-profile-only")])
++def test_multiplex_profile_isolation(monkeypatch, scope, expected):
++    from agent import secret_scope
++    from hermes_cli import auth
++    monkeypatch.setenv("GOOGLE_API_KEY", KEY)
++    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
++    monkeypatch.setattr(auth, "resolve_api_key_provider_credentials", lambda _: pytest.fail("global authority used in multiplex"))
++    token = secret_scope.set_secret_scope(scope)
++    try:
++        assert google._key() == expected
++    finally:
++        secret_scope.reset_secret_scope(token)
++
++
++def test_suppression_in_multiplex(monkeypatch):
++    from agent import secret_scope
++    from hermes_cli import auth
++    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
++    monkeypatch.setattr(auth, "is_source_suppressed", lambda *_: True)
++    token = secret_scope.set_secret_scope({"GOOGLE_API_KEY": KEY})
++    try:
++        assert google._key() == ""
++    finally:
++        secret_scope.reset_secret_scope(token)
++
++
++def test_authority_failure_is_closed(monkeypatch):
++    from hermes_cli import auth
++    monkeypatch.setenv("GOOGLE_API_KEY", KEY)
++    def broken(_):
++        raise ValueError(KEY)
++    monkeypatch.setattr(auth, "resolve_api_key_provider_credentials", broken)
++    assert google._key() == ""
++
++
++def test_readiness_uses_plugin_resolver_and_not_only_env(monkeypatch):
++    from agent import image_gen_registry
++    from hermes_cli import tools_config as tc
++    from tools import native_tool_setup_tool as setup
++    provider = google.GoogleImageGenProvider()
++    row = {**provider.get_setup_schema(), "image_gen_plugin_name": "google"}
++    monkeypatch.setattr(image_gen_registry, "get_provider", lambda name: provider)
++    monkeypatch.setattr(tc, "get_env_value", lambda name: "")
++    monkeypatch.setattr(google, "_key", lambda: KEY)
++    monkeypatch.setattr(tc, "_get_platform_tools", lambda *a, **kw: ["image_gen"])
++    assert tc.provider_readiness_status(row, {}) == "ready"
++    snapshot = setup._snapshot("image_gen", {}, [row])
++    assert snapshot["providers"][0]["missing_fields"] == []
++    assert snapshot["loaded_verified"] is False and snapshot["api_verified"] is False
++    monkeypatch.setattr(google, "_key", lambda: "")
++    assert tc.provider_readiness_status(row, {}) == "needs_keys"
++    assert setup._support(setup._credential_form(row)) == "native_manager_required"
++
++
++def test_readiness_failed_provider_is_not_ready(monkeypatch):
++    from agent import image_gen_registry
++    from hermes_cli import tools_config as tc
++    row = {"image_gen_plugin_name": "google", "env_vars": [{"key": "GOOGLE_API_KEY"}]}
++    monkeypatch.setattr(tc, "get_env_value", lambda name: KEY)
++    monkeypatch.setattr(image_gen_registry, "get_provider", lambda name: SimpleNamespace(get_readiness_status=lambda: "unknown"))
++    assert tc.provider_readiness_status(row, {}) == "needs_setup"
++
++
++@pytest.mark.parametrize("model", list(google._MODELS))
++def test_official_request_response_no_credentials_or_model_fallback(monkeypatch, tmp_path, model):
++    monkeypatch.setenv("GEMINI_BASE_URL", "https://not-google.invalid/collect")
++    calls = mocked_call(monkeypatch)
++    result = google.GoogleImageGenProvider().generate("a tree", "portrait", model=model)
++    assert result["success"] is True and result["provider"] == "google" and result["model"] == model
++    assert len(calls) == 1
++    (url,), kwargs = calls[0]
++    assert url == google._ENDPOINT + model + ":generateContent"
++    assert kwargs["allow_redirects"] is False and kwargs["timeout"] == (10, 120)
++    assert kwargs["headers"]["x-goog-api-key"] == KEY
++    payload = kwargs["json"]
++    assert payload["contents"] == [{"role": "user", "parts": [{"text": "a tree"}]}]
++    assert payload["generationConfig"]["responseModalities"] == ["TEXT", "IMAGE"]
++    assert payload["generationConfig"]["responseFormat"]["image"]["aspectRatio"] == "9:16"
++    assert ("imageSize" in payload["generationConfig"]["responseFormat"]["image"]) == (model != "gemini-2.5-flash-image")
++    assert KEY not in json.dumps(result) and KEY not in json.dumps(payload)
++    path = Path(result["image"])
++    assert path.parent == tmp_path / "cache/images"
++    assert path.read_bytes() == png()
++
++
++def test_reference_image_native_resolver_and_mime(monkeypatch):
++    from tools import image_source
++    calls = mocked_call(monkeypatch)
++    refs = []
++    async def resolve(ref, ctx):
++        refs.append(ref)
++        return SimpleNamespace(data=png(), mime="image/png")
++    monkeypatch.setattr(image_source, "resolve_image_source", resolve)
++    result = google.GoogleImageGenProvider().generate("make blue", image_url="fixture.png")
++    assert result["modality"] == "image" and refs == ["fixture.png"]
++    part = calls[0][1]["json"]["contents"][0]["parts"][1]
++    assert base64.b64decode(part["inlineData"]["data"]) == png()
++
++
++def test_reference_secret_guard_before_submission(monkeypatch, tmp_path):
++    calls = mocked_call(monkeypatch)
++    secret = tmp_path / ".env"
++    secret.write_bytes(png())  # A valid picture at a secret path must still be blocked.
++    result = google.GoogleImageGenProvider().generate("edit", image_url=str(secret))
++    assert result["error_type"] == "invalid_reference"
++    assert calls == []
++
++
++def test_native_local_source_reads_at_most_the_existing_ingest_budget(monkeypatch):
++    from tools import image_source
++    read_sizes = []
++    class BoundedStream(io.BytesIO):
++        def read(self, size=-1):
++            read_sizes.append(size)
++            assert 0 <= size <= 65
++            return super().read(size)
++    stream = BoundedStream(b"x" * 200)
++    path = SimpleNamespace(open=lambda mode: stream)
++    monkeypatch.setattr(image_source, "_MAX_INGEST_BYTES", 64)
++    with pytest.raises(image_source.SourceTooLarge):
++        image_source._read_host_image_bytes(path)
++    assert read_sizes == [65] and stream.closed
++
++
++def test_oversized_native_local_reference_does_not_submit(monkeypatch, tmp_path):
++    from tools import image_source
++    calls = mocked_call(monkeypatch)
++    local = tmp_path / "picture.png"
++    local.write_bytes(png())
++    monkeypatch.setattr(image_source, "_MAX_INGEST_BYTES", 8)
++    result = google.GoogleImageGenProvider().generate("edit", image_url=str(local))
++    assert result["error_type"] == "invalid_reference" and calls == []
++
++
++def test_truncated_reference_jpeg_is_rejected_before_submission(monkeypatch, tmp_path):
++    calls = mocked_call(monkeypatch)
++    local = tmp_path / "truncated.jpg"
++    local.write_bytes(truncated_jpeg())
++    result = google.GoogleImageGenProvider().generate("edit", image_url=str(local))
++    assert result["error_type"] == "invalid_reference" and calls == []
++
++
++def test_truncated_generated_jpeg_is_not_published(monkeypatch, tmp_path):
++    value = good_response()
++    value["candidates"][0]["content"]["parts"][1] = {"inlineData": {
++        "mimeType": "image/jpeg", "data": base64.b64encode(truncated_jpeg()).decode()}}
++    calls = mocked_call(monkeypatch, Response(value))
++    result = google.GoogleImageGenProvider().generate("tree")
++    assert result["error_type"] == "invalid_response" and len(calls) == 1
++    assert not (tmp_path / "cache/images").exists()
++
++
++@pytest.mark.parametrize("refs", [["x"] * 15, [5], "not-a-list", ["data:image/png;base64,bm90YW5pbWFnZQ=="]])
++def test_invalid_reference_does_not_submit(monkeypatch, refs):
++    calls = mocked_call(monkeypatch)
++    result = google.GoogleImageGenProvider().generate("edit", reference_image_urls=refs)
++    assert result["error_type"] == "invalid_reference" and calls == []
++
++
++@pytest.mark.parametrize("status,kind", [(302, "api_error"), (401, "auth_failed"), (403, "access_denied"),
++                                        (404, "model_unavailable"), (429, "quota_or_rate_limit"), (500, "api_error")])
++def test_http_error_redacted_and_no_retry(monkeypatch, status, kind):
++    calls = mocked_call(monkeypatch, Response({"error": KEY}, status))
++    result = google.GoogleImageGenProvider().generate("tree")
++    assert result["error_type"] == kind and len(calls) == 1
++    assert result["retryable"] is False and result["effect_disposition"] == "unknown"
++    assert KEY not in json.dumps(result)
++
++
++@pytest.mark.parametrize("exception", [TimeoutError(KEY), TypeError(KEY), ValueError(KEY)])
++def test_transport_failure_cannot_escape_or_retry(monkeypatch, exception):
++    calls = mocked_call(monkeypatch, error=exception)
++    result = google.GoogleImageGenProvider().generate("tree")
++    assert result["success"] is False and len(calls) == 1
++    assert result["effect_disposition"] == "unknown" and result["retryable"] is False
++    assert KEY not in json.dumps(result)
++
++
++@pytest.mark.parametrize("value", [None, [], {}, {"promptFeedback": {"blockReason": "SAFETY"}},
++                                    {"candidates": [None]}, {"candidates": [{"finishReason": "MAX_TOKENS"}]},
++                                    {"candidates": [{"finishReason": "STOP", "content": None}]}])
++def test_malformed_or_blocked_response_no_success(monkeypatch, value):
++    calls = mocked_call(monkeypatch, Response(value))
++    result = google.GoogleImageGenProvider().generate("tree")
++    assert result["success"] is False and len(calls) == 1 and result["image"] is None
++
++
++@pytest.mark.parametrize("modification", ["thought", "wrong_mime", "bad_base64", "text_only", "extra_image"])
++def test_only_a_valid_final_image_can_succeed(monkeypatch, modification):
++    value = good_response()
++    parts = value["candidates"][0]["content"]["parts"]
++    if modification == "thought":
++        parts[1]["thought"] = True
++    elif modification == "wrong_mime":
++        parts[1]["inlineData"]["mimeType"] = "text/plain"
++    elif modification == "bad_base64":
++        parts[1]["inlineData"]["data"] = "!!not-base64"
++    elif modification == "text_only":
++        parts.pop()
++    else:
++        parts.append(parts[1])
++    calls = mocked_call(monkeypatch, Response(value))
++    assert google.GoogleImageGenProvider().generate("tree")["success"] is False
++    assert len(calls) == 1
++
++
++def test_timeout_deadline_and_size_cap(monkeypatch):
++    response = Response(chunks=[b"x" * 7])
++    monkeypatch.setattr(google, "_MAX_RESPONSE", 4)
++    with pytest.raises(ValueError):
++        google._read_response(response, float("inf"))
++    with pytest.raises(TimeoutError):
++        google._read_response(response, 0)
++
++
++def test_revocation_during_reference_preparation(monkeypatch):
++    calls = mocked_call(monkeypatch)
++    values = iter([KEY, ""])
++    monkeypatch.setattr(google, "_key", lambda: next(values))
++    result = google.GoogleImageGenProvider().generate("tree")
++    assert result["error_type"] == "auth_required" and calls == []
++
++
++def test_interrupt_before_submission_no_request(monkeypatch):
++    from tools import interrupt
++    calls = mocked_call(monkeypatch)
++    monkeypatch.setattr(interrupt, "is_interrupted", lambda: True)
++    result = google.GoogleImageGenProvider().generate("tree")
++    assert result["error_type"] == "cancelled" and result["effect_disposition"] == "none" and calls == []
++
++
++def test_interrupt_after_submission_no_publish(monkeypatch, tmp_path):
++    from tools import interrupt
++    calls = mocked_call(monkeypatch)
++    checks = iter([False, True])
++    monkeypatch.setattr(interrupt, "is_interrupted", lambda: next(checks))
++    result = google.GoogleImageGenProvider().generate("tree")
++    assert result["error_type"] == "cancelled" and result["effect_disposition"] == "unknown"
++    assert len(calls) == 1 and not (tmp_path / "cache/images").exists()
++
++
++@pytest.mark.parametrize("model", ["fal-ai/nano-banana-2", "gemini-3.1-flash-image:evil", "not-known", "", 5])
++def test_model_validation_has_no_fallback(monkeypatch, model):
++    calls = mocked_call(monkeypatch)
++    monkeypatch.setattr(google, "_model", REAL_MODEL)
++    result = google.GoogleImageGenProvider().generate("tree", model=model)
++    assert result["error_type"] == "invalid_model" and calls == []
++
++
++@pytest.mark.parametrize("prompt", [None, 3, "", " ", "\ud800", "a" * 32001])
++def test_invalid_prompt_no_effect(monkeypatch, prompt):
++    calls = mocked_call(monkeypatch)
++    result = google.GoogleImageGenProvider().generate(prompt)
++    assert result["error_type"] == "invalid_argument" and calls == []
++
++
++def test_native_wrapper_post_dispatch_typeerror_not_retried(monkeypatch):
++    from tools import image_generation_tool as tool
++    from agent import image_gen_registry as registry
++    from hermes_cli import plugins
++    calls = mocked_call(monkeypatch, Response({"candidates": [{"finishReason": "STOP", "content": None}]}))
++    monkeypatch.setattr(tool, "_read_configured_image_provider", lambda: "google")
++    monkeypatch.setattr(tool, "_read_configured_image_model", lambda: google.DEFAULT_MODEL)
++    monkeypatch.setattr(plugins, "_ensure_plugins_discovered", lambda **kw: None)
++    monkeypatch.setattr(registry, "get_provider", lambda _: google.GoogleImageGenProvider())
++    result = json.loads(tool._dispatch_to_plugin_provider("tree", "square"))
++    assert result["error_type"] == "invalid_response" and len(calls) == 1
++
++
++def test_google_setup_never_requests_a_key_or_changes_provider(monkeypatch):
++    from tools import native_tool_setup_tool as setup
++    from hermes_cli import tools_config as tc
++    from agent import image_gen_registry
++    from tui_gateway import native_setup
++    provider = google.GoogleImageGenProvider()
++    row = {**provider.get_setup_schema(), "image_gen_plugin_name": "google"}
++    cfg = {"image_gen": {"provider": "google", "model": google.DEFAULT_MODEL}}
++    monkeypatch.setattr(setup, "_metadata", lambda name: (cfg, [row]))
++    monkeypatch.setattr(tc, "_get_platform_tools", lambda *a, **kw: ["image_gen"])
++    monkeypatch.setattr(tc, "_is_provider_active", lambda *a: True)
++    monkeypatch.setattr(native_setup, "resolve_selection", lambda *a: row)
++    monkeypatch.setattr(image_gen_registry, "get_provider", lambda _: provider)
++    monkeypatch.setattr(google, "_key", lambda: "")
++    result = setup.run_native_setup("image_gen", "configure",
++        prompt=lambda *a, **kw: pytest.fail("Google keys belong to existing model credential manager"),
++        cancelled=lambda: False)
++    assert result["status"] == "native_manager_required"
++    assert result["reason"] == "native_credential_manager_required"
++    assert cfg["image_gen"]["provider"] == "google"
++
++
++def test_discovery_failure_never_falls_back_to_fal(monkeypatch):
++    from tools import image_generation_tool as tool
++    from hermes_cli import plugins
++    monkeypatch.setattr(tool, "_read_configured_image_provider", lambda: "google")
++    monkeypatch.setattr(tool, "_read_configured_image_model", lambda: google.DEFAULT_MODEL)
++    def broken(**kwargs):
++        raise RuntimeError(KEY)
++    monkeypatch.setattr(plugins, "_ensure_plugins_discovered", broken)
++    result = json.loads(tool._dispatch_to_plugin_provider("tree", "square"))
++    assert result["error_type"] == "provider_unavailable"
++    assert result["effect_disposition"] == "none" and KEY not in json.dumps(result)
++
++
++@pytest.mark.parametrize("locale", ["zh-TW", "zh-CN", "ja-JP", "en-US"])
++def test_setup_copy_describes_only_the_selected_service(locale):
++    from tools.native_setup_locale import text
++    for provider in ("Google AI Studio", "FAL.ai"):
++        assert "Spotify" not in text(locale, "confirm_setup", toolset="image_gen", provider=provider)
++    assert "Spotify" in text(locale, "confirm_spotify", toolset="spotify", provider="Spotify")
+diff --git a/tools/image_generation_tool.py b/tools/image_generation_tool.py
+index e77e064..1faf102 100644
+--- a/tools/image_generation_tool.py
++++ b/tools/image_generation_tool.py
+@@ -1614,9 +1614,14 @@ def _dispatch_to_plugin_provider(
+ 
+         _ensure_plugins_discovered()
+         provider = get_provider(configured)
+-    except Exception as exc:
+-        logger.debug("image_gen plugin dispatch skipped: %s", exc)
+-        return None
++    except Exception:
++        # A selected non-FAL backend is an explicit user choice. Discovery
++        # failure must never submit a differently billed FAL request.
++        return json.dumps({
++            "success": False, "image": None,
++            "error": "The selected image provider could not be loaded. No generation was submitted.",
++            "error_type": "provider_unavailable", "effect_disposition": "none", "retryable": False,
++        })
+ 
+     if provider is None:
+         try:
+diff --git a/tools/image_source.py b/tools/image_source.py
+index 8e60c08..dfb3a84 100644
+--- a/tools/image_source.py
++++ b/tools/image_source.py
+@@ -144,7 +144,7 @@ async def resolve_image_source(
+                 raise_if_read_blocked(str(host_target))
+             except ValueError as exc:
+                 raise SourceUnsafe(str(exc), src=s, origin="file")
+-        data = await asyncio.to_thread(host_target.read_bytes)
++        data = await asyncio.to_thread(_read_host_image_bytes, host_target)
+         return _finalize(data, "", "file", s, permitted)
+     if _is_local_terminal_backend():
+         # Local backend: any path was host-readable, so a miss simply means
+@@ -156,6 +156,17 @@ async def resolve_image_source(
+     return await _resolve_container_fallback(p, ctx, s, permitted)
+ 
+ 
++def _read_host_image_bytes(path: Path) -> bytes:
++    # Enforce the existing ingest cap while reading, not only afterwards in
++    # _finalize. stat() alone is insufficient when a local file grows between
++    # inspection and read. Confinement/credential checks remain above.
++    with path.open("rb") as source:
++        data = source.read(_MAX_INGEST_BYTES + 1)
++    if len(data) > _MAX_INGEST_BYTES:
++        raise SourceTooLarge("local image exceeds size limit", origin="file")
++    return data
++
++
+ def _resolve_data_url(s: str) -> tuple[bytes, str]:
+     header, _, payload = s.partition(",")
+     if ";base64" not in header:
+diff --git a/tools/native_setup_locale.py b/tools/native_setup_locale.py
+index 414e295..253079b 100644
+--- a/tools/native_setup_locale.py
++++ b/tools/native_setup_locale.py
+@@ -5,7 +5,8 @@ _TEXT = {
+         "cancel": "取消設定", "confirm": "繼續設定", "keep": "保留現有設定",
+         "replace": "替換", "remove": "移除", "install": "安裝必要元件", "skip": "稍後安裝",
+         "choose": "要協助設定 {toolset} 的哪個供應商？這不會改變工具開關或核准模式。",
+-        "confirm_setup": "協助設定 {toolset} / {provider}。資料只填入安全輸入卡，不會加入聊天；Spotify 登入由你在官方網頁完成。這不更改工具開關或核准模式。",
++        "confirm_setup": "協助設定 {toolset} / {provider}。資料只填入安全輸入卡，不會加入聊天。這不更改工具開關或核准模式。",
++        "confirm_spotify": "協助設定 {toolset} / {provider}。資料只填入安全輸入卡，不會加入聊天；Spotify 登入由你在官方網頁完成。這不更改工具開關或核准模式。",
+         "existing": "{provider} 的 {key} 已有設定。要保留、替換或移除？不會顯示現有內容。移除僅限此莉莉絲設定檔。",
+         "value": "請輸入 {provider} 的 {key}。內容不會加入聊天紀錄。",
+         "default": "預設建議值：{value}",
+@@ -19,7 +20,8 @@ _TEXT = {
+         "cancel": "取消设置", "confirm": "继续设置", "keep": "保留现有设置",
+         "replace": "替换", "remove": "移除", "install": "安装必要组件", "skip": "稍后安装",
+         "choose": "要协助设置 {toolset} 的哪个提供商？这不会改变工具开关或批准模式。",
+-        "confirm_setup": "协助设置 {toolset} / {provider}。资料只填入安全输入卡，不会加入聊天；Spotify 登录由你在官方网页完成。这不更改工具开关或批准模式。",
++        "confirm_setup": "协助设置 {toolset} / {provider}。资料只填入安全输入卡，不会加入聊天。这不更改工具开关或批准模式。",
++        "confirm_spotify": "协助设置 {toolset} / {provider}。资料只填入安全输入卡，不会加入聊天；Spotify 登录由你在官方网页完成。这不更改工具开关或批准模式。",
+         "existing": "{provider} 的 {key} 已有设置。要保留、替换或移除？不会显示现有内容。移除仅限此莉莉丝配置。",
+         "value": "请输入 {provider} 的 {key}。内容不会加入聊天记录。",
+         "default": "默认建议值：{value}",
+@@ -33,7 +35,8 @@ _TEXT = {
+         "cancel": "設定をキャンセル", "confirm": "設定を続ける", "keep": "現在の設定を保持",
+         "replace": "置き換える", "remove": "削除する", "install": "必要なコンポーネントをインストール", "skip": "後でインストール",
+         "choose": "{toolset} のどのプロバイダーを設定しますか？ツールの有効化や承認モードは変更しません。",
+-        "confirm_setup": "{toolset} / {provider} を設定します。値は安全な入力欄にのみ入力し、チャットには保存しません。Spotify は公式ページでご自身がログインします。ツールの有効化や承認モードは変更しません。",
++        "confirm_setup": "{toolset} / {provider} を設定します。値は安全な入力欄にのみ入力し、チャットには保存しません。ツールの有効化や承認モードは変更しません。",
++        "confirm_spotify": "{toolset} / {provider} を設定します。値は安全な入力欄にのみ入力し、チャットには保存しません。Spotify は公式ページでご自身がログインします。ツールの有効化や承認モードは変更しません。",
+         "existing": "{provider} の {key} は設定済みです。保持、置換、削除のどれにしますか？現在の値は表示しません。削除対象はこのリリスのプロファイルのみです。",
+         "value": "{provider} の {key} を入力してください。チャット履歴には追加しません。",
+         "default": "推奨される既定値：{value}",
+@@ -47,7 +50,8 @@ _TEXT = {
+         "cancel": "Cancel setup", "confirm": "Continue setup", "keep": "Keep existing setting",
+         "replace": "Replace", "remove": "Remove", "install": "Install required components", "skip": "Install later",
+         "choose": "Which provider should be configured for {toolset}? This does not change tool enablement or approval mode.",
+-        "confirm_setup": "Configure {toolset} / {provider}. Enter values only in the secure cards, not chat. Complete Spotify login yourself on its official page. Tool enablement and approval mode remain unchanged.",
++        "confirm_setup": "Configure {toolset} / {provider}. Enter values only in the secure cards, not chat. Tool enablement and approval mode remain unchanged.",
++        "confirm_spotify": "Configure {toolset} / {provider}. Enter values only in the secure cards, not chat. Complete Spotify login yourself on its official page. Tool enablement and approval mode remain unchanged.",
+         "existing": "{provider} already has a setting for {key}. Keep, replace, or remove it? Its value is never displayed. Removal applies only to this Lilith profile.",
+         "value": "Enter {key} for {provider}. The value will not be added to chat history.",
+         "default": "Suggested default: {value}",
+diff --git a/tools/native_tool_setup_tool.py b/tools/native_tool_setup_tool.py
+index 0a1d9bb..acd7499 100644
+--- a/tools/native_tool_setup_tool.py
++++ b/tools/native_tool_setup_tool.py
+@@ -89,8 +89,9 @@ def _snapshot(name, config, providers, locale="zh-TW"):
+         rows.append({"index": index, "name": provider["name"],
+                      "readiness": readiness, "setup_support": _support(provider),
+                      "dependency_status": dependency,
+-                     "missing_fields": [f["key"] for f in provider.get("env_vars", [])
+-                                        if not get_env_value(f["key"])]})
++                     "missing_fields": ([] if provider.get("image_gen_plugin_name") and readiness == "ready"
++                                        else [f["key"] for f in provider.get("env_vars", [])
++                                              if not get_env_value(f["key"])])})
+     return {"toolset": name, "enabled": name in tc._get_platform_tools(config, "cli", include_default_mcp_servers=False),
+             "providers": rows, "loaded_verified": False, "api_verified": False,
+             "next_step": _text(locale, "next")}
+@@ -176,7 +177,8 @@ def run_native_setup(name, action, *, prompt, cancelled, locale="zh-TW"):
+         if support == "no_setup_fields":
+             return {"status": "no_setup_fields", **snapshot}
+         answer = prompt("clarify.request", {
+-            "question": _text(locale, "confirm_setup", toolset=name, provider=provider["name"]),
++            "question": _text(locale, "confirm_spotify" if support == "spotify_oauth" else "confirm_setup",
++                              toolset=name, provider=provider["name"]),
+             "choices": [confirm, cancel]}, timeout=300)
+         if cancelled() or answer != confirm:
+             return {"status": "cancelled", "toolset": name}

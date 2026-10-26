@@ -1,0 +1,1751 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 74785e5..6d50194 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1083,7 +1083,8 @@ def init_agent(
+     # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
+     # (which creates a new AIAgent per message) won't duplicate handlers.
+     from hermes_logging import setup_logging, setup_verbose_logging
+-    setup_logging(hermes_home=_ra()._hermes_home)
++    if not isolated_request:
++        setup_logging(hermes_home=_ra()._hermes_home)
+ 
+     if agent.verbose_logging:
+         setup_verbose_logging()
+@@ -1594,6 +1595,7 @@ def init_agent(
+         enabled_toolsets=enabled_toolsets,
+         disabled_toolsets=disabled_toolsets,
+         quiet_mode=agent.quiet_mode,
++        **({"skip_tool_search_assembly": True} if isolated_request else {}),
+     )
+     
+     # Show tool configuration and store valid tool names for validation
+@@ -2047,7 +2049,7 @@ def init_agent(
+     # the probe is skipped entirely (no subprocess calls, no system-prompt
+     # line).  Useful for users on exotic setups where the probe heuristics
+     # are noisy.
+-    agent._environment_probe = bool(_agent_section.get("environment_probe", True))
++    agent._environment_probe = not isolated_request and bool(_agent_section.get("environment_probe", True))
+     # Warm the probe off-thread: it shells out to python3/pip (~0.5s of
+     # subprocess round-trips) and its result lands in the FIRST system
+     # prompt build, which sits on the time-to-first-token critical path.
+diff --git a/hermes_cli/providers.py b/hermes_cli/providers.py
+index 20884cb..35d5e07 100644
+--- a/hermes_cli/providers.py
++++ b/hermes_cli/providers.py
+@@ -668,7 +668,7 @@ def nous_api_mode(model: str = "") -> str:
+     return "chat_completions"
+ 
+ 
+-def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> str:
++def determine_api_mode(provider: str, base_url: str = "", model: str = "", *, allow_network: bool = True) -> str:
+     """Determine the API mode (wire protocol) for a provider/endpoint.
+ 
+     Resolution order:
+@@ -693,7 +693,7 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
+     if provider_norm in {"nous", "nous-portal", "nousresearch"}:
+         return nous_api_mode(model)
+ 
+-    pdef = get_provider(provider)
++    pdef = get_provider(provider) if allow_network else get_provider(provider, allow_network=False)
+     if pdef is not None:
+         return TRANSPORT_TO_API_MODE.get(pdef.transport, "chat_completions")
+ 
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index ee65a12..3af7acd 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -155,7 +155,7 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
+     return None
+ 
+ 
+-def _fallback_api_mode(provider: str, base_url: str, model: str = "") -> str:
++def _fallback_api_mode(provider: str, base_url: str, model: str = "", *, allow_metadata_network: bool = True) -> str:
+     """Resolve api_mode when no explicit/persisted mode applies.
+ 
+     Precedence: URL detection (host-mandated wire shapes) first, then the
+@@ -177,7 +177,8 @@ def _fallback_api_mode(provider: str, base_url: str, model: str = "") -> str:
+         return detected
+     from hermes_cli.providers import determine_api_mode
+ 
+-    return determine_api_mode(provider, base_url, model) or "chat_completions"
++    return (determine_api_mode(provider, base_url, model) if allow_metadata_network else
++            determine_api_mode(provider, base_url, model, allow_network=False)) or "chat_completions"
+ 
+ 
+ def _resolve_plain_custom_api_mode(model_cfg: Dict[str, Any], base_url: str) -> str:
+@@ -1498,6 +1499,7 @@ def _resolve_explicit_runtime(
+     explicit_api_key: Optional[str] = None,
+     explicit_base_url: Optional[str] = None,
+     target_model: Optional[str] = None,
++    allow_metadata_network: bool = True,
+ ) -> Optional[Dict[str, Any]]:
+     explicit_api_key = str(explicit_api_key or "").strip()
+     explicit_base_url = str(explicit_base_url or "").strip().rstrip("/")
+@@ -1645,7 +1647,8 @@ def _resolve_explicit_runtime(
+                 # URL detection first, then the provider's declared transport
+                 # (fixes regional OpenAI hosts and other non-chat overlays).
+                 api_mode = _fallback_api_mode(
+-                    provider, base_url, target_model or model_cfg.get("default", "")
++                    provider, base_url, target_model or model_cfg.get("default", ""),
++                    **({"allow_metadata_network": False} if not allow_metadata_network else {}),
+                 )
+ 
+         if provider == "actual" and not api_key and is_actual_local_base_url(base_url):
+@@ -1696,7 +1699,8 @@ def resolve_isolated_static_runtime(*, config_snapshot: Dict[str, Any],
+         raise ValueError("isolated native static credential is unavailable")
+     runtime = _resolve_explicit_runtime(provider=requested, requested_provider=requested,
+         model_cfg=model_cfg, explicit_api_key=key,
+-        explicit_base_url=str(model_cfg.get("base_url") or ""), target_model=target_model)
++        explicit_base_url=str(model_cfg.get("base_url") or ""), target_model=target_model,
++        allow_metadata_network=False)
+     if (runtime is None or runtime.get("api_mode") != "chat_completions"
+             or runtime.get("base_url") != pconfig.inference_base_url.rstrip("/")):
+         raise ValueError("isolated native API mode is unsupported")
+diff --git a/tests/tools/test_process_registry_deferred_restore.py b/tests/tools/test_process_registry_deferred_restore.py
+new file mode 100644
+index 0000000..6a61ba9
+--- /dev/null
++++ b/tests/tools/test_process_registry_deferred_restore.py
+@@ -0,0 +1,200 @@
++"""Import-only discovery must not recover durable background completions."""
++
++import json
++import os
++from pathlib import Path
++import queue
++import subprocess
++import sys
++import threading
++import time
++
++from tools import async_delegation as delegation
++from tools.process_registry import ProcessRegistry
++
++
++def test_explicit_constructor_preserves_eager_restore(monkeypatch):
++    calls = []
++
++    def restore(target):
++        calls.append(target)
++        target.put({"delegation_id": "eager-fixture"})
++
++    monkeypatch.setattr(delegation, "restore_undelivered_completions", restore)
++    registry = ProcessRegistry()
++    assert len(calls) == 1
++    assert registry.completion_queue is calls[0]
++    assert registry.completion_queue.get_nowait() == {"delegation_id": "eager-fixture"}
++    assert registry.completion_queue.empty()
++    assert len(calls) == 1
++
++
++def test_deferred_first_access_restores_once_into_the_same_queue(monkeypatch):
++    calls = []
++    event = {"delegation_id": "deferred-fixture", "restored": True}
++
++    def restore(target):
++        calls.append(target)
++        target.put(event)
++
++    monkeypatch.setattr(delegation, "restore_undelivered_completions", restore)
++    registry = ProcessRegistry(defer_completion_restore=True)
++    assert calls == []
++    target = registry.completion_queue
++    assert calls == [target]
++    assert target.get_nowait() == event
++    for _ in range(5):
++        assert registry.completion_queue is target
++        assert registry.completion_queue.empty()
++    assert calls == [target]
++
++
++def test_cold_module_singleton_import_defers_until_first_real_queue_access(tmp_path):
++    # A fresh interpreter proves import behaviour without replacing the
++    # process-wide singleton used by other tests. No real delegation DB opens.
++    home = tmp_path / "cold-home"
++    home.mkdir()
++    code = r'''
++import importlib, json, os, sys, types
++from pathlib import Path
++calls = []
++fake = types.ModuleType("tools.async_delegation")
++def restore(target):
++    calls.append(target)
++    target.put({"delegation_id": "cold-fixture"})
++fake.restore_undelivered_completions = restore
++sys.modules["tools.async_delegation"] = fake
++module = importlib.import_module("tools.process_registry")
++assert calls == []
++assert not (Path(os.environ["HERMES_HOME"]) / "state.db").exists()
++target = module.process_registry.completion_queue
++assert calls == [target]
++assert target.get_nowait() == {"delegation_id": "cold-fixture"}
++assert module.process_registry.completion_queue is target
++assert target.empty() and len(calls) == 1
++print(json.dumps({"cold_import_restores": 0, "first_queue_restores": len(calls)}))
++'''
++    env = dict(os.environ, HERMES_HOME=str(home), PYTHONDONTWRITEBYTECODE="1")
++    completed = subprocess.run(
++        [sys.executable, "-B", "-c", code],
++        cwd=Path(__file__).resolve().parents[2],
++        env=env, capture_output=True, text=True, timeout=30,
++    )
++    assert completed.returncode == 0, completed.stderr
++    assert json.loads(completed.stdout.strip().splitlines()[-1]) == {
++        "cold_import_restores": 0, "first_queue_restores": 1,
++    }
++    assert not (home / "state.db").exists()
++
++
++def test_concurrent_first_readers_wait_for_one_completed_restore(monkeypatch):
++    entered = threading.Event()
++    release = threading.Event()
++    second_started = threading.Event()
++    second_returned = threading.Event()
++    calls = []
++    results = []
++    errors = []
++
++    def restore(target):
++        calls.append(target)
++        entered.set()
++        if not release.wait(3):
++            raise RuntimeError("synthetic restore barrier timed out")
++        target.put({"delegation_id": "concurrent-fixture"})
++
++    monkeypatch.setattr(delegation, "restore_undelivered_completions", restore)
++    registry = ProcessRegistry(defer_completion_restore=True)
++
++    def read(second=False):
++        try:
++            if second:
++                second_started.set()
++            target = registry.completion_queue
++            results.append((target, target.qsize()))
++        except BaseException as error:
++            errors.append(error)
++        finally:
++            if second:
++                second_returned.set()
++
++    first = threading.Thread(target=read)
++    second = threading.Thread(target=read, kwargs={"second": True})
++    first.start()
++    try:
++        assert entered.wait(2)
++        second.start()
++        assert second_started.wait(2)
++        returned_before_restore_finished = second_returned.wait(0.2)
++    finally:
++        release.set()
++        first.join(3)
++        if second.ident is not None:
++            second.join(3)
++    assert not first.is_alive() and not second.is_alive()
++    assert not errors
++    assert not returned_before_restore_finished
++    assert len(calls) == 1 and len(results) == 2
++    assert all(target is calls[0] and count == 1 for target, count in results)
++
++
++def test_restore_failure_is_logged_once_without_retries_or_invented_events(monkeypatch, caplog):
++    calls = []
++
++    def fail(target):
++        calls.append(target)
++        raise OSError("synthetic restore unavailable")
++
++    monkeypatch.setattr(delegation, "restore_undelivered_completions", fail)
++    registry = ProcessRegistry(defer_completion_restore=True)
++    with caplog.at_level("WARNING", logger="tools.process_registry"):
++        target = registry.completion_queue
++        for _ in range(5):
++            assert registry.completion_queue is target
++            assert target.empty()
++    assert calls == [target]
++    matching = [record for record in caplog.records
++                if "Could not restore async delegation completions" in record.getMessage()]
++    assert len(matching) == 1
++    assert "synthetic restore unavailable" in matching[0].getMessage()
++
++
++def test_explicit_queue_replacement_preserves_embedder_ownership(monkeypatch):
++    calls = []
++    monkeypatch.setattr(delegation, "restore_undelivered_completions", lambda target: calls.append(target))
++    registry = ProcessRegistry(defer_completion_restore=True)
++    replacement = queue.Queue()
++    replacement.put({"delegation_id": "embedder-fixture"})
++    registry.completion_queue = replacement
++    assert registry.completion_queue is replacement
++    assert replacement.get_nowait() == {"delegation_id": "embedder-fixture"}
++    assert calls == []
++
++
++def test_existing_durable_pending_completion_rehydrates_once_without_acknowledging_it(monkeypatch, tmp_path):
++    db_path = tmp_path / "existing-state.db"
++    monkeypatch.setattr(delegation, "_db_path", lambda: db_path)
++    now = time.time()
++    expected = {"type": "async_delegation", "delegation_id": "pending-fixture", "session_key": "owner-fixture"}
++    with delegation._transaction() as conn:
++        for identity, delivery in (("pending-fixture", "pending"), ("delivered-fixture", "delivered")):
++            payload = dict(expected, delegation_id=identity)
++            conn.execute(
++                "INSERT INTO async_delegations "
++                "(delegation_id, origin_session, state, dispatched_at, completed_at, updated_at, event_json, delivery_state) "
++                "VALUES (?, ?, 'completed', ?, ?, ?, ?, ?)",
++                (identity, "owner-fixture", now, now, now, json.dumps(payload), delivery),
++            )
++    registry = ProcessRegistry(defer_completion_restore=True)
++    target = registry.completion_queue
++    assert target.get_nowait() == dict(expected, restored=True)
++    assert target.empty()
++    assert registry.completion_queue is target and target.empty()
++    with delegation._transaction() as conn:
++        rows = conn.execute(
++            "SELECT delegation_id, delivery_state, event_json FROM async_delegations ORDER BY delegation_id"
++        ).fetchall()
++    assert [(row[0], row[1]) for row in rows] == [
++        ("delivered-fixture", "delivered"), ("pending-fixture", "pending"),
++    ]
++    assert all("restored" not in json.loads(row[2]) for row in rows)
+diff --git a/tests/tui_gateway/test_daily_note.py b/tests/tui_gateway/test_daily_note.py
+index 2699018..9272619 100644
+--- a/tests/tui_gateway/test_daily_note.py
++++ b/tests/tui_gateway/test_daily_note.py
+@@ -17,7 +17,7 @@ from run_agent import AIAgent  # Warm-native cases; the cold case uses a fresh p
+ from agent import identity_policy
+ from agent.transports.chat_completions import ChatCompletionsTransport
+ from providers import get_provider_profile
+-from tui_gateway import daily_note as daily, lilith_noteinbox_bridge as bridge, server
++from tui_gateway import daily_note as daily, daily_note_readiness as ready, lilith_noteinbox_bridge as bridge, server
+ from tui_gateway.transport import bind_transport, reset_transport
+ 
+ NATIVE_FACTORY = daily._make_agent
+@@ -118,6 +118,10 @@ class Transport:
+ def setup(monkeypatch):
+     assert daily._active is None
+     monkeypatch.setattr(daily, "_claims", {key: set() for key in daily._claims})
++    monkeypatch.setattr(ready, "_claims", {})
++    monkeypatch.setattr(ready, "_bootstrap", lambda: None)
++    monkeypatch.setattr(ready, "_schema_proof", lambda: (1, "fixture-note", "A" * 64))
++    monkeypatch.setattr("tools.approval.tool_approval_requires_human", lambda *a: True)
+     monkeypatch.setattr(daily, "_native_authority", lambda: True)
+     monkeypatch.setattr("socket.create_connection", MagicMock(side_effect=AssertionError("no network")))
+     for name in ("assert_scoped_identity_prompt", "assert_scoped_identity_provider_request",
+@@ -142,11 +146,34 @@ def setup(monkeypatch):
+     if daily._active is not None:
+         daily._abort(daily._active)
+         assert daily._active.finished.wait(3)
++    if ready._holder is not None:
++        holder = ready._holder
++        holder.cancelled.set()
++        holder.released.set()
++        assert holder.finished.wait(3)
+ 
+ 
+ def invoke(transport, value=None):
++    value = value or scope()
++    token = uuid.uuid4().hex
++    try:
++        normalized = daily.normalize_scope(value)
++        duplicate = any(normalized[k] in values or len(values) >= daily.MAX_CLAIMS for k, values in daily._claims.items())
++        valid_time = 0 < (daily._timestamp(value["expires_at_utc"]) - daily._utc_now()).total_seconds() <= daily.MAX_SECONDS
++    except Exception:
++        duplicate, valid_time = True, False
++    if not duplicate and valid_time and daily._active is None:
++        preparation = server.dispatch({"jsonrpc": "2.0", "id": "prepare", "method": "lilith.daily_note.prepare",
++            "params": {"profile_id": "local", "runtime_generation": value["runtime_generation"],
++                "game_epoch": value["game_epoch"], "preparation_id": uuid.uuid4().hex,
++                "locale": "zh-TW", "ui_lease_id": uuid.uuid4().hex}}, transport=transport)
++        if "error" in preparation:
++            return preparation
++        if not preparation["result"]["ready"]:
++            return {"error": {"code": preparation["result"]["code"]}}
++        token = preparation["result"]["token"]
+     return server.dispatch({"jsonrpc": "2.0", "id": "daily-rpc", "method": "lilith.daily_note.evaluate",
+-                           "params": {"scope": value or scope(), "locale": "zh-TW"}}, transport=transport)
++                           "params": {"scope": value, "locale": "zh-TW", "preparation_token": token}}, transport=transport)
+ 
+ 
+ def test_unsupported_native_route_returns_exact_no_effect_code_without_provider_dispatch(setup, monkeypatch):
+@@ -155,8 +182,8 @@ def test_unsupported_native_route_returns_exact_no_effect_code_without_provider_
+     monkeypatch.setattr(daily, "_config_proof", lambda: ("fixture", "A" * 64))
+     monkeypatch.setattr(server, "_load_cfg", lambda: {"model": {"provider": "openrouter", "default": "fixture"}})
+     outcome = invoke(transport)
+-    assert outcome["result"]["status"] == "no_effect"
+-    assert outcome["result"]["code"] == "daily.unsupported_route"
++    assert outcome["error"]["code"] == "daily.unsupported_route"
++    assert all(not v for v in daily._claims.values())
+     assert not agent.calls and not transport.frames and control["handler_calls"] == 0
+ 
+ 
+@@ -164,8 +191,12 @@ def test_unsupported_native_route_returns_exact_no_effect_code_without_provider_
+ def test_incomplete_native_bootstrap_does_not_import_or_dispatch(setup, monkeypatch, module):
+     agent, transport, control = setup
+     monkeypatch.setitem(sys.modules, module, None)
+-    outcome = invoke(transport)["result"]
+-    assert outcome["status"] == "no_effect" and outcome["code"] == "daily.native_not_ready"
++    # Preparation, not model admission, owns a failed bootstrap now.
++    from tui_gateway.daily_note_readiness import _bootstrap
++    monkeypatch.setattr(ready, "_bootstrap", lambda: __import__(module))
++    outcome = invoke(transport)
++    assert outcome["error"]["code"] == "daily.preparation_failed"
++    assert all(not v for v in daily._claims.values())
+     assert not agent.calls and not transport.frames and control["handler_calls"] == 0
+ 
+ 
+@@ -191,18 +222,21 @@ class Transport:
+     lilith_runtime_attested = True
+     _closed = False
+     def write(self, frame): raise AssertionError("must not emit")
+-result = daily.evaluate({"scope": value, "locale": "zh-TW"}, Transport())
+-assert result["status"] == "no_effect" and result["code"] == "daily.native_not_ready"
+-assert daily.evaluate({"scope": value, "locale": "zh-TW"}, Transport())["status"] == "unknown"
++try:
++    daily.evaluate({"scope": value, "locale": "zh-TW", "preparation_token": uuid.uuid4().hex}, Transport())
++    raise AssertionError('unprepared cold evaluate must be rejected')
++except daily.LilithHostAuthorityError:
++    pass
++assert daily.evaluate({"scope": value, "locale": "zh-TW", "preparation_token": uuid.uuid4().hex}, Transport())["status"] == "unknown"
+ assert "run_agent" not in sys.modules and "model_tools" not in sys.modules
+ assert {str(p.relative_to(root)): p.read_bytes() if p.is_file() else None for p in root.rglob("*")} == before
+-print(json.dumps({"status": result["status"], "code": result["code"], "no_profile_writes": True}))
++print(json.dumps({"status": "rejected", "code": "preparation_required", "no_profile_writes": True}))
+ '''
+     environment = dict(os.environ, HERMES_HOME=str(tmp_path))
+     completed = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True,
+         timeout=20, env=environment)
+     assert completed.returncode == 0, completed.stderr
+-    assert json.loads(completed.stdout)["code"] == "daily.native_not_ready"
++    assert json.loads(completed.stdout)["code"] == "preparation_required"
+ 
+ 
+ @pytest.mark.parametrize("provider", ["deepseek", "gemini"])
+@@ -412,6 +446,9 @@ def test_real_registry_dispatch_and_native_manual_approval_denies_without_event(
+     # same native approval and bridge functions as the shipped image plugin.
+     monkeypatch.undo()
+     monkeypatch.setattr(daily, "_claims", {key: set() for key in daily._claims})
++    monkeypatch.setattr(ready, "_claims", {})
++    monkeypatch.setattr(ready, "_bootstrap", lambda: None)
++    monkeypatch.setattr(ready, "_schema_proof", lambda: (1, "fixture-note", "A" * 64))
+     monkeypatch.setattr(daily, "_native_authority", lambda: True)
+     monkeypatch.setattr(daily, "_make_agent", lambda task: agent)
+     monkeypatch.setattr(identity_policy, "enforce_scoped_turn_identity", lambda *a, **k: None)
+@@ -424,6 +461,9 @@ def test_real_registry_dispatch_and_native_manual_approval_denies_without_event(
+     monkeypatch.setattr(approval, "is_approved", lambda *args: False)
+     monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+     monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
++    # Keep the original unavailable-listener negative control; the genuine
++    # newly routed callback/once/session/always/deny path has dedicated tests.
++    monkeypatch.setattr(approval, "register_gateway_notify", lambda *a, **k: None)
+     observed = []
+     def native_handler(args, **kwargs):
+         decision = approval.request_tool_approval("lilith_leave_note", "Save one image note", rule_key="lilith_leave_note:deliver")
+diff --git a/tests/tui_gateway/test_daily_note_approval.py b/tests/tui_gateway/test_daily_note_approval.py
+new file mode 100644
+index 0000000..217499c
+--- /dev/null
++++ b/tests/tui_gateway/test_daily_note_approval.py
+@@ -0,0 +1,229 @@
++"""Real native queue and two-phase approval, isolated transport and filesystem."""
++import copy
++import hashlib
++import json
++import os
++import threading
++import time
++import uuid
++
++import pytest
++import yaml
++
++from tests.tui_gateway.test_daily_note_readiness import isolated, request
++from tests.tui_gateway.test_daily_note import scope, receipt
++from tests.tui_gateway.test_tools_policy_rpc import (
++    _clean_gateway_sessions, _strict_config, _write_config, _attest_strict_host, _home)
++from tui_gateway import daily_note as daily, daily_note_readiness as ready, daily_note_approval as lane, server
++from tools import approval
++from agent import identity_policy as identity
++
++NATIVE_PREDICATE = approval.tool_approval_requires_human
++
++
++@pytest.fixture
++def real_queue(isolated, _clean_gateway_sessions, monkeypatch):
++    agent, transport, _ = isolated
++    monkeypatch.setattr(approval, "tool_approval_requires_human", NATIVE_PREDICATE)
++    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
++    monkeypatch.setattr(approval, "_get_approval_timeout", lambda: 300)
++    monkeypatch.setattr(approval, "is_interrupted", lambda: False)
++    monkeypatch.setattr(identity, "identity_lock_required_by_host", lambda *a, **k: True)
++    monkeypatch.setattr(daily, "_native_authority", lambda: identity.native_authority_dispatch_block_state() is None)
++    old_permanent, old_sessions = set(approval._permanent_approved), dict(approval._session_approved)
++    approval._permanent_approved.clear()
++    approval._session_approved.clear()
++    def actual_gate(name, args, **kwargs):
++        consent = approval.request_tool_approval(name, "Create one game image note", rule_key="lilith_leave_note:deliver")
++        return daily.request_note(args) if consent["approved"] else consent
++    monkeypatch.setattr("model_tools.handle_function_call", actual_gate)
++    yield agent, transport
++    if daily._active is not None:
++        daily._abort(daily._active)
++        assert daily._active.finished.wait(3)
++    approval._permanent_approved.clear()
++    approval._permanent_approved.update(old_permanent)
++    approval._session_approved.clear()
++    approval._session_approved.update(old_sessions)
++
++
++def start(real_queue):
++    agent, transport = real_queue
++    value = scope()
++    prepared = ready.prepare(request(value), transport)
++    assert prepared["ready"] and prepared["requires_ui"]
++    published = threading.Event()
++    offers, results = [], []
++    def frame(frame):
++        name, body = frame["params"]["type"], frame["params"]["payload"]
++        if name == "lilith.daily_note.approval.request":
++            assert frame["params"]["session_id"] == value["attempt_id"]
++            offers.append(body)
++            published.set()
++        elif name == "lilith.daily_note.tool":
++            daily.complete({"scope": value, "result": receipt(value)}, transport)
++    transport.on_frame = frame
++    thread = threading.Thread(target=lambda: results.append(daily.evaluate({"scope": value,
++        "locale": "zh-TW", "preparation_token": prepared["token"]}, transport)))
++    thread.start()
++    assert published.wait(3), results
++    # Native publication marks notified after the callback returns.
++    until = time.monotonic() + 2
++    while not approval._gateway_queues[value["attempt_id"]][0].notified:
++        assert time.monotonic() < until
++        time.sleep(.002)
++    body = offers[0]
++    assert body["choices"] == ["once", "session", "always", "deny"]
++    params = {k: copy.deepcopy(body[k]) for k in ("scope", "approval_id", "ui_lease_id")}
++    return thread, results, params
++
++
++def tool_count(transport):
++    return sum(f["params"]["type"] == "lilith.daily_note.tool" for f in transport.frames)
++
++
++@pytest.mark.parametrize("choice", ["once", "session", "deny"])
++def test_native_queue_choice_without_foreground_or_permission_write(real_queue, choice):
++    agent, transport = real_queue
++    thread, results, params = start(real_queue)
++    assert tool_count(transport) == 0 and len(agent.calls) == 1
++    assert lane.respond({**params, "choice": choice}, transport) == {"resolved": 1}
++    thread.join(3)
++    assert not thread.is_alive()
++    assert tool_count(transport) == (0 if choice == "deny" else 1)
++    assert results[0]["status"] == ("no_effect" if choice == "deny" else "completed")
++    assert not server._sessions
++    assert params["scope"]["attempt_id"] not in approval._gateway_notify_cbs
++    assert params["scope"]["attempt_id"] not in approval._session_approved
++    assert not approval._permanent_approved
++
++
++@pytest.mark.parametrize("field", ["approval_id", "ui_lease_id", "scope", "transport"])
++def test_foreign_approval_cannot_release_waiter(real_queue, field):
++    _, transport = real_queue
++    thread, results, params = start(real_queue)
++    bad, peer = copy.deepcopy(params), transport
++    if field == "scope": bad["scope"]["attempt_id"] = uuid.uuid4().hex
++    elif field == "transport": peer = type(transport)()
++    else: bad[field] = uuid.uuid4().hex
++    with pytest.raises(Exception): lane.respond({**bad, "choice": "once"}, peer)
++    assert tool_count(transport) == 0 and thread.is_alive()
++    daily.cancel({"scope": params["scope"]}, transport)
++    thread.join(3)
++    assert not thread.is_alive() and tool_count(transport) == 0
++    with pytest.raises(Exception): lane.respond({**params, "choice": "once"}, transport)
++
++
++def strict_config(real_queue, monkeypatch):
++    agent, _ = real_queue
++    soul, persona = "Lilith soul.\n", "You are Lilith.\n"
++    raw = _write_config(_strict_config(persona))
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, raw, soul, persona)
++    agent._identity_config_sha256 = hashlib.sha256(raw).hexdigest()
++    agent._session_init_model_config = {"_identity_config_sha256": agent._identity_config_sha256}
++    return raw, soul, persona
++
++
++def write_commit_receipt(persistence, soul, persona):
++    value = {"schema_version": 1, "source": "hermes.approval.respond.always", "sequence": 1,
++        "canonical_base_sha256": persistence["previous_config_sha256"],
++        "previous_config_sha256": persistence["previous_config_sha256"],
++        "config_sha256": persistence["config_sha256"], "operation_nonce": persistence["commit_nonce"],
++        "identity_fingerprint_sha256": "a" * 64, "soul_sha256": hashlib.sha256(soul.encode()).hexdigest(),
++        "personality_sha256": hashlib.sha256(persona.encode()).hexdigest(),
++        "approval_mode": persistence["approval_mode"], "enabled_toolsets": persistence["enabled_toolsets"]}
++    raw = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode()
++    (_home() / "runtime" / "native-config-receipt.v1.json").write_bytes(raw)
++    return hashlib.sha256(raw).hexdigest()
++
++
++def test_native_always_real_config_receipt_rebinds_exact_agent_then_one_note(real_queue, monkeypatch):
++    agent, transport = real_queue
++    old, soul, persona = strict_config(real_queue, monkeypatch)
++    thread, results, params = start(real_queue)
++    task = daily._active
++    phase1 = lane.respond({**params, "choice": "always"}, transport)
++    persistence = phase1["persistence"]
++    assert phase1["prepared"] == 1 and tool_count(transport) == 0 and thread.is_alive()
++    assert lane.waiting_on_own_transition(task) and not daily._native_authority()
++    assert (_home() / "config.yaml").read_bytes() != old
++    assert yaml.safe_load((_home() / "config.yaml").read_text())["approvals"]["mode"] == "manual"
++    time.sleep(.12)  # At least two native monitor polls during its own pending phase.
++    assert thread.is_alive() and not task.cancelled.is_set()
++    digest = write_commit_receipt(persistence, soul, persona)
++    assert lane.commit({**params, "authority": "lilith-runtime-native-config.v1",
++        "commit_nonce": persistence["commit_nonce"], "receipt_sha256": digest}, transport) == {"resolved": 1}
++    thread.join(3)
++    assert not thread.is_alive() and results[0]["status"] == "completed"
++    assert tool_count(transport) == len(agent.calls) == 1
++    assert agent._identity_config_sha256 == persistence["config_sha256"]
++    assert identity.native_authority_dispatch_block_state() is None and not server._sessions
++
++
++def test_monitor_pending_cleared_between_two_reads_does_not_cancel_committed_always(real_queue, monkeypatch):
++    agent, transport = real_queue
++    _, soul, persona = strict_config(real_queue, monkeypatch)
++    thread, results, params = start(real_queue)
++    task = daily._active
++    phase1 = lane.respond({**params, "choice": "always"}, transport)["persistence"]
++    observed_false, resume_monitor = threading.Event(), threading.Event()
++    real_authority = daily._native_authority
++    def authority():
++        current = real_authority()
++        if threading.get_ident() == thread.ident and not current and not observed_false.is_set():
++            observed_false.set()
++            assert resume_monitor.wait(3)
++        return current
++    monkeypatch.setattr(daily, "_native_authority", authority)
++    assert observed_false.wait(2)
++    digest = write_commit_receipt(phase1, soul, persona)
++    try:
++        assert lane.commit({**params, "authority": "lilith-runtime-native-config.v1",
++            "commit_nonce": phase1["commit_nonce"], "receipt_sha256": digest}, transport) == {"resolved": 1}
++        assert identity.native_authority_pending_transition_state() is None
++    finally:
++        resume_monitor.set()
++    thread.join(3)
++    assert not thread.is_alive() and results[0]["status"] == "completed"
++    assert not task.cancelled.is_set() and len(agent.calls) == tool_count(transport) == 1
++
++
++@pytest.mark.parametrize("retire", ["cancel", "abort", "expired", "bad_receipt"])
++def test_native_prepared_always_revocation_quarantines_never_releases(real_queue, monkeypatch, retire):
++    _, transport = real_queue
++    strict_config(real_queue, monkeypatch)
++    thread, results, params = start(real_queue)
++    phase1 = lane.respond({**params, "choice": "always"}, transport)["persistence"]
++    phase2 = {**params, "authority": "lilith-runtime-native-config.v1", "commit_nonce": phase1["commit_nonce"]}
++    if retire == "cancel": daily.cancel({"scope": params["scope"]}, transport)
++    elif retire == "abort":
++        assert lane.abort({**phase2, "reason": "runtime_receipt_commit_failed"}, transport) == {"aborted": 1, "quarantined": True}
++    else:
++        if retire == "expired": daily._active.deadline = time.monotonic() - 1
++        response = server.dispatch({"jsonrpc": "2.0", "id": "bad-commit", "method": "lilith.daily_note.approval.commit",
++            "params": {**phase2, "receipt_sha256": "A" * 64}}, transport=transport)
++        assert response["error"]["code"] == 5035
++    thread.join(3)
++    assert not thread.is_alive() and tool_count(transport) == 0
++    assert identity.native_authority_quarantine_state() is not None
++
++
++@pytest.mark.parametrize("payload,choices", [
++    ({"allow_session": True, "allow_permanent": True}, ["once", "session", "always", "deny"]),
++    ({"smart_denied": True, "choices": ["once", "session", "always", "deny"]}, ["once", "deny"]),
++    ({"choices": ["deny"]}, ["deny"]), ({}, ["once", "deny"])])
++def test_native_canonical_offer_is_shared_and_does_not_invent_choice(payload, choices):
++    assert lane._offer(payload)["choices"] == approval.gateway_approval_choices(payload) == choices
++
++
++def test_uncertain_native_persistence_exception_is_5035_not_pre_effect(real_queue, monkeypatch):
++    _, transport = real_queue
++    thread, results, params = start(real_queue)
++    def uncertain(*a, **kw): raise RuntimeError("secret must not leak")
++    monkeypatch.setattr(approval, "resolve_gateway_approval_with_persistence", uncertain)
++    response = server.dispatch({"jsonrpc": "2.0", "id": "uncertain", "method": "lilith.daily_note.approval.respond",
++        "params": {**params, "choice": "always"}}, transport=transport)
++    assert response["error"]["code"] == 5035 and "secret" not in json.dumps(response)
++    thread.join(3)
++    assert not thread.is_alive() and tool_count(transport) == 0
+diff --git a/tests/tui_gateway/test_daily_note_readiness.py b/tests/tui_gateway/test_daily_note_readiness.py
+new file mode 100644
+index 0000000..55493f9
+--- /dev/null
++++ b/tests/tui_gateway/test_daily_note_readiness.py
+@@ -0,0 +1,265 @@
++"""No-budget native readiness and exact one-use handoff (isolated only)."""
++import copy
++import json
++import threading
++import time
++import uuid
++import hashlib
++import os
++import subprocess
++import sys
++import yaml
++
++import pytest
++
++from tests.tui_gateway.test_daily_note import FakeAgent, Transport, SCHEMA, scope, receipt
++from tui_gateway import daily_note as daily, daily_note_readiness as ready, server
++
++
++def request(value=None, *, ui=True):
++    value = value or scope()
++    return {"profile_id": value["profile_id"], "runtime_generation": value["runtime_generation"],
++        "game_epoch": value["game_epoch"], "preparation_id": uuid.uuid4().hex, "locale": "zh-TW",
++        "ui_lease_id": uuid.uuid4().hex if ui else None}
++
++
++@pytest.fixture
++def isolated(monkeypatch):
++    assert daily._active is None and ready._holder is None
++    monkeypatch.setattr(daily, "_native_authority", lambda: True)
++    monkeypatch.setattr(daily, "_claims", {key: set() for key in daily._claims})
++    monkeypatch.setattr(ready, "_claims", {})
++    monkeypatch.setattr(ready, "_schema_proof", lambda: (1, "native-note", "A" * 64))
++    starts = []
++    monkeypatch.setattr(ready, "_bootstrap", lambda: starts.append(True))
++    agent, transport = FakeAgent(), Transport()
++    monkeypatch.setattr(daily, "_make_agent", lambda task: agent)
++    for name in ("enforce_scoped_turn_identity", "assert_scoped_identity_prompt",
++                 "assert_scoped_identity_provider_request", "assert_scoped_identity_request_messages"):
++        monkeypatch.setattr("agent.identity_policy." + name, lambda *a, **k: None)
++    monkeypatch.setattr("agent.identity_policy.policy_for_agent", lambda a: a._identity_policy)
++    monkeypatch.setattr("tools.approval.tool_approval_requires_human", lambda *a: True)
++    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **k: [SCHEMA])
++    monkeypatch.setattr("model_tools.handle_function_call", lambda name, args, **kw: daily.request_note(args))
++    transport.on_frame = lambda frame: (daily.complete({"scope": frame["params"]["payload"]["scope"],
++        "result": receipt(frame["params"]["payload"]["scope"])}, transport)
++        if frame["params"]["type"] == "lilith.daily_note.tool" else None)
++    yield agent, transport, starts
++    if daily._active is not None:
++        daily._abort(daily._active)
++        assert daily._active.finished.wait(3)
++    item = ready._holder
++    if item is not None:
++        item.cancelled.set()
++        item.released.set()
++        assert item.finished.wait(3)
++
++
++def test_prepare_is_zero_model_and_evaluate_uses_exact_prepared_agent_once(isolated):
++    agent, transport, _ = isolated
++    value = scope()
++    prepared = ready.prepare(request(value), transport)
++    assert prepared["ready"] and prepared["code"] == "daily.ready" and len(prepared["token"]) == 32
++    assert not agent.calls and not transport.frames and all(not x for x in daily._claims.values())
++    result = daily.evaluate({"scope": value, "locale": "zh-TW", "preparation_token": prepared["token"]}, transport)
++    assert result["status"] == "completed" and result["result"]["status"] == "delivered"
++    assert len(agent.calls) == 1 and agent.closed
++    assert daily.evaluate({"scope": value, "locale": "zh-TW", "preparation_token": prepared["token"]}, transport)["status"] == "unknown"
++    assert len(agent.calls) == 1
++
++
++def test_missing_ui_is_unavailable_before_any_model_claim(isolated):
++    agent, transport, _ = isolated
++    response = ready.prepare(request(ui=False), transport)
++    assert not response["ready"] and response["token"] is None
++    assert response["code"] == "daily.approval_ui_unavailable"
++    assert agent.closed and not agent.calls and not transport.frames
++    assert all(not x for x in daily._claims.values())
++
++
++def test_native_preapproved_does_not_require_a_ui(isolated, monkeypatch):
++    _, transport, _ = isolated
++    monkeypatch.setattr("tools.approval.tool_approval_requires_human", lambda *a: False)
++    response = ready.prepare(request(ui=False), transport)
++    assert response["ready"] and not response["requires_ui"] and response["ui_lease_id"] is None
++
++
++@pytest.mark.parametrize("field", ["runtime_generation", "game_epoch", "locale", "transport", "schema", "route", "policy", "expired"])
++def test_prepared_token_rejects_changed_authority_without_model(isolated, monkeypatch, field):
++    agent, transport, _ = isolated
++    value = scope()
++    response = ready.prepare(request(value), transport)
++    locale, target = "zh-TW", transport
++    if field in {"runtime_generation", "game_epoch"}: value[field] = uuid.uuid4().hex
++    elif field == "locale": locale = "en"
++    elif field == "transport": target = Transport()
++    elif field == "schema": monkeypatch.setattr(ready, "_schema_proof", lambda: (2, "changed", "A" * 64))
++    elif field == "route": agent.model = "changed-model"
++    elif field == "policy": monkeypatch.setattr("tools.approval.tool_approval_requires_human", lambda *a: False)
++    else: ready._holder.expires = time.monotonic() - 1
++    with pytest.raises(Exception, match="preparation"):
++        daily.evaluate({"scope": value, "locale": locale, "preparation_token": response["token"]}, target)
++    assert not agent.calls and not transport.frames
++
++
++def test_preparation_cancel_overtakes_request_and_consumes_identity(isolated):
++    agent, transport, starts = isolated
++    req = request()
++    cancel = {k: req[k] for k in ("profile_id", "runtime_generation", "preparation_id")}
++    assert not ready.cancel(cancel, transport)["accepted"]
++    assert ready.prepare(req, transport)["code"] == "daily.preparation_duplicate_or_capacity"
++    assert not starts and not agent.calls
++
++
++def test_unresolved_prepare_worker_retains_slot_without_overlap(isolated, monkeypatch):
++    agent, transport, _ = isolated
++    entered, release = threading.Event(), threading.Event()
++    def bootstrap():
++        entered.set()
++        release.wait(3)
++    monkeypatch.setattr(ready, "_bootstrap", bootstrap)
++    monkeypatch.setattr(ready, "PREPARE_SECONDS", 0.08)
++    first = ready.prepare(request(), transport)
++    assert entered.is_set() and first["code"] == "daily.preparation_cancelled_or_timeout"
++    try:
++        assert ready.prepare(request(), transport)["code"] == "daily.preparation_busy"
++        assert not agent.calls
++    finally:
++        holder = ready._holder
++        release.set()
++        assert holder.finished.wait(3)
++
++
++def test_unsupported_factory_code_is_preserved_without_model_claim(isolated, monkeypatch):
++    agent, transport, _ = isolated
++    def unsupported(item):
++        item.code = "daily.unsupported_route"
++        raise ValueError("secret must not be returned")
++    monkeypatch.setattr(daily, "_make_agent", unsupported)
++    result = ready.prepare(request(), transport)
++    assert not result["ready"] and result["code"] == "daily.unsupported_route"
++    assert all(not x for x in daily._claims.values()) and not agent.calls
++
++
++def test_expired_ready_agent_is_closed_without_a_new_opportunity(isolated, monkeypatch):
++    agent, transport, _ = isolated
++    monkeypatch.setattr(ready, "TOKEN_SECONDS", 0.05)
++    result = ready.prepare(request(), transport)
++    holder = ready._holder
++    assert result["ready"] and holder.finished.wait(2)
++    assert agent.closed and ready._holder is None and not agent.calls
++
++
++def test_preparation_recent_claims_expire_without_permanent_capacity_lockout(isolated, monkeypatch):
++    agent, transport, _ = isolated
++    monkeypatch.setattr(daily, "MAX_CLAIMS", 3)
++    def unsupported(item):
++        item.code = "daily.unsupported_route"
++        raise ValueError("unsupported")
++    monkeypatch.setattr(daily, "_make_agent", unsupported)
++    for _ in range(3):
++        assert ready.prepare(request(), transport)["code"] == "daily.unsupported_route"
++    assert ready.prepare(request(), transport)["code"] == "daily.preparation_duplicate_or_capacity"
++    for key in ready._claims:
++        ready._claims[key] = time.monotonic() - 1
++    for _ in range(8):
++        assert ready.prepare(request(), transport)["code"] == "daily.unsupported_route"
++        for key in ready._claims: ready._claims[key] = time.monotonic() - 1
++    monkeypatch.setattr(daily, "_make_agent", lambda item: agent)
++    assert ready.prepare(request(), transport)["ready"]
++    assert not agent.calls and all(not x for x in daily._claims.values())
++
++
++def test_expired_old_token_never_matches_new_preparation(isolated, monkeypatch):
++    agent, transport, _ = isolated
++    monkeypatch.setattr(ready, "TOKEN_SECONDS", .05)
++    first = ready.prepare(request(), transport)
++    holder = ready._holder
++    assert holder.finished.wait(3)
++    second = ready.prepare(request(), transport)
++    assert second["ready"] and second["token"] != first["token"]
++    with pytest.raises(Exception, match="preparation token unavailable"):
++        ready.consume(first["token"], scope(), "zh-TW", transport)
++    assert not agent.calls
++
++
++def test_genuine_cold_process_prepares_native_agent_without_chat_network_or_player_writes(tmp_path):
++    soul, persona = "PINNED SOUL\n", "LOCKED CUSTOM VOICE\n"
++    config = {"identity": {"require_soul": True, "suppress_kernel_help": True,
++        "personality_allowlist": ["lilith"], "locked_personality": "lilith",
++        "force_soul_for_children": True, "fingerprint": "A" * 64},
++        "display": {"personality": "lilith"}, "agent": {"system_prompt": "",
++            "personalities": {"lilith": {"system_prompt": persona}}},
++        "model": {"provider": "deepseek", "default": "deepseek-v4-pro"},
++        "plugins": {"enabled": ["lilith_leave_note"]},
++        "toolsets": ["lilith_leave_note"],
++        "approvals": {"mode": "manual"},
++        "memory": {"memory_enabled": True, "user_profile_enabled": True}}
++    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8", newline="\n")
++    (tmp_path / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    (tmp_path / ".env").write_text("DEEPSEEK_API_KEY=fixture-no-network-key\n", encoding="utf-8")
++    plugin = tmp_path / "plugins" / "lilith_leave_note"
++    plugin.mkdir(parents=True)
++    (plugin / "plugin.yaml").write_text("name: lilith_leave_note\nversion: 1.0.0\nkind: standalone\nprovides_tools:\n  - lilith_leave_note\n", encoding="utf-8")
++    (plugin / "__init__.py").write_text("def register(ctx):\n    ctx.register_tool(name='lilith_leave_note', toolset='lilith_leave_note', schema=" + repr(SCHEMA["function"]) + ", handler=lambda args, **kw: (_ for _ in ()).throw(AssertionError('must not dispatch')))\n", encoding="utf-8")
++    environment = dict(os.environ, HERMES_HOME=str(tmp_path), HERMES_IDENTITY_REQUIRED="1",
++        HERMES_IDENTITY_EXPECTED_FINGERPRINT="A" * 64,
++        HERMES_IDENTITY_EXPECTED_CONFIG_SHA256=hashlib.sha256((tmp_path / "config.yaml").read_bytes()).hexdigest(),
++        HERMES_IDENTITY_EXPECTED_SOUL_SHA256=hashlib.sha256(soul.encode()).hexdigest(),
++        HERMES_IDENTITY_EXPECTED_PERSONALITY_SHA256=hashlib.sha256(persona.encode()).hexdigest(),
++        PYTHONDONTWRITEBYTECODE="1")
++    program = r'''
++import json, sys, uuid, os, traceback, platform
++from pathlib import Path
++platform.uname()  # Windows stdlib OS-version probe, not native agent startup.
++root=Path(os.environ['HERMES_HOME'])
++effects=[]
++writes={}
++def audit(event,args):
++    if event in {'open','sqlite3.connect'}:
++        path=str(args[0])
++        if any(x in path for x in ('state.db','auth.json','auth.lock','.update_check','agent.log')) and path not in writes:
++            writes[path]=''.join(traceback.format_stack(limit=12))
++    if event in {'socket.connect','subprocess.Popen'}:
++        effects.append((event,repr(args)[:300],''.join(traceback.format_stack(limit=35))))
++        raise AssertionError('unexpected external effect: '+event)
++sys.addaudithook(audit)
++from tui_gateway import server, daily_note as daily, daily_note_readiness as ready
++assert 'run_agent' not in sys.modules and 'model_tools' not in sys.modules
++# The attested gateway exists before Runtime can call prepare. Its normal
++# startup update/log effects are measured separately, not silently attributed
++# to the ON-only preparation. No player conversation or AIAgent has run.
++from hermes_cli import banner
++banner._update_check_done.wait(3)
++startup_effects=list(effects)
++effects.clear()
++writes.clear()
++before={str(p.relative_to(root)):p.read_bytes() for p in root.rglob('*') if p.is_file()}
++class Transport:
++    lilith_runtime_attested=True
++    _closed=False
++    def write(self, frame): raise AssertionError('prepare must not emit events')
++transport=Transport()
++params={'profile_id':'local','runtime_generation':uuid.uuid4().hex,'game_epoch':uuid.uuid4().hex,
++    'preparation_id':uuid.uuid4().hex,'locale':'zh-TW','ui_lease_id':uuid.uuid4().hex}
++result=ready.prepare(params,transport)
++assert result['ready'], result
++assert result['requires_ui'] and result['provider']=='deepseek'
++holder=ready._holder
++assert holder.agent._isolated_request and holder.agent._session_db is None
++assert holder.agent._memory_manager is None and holder.agent._memory_store is None
++assert not holder.agent._session_json_enabled and holder.agent._persist_disabled
++assert all(not v for v in daily._claims.values())
++ready.cancel({k:params[k] for k in ('profile_id','runtime_generation','preparation_id')},transport)
++assert holder.finished.wait(3)
++after={str(p.relative_to(root)):p.read_bytes() for p in root.rglob('*') if p.is_file()}
++assert all(after[k]==v for k,v in before.items())
++added=set(after)-set(before)
++assert {x.replace('\\','/') for x in added} <= {'cache/tool_discovery_cache.json'}, str(sorted(added))+'\n'+json.dumps(writes)
++assert not effects, effects
++print('COLD_READY:'+json.dumps({'ready':True,'model_calls':0,'history_writes':0,'startup_added_files':sorted(added)}))
++'''
++    completed = subprocess.run([sys.executable, "-c", program], env=environment,
++        capture_output=True, text=True, timeout=40)
++    assert completed.returncode == 0, completed.stdout + completed.stderr
++    assert "COLD_READY:" in completed.stdout + completed.stderr
+diff --git a/tools/approval.py b/tools/approval.py
+index d30e3fb..415ff3b 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -4194,6 +4194,42 @@ def _smart_approve(command: str, description: str) -> str:
+         return "escalate"
+ 
+ 
++def gateway_approval_choices(payload: dict) -> list[str]:
++    """Canonical native presentation, shared by foreground and daily UI.
++
++    Producers may supply choices or the native allow flags. Preserve the
++    existing foreground normalization, including its legacy flag fallback.
++    """
++    canonical = ("once", "session", "always", "deny")
++    supplied = payload.get("choices")
++    explicit = isinstance(supplied, (list, tuple))
++    choices = list(dict.fromkeys(v for v in supplied if isinstance(v, str) and v in canonical)) if explicit else []
++    if payload.get("smart_denied"):
++        return [v for v in choices if v in {"once", "deny"}] or ["once", "deny"]
++    if "allow_permanent" in payload or "allow_session" in payload:
++        allowed = {"once", "deny"}
++        if payload.get("allow_session") is not False:
++            allowed.add("session")
++        if payload.get("allow_permanent") is not False:
++            allowed.add("always")
++        return [v for v in choices if v in allowed] or [v for v in canonical if v in allowed]
++    return choices or ["once", "deny"]
++
++
++def tool_approval_requires_human(session_key: str, pattern_key: str) -> bool:
++    """Read the exact gate short-circuit; availability is not a grant.
++
++    Dedicated native tasks use this before reserving model work. The eventual
++    tool still calls the same approval gate, so a stale answer never approves.
++    In particular this must not infer approval from a surface's mode label.
++    """
++    return not (
++        _YOLO_MODE_FROZEN
++        or is_session_yolo_enabled(session_key)
++        or is_approved(session_key, pattern_key)
++    )
++
++
+ def _run_approval_gate(
+     *,
+     pattern_key: str,
+@@ -4248,11 +4284,8 @@ def _run_approval_gate(
+     # --yolo bypasses all approval prompts (session- or process-scoped).
+     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
+     # here only skips the recoverable approval layer.
+-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+-        return {"approved": True, "message": None}
+-
+     session_key = get_current_session_key()
+-    if is_approved(session_key, pattern_key):
++    if not tool_approval_requires_human(session_key, pattern_key):
+         return {"approved": True, "message": None}
+ 
+     if approval_callback is None:
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 66196df..fe82434 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -610,7 +610,7 @@ class ProcessRegistry:
+         "tcsetattr: Inappropriate ioctl for device",
+     )
+ 
+-    def __init__(self):
++    def __init__(self, *, defer_completion_restore: bool = False):
+         self._running: Dict[str, ProcessSession] = {}
+         self._finished: Dict[str, ProcessSession] = {}
+         self._lock = threading.Lock()
+@@ -623,14 +623,11 @@ class ProcessRegistry:
+         # both land here, distinguished by "type" field.  CLI process_loop and
+         # gateway drain this after each agent turn to auto-trigger new turns.
+         import queue as _queue_mod
+-        self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
+-        # Rehydrate durable delegation completions only at registry startup.
+-        # Consumers still inject them as fresh turns through this existing rail.
+-        try:
+-            from tools.async_delegation import restore_undelivered_completions
+-            restore_undelivered_completions(self.completion_queue)
+-        except Exception as exc:
+-            logger.warning("Could not restore async delegation completions: %s", exc)
++        self._completion_queue: _queue_mod.Queue = _queue_mod.Queue()
++        self._completion_restore_lock = threading.Lock()
++        self._completion_restore_done = False
++        if not defer_completion_restore:
++            self._ensure_completion_restore()
+ 
+         # Track sessions whose completion was already consumed by the agent
+         # via wait/log.  Drain loops AND gateway/tui watchers skip notifications
+@@ -666,6 +663,34 @@ class ProcessRegistry:
+         # UI view is dropped (the user can reopen it from the status stack).
+         self.on_close = None
+ 
++    def _ensure_completion_restore(self) -> None:
++        if self._completion_restore_done:
++            return
++        with self._completion_restore_lock:
++            if self._completion_restore_done:
++                return
++            # Preserve the original once-only failure/log behavior. Pass the
++            # private queue so restoration cannot recursively enter this gate.
++            try:
++                from tools.async_delegation import restore_undelivered_completions
++                restore_undelivered_completions(self._completion_queue)
++            except Exception as exc:
++                logger.warning("Could not restore async delegation completions: %s", exc)
++            finally:
++                self._completion_restore_done = True
++
++    @property
++    def completion_queue(self):
++        self._ensure_completion_restore()
++        return self._completion_queue
++
++    @completion_queue.setter
++    def completion_queue(self, value):
++        # Preserve explicit queue replacement used by embedders/tests.
++        with self._completion_restore_lock:
++            self._completion_queue = value
++            self._completion_restore_done = True
++
+     @staticmethod
+     def _clean_shell_noise(text: str) -> str:
+         """Strip shell startup warnings from the beginning of output."""
+@@ -2838,7 +2863,10 @@ class ProcessRegistry:
+ 
+ 
+ # Module-level singleton
+-process_registry = ProcessRegistry()
++# Import/schema discovery must not recover or mutate durable delegations.
++# Every real queue producer/consumer still rehydrates exactly once before its
++# first access; ordinary explicitly constructed registries keep eager startup.
++process_registry = ProcessRegistry(defer_completion_restore=True)
+ 
+ 
+ def _format_age(seconds: float) -> str:
+diff --git a/tui_gateway/daily_note.py b/tui_gateway/daily_note.py
+index e8afc72..52745d2 100644
+--- a/tui_gateway/daily_note.py
++++ b/tui_gateway/daily_note.py
+@@ -99,6 +99,10 @@ class _Task:
+     proof: object = None
+     owned_client: object = None
+     config_proof: object = None
++    schema_proof: object = None
++    ui_lease_id: str | None = None
++    approval_id: str | None = None
++    approval_pending: bool = False
+ 
+     def current(self):
+         _require_transport(self.transport)
+@@ -141,6 +145,8 @@ def _abort(task):
+     # deadline or release the global worker slot while the worker still runs.
+     task.cancelled.set()
+     task.completion.set()
++    from tui_gateway.daily_note_approval import finish
++    finish(task, "daily.approval_cancelled")
+     def close_request():
+         try:
+             with _lock:
+@@ -154,7 +160,7 @@ def _abort(task):
+ 
+ def evaluate(params, transport):
+     global _active
+-    if not isinstance(params, dict) or set(params) != {"scope", "locale"}:
++    if not isinstance(params, dict) or set(params) != {"scope", "locale", "preparation_token"}:
+         raise LilithHostProtocolError("daily evaluate shape was rejected")
+     scope = normalize_scope(params["scope"])
+     locale = params["locale"]
+@@ -173,6 +179,10 @@ def evaluate(params, transport):
+         if _active is not None:
+             task.code = "daily.busy"
+             return _outcome(task)
++        from tui_gateway.daily_note_readiness import consume
++        prepared = consume(params["preparation_token"], scope, locale, transport)
++        task.agent, task.proof, task.config_proof = prepared.agent, prepared.proof, prepared.config_proof
++        task.schema_proof, task.ui_lease_id = prepared.schema_proof, prepared.params["ui_lease_id"]
+         _active = task
+ 
+     def worker():
+@@ -199,6 +209,7 @@ def evaluate(params, transport):
+                     task.agent = None
+                     task.proof = None
+                     task.config_proof = None
++                    task.schema_proof = None
+                     task.owned_client = None
+                     task.finished.set()
+                     if _active is task:
+@@ -209,7 +220,11 @@ def evaluate(params, transport):
+             task.code = "daily.cancelled_or_timeout"
+             _abort(task)
+             return _outcome(task, unfinished=True)
+-        if not _native_authority() or getattr(transport, "_closed", False):
++        from tui_gateway.daily_note_approval import waiting_on_own_transition
++        # An own phase-two commit can clear the pending marker between the
++        # first authority read and the waiter check. Re-read the true native
++        # gate before cancelling; this never grants tool dispatch authority.
++        if (not _native_authority() and not waiting_on_own_transition(task) and not _native_authority()) or getattr(transport, "_closed", False):
+             task.code = "daily.authority_lost"
+             _abort(task)
+             return _outcome(task, unfinished=True)
+@@ -362,14 +377,6 @@ def _strict_json(text):
+ 
+ 
+ def _run_native_task(task):
+-    # Importing run_agent/model_tools from an entirely cold process performs
+-    # normal native dotenv/tool/plugin discovery. Daily must not trigger it.
+-    # A fresh agent is supported only after the normal native bootstrap loaded
+-    # both modules. This is an explicit unfinished cold-boot integration seam.
+-    if (not callable(getattr(sys.modules.get("run_agent"), "AIAgent", None)) or
+-            not callable(getattr(sys.modules.get("model_tools"), "handle_function_call", None))):
+-        task.code = "daily.native_not_ready"
+-        return
+     from agent.identity_policy import (assert_scoped_identity_prompt, assert_scoped_identity_provider_request,
+         assert_scoped_identity_request_messages, policy_for_agent)
+     from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+@@ -378,9 +385,11 @@ def _run_native_task(task):
+     from tools.approval import set_current_session_key, reset_current_session_key
+     from hermes_cli.plugins import set_thread_tool_whitelist, clear_thread_tool_whitelist
+ 
+-    agent = _make_agent(task)
+-    task.agent = agent
+-    task.proof = _agent_proof(agent)
++    # The same isolated native agent was prepared before Runtime's durable
++    # model reservation. Evaluation never silently reconstructs it.
++    agent = task.agent
++    if agent is None:
++        raise LilithHostAuthorityError("daily prepared native agent unavailable")
+     task.current()
+     if not policy_for_agent(agent).enabled or agent.api_mode != "chat_completions":
+         raise LilithHostAuthorityError("daily strict identity is unavailable")
+@@ -443,11 +452,13 @@ def _run_native_task(task):
+         return
+     task.arguments = arguments
+     context = set_session_vars(session_key=task.scope["attempt_id"], session_id=task.scope["attempt_id"],
+-        source="lilith-daily-note", cwd="", ui_session_id="", cron_session="")
++        platform="lilith-daily-note", source="lilith-daily-note", cwd="", ui_session_id="", cron_session="")
+     approval = set_current_session_key(task.scope["attempt_id"])
+     set_thread_tool_whitelist({"lilith_leave_note"}, deny_msg_fmt="Daily note denied tool: {tool_name}")
+     try:
+         task.current()
++        from tui_gateway.daily_note_approval import install, finish
++        install(task)
+         # Keep the true native plugin/approval/middleware path. Its returned
+         # text cannot produce a receipt; only complete() writes task.result.
+         handle_function_call("lilith_leave_note", arguments, task_id=task.scope["attempt_id"],
+@@ -455,12 +466,17 @@ def _run_native_task(task):
+             enabled_toolsets=agent.enabled_toolsets, disabled_toolsets=agent.disabled_toolsets)
+         task.code = "daily.tool_returned"
+     finally:
++        from tui_gateway.daily_note_approval import finish
++        finish(task)
+         clear_thread_tool_whitelist()
+         reset_current_session_key(approval)
+         clear_session_vars(context)
+ 
+ 
+ def register(server):
++    from tui_gateway import daily_note_readiness, daily_note_approval
++    daily_note_readiness.register(server)
++    daily_note_approval.register(server)
+     for name, callback in (("evaluate", evaluate), ("complete", complete), ("cancel", cancel)):
+         def handler(rid, params, callback=callback):
+             from tui_gateway.lilith_host_bridge import LilithHostBridgeError
+diff --git a/tui_gateway/daily_note_approval.py b/tui_gateway/daily_note_approval.py
+new file mode 100644
+index 0000000..de64c4f
+--- /dev/null
++++ b/tui_gateway/daily_note_approval.py
+@@ -0,0 +1,188 @@
++"""Daily owner routing into the existing native approval queue and commit.
++
++This module presents no permission policy. Native choices and the native
++Always two-phase transaction remain authoritative; no conversation is minted.
++"""
++from __future__ import annotations
++
++import copy
++import threading
++import time
++import uuid
++
++from tui_gateway import daily_note as daily
++from tui_gateway.lilith_host_bridge import LilithHostAuthorityError, LilithHostProtocolError
++
++CHOICES = ("once", "session", "always", "deny")
++
++
++def _offer(data):
++    from agent.redact import redact_sensitive_text
++    from tools.approval import gateway_approval_choices
++    if not isinstance(data, dict):
++        raise LilithHostProtocolError("daily native approval offer unavailable")
++    choices = gateway_approval_choices(data)
++    supplied = data.get("choices")
++    if isinstance(supplied, (list, tuple)) and any(c not in supplied for c in choices):
++        raise LilithHostProtocolError("daily native producer choices were inconsistent")
++    if not choices:
++        raise LilithHostProtocolError("daily native producer offered no choices")
++    return {"pattern_key": str(data.get("pattern_key") or "")[:512],
++        "command": redact_sensitive_text(str(data.get("command") or ""), force=True)[:2048],
++        "description": redact_sensitive_text(str(data.get("description") or ""), force=True)[:2048],
++        "choices": choices, "allow_session": "session" in choices,
++        "allow_permanent": "always" in choices, "smart_denied": data.get("smart_denied") is True}
++
++
++def install(task):
++    from tools.approval import register_gateway_notify
++    task.approval_lock = threading.Lock()
++    task.approval_choices = ()
++    task.approval_response_started = False
++    def notify(data):
++        task.current()
++        if task.ui_lease_id is None:
++            raise LilithHostAuthorityError("daily approval UI is unavailable")
++        payload = _offer(data)
++        with daily._lock:
++            task.current()
++            if task.approval_id is not None:
++                raise LilithHostAuthorityError("daily approval was already published")
++            task.approval_id = uuid.uuid4().hex
++            task.approval_choices = tuple(payload["choices"])
++            payload.update(scope=copy.deepcopy(task.scope), approval_id=task.approval_id,
++                ui_lease_id=task.ui_lease_id, expires_at_utc=task.scope["expires_at_utc"])
++        from tui_gateway import server
++        if server._emit("lilith.daily_note.approval.request", task.scope["attempt_id"], payload) is False:
++            raise LilithHostAuthorityError("daily approval request was not emitted")
++    register_gateway_notify(task.scope["attempt_id"], notify)
++
++
++def finish(task, code="daily.approval_closed"):
++    from tools.approval import unregister_gateway_notify
++    unregister_gateway_notify(task.scope["attempt_id"])
++    with daily._lock:
++        approval_id, task.approval_id = task.approval_id, None
++    if approval_id is not None:
++        from tui_gateway import server
++        try:
++            server._emit("lilith.daily_note.approval.closed", task.scope["attempt_id"], {
++                "scope": copy.deepcopy(task.scope), "approval_id": approval_id,
++                "ui_lease_id": task.ui_lease_id, "code": code})
++        except Exception:
++            pass
++
++
++def waiting_on_own_transition(task):
++    """Keep only this paused waiter alive; never authorize any dispatch."""
++    from agent.identity_policy import (identity_lock_required_by_host,
++        native_authority_pending_transition_state, native_authority_quarantine_state)
++    if not task.approval_pending or not identity_lock_required_by_host() or native_authority_quarantine_state() is not None:
++        return False
++    pending = native_authority_pending_transition_state()
++    return bool(pending is not None and pending.get("session_key") == task.scope["attempt_id"]
++        and pending.get("source") in (None, "hermes.approval.respond.always"))
++
++
++def _lookup(params, transport, extra):
++    required = {"scope", "approval_id", "ui_lease_id"} | set(extra)
++    if not isinstance(params, dict) or set(params) != required:
++        raise LilithHostProtocolError("daily approval response shape rejected")
++    scope = daily.normalize_scope(params["scope"])
++    daily._require_transport(transport)
++    with daily._lock:
++        task = daily._active
++        if (task is None or task.scope != scope or task.transport is not transport
++                or task.approval_id is None or params["approval_id"] != task.approval_id
++                or params["ui_lease_id"] != task.ui_lease_id
++                or task.cancelled.is_set() or task.finished.is_set() or time.monotonic() >= task.deadline):
++            raise LilithHostAuthorityError("daily approval owner expired or changed")
++        return task
++
++
++def respond(params, transport):
++    from tools.approval import resolve_gateway_approval_with_persistence
++    task = _lookup(params, transport, {"choice"})
++    choice = params["choice"]
++    if choice not in task.approval_choices:
++        raise LilithHostProtocolError("daily native choice was not offered")
++    with task.approval_lock:
++        _lookup(params, transport, {"choice"})
++        task.current()
++        if task.approval_response_started:
++            raise LilithHostAuthorityError("daily approval response was already consumed")
++        task.approval_response_started = True
++        task.approval_pending = choice == "always"
++        def adopt(previous_sha256, config_sha256):
++            from agent.identity_policy import adopt_verified_native_config_digest
++            _lookup(params, transport, {"choice"})
++            adopt_verified_native_config_digest(task.agent,
++                previous_config_sha256=previous_sha256, config_sha256=config_sha256)
++            # This runs only inside native phase two after Runtime's exact
++            # durable receipt was verified. Unrelated changes cannot use it.
++            task.config_proof = daily._config_proof()
++            task.proof = daily._agent_proof(task.agent)
++        resolved, persistence = resolve_gateway_approval_with_persistence(task.scope["attempt_id"], choice,
++            resolve_all=False, on_verified_config_commit=adopt)
++        if resolved != 1:
++            raise LilithHostAuthorityError("daily approval did not resolve exactly one waiter")
++        if persistence is not None and "commit_nonce" in persistence:
++            return {"prepared": resolved, "persistence": persistence}
++        task.approval_pending = False
++        result = {"resolved": resolved}
++        if persistence is not None:
++            result["persistence"] = persistence
++        return result
++
++
++def commit(params, transport):
++    from tools.approval import commit_gateway_approval
++    task = _lookup(params, transport, {"authority", "commit_nonce", "receipt_sha256"})
++    with task.approval_lock:
++        _lookup(params, transport, {"authority", "commit_nonce", "receipt_sha256"})
++        if not task.approval_pending:
++            raise LilithHostAuthorityError("daily approval commit was not pending")
++        count = commit_gateway_approval(task.scope["attempt_id"], authority=params["authority"],
++            commit_nonce=params["commit_nonce"], receipt_sha256=params["receipt_sha256"])
++        task.approval_pending = False
++        if count != 1:
++            raise LilithHostAuthorityError("daily approval commit did not resolve exactly one")
++        return {"resolved": 1}
++
++
++def abort(params, transport):
++    from tools.approval import abort_gateway_approval
++    task = _lookup(params, transport, {"authority", "commit_nonce", "reason"})
++    with task.approval_lock:
++        _lookup(params, transport, {"authority", "commit_nonce", "reason"})
++        count = abort_gateway_approval(task.scope["attempt_id"], authority=params["authority"],
++            commit_nonce=params["commit_nonce"], reason=params["reason"])
++        task.approval_pending = False
++        if count != 1:
++            raise RuntimeError("daily approval abort did not abort exactly one")
++        return {"aborted": 1, "quarantined": True}
++
++
++def register(server):
++    for name, callback in (("respond", respond), ("commit", commit), ("abort", abort)):
++        def handler(rid, params, callback=callback, name=name):
++            from tui_gateway.lilith_host_bridge import LilithHostBridgeError
++            from agent.identity_policy import (NativeAuthorityTransitionBusyError,
++                native_authority_quarantine_state, latch_native_authority_quarantine)
++            try:
++                return server._ok(rid, callback(params, server.current_transport()))
++            except NativeAuthorityTransitionBusyError:
++                return server._err(rid, 4090, "daily native authority transaction busy")
++            except LilithHostBridgeError as exc:
++                if name != "respond" or native_authority_quarantine_state() is not None:
++                    latch_native_authority_quarantine("daily native approval phase two owner was unavailable",
++                        drifted_labels=("config.yaml", "runtime/native-config-receipt.v1.json"))
++                    return server._err(rid, 5035, "daily native approval authority quarantined")
++                return server._err(rid, exc.rpc_code, str(exc))
++            except Exception:
++                # Unknown persistence cannot be called a definite pre-effect
++                # error (5034). Native owns quarantine and no tool is released.
++                latch_native_authority_quarantine("daily native approval transaction failed without verified completion",
++                    drifted_labels=("config.yaml", "runtime/native-config-receipt.v1.json"))
++                return server._err(rid, 5035, "daily native approval transaction uncertain")
++        server.method("lilith.daily_note.approval." + name)(handler)
+diff --git a/tui_gateway/daily_note_readiness.py b/tui_gateway/daily_note_readiness.py
+new file mode 100644
+index 0000000..f9a79b6
+--- /dev/null
++++ b/tui_gateway/daily_note_readiness.py
+@@ -0,0 +1,292 @@
++"""Explicit native startup and one-use daily readiness; no model execution.
++
++The ON-only Runtime caller owns admission. First preparation performs normal
++native module/configured-plugin registration and its discovery-cache/env init,
++not a chat-session build. Those startup effects are once per native process and
++profile, never an implicit model, MCP discovery, conversation or note request.
++"""
++from __future__ import annotations
++
++import copy
++import hashlib
++import json
++import threading
++import time
++import uuid
++from dataclasses import dataclass, field
++from datetime import timedelta
++
++from tui_gateway import daily_note as daily
++from tui_gateway.lilith_host_bridge import LilithHostAuthorityError, LilithHostProtocolError
++
++PREPARE_SECONDS = 30.0
++TOKEN_SECONDS = 5.0
++CLAIM_SECONDS = 60.0
++FIELDS = frozenset({"profile_id", "runtime_generation", "game_epoch", "preparation_id", "locale", "ui_lease_id"})
++PATTERN = "plugin_rule:lilith_leave_note:deliver"
++_holder = None
++_claims = {}
++_bootstrap_home = None
++
++
++def _claim_preparation(identifier):
++    # Readiness has no model/write effect. Retain only a short replay window;
++    # abandoned/unready attempts must not brick a long-running native process.
++    now = time.monotonic()
++    for key, expiry in tuple(_claims.items()):
++        if expiry <= now:
++            del _claims[key]
++    if identifier in _claims or len(_claims) >= daily.MAX_CLAIMS:
++        return False
++    _claims[identifier] = now + CLAIM_SECONDS
++    return True
++
++
++def _id(value):
++    return isinstance(value, str) and daily._ID.fullmatch(value) and value != "0" * 32
++
++
++def _normalize(params):
++    if (not isinstance(params, dict) or set(params) != FIELDS or params["profile_id"] != "local"
++            or any(not _id(params[k]) for k in ("runtime_generation", "game_epoch", "preparation_id"))
++            or not isinstance(params["locale"], str) or params["locale"] not in daily._LOCALES
++            or (params["ui_lease_id"] is not None and not _id(params["ui_lease_id"]))):
++        raise LilithHostProtocolError("daily preparation shape was rejected")
++    return dict(params)
++
++
++def _utc_text(value):
++    return value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{value.microsecond:06d}0+00:00"
++
++
++def _bootstrap():
++    global _bootstrap_home
++    from hermes_constants import hermes_home_key
++    home = hermes_home_key()
++    if _bootstrap_home is not None:
++        if _bootstrap_home != home:
++            raise LilithHostAuthorityError("daily bootstrap profile changed")
++        return
++    # Python's module import lock and PluginManager's native discovery lock own
++    # concurrent normal startup. Do not invoke server._start_agent_build, an
++    # entry-point main(), SessionDB, MCP discovery, or an agent conversation.
++    import run_agent
++    import model_tools
++    from hermes_cli.plugins import discover_plugins
++    from tools.approval import load_permanent_allowlist
++    discover_plugins()
++    load_permanent_allowlist()
++    if not callable(run_agent.AIAgent) or not callable(model_tools.handle_function_call):
++        raise LilithHostAuthorityError("daily native startup incomplete")
++    _bootstrap_home = home
++
++
++def _schema_proof():
++    from model_tools import get_tool_definitions
++    from tools.registry import registry
++    definitions = get_tool_definitions(enabled_toolsets=["lilith_leave_note"], disabled_toolsets=[],
++        quiet_mode=True, skip_tool_search_assembly=True)
++    selected = [copy.deepcopy(x) for x in definitions if x.get("function", {}).get("name") == "lilith_leave_note"]
++    entry = registry.get_entry("lilith_leave_note")
++    if len(selected) != 1 or entry is None:
++        raise LilithHostAuthorityError("daily native note registry unavailable")
++    return (registry._generation, id(entry), hashlib.sha256(json.dumps(
++        selected, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest())
++
++
++@dataclass
++class _Preparation:
++    params: dict
++    transport: object
++    deadline: float
++    scope: dict = field(default_factory=dict)
++    agent: object = None
++    proof: object = None
++    config_proof: object = None
++    schema_proof: object = None
++    code: str = "daily.preparation_failed"
++    token: str | None = None
++    expiry_text: str | None = None
++    expires: float = 0.0
++    requires_ui: bool = True
++    ready: threading.Event = field(default_factory=threading.Event)
++    cancelled: threading.Event = field(default_factory=threading.Event)
++    released: threading.Event = field(default_factory=threading.Event)
++    finished: threading.Event = field(default_factory=threading.Event)
++    consumed: bool = False
++
++    @property
++    def locale(self):
++        return self.params["locale"]
++
++    def current(self):
++        daily._require_transport(self.transport)
++        if (self.cancelled.is_set() or time.monotonic() >= self.deadline
++                or not daily._native_authority()):
++            raise LilithHostAuthorityError("daily preparation authority revoked")
++        if self.config_proof is not None and daily._config_proof() != self.config_proof:
++            raise LilithHostAuthorityError("daily preparation configuration changed")
++
++
++def _response(item, *, available=False, code=None):
++    p = item.params
++    agent = item.agent
++    return {**{k: p[k] for k in ("profile_id", "runtime_generation", "game_epoch", "preparation_id")},
++        "ready": bool(available), "code": code or item.code,
++        "token": item.token if available else None,
++        "expires_at_utc": item.expiry_text if available else None,
++        "provider": str(getattr(agent, "provider", "") or ""),
++        "model": str(getattr(agent, "model", "") or ""),
++        "requires_ui": item.requires_ui, "ui_lease_id": p["ui_lease_id"]}
++
++
++def _close(item):
++    if item.agent is not None:
++        daily._close_agent(item)
++        item.agent = None
++    item.proof = item.config_proof = item.schema_proof = None
++    item.token = None
++
++
++def prepare(params, transport):
++    global _holder
++    p = _normalize(params)
++    daily._require_transport(transport)
++    if not daily._native_authority():
++        raise LilithHostAuthorityError("daily preparation requires native authority")
++    item = _Preparation(p, transport, time.monotonic() + PREPARE_SECONDS,
++        scope={"attempt_id": p["preparation_id"]})
++    with daily._lock:
++        if not _claim_preparation(p["preparation_id"]):
++            return _response(item, code="daily.preparation_duplicate_or_capacity")
++        if _holder is not None or daily._active is not None:
++            return _response(item, code="daily.preparation_busy")
++        _holder = item
++
++    def worker():
++        global _holder
++        from tui_gateway.transport import bind_transport, reset_transport
++        binding = bind_transport(transport)
++        try:
++            item.current()
++            _bootstrap()
++            item.current()
++            item.agent = daily._make_agent(item)
++            item.current()
++            from agent.identity_policy import enforce_scoped_turn_identity, policy_for_agent, assert_scoped_identity_prompt
++            from tools.approval import tool_approval_requires_human
++            enforce_scoped_turn_identity(item.agent)
++            if not policy_for_agent(item.agent).enabled:
++                raise LilithHostAuthorityError("daily persona unavailable")
++            soul, persona = item.agent._identity_soul_content, item.agent._identity_personality_prompt
++            if not isinstance(soul, str) or not soul.strip() or not isinstance(persona, str) or not persona.strip():
++                raise LilithHostAuthorityError("daily persona unavailable")
++            assert_scoped_identity_prompt(item.agent, soul.strip() + "\n\n" + persona.strip(), label="daily preparation identity")
++            item.schema_proof = _schema_proof()
++            item.proof = daily._agent_proof(item.agent)
++            item.requires_ui = tool_approval_requires_human(p["preparation_id"], PATTERN)
++            if item.requires_ui and p["ui_lease_id"] is None:
++                item.code = "daily.approval_ui_unavailable"
++                return
++            item.current()
++            with daily._lock:
++                item.current()
++                item.token = uuid.uuid4().hex
++                item.expires = time.monotonic() + TOKEN_SECONDS
++                item.deadline = item.expires
++                item.expiry_text = _utc_text(daily._utc_now() + timedelta(seconds=TOKEN_SECONDS))
++                item.code = "daily.ready"
++                item.ready.set()
++            while not item.released.wait(min(0.05, max(0.0, item.expires - time.monotonic()))):
++                if item.cancelled.is_set() or time.monotonic() >= item.expires:
++                    break
++        except Exception:
++            # Factory may supply an exact safe unsupported code; never expose
++            # secrets or let an exception string become model-budget evidence.
++            pass
++        finally:
++            try:
++                with daily._lock:
++                    consumed = item.consumed
++                    if not consumed:
++                        item.cancelled.set()
++                if not consumed:
++                    _close(item)
++            finally:
++                reset_transport(binding)
++                with daily._lock:
++                    item.finished.set()
++                    if _holder is item:
++                        _holder = None
++    threading.Thread(target=worker, daemon=True, name="lilith-daily-prepare").start()
++    while True:
++        with daily._lock:
++            if item.ready.is_set() and not item.cancelled.is_set() and not item.consumed and time.monotonic() < item.expires:
++                return _response(item, available=True)
++            if item.finished.is_set():
++                return _response(item)
++        if item.cancelled.is_set() or time.monotonic() >= item.deadline or getattr(transport, "_closed", False):
++            item.cancelled.set()
++            item.released.set()
++            return _response(item, code="daily.preparation_cancelled_or_timeout")
++        item.ready.wait(0.02)
++
++
++def consume(token, scope, locale, transport):
++    """Called under the same native task lock before publishing its owner."""
++    global _holder
++    if not _id(token):
++        raise LilithHostProtocolError("daily preparation token was rejected")
++    with daily._lock:
++        item = _holder
++        if item is None or item.token != token or item.transport is not transport:
++            raise LilithHostAuthorityError("daily preparation token unavailable")
++        # Any matched token is burned, including wrong-scope and expired uses.
++        item.token = None
++        try:
++            item.current()
++            if (not item.ready.is_set() or item.consumed or time.monotonic() >= item.expires
++                    or locale != item.locale or any(scope[k] != item.params[k]
++                        for k in ("profile_id", "runtime_generation", "game_epoch"))):
++                raise LilithHostAuthorityError("daily preparation scope expired or changed")
++            from agent.identity_policy import enforce_scoped_turn_identity
++            from tools.approval import tool_approval_requires_human
++            enforce_scoped_turn_identity(item.agent)
++            if (daily._agent_proof(item.agent) != item.proof or _schema_proof() != item.schema_proof
++                    or tool_approval_requires_human(scope["attempt_id"], PATTERN) != item.requires_ui):
++                raise LilithHostAuthorityError("daily preparation authority changed")
++            item.consumed = True
++            _holder = None
++            return item
++        finally:
++            if not item.consumed:
++                item.cancelled.set()
++            item.released.set()
++
++
++def cancel(params, transport):
++    if (not isinstance(params, dict) or set(params) != {"profile_id", "runtime_generation", "preparation_id"}
++            or params["profile_id"] != "local" or not _id(params["runtime_generation"])
++            or not _id(params["preparation_id"])):
++        raise LilithHostProtocolError("daily preparation cancellation rejected")
++    daily._require_transport(transport)
++    with daily._lock:
++        item = _holder
++        accepted = bool(item is not None and item.transport is transport
++            and all(item.params[k] == v for k, v in params.items()))
++        _claim_preparation(params["preparation_id"])
++        if accepted:
++            item.cancelled.set()
++            item.released.set()
++    return {**params, "accepted": accepted}
++
++
++def register(server):
++    for name, callback in (("prepare", prepare), ("prepare.cancel", cancel)):
++        def handler(rid, params, callback=callback):
++            from tui_gateway.lilith_host_bridge import LilithHostBridgeError
++            try:
++                return server._ok(rid, callback(params, server.current_transport()))
++            except LilithHostBridgeError as exc:
++                return server._err(rid, exc.rpc_code, str(exc))
++        server.method("lilith.daily_note." + name)(handler)
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 4610867..c0ba8a6 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2753,35 +2753,8 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
+     platforms and the SSE/API stream fixed in #50767). Reuse the shared gateway
+     seam so all approval transports redact consistently."""
+     payload = dict(data or {})
+-    canonical_choices = ("once", "session", "always", "deny")
+-    supplied = payload.get("choices")
+-    choices = []
+-    if isinstance(supplied, (list, tuple)):
+-        for value in supplied:
+-            if value in canonical_choices and value not in choices:
+-                choices.append(value)
+-
+-    if payload.get("smart_denied"):
+-        choices = [choice for choice in choices if choice in {"once", "deny"}]
+-        if not choices:
+-            choices = ["once", "deny"]
+-    elif "allow_permanent" in payload or "allow_session" in payload:
+-        allowed = {"once", "deny"}
+-        if payload.get("allow_session") is not False:
+-            allowed.add("session")
+-        if payload.get("allow_permanent") is not False:
+-            allowed.add("always")
+-        choices = [choice for choice in choices if choice in allowed]
+-        if not choices:
+-            choices = [
+-                choice for choice in canonical_choices if choice in allowed
+-            ]
+-    elif not choices:
+-        # MCP elicitation and any legacy request without policy metadata are
+-        # per-operation consent prompts. Never make a client invent
+-        # persistence semantics when the native producer did not offer them.
+-        choices = ["once", "deny"]
+-    payload["choices"] = choices
++    from tools.approval import gateway_approval_choices
++    payload["choices"] = gateway_approval_choices(payload)
+     if "command" in payload:
+         from gateway.run import _redact_approval_command
+ 

@@ -1,0 +1,559 @@
+diff --git a/tests/test_completed_speech_origin.py b/tests/test_completed_speech_origin.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_completed_speech_origin.py
+@@ -0,0 +1,128 @@
++"""Pure lifecycle tests. Model/runtime imports are explicit synthetic doubles."""
++import contextlib
++import sys
++import threading
++import types
++import unittest
++from unittest.mock import patch
++
++from tui_gateway import speech_origin as subject
++
++
++class CompletedOriginTests(unittest.TestCase):
++    def setUp(self):
++        self.state = types.SimpleNamespace(stopped=False)
++        self.origin = types.SimpleNamespace(origin_id="a" * 32,
++            ledger=types.SimpleNamespace(snapshot=lambda: self.state),
++            _owner=types.SimpleNamespace(_validate=lambda handle: None))
++        self.agent = object()
++        self.snapshot = object()
++        self.session = dict(agent=self.agent, history_lock=threading.Lock(),
++            source="lilith-game", archived=True, session_key="tip",
++            _durable_lineage_root="root", running=False, inflight_turn=None)
++        self.modules = patch.dict(sys.modules, {
++            "agent.usage_budget_runtime": types.SimpleNamespace(capture_origin=lambda: self.origin),
++            "agent.speech_projection": types.SimpleNamespace(capture_speech_projection=lambda *a, **kw: self.snapshot),
++            "agent.turn_identity": types.SimpleNamespace(require_canonical_id=lambda value, _: value),
++        })
++        self.modules.start()
++        self.addCleanup(self.modules.stop)
++
++    def retain(self):
++        subject.retain_completed(self.session, "live", "a" * 32, "早安。", self.origin)
++
++    def claim(self, **changes):
++        args = dict(session=self.session, session_id="live", turn_id="a" * 32, text="早安。")
++        args.update(changes)
++        return subject.claim(**args)
++
++    def test_exact_reply_once(self):
++        self.retain()
++        grant = self.claim()
++        self.assertIs(self.origin, grant.origin)
++        self.assertIs(self.snapshot, grant.snapshot)
++        self.assertTrue(subject.is_current(self.session, grant))
++        with self.assertRaises(ValueError): self.claim()
++        subject.finish(self.session, grant)
++        self.assertFalse(subject.is_current(self.session, grant))
++        with self.assertRaises(ValueError): self.claim()
++
++    def test_missing_or_restarted_session(self):
++        with self.assertRaises(ValueError): self.claim()
++
++    def test_mismatch_does_not_consume_valid_reply(self):
++        self.retain()
++        for change in ({"session_id": "other"}, {"turn_id": "b" * 32}, {"text": "早安。 "}):
++            with self.subTest(change=change), self.assertRaises(ValueError): self.claim(**change)
++        self.claim()
++
++    def test_cross_session_even_if_slot_copied(self):
++        self.retain()
++        with self.assertRaises(ValueError): self.claim(session=dict(self.session))
++
++    def test_state_changes_invalidate_before_and_after_claim(self):
++        for field, value in (("agent", object()), ("source", "other"), ("archived", False),
++                             ("session_key", "other"), ("_durable_lineage_root", "other"),
++                             ("running", True), ("inflight_turn", {}), ("_finalized", True),
++                             ("_turn_cancel_requested", True)):
++            with self.subTest(field=field):
++                self.retain()
++                grant = self.claim()
++                old = self.session.get(field)
++                self.session[field] = value
++                self.assertFalse(subject.is_current(self.session, grant))
++                with self.assertRaises(ValueError): self.claim()
++                self.session[field] = old
++
++    def test_stop_ledger_remains_effective_without_quota(self):
++        self.retain()
++        grant = self.claim()
++        self.state.stopped = True
++        self.assertFalse(subject.is_current(self.session, grant))
++        with self.assertRaises(ValueError): self.retain()
++
++    def test_next_turn_invalidates_and_old_cleanup_cannot_erase_new(self):
++        self.retain()
++        old = self.claim()
++        with self.session["history_lock"]: subject.invalidate_locked(self.session)
++        self.assertFalse(subject.is_current(self.session, old))
++        self.retain()
++        subject.finish(self.session, old)
++        self.claim()
++
++    def test_foreign_or_missing_origin_never_mints(self):
++        for handle in (None, object()):
++            with self.assertRaises(ValueError):
++                subject.retain_completed(self.session, "live", "a" * 32, "早安。", handle)
++
++    def test_capture_failure_leaves_no_grant(self):
++        self.retain()
++        with patch.object(sys.modules["agent.speech_projection"], "capture_speech_projection", side_effect=ValueError):
++            with self.assertRaises(ValueError): self.retain()
++        with self.assertRaises(ValueError): self.claim()
++
++    def test_invalid_text_cannot_be_admitted(self):
++        for text in (None, "", " ", "a" * 32769):
++            with self.assertRaises(ValueError):
++                subject.retain_completed(self.session, "live", "a" * 32, text, self.origin)
++
++    def test_no_history_or_credentials_in_diagnostics(self):
++        self.retain()
++        grant = self.claim()
++        self.assertNotIn("早安", repr(grant))
++        self.assertNotIn("snapshot=", repr(grant))
++
++    def test_concurrent_duplicate_only_one_claims(self):
++        self.retain()
++        accepted = []
++        def attempt():
++            try: accepted.append(self.claim())
++            except ValueError: pass
++        threads = [threading.Thread(target=attempt) for _ in range(8)]
++        for thread in threads: thread.start()
++        for thread in threads: thread.join()
++        self.assertEqual(1, len(accepted))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_speech_origin_integration.py b/tests/test_speech_origin_integration.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_speech_origin_integration.py
+@@ -0,0 +1,177 @@
++"""Fixed complete native speech path fixture, invoked by the denied-effects harness."""
++import contextvars
++import copy
++import json
++import threading
++import uuid
++from unittest.mock import patch
++
++
++def exercise(profile):
++    import httpx
++    import openai
++    import requests
++    import run_agent
++    import tools.env_probe
++    import hermes_constants
++    import agent.prompt_builder as prompt_builder
++    from run_agent import AIAgent
++    from agent import auxiliary_client, identity_policy, plugin_llm
++    from agent.usage_budget_runtime import get_runtime, capture_origin
++    from agent.usage_budget_preferences import PreferenceUpdate
++    from agent.usage_budget_entrypoints import accept_native_origin, bind_native_agent_origin, native_origin_scope, complete_primary
++    from tui_gateway import server, speech_origin
++
++    transport_calls = []
++    on_send = [None]
++    output = ["早安。"]
++    foreign_authority = contextvars.ContextVar("fixture_tool_authority", default=None)
++
++    def fake_http(request):
++        payload = json.loads(request.content)
++        transport_calls.append((payload, capture_origin(), foreign_authority.get()))
++        if on_send[0] is not None:
++            on_send[0]()
++        if payload.get("stream"):
++            chunks = [
++                {"id": "fixture", "object": "chat.completion.chunk", "created": 0, "model": "gpt-4o",
++                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": output[0]}, "finish_reason": None}]},
++                {"id": "fixture", "object": "chat.completion.chunk", "created": 0, "model": "gpt-4o",
++                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
++                 "usage": {"prompt_tokens": 200000, "completion_tokens": 20, "total_tokens": 200020}}]
++            body = "".join("data: " + json.dumps(row) + "\n\n" for row in chunks) + "data: [DONE]\n\n"
++            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body.encode())
++        return httpx.Response(200, json={"id": "fixture", "object": "chat.completion", "created": 0,
++            "model": "gpt-4o", "choices": [{"index": 0, "message": {"role": "assistant", "content": output[0]}, "finish_reason": "stop"}],
++            "usage": {"prompt_tokens": 200000, "completion_tokens": 20, "total_tokens": 200020}})
++
++    client = openai.OpenAI(api_key="synthetic-not-a-secret", base_url="https://api.openai.com/v1", max_retries=0,
++                          http_client=httpx.Client(transport=httpx.MockTransport(fake_http), trust_env=False))
++    run_agent.OpenAI = lambda *args, **kwargs: client
++    AIAgent._build_keepalive_http_client = staticmethod(lambda *args, **kwargs: client._client)
++    tools.env_probe.warm_environment_probe_async = lambda *args, **kwargs: None
++    tools.env_probe.get_environment_probe_line = lambda *args, **kwargs: "synthetic environment"
++    tools.env_probe._build_probe_line = lambda *args, **kwargs: "synthetic environment"
++    hermes_constants.is_wsl = lambda: False
++    prompt_builder.is_wsl = lambda: False
++    def catalog_response(*args, **kwargs):
++        response = requests.Response()
++        response.status_code = 200
++        response._content = b'{"data":[]}'
++        return response
++    requests.Session.request = catalog_response
++    runtime = get_runtime(profile)
++    projection = server._methods["prompt.project_speech"]
++
++    def frozen_client(*args, **kwargs):
++        assert kwargs["main_runtime"]["model"] == "gpt-4o"
++        assert kwargs["main_runtime"]["provider"] == "openai"
++        return client, kwargs["main_runtime"]["model"]
++
++    for level in range(1, 7):
++        current = runtime.store.get()
++        runtime.store.set(PreferenceUpdate(f"speech-level-{level}", current.revision, level))
++        agent = AIAgent(model="gpt-4o", provider="openai", api_mode="chat_completions", api_key="synthetic-not-a-secret",
++            base_url="https://api.openai.com/v1", session_id=f"fixture-{level}", max_tokens=2048, max_iterations=32,
++            enabled_toolsets=[], skip_context_files=True, skip_memory=True, skip_background_review=True, quiet_mode=True)
++        agent._persist_disabled = True
++        agent.client = client
++        turn_id = uuid.uuid4().hex
++        handle = bind_native_agent_origin(accept_native_origin(profile, turn_id), agent)
++        session = dict(agent=agent, archived=True, source="lilith-game", session_key=f"tip-{level}",
++            _durable_lineage_root=f"root-{level}", history_lock=threading.Lock(), running=False,
++            inflight_turn=None, history=[{"role": "user", "content": "早安"}], profile_home=profile)
++        output[0] = "早安。"
++        with native_origin_scope(handle):
++            result = agent.run_conversation("早安", conversation_history=[])
++            assert result.get("final_response") == "早安。" and not result.get("failed"), result
++            speech_origin.retain_completed(session, "live", turn_id, result["final_response"], handle)
++        complete_primary(handle)
++        assert capture_origin() is None
++        history = copy.deepcopy(session["history"])
++        prompt = agent._cached_system_prompt
++        params = dict(session_id="live", turn_id=turn_id, text="早安。", display_locale="zh-Hant", speech_locale="ja")
++
++        # Host identity/DB attestation is synthetic. The economic guard,
++        # actual RPC, clean-context projector, serializer and dispatch are real.
++        with patch.object(server, "_sess", return_value=(session, None)), \
++                patch.object(server, "_attest_durable_lineage_postcondition", return_value={"stored_session_id": session["session_key"]}), \
++                patch.object(identity_policy, "identity_lock_required_by_host", return_value=True), \
++                patch.object(identity_policy, "assert_scoped_identity_prompt"), \
++                patch.object(identity_policy, "bind_host_required_auxiliary_messages", side_effect=lambda value: value), \
++                patch.object(identity_policy, "preflight_host_required_auxiliary_request", return_value=False), \
++                patch.object(identity_policy, "assert_scoped_identity_request_overrides"), \
++                patch.object(plugin_llm, "_resolve_trust_policy", return_value=plugin_llm._TrustPolicy(plugin_id="lilith-runtime-speech-projection")), \
++                patch.object(auxiliary_client, "_get_cached_client", side_effect=frozen_client):
++            output[0] = json.dumps({"speech_text": "おはようございます。"}, ensure_ascii=False)
++            # Reproduce the old unowned RPC failure without disabling the guard.
++            legacy = {key: value for key, value in params.items() if key != "turn_id"}
++            before = len(transport_calls)
++            negative = projection("missing", legacy)
++            assert ("error" in negative) == (level != 5), (level, negative)
++            assert len(transport_calls) - before == int(level == 5)
++
++            # Moving the slider/model after completion cannot replace this turn.
++            current = runtime.store.get()
++            runtime.store.set(PreferenceUpdate(f"speech-hot-{level}", current.revision, 1 if level == 6 else 6))
++            agent.model = "changed-after-primary"
++            before_usage = handle.ledger.snapshot().known_input_tokens
++            token = foreign_authority.set("must-not-cross")
++            try:
++                before = len(transport_calls)
++                response = projection("speech", params)
++            finally:
++                foreign_authority.reset(token)
++            assert response.get("result", {}).get("speech_text") == "おはようございます。", (level, response)
++            assert len(transport_calls) == before + 1
++            wire, actual_origin, tool_scope = transport_calls[-1]
++            assert actual_origin is handle and handle.ledger.policy.level == level
++            assert tool_scope is None and wire["model"] == "gpt-4o"
++            assert not wire.get("tools") and len(wire["messages"]) == 2
++            assert wire["messages"][0]["content"].startswith(prompt)
++            assert handle.ledger.snapshot().known_input_tokens == before_usage + 200000
++            assert session["history"] == history and capture_origin() is None
++            assert "error" in projection("replay", params)
++            assert len(transport_calls) == before + 1
++
++            def retain():
++                agent.model = "gpt-4o"
++                session["inflight_turn"] = None
++                session["running"] = False
++                session["_turn_cancel_requested"] = False
++                session["_finalized"] = False
++                with native_origin_scope(handle):
++                    speech_origin.retain_completed(session, "live", turn_id, "早安。", handle)
++
++            for mismatch in ({"turn_id": "b" * 32}, {"text": "另一段文字"}, {"session_id": "other"}):
++                retain()
++                before = len(transport_calls)
++                assert "error" in projection("mismatch", {**params, **mismatch})
++                assert len(transport_calls) == before
++
++            for field in ("_turn_cancel_requested", "_finalized"):
++                retain()
++                session[field] = True
++                before = len(transport_calls)
++                assert "error" in projection("closed", params)
++                assert len(transport_calls) == before
++
++            # Invalidate during the first actual send; no result publication
++            # and no language-repair retry after cancellation/new-turn admission.
++            for action in ("stop", "next_turn", "close"):
++                retain()
++                def invalidate(action=action):
++                    with session["history_lock"]:
++                        if action == "next_turn":
++                            server._start_inflight_turn(session, "新一輪")
++                        elif action == "close":
++                            session["_finalized"] = True
++                        else:
++                            session["_turn_cancel_requested"] = True
++                on_send[0] = invalidate
++                before = len(transport_calls)
++                assert "error" in projection("stale", params)
++                assert len(transport_calls) == before + 1
++                on_send[0] = None
++            assert result["final_response"] == "早安。"
++            print(f"PASS: level {level}, owned projection, frozen route/policy, observed usage, exact binding, replay and stale-result denial")
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index ebdccf3..0605c98 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -1384,14 +1384,15 @@ def _(rid, params: dict) -> dict:
+ 
+     This is deliberately outside the conversation loop: it reads no history,
+     exposes no tools or memory, and persists nothing.  The live session is used
+-    only to freeze its active model route and strict system-authority prefix.
++    to attest the completed reply's frozen model, identity and economic origin.
++    Legacy notifications have no turn_id and cannot borrow that grant.
+     """
+     required = {"session_id", "text", "display_locale", "speech_locale"}
+-    if not isinstance(params, dict) or set(params) != required:
++    if not isinstance(params, dict) or set(params) not in (required, required | {"turn_id"}):
+         return _err(
+             rid,
+             4004,
+-            "prompt.project_speech requires exactly session_id, text, display_locale, and speech_locale",
++            "prompt.project_speech requires session_id, text, display_locale, speech_locale and optional turn_id",
+         )
+ 
+     session_id = params["session_id"]
+@@ -1411,6 +1412,13 @@ def _(rid, params: dict) -> dict:
+         return _err(rid, 4004, "speech text must be a non-blank string")
+     if len(text) > 32768:
+         return _err(rid, 4004, "speech text exceeds 32768 characters")
++    turn_id = params.get("turn_id")
++    if "turn_id" in params:
++        from agent.turn_identity import require_canonical_id
++        try:
++            require_canonical_id(turn_id, "turn_id")
++        except (TypeError, ValueError):
++            return _err(rid, 4004, "invalid speech turn identity")
+ 
+     session, err = _sess(params, rid)
+     if err:
+@@ -1449,17 +1457,26 @@ def _(rid, params: dict) -> dict:
+             return _err(rid, 4090, "speech projection session state changed")
+     agent = session.get("agent")
+     cached_system_prompt = getattr(agent, "_cached_system_prompt", None)
+-    if not isinstance(cached_system_prompt, str) or not cached_system_prompt:
++    if turn_id is None and (not isinstance(cached_system_prompt, str) or not cached_system_prompt):
+         return _err(rid, 4091, "session system authority is unavailable")
+ 
++    grant = None
+     try:
+         from agent.speech_projection import capture_speech_projection, project_speech
++        from tui_gateway.speech_origin import claim, finish, is_current
+ 
+-        if not _main_runtime_from_agent(agent, session_id=session_id):
+-            return _err(rid, 4091, "session model route is unavailable")
+-        snapshot = capture_speech_projection(agent, session_id=session_id)
++        if turn_id is not None:
++            grant = claim(session, session_id, turn_id, text)
++            snapshot = grant.snapshot
++        else:
++            # Preserve the separate legacy notification path. In particular,
++            # missing foreground provenance never falls back here, even at 5.
++            if not _main_runtime_from_agent(agent, session_id=session_id):
++                return _err(rid, 4091, "session model route is unavailable")
++            snapshot = capture_speech_projection(agent, session_id=session_id)
+         speech_text = project_speech(
+             snapshot, text, display_locale=display_locale, speech_locale=speech_locale,
++            is_current=(lambda: is_current(session, grant)) if grant is not None else None,
+         )
+         return _ok(rid, {"speech_text": speech_text})
+     except Exception as exc:
+@@ -1470,6 +1487,9 @@ def _(rid, params: dict) -> dict:
+             type(exc).__name__,
+         )
+         return _err(rid, 5030, "speech projection failed")
++    finally:
++        if grant is not None:
++            finish(session, grant)
+ 
+ 
+ @method("preview.restart")
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index db8ab4c..881aa66 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -4357,6 +4357,8 @@ def _(rid, params: dict) -> dict:
+     had_native_owner = False
+     with session["history_lock"]:
+         from agent.usage_budget_entrypoints import stop_origin
++        from tui_gateway.speech_origin import invalidate_locked
++        invalidate_locked(session)
+         stop_origin(session.get("_usage_budget_origin"))
+         stop_origin(session.get("_usage_budget_manual_origin"))
+         cancel = session.get("_usage_budget_manual_cancel")
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 3725e40..dc22826 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -787,6 +787,8 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
+     lock = session.get("history_lock")
+     if lock is not None:
+         with lock:
++            from tui_gateway.speech_origin import invalidate_locked
++            invalidate_locked(session)
+             history = list(session.get("history", []))
+     else:
+         history = list(session.get("history", []))
+@@ -1030,6 +1032,9 @@ def _pop_session_by_id(sid: str) -> dict | None:
+         # (e.g. _finalize_session's per-session async-delegation interrupt) can't
+         # recover its live id by scanning the dict — stamp it on the record.
+         session["_sid"] = sid
++        with session["history_lock"]:
++            from tui_gateway.speech_origin import invalidate_locked
++            invalidate_locked(session)
+         session["_native_lifecycle_effect_token"] = effect_token
+         effect_token = ""
+         return session
+@@ -10877,6 +10882,8 @@ def _start_inflight_turn(
+     )
+ 
+     now = time.time()
++    from tui_gateway.speech_origin import invalidate_locked
++    invalidate_locked(session)
+     session.pop("_usage_budget_accepted", None)
+     session.pop("_usage_budget_transfer", None)
+     session.pop("_usage_budget_completed_constraints", None)
+@@ -15959,6 +15966,18 @@ def _run_prompt_submit(
+                 if _session_verbose(sid):
+                     reasoning_payload["verbose"] = True
+                 _emit("reasoning.available", sid, reasoning_payload)
++            # Freeze before cleanup drops the origin or restores a one-turn
++            # model. This is only the successful, attested human game reply;
++            # notifications never borrow this foreground economic lineage.
++            if (status == "complete" and _budget_is_human and budget_origin is not None
++                    and session.get("source") == "lilith-game"
++                    and isinstance(durable_postcondition, dict)):
++                try:
++                    from tui_gateway.speech_origin import retain_completed
++                    retain_completed(session, sid, turn_id, raw, budget_origin)
++                except Exception as speech_capture_error:
++                    logger.warning("completed speech origin unavailable (%s)",
++                                   type(speech_capture_error).__name__)
+             _emit("message.complete", sid, payload)
+ 
+             # ── /goal continuation (Ralph-style loop) ─────────────────
+diff --git a/tui_gateway/speech_origin.py b/tui_gateway/speech_origin.py
+new file mode 100644
+--- /dev/null
++++ b/tui_gateway/speech_origin.py
+@@ -0,0 +1,97 @@
++"""Ephemeral completed-reply provenance, never a new allowance or tool authority."""
++from dataclasses import dataclass, field
++import hashlib
++
++
++_KEY = "_completed_speech_origin"
++
++
++@dataclass(eq=False)
++class CompletedSpeechOrigin:
++    session: object = field(repr=False)
++    agent: object = field(repr=False)
++    session_id: str
++    session_key: str
++    lineage_root: str
++    turn_id: str
++    text_digest: str = field(repr=False)
++    origin: object = field(repr=False)
++    snapshot: object = field(repr=False)
++    claimed: bool = False
++
++
++def _digest(text):
++    return hashlib.sha256(text.encode("utf-8")).hexdigest()
++
++
++def invalidate_locked(session):
++    """Caller owns history_lock. In-flight projections check this same slot."""
++    session.pop(_KEY, None)
++
++
++def retain_completed(session, session_id, turn_id, text, origin):
++    """Called before terminal publication, inside the original economic scope.
++
++    Capture failures are auxiliary failures: the caller must keep the primary
++    reply. Nothing is serialized, read back from history, or minted on resume.
++    """
++    from agent.usage_budget_runtime import capture_origin
++    from agent.speech_projection import capture_speech_projection
++    from agent.turn_identity import require_canonical_id
++
++    require_canonical_id(turn_id, "turn_id")
++    if origin is None or capture_origin() is not origin or origin.origin_id != turn_id:
++        raise ValueError("speech origin does not own the completed turn")
++    if type(text) is not str or not text.strip() or len(text) > 32768:
++        raise ValueError("speech source is unavailable")
++    with session["history_lock"]:
++        invalidate_locked(session)
++        if (session.get("source") != "lilith-game" or session.get("archived") is not True
++                or session.get("_finalized") or session.get("_turn_cancel_requested")
++                or not session.get("session_key") or not session.get("_durable_lineage_root")
++                or origin.ledger.snapshot().stopped):
++            raise ValueError("speech session is unavailable")
++        agent = session.get("agent")
++        snapshot = capture_speech_projection(agent, session_id=session_id)
++        session[_KEY] = CompletedSpeechOrigin(
++            session, agent, session_id, session["session_key"], session["_durable_lineage_root"],
++            turn_id, _digest(text), origin, snapshot)
++
++
++def _current_locked(session, grant):
++    if (type(grant) is not CompletedSpeechOrigin or grant.session is not session
++            or session.get(_KEY) is not grant or session.get("agent") is not grant.agent
++            or session.get("source") != "lilith-game" or session.get("archived") is not True
++            or session.get("session_key") != grant.session_key
++            or session.get("_durable_lineage_root") != grant.lineage_root
++            or session.get("_finalized") or session.get("_turn_cancel_requested")
++            or session.get("running") or isinstance(session.get("inflight_turn"), dict)):
++        return False
++    try:
++        grant.origin._owner._validate(grant.origin)
++        return not grant.origin.ledger.snapshot().stopped
++    except Exception:
++        return False
++
++
++def claim(session, session_id, turn_id, text):
++    """One exact terminal reply, once. A public ID alone is not authority."""
++    with session["history_lock"]:
++        grant = session.get(_KEY)
++        if (not _current_locked(session, grant) or grant.claimed
++                or grant.session_id != session_id or grant.turn_id != turn_id
++                or grant.text_digest != _digest(text)):
++            raise ValueError("completed speech origin unavailable")
++        grant.claimed = True
++        return grant
++
++
++def is_current(session, grant):
++    with session["history_lock"]:
++        return _current_locked(session, grant)
++
++
++def finish(session, grant):
++    with session["history_lock"]:
++        if session.get(_KEY) is grant:
++            invalidate_locked(session)

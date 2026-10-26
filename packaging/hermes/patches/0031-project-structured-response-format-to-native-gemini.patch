@@ -1,0 +1,232 @@
+diff --git a/agent/gemini_native_adapter.py b/agent/gemini_native_adapter.py
+index 974d3ec..19078f3 100644
+--- a/agent/gemini_native_adapter.py
++++ b/agent/gemini_native_adapter.py
+@@ -18,6 +18,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import base64
++import copy
+ import json
+ import logging
+ import time
+@@ -522,6 +523,35 @@ def _normalize_thinking_config(config: Any) -> Optional[Dict[str, Any]]:
+     return normalized or None
+ 
+ 
++def _normalize_response_format(config: Any) -> Optional[Dict[str, Any]]:
++    """Translate the existing OpenAI-shaped structured-output envelope.
++
++    The native Gemini transport must not silently discard a response format
++    that the shared host already accepted. Unknown or malformed shapes fail
++    closed so callers can use their explicit fallback policy.
++    """
++
++    if config is None:
++        return None
++    if not isinstance(config, dict):
++        raise ValueError("Gemini response_format must be an object")
++    format_type = config.get("type")
++    if format_type == "json_object":
++        return {"mime_type": "application/json", "json_schema": None}
++    if format_type != "json_schema":
++        raise ValueError("Gemini response_format has an unsupported type")
++    envelope = config.get("json_schema")
++    if not isinstance(envelope, dict):
++        raise ValueError("Gemini json_schema response_format must contain an object")
++    schema = envelope.get("schema")
++    if not isinstance(schema, dict):
++        raise ValueError("Gemini json_schema response_format must contain a schema object")
++    return {
++        "mime_type": "application/json",
++        "json_schema": copy.deepcopy(schema),
++    }
++
++
+ def build_gemini_request(
+     *,
+     messages: List[Dict[str, Any]],
+@@ -532,6 +562,7 @@ def build_gemini_request(
+     top_p: Optional[float] = None,
+     stop: Any = None,
+     thinking_config: Any = None,
++    response_format: Any = None,
+ ) -> Dict[str, Any]:
+     contents, system_instruction = _build_gemini_contents(messages)
+     request: Dict[str, Any] = {"contents": contents}
+@@ -570,6 +601,12 @@ def build_gemini_request(
+     normalized_thinking = _normalize_thinking_config(thinking_config)
+     if normalized_thinking:
+         generation_config["thinkingConfig"] = normalized_thinking
++    normalized_response_format = _normalize_response_format(response_format)
++    if normalized_response_format:
++        generation_config["responseMimeType"] = normalized_response_format["mime_type"]
++        response_json_schema = normalized_response_format["json_schema"]
++        if response_json_schema is not None:
++            generation_config["responseJsonSchema"] = response_json_schema
+     if generation_config:
+         request["generationConfig"] = generation_config
+ 
+@@ -1083,6 +1120,7 @@ class GeminiNativeClient:
+         max_tokens: Optional[int] = None,
+         top_p: Optional[float] = None,
+         stop: Any = None,
++        response_format: Any = None,
+         extra_body: Optional[Dict[str, Any]] = None,
+         timeout: Any = None,
+         **_: Any,
+@@ -1090,6 +1128,11 @@ class GeminiNativeClient:
+         thinking_config = None
+         if isinstance(extra_body, dict):
+             thinking_config = extra_body.get("thinking_config") or extra_body.get("thinkingConfig")
++            nested_response_format = extra_body.get("response_format")
++            if nested_response_format is not None:
++                if response_format is not None and response_format != nested_response_format:
++                    raise ValueError("Conflicting Gemini response_format values")
++                response_format = nested_response_format
+ 
+         request = build_gemini_request(
+             messages=messages or [],
+@@ -1100,6 +1143,7 @@ class GeminiNativeClient:
+             top_p=top_p,
+             stop=stop,
+             thinking_config=thinking_config,
++            response_format=response_format,
+         )
+ 
+         model = bare_gemini_model_id(model)
+diff --git a/tests/agent/test_gemini_native_adapter.py b/tests/agent/test_gemini_native_adapter.py
+index 3650e8d..09422f4 100644
+--- a/tests/agent/test_gemini_native_adapter.py
++++ b/tests/agent/test_gemini_native_adapter.py
+@@ -237,6 +237,125 @@ def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatc
+     assert response.choices[0].message.content == "hello"
+ 
+ 
++def test_native_client_projects_json_schema_response_format_without_mutation(monkeypatch):
++    from agent.gemini_native_adapter import GeminiNativeClient
++
++    recorded = {}
++
++    class DummyHTTP:
++        def post(self, url, json=None, headers=None, timeout=None):
++            recorded["json"] = json
++            return DummyResponse(
++                payload={
++                    "candidates": [{
++                        "content": {"parts": [{"text": '{"event_ids": []}'}]},
++                        "finishReason": "STOP",
++                    }]
++                }
++            )
++
++        def close(self):
++            return None
++
++    monkeypatch.setattr("agent.gemini_native_adapter.httpx.Client", lambda *a, **k: DummyHTTP())
++    schema = {
++        "type": "object",
++        "properties": {"event_ids": {"type": "array", "items": {"type": "string"}}},
++        "required": ["event_ids"],
++        "additionalProperties": False,
++    }
++    original = json.loads(json.dumps(schema))
++    client = GeminiNativeClient(api_key="AIza-test")
++
++    client.chat.completions.create(
++        model="gemini-test",
++        messages=[{"role": "user", "content": "Select events"}],
++        extra_body={
++            "response_format": {
++                "type": "json_schema",
++                "json_schema": {"name": "selection", "schema": schema, "strict": False},
++            }
++        },
++    )
++
++    config = recorded["json"]["generationConfig"]
++    assert config["responseMimeType"] == "application/json"
++    assert config["responseJsonSchema"] == original
++    assert config["responseJsonSchema"] is not schema
++    assert schema == original
++
++
++def test_native_client_projects_json_object_response_format(monkeypatch):
++    from agent.gemini_native_adapter import GeminiNativeClient
++
++    recorded = {}
++
++    class DummyHTTP:
++        def post(self, url, json=None, headers=None, timeout=None):
++            recorded["json"] = json
++            return DummyResponse(
++                payload={
++                    "candidates": [{
++                        "content": {"parts": [{"text": "{}"}]},
++                        "finishReason": "STOP",
++                    }]
++                }
++            )
++
++        def close(self):
++            return None
++
++    monkeypatch.setattr("agent.gemini_native_adapter.httpx.Client", lambda *a, **k: DummyHTTP())
++    client = GeminiNativeClient(api_key="AIza-test")
++    client.chat.completions.create(
++        model="gemini-test",
++        messages=[{"role": "user", "content": "Return JSON"}],
++        response_format={"type": "json_object"},
++    )
++
++    config = recorded["json"]["generationConfig"]
++    assert config["responseMimeType"] == "application/json"
++    assert "responseJsonSchema" not in config
++
++
++@pytest.mark.parametrize(
++    "response_format",
++    [
++        "json",
++        {},
++        {"type": "yaml"},
++        {"type": "json_schema"},
++        {"type": "json_schema", "json_schema": {"schema": "not-an-object"}},
++    ],
++)
++def test_native_client_rejects_unknown_response_format_before_http(
++    monkeypatch,
++    response_format,
++):
++    from agent.gemini_native_adapter import GeminiNativeClient
++
++    calls = []
++
++    class DummyHTTP:
++        def post(self, *args, **kwargs):
++            calls.append((args, kwargs))
++            raise AssertionError("HTTP must not be called for an invalid response format")
++
++        def close(self):
++            return None
++
++    monkeypatch.setattr("agent.gemini_native_adapter.httpx.Client", lambda *a, **k: DummyHTTP())
++    client = GeminiNativeClient(api_key="AIza-test")
++
++    with pytest.raises(ValueError, match="response_format"):
++        client.chat.completions.create(
++            model="gemini-test",
++            messages=[{"role": "user", "content": "Return JSON"}],
++            extra_body={"response_format": response_format},
++        )
++    assert calls == []
++
++
+ 
+ 
+ 
+@@ -372,4 +491,3 @@ def test_malformed_function_call_stream_preserves_recovery_signal_and_safe_diagn
+ 
+ 
+ 
+-

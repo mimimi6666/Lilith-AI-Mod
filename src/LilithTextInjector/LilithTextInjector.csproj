@@ -4,28 +4,118 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>LilithTextInjector</AssemblyName>
-    <GameInterop>C:\Program Files (x86)\Steam\steamapps\common\The NOexistenceN of Lilith\BepInEx\interop</GameInterop>
+    <GameInterop>$(LILITH_INTEROP_DIR)</GameInterop>
+    <BepInExCoreDir>$(LILITH_BEPINEX_CORE_DIR)</BepInExCoreDir>
+    <OldMaidDrawPcm>Assets\Audio\card-slide-1.pcm</OldMaidDrawPcm>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="Gera.Chess" Version="1.1.1" />
     <PackageReference Include="NAudio" Version="2.2.1" />
-    <Reference Include="BepInEx.Core" HintPath="..\bepinex-be780\BepInEx\core\BepInEx.Core.dll" />
-    <Reference Include="BepInEx.Unity.IL2CPP" HintPath="..\bepinex-be780\BepInEx\core\BepInEx.Unity.IL2CPP.dll" />
-    <Reference Include="Il2CppInterop.Runtime" HintPath="..\bepinex-be780\BepInEx\core\Il2CppInterop.Runtime.dll" />
-    <Reference Include="0Harmony" HintPath="..\bepinex-be780\BepInEx\core\0Harmony.dll" />
+    <Reference Include="BepInEx.Core" HintPath="$(BepInExCoreDir)\BepInEx.Core.dll" />
+    <Reference Include="BepInEx.Unity.IL2CPP" HintPath="$(BepInExCoreDir)\BepInEx.Unity.IL2CPP.dll" />
+    <Reference Include="Il2CppInterop.Runtime" HintPath="$(BepInExCoreDir)\Il2CppInterop.Runtime.dll" />
+    <Reference Include="0Harmony" HintPath="$(BepInExCoreDir)\0Harmony.dll" />
     <Reference Include="Assembly-CSharp" HintPath="$(GameInterop)\Assembly-CSharp.dll" />
     <Reference Include="Il2Cppmscorlib" HintPath="$(GameInterop)\Il2Cppmscorlib.dll" />
     <Reference Include="UnityEngine" HintPath="$(GameInterop)\UnityEngine.dll" />
     <Reference Include="UnityEngine.CoreModule" HintPath="$(GameInterop)\UnityEngine.CoreModule.dll" />
+    <Reference Include="Unity.RenderPipelines.Core.Runtime" HintPath="$(GameInterop)\Unity.RenderPipelines.Core.Runtime.dll" />
+    <Reference Include="Unity.RenderPipelines.Universal.Runtime" HintPath="$(GameInterop)\Unity.RenderPipelines.Universal.Runtime.dll" />
+    <Reference Include="UnityEngine.Physics2DModule" HintPath="$(GameInterop)\UnityEngine.Physics2DModule.dll" />
     <Reference Include="UnityEngine.InputLegacyModule" HintPath="$(GameInterop)\UnityEngine.InputLegacyModule.dll" />
     <Reference Include="UnityEngine.IMGUIModule" HintPath="$(GameInterop)\UnityEngine.IMGUIModule.dll" />
+    <Reference Include="UnityEngine.ImageConversionModule" HintPath="$(GameInterop)\UnityEngine.ImageConversionModule.dll" />
     <Reference Include="UnityEngine.AudioModule" HintPath="$(GameInterop)\UnityEngine.AudioModule.dll" />
     <Reference Include="UnityEngine.UIModule" HintPath="$(GameInterop)\UnityEngine.UIModule.dll" />
     <Reference Include="UnityEngine.UI" HintPath="$(GameInterop)\UnityEngine.UI.dll" />
     <Reference Include="Unity.TextMeshPro" HintPath="$(GameInterop)\Unity.TextMeshPro.dll" />
     <Reference Include="Unity.Localization" HintPath="$(GameInterop)\Unity.Localization.dll" />
+    <Reference Include="spine-csharp" HintPath="$(GameInterop)\spine-csharp.dll" />
+    <Reference Include="spine-unity" HintPath="$(GameInterop)\spine-unity.dll" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="$(OldMaidDrawPcm)" LogicalName="LilithTextInjector.Audio.card-slide-1.pcm" />
+    <EmbeddedResource Include="Assets\MiniGameDialogue\catalog.json" LogicalName="LilithTextInjector.MiniGameDialogue.catalog.json" />
+    <EmbeddedResource Include="Assets\MiniGameDialogue\Subtitles\*.json" LogicalName="LilithTextInjector.MiniGameDialogue.Subtitles.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Assets\Audio\chess-move.pcm" LogicalName="LilithTextInjector.Audio.chess-move.pcm" />
+    <EmbeddedResource Include="Assets\Audio\chess-capture.pcm" LogicalName="LilithTextInjector.Audio.chess-capture.pcm" />
+    <EmbeddedResource Include="Assets\Audio\CHESS_AUDIO_NOTICE.txt" LogicalName="LilithTextInjector.Audio.CHESS_AUDIO_NOTICE.txt" />
+    <EmbeddedResource Include="Assets\Audio\KENNEY_CASINO_LICENSE.txt" LogicalName="LilithTextInjector.Audio.KENNEY_CASINO_LICENSE.txt" />
+    <EmbeddedResource Include="Assets\lilith-desktop-artifact-icon.png"
+                      LogicalName="LilithTextInjector.Assets.lilith-desktop-artifact-icon.png" />
+    <Compile Include="..\LilithProviderControlPlane\DeepSeekControlPlane.cs"
+             Link="ProviderControl\DeepSeekControlPlane.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderProfiles.cs"
+             Link="ProviderControl\UnifiedProviderProfiles.cs" />
+    <Compile Include="..\LilithProviderControlPlane\D045WorkbenchModelCatalogRules.cs"
+             Link="ProviderControl\D045WorkbenchModelCatalogRules.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderEndpointAdmission.cs"
+             Link="ProviderControl\UnifiedProviderEndpointAdmission.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderConnectedAddressTransport.cs"
+             Link="ProviderControl\UnifiedProviderConnectedAddressTransport.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderControlPlaneCanonicalSnapshotCodec.cs"
+             Link="ProviderControl\UnifiedProviderControlPlaneCanonicalSnapshotCodec.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderControlPlaneStore.cs"
+             Link="ProviderControl\UnifiedProviderControlPlaneStore.cs" />
+    <Compile Include="..\LilithProviderControlPlane\D045AiFunctionRoutingStore.cs"
+             Link="ProviderControl\D045AiFunctionRoutingStore.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderCatalogAdapters.cs"
+             Link="ProviderControl\UnifiedProviderCatalogAdapters.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderCatalogNetworkClient.cs"
+             Link="ProviderControl\UnifiedProviderCatalogNetworkClient.cs" />
+    <Compile Include="..\LilithProviderControlPlane\ProviderControlPlaneCoreContracts.cs"
+             Link="ProviderControl\ProviderControlPlaneCoreContracts.cs" />
+    <Compile Include="..\LilithProviderControlPlane\ProviderControlPlaneCoreStore.cs"
+             Link="ProviderControl\ProviderControlPlaneCoreStore.cs" />
+    <Compile Include="..\LilithProviderControlPlane\ProviderStartupHealthScheduler.cs"
+             Link="ProviderControl\ProviderStartupHealthScheduler.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderStartupHealthRuntimeHost.cs"
+             Link="ProviderControl\UnifiedProviderStartupHealthRuntimeHost.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderSetupTransactionHost.cs"
+             Link="ProviderControl\UnifiedProviderSetupTransactionHost.cs" />
+    <Compile Include="..\LilithWorkbenchBridge\D045WorkbenchLiveProtocol.cs"
+             Link="WorkbenchBridge\D045WorkbenchLiveProtocol.cs" />
+    <Compile Include="..\LilithRuntimeConfiguration\D046GameControlPreferences.cs"
+             Link="RuntimeConfiguration\D046GameControlPreferences.cs" />
+    <Compile Include="..\LilithRuntimeConfiguration\D059ManualNotePreferences.cs"
+             Link="RuntimeConfiguration\D059ManualNotePreferences.cs" />
+    <Compile Include="..\LilithRuntimeContracts\LilithGameBridgeProtocol.cs"
+             Link="RuntimeContracts\LilithGameBridgeProtocol.cs" />
+    <Compile Include="..\LilithRuntimeContracts\LilithMiniGamePublicContext.cs"
+             Link="RuntimeContracts\LilithMiniGamePublicContext.cs" />
+    <Compile Include="..\LilithRuntimeContracts\LilithMiniGameEvents.cs"
+             Link="RuntimeContracts\LilithMiniGameEvents.cs" />
+    <Compile Include="..\LilithRuntimeContracts\LilithMiniGameAnswerRepair.cs"
+             Link="RuntimeContracts\LilithMiniGameAnswerRepair.cs" />
+    <Compile Include="..\LilithRuntimeContracts\LilithMiniGameDiagnostic.cs"
+             Link="RuntimeContracts\LilithMiniGameDiagnostic.cs" />
+    <Compile Include="..\LilithRuntimeContracts\LilithGameBridgeContinuationContext.cs"
+             Link="RuntimeContracts\LilithGameBridgeContinuationContext.cs" />
+    <Compile Include="..\LilithRuntimeContracts\LilithGameBridgeNativeApplicationObservation.cs"
+             Link="RuntimeContracts\LilithGameBridgeNativeApplicationObservation.cs" />
+    <Compile Include="..\LilithRuntimeContracts\LilithMemoProtocol.cs"
+             Link="RuntimeContracts\LilithMemoProtocol.cs" />
+    <Compile Include="..\LilithRuntimeContracts\LilithNoteInboxProtocol.cs"
+             Link="RuntimeContracts\LilithNoteInboxProtocol.cs" />
+    <Compile Include="..\LilithRuntimeContracts\LilithNoteInboxGameFrames.cs"
+             Link="RuntimeContracts\LilithNoteInboxGameFrames.cs" />
+    <Compile Include="..\LilithRuntimeContracts\LilithDailyNoteProtocol.cs"
+             Link="RuntimeContracts\LilithDailyNoteProtocol.cs" />
+    <Compile Include="..\LilithRuntimeContracts\LilithDailyNoteGameFrames.cs"
+             Link="RuntimeContracts\LilithDailyNoteGameFrames.cs" />
+    <Compile Include="..\LilithPermissionControl\D045PermissionControlStore.cs"
+             Link="PermissionControl\D045PermissionControlStore.cs" />
+    <Compile Include="..\LilithPermissionControl\D045CapabilityDescriptorCatalog.cs"
+             Link="PermissionControl\D045CapabilityDescriptorCatalog.cs" />
+    <Compile Include="..\LilithPermissionControl\D045LocalTaskHarness.cs"
+             Link="PermissionControl\D045LocalTaskHarness.cs" />
+    <Compile Include="..\LilithPermissionControl\D045CodexCapabilityHarness.cs"
+             Link="PermissionControl\D045CodexCapabilityHarness.cs" />
+    <Compile Include="..\LilithPermissionControl\D045SemanticLocalObservations.cs"
+             Link="PermissionControl\D045SemanticLocalObservations.cs" />
   </ItemGroup>
 </Project>

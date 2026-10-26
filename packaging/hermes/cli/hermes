@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -eu
+_lilith_cli_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# The native terminal can set MSYS_NO_PATHCONV/MSYS2_ARG_CONV_EXCL.
+# Convert the interpreter's script argument explicitly, not user arguments.
+_lilith_cli_entry="$_lilith_cli_root/cli/entry.py"
+if command -v cygpath >/dev/null 2>&1; then
+    _lilith_cli_entry="$(cygpath -m -- "$_lilith_cli_entry")"
+fi
+exec "$_lilith_cli_root/python/python.exe" -I -S -B "$_lilith_cli_entry" "$@"

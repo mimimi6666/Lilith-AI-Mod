@@ -1,0 +1,340 @@
+diff --git a/model_tools.py b/model_tools.py
+index 638ee6c..131ea6e 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -282,10 +282,12 @@ _LEGACY_TOOLSET_MAP = {
+ #
+ # Invalidation happens transparently via the registry's _generation counter,
+ # which bumps on register() / deregister() / register_toolset_alias(). The
+-# inner check_fn TTL cache in registry.py handles environment drift (Docker
+-# daemon start/stop, env var changes, etc.) on a 30 s horizon.
++# credential revision invalidates both cache layers after native setup. The
++# outer cache also expires so it cannot mask the inner availability probes.
+ _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
++_tool_defs_cache_created: Dict[tuple, float] = {}
+ _tool_defs_cache_lock = threading.Lock()
++_TOOL_DEFS_CACHE_TTL_SECONDS = 30.0
+ 
+ # Hard cap on memoized get_tool_definitions() results. A long-lived Gateway
+ # process sees many distinct toolset/config fingerprints over its lifetime
+@@ -302,6 +304,7 @@ def _clear_tool_defs_cache() -> None:
+     execute_code sandbox reconfigured)."""
+     with _tool_defs_cache_lock:
+         _tool_defs_cache.clear()
++        _tool_defs_cache_created.clear()
+ 
+ 
+ def get_tool_definitions(
+@@ -337,6 +340,9 @@ def get_tool_definitions(
+     # mode, discord action allowlist, etc.) without needing an explicit
+     # invalidate hook on every config-writer.
+     cache_key = None
++    from tools.registry import tool_availability_revision
++    availability_revision = tool_availability_revision()
++    cache_started = time.monotonic()
+     if quiet_mode:
+         try:
+             from hermes_cli.config import get_config_path
+@@ -359,7 +365,7 @@ def get_tool_definitions(
+         except Exception:
+             runtime_model_fp = ("", "")
+         profile_scope = check_fn_cache_scope()
+-        if profile_scope != CHECK_FN_CACHE_BYPASS:
++        if profile_scope != CHECK_FN_CACHE_BYPASS and availability_revision is not None:
+             cache_key = (
+                 registry.current_scope_key(),
+                 frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+@@ -372,9 +378,14 @@ def get_tool_definitions(
+                 _is_delegated_child_context(),
+                 _is_dispatcher_owned_worker(),
+                 profile_scope,
++                availability_revision,
+             )
+         with _tool_defs_cache_lock:
+             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
++            if (cached is not None and cache_started -
++                    _tool_defs_cache_created.get(cache_key, float("-inf")) >=
++                    _TOOL_DEFS_CACHE_TTL_SECONDS):
++                cached = None
+         if cached is not None:
+             # Update _last_resolved_tool_names so downstream callers see
+             # consistent state even on a cache hit.
+@@ -386,7 +397,8 @@ def get_tool_definitions(
+ 
+     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
+                                        skip_tool_search_assembly=skip_tool_search_assembly)
+-    if quiet_mode and cache_key is not None:
++    if (quiet_mode and cache_key is not None and
++            tool_availability_revision() == availability_revision):
+         # Cache the freshly-computed list, but hand callers a shallow copy so
+         # downstream mutations (e.g. run_agent appending memory/LCM tool
+         # schemas to self.tools) don't poison the cache. Without this, a
+@@ -401,10 +413,19 @@ def get_tool_definitions(
+             # Another thread may have populated this exact key while this
+             # thread computed. Reuse it and serialize capacity eviction.
+             cached = _tool_defs_cache.get(cache_key)
++            if (cached is not None and time.monotonic() -
++                    _tool_defs_cache_created.get(cache_key, float("-inf")) >=
++                    _TOOL_DEFS_CACHE_TTL_SECONDS):
++                _tool_defs_cache.pop(cache_key, None)
++                _tool_defs_cache_created.pop(cache_key, None)
++                cached = None
+             if cached is None:
+                 if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
+-                    _tool_defs_cache.pop(next(iter(_tool_defs_cache)))
++                    evicted = next(iter(_tool_defs_cache))
++                    _tool_defs_cache.pop(evicted)
++                    _tool_defs_cache_created.pop(evicted, None)
+                 _tool_defs_cache[cache_key] = result
++                _tool_defs_cache_created[cache_key] = cache_started
+                 cached = result
+         return list(cached)
+     if quiet_mode:
+diff --git a/tools/registry.py b/tools/registry.py
+index d5699ac..0f25ad5 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -272,11 +272,50 @@ _CHECK_FN_TTL_SECONDS = 30.0
+ # so a genuinely-down backend is reflected within a couple of turns.
+ _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
+ _CHECK_FN_CACHE_MAX = 512
+-_check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
++_check_fn_cache: Dict[tuple, tuple[float, bool]] = {}
+ # Monotonic timestamp of the most recent True result per check_fn.
+-_check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
++_check_fn_last_good: Dict[tuple, float] = {}
+ _check_fn_cache_lock = threading.Lock()
+ CHECK_FN_CACHE_BYPASS = ""
++_tool_availability_epoch = 0
++
++
++def tool_availability_revision() -> Optional[tuple]:
++    """Non-secret revision of the active profile's availability inputs.
++
++    Do not read credential contents or cache their values. File identity and
++    timestamps detect native setup, CLI auth, atomic replacements and removal.
++    The global auth file is included because native auth permits a read-only
++    root fallback. Its metadata never supplies another profile's probe result.
++    Unresolved identity / inaccessible metadata bypasses caching.
++    """
++    if check_fn_cache_scope() == CHECK_FN_CACHE_BYPASS:
++        return None
++    try:
++        from hermes_constants import get_hermes_home, get_default_hermes_root
++        from agent.secret_scope import secret_scope_cache_revision
++
++        secret_revision = secret_scope_cache_revision()
++        if secret_revision is None:
++            return None
++
++        profile = get_hermes_home().resolve()
++        root = get_default_hermes_root().resolve()
++        paths = [profile / name for name in ("auth.json", ".env", "config.yaml")]
++        if root != profile:
++            paths.append(root / "auth.json")
++        metadata = []
++        for path in paths:
++            try:
++                stat = path.stat()
++                fingerprint = (stat.st_mtime_ns, stat.st_ctime_ns,
++                               stat.st_size, stat.st_ino)
++            except FileNotFoundError:
++                fingerprint = None
++            metadata.append((str(path), fingerprint))
++        return (str(profile), tuple(metadata), secret_revision, _tool_availability_epoch)
++    except (OSError, RuntimeError):
++        return None
+ 
+ 
+ def _prune_check_fn_caches(now: float) -> None:
+@@ -359,7 +398,13 @@ def _check_fn_cached(fn: Callable) -> bool:
+                 exc_info=True,
+             )
+             return False
+-    cache_key = (fn, scope)
++    revision = tool_availability_revision()
++    if revision is None:
++        try:
++            return bool(fn())
++        except Exception:
++            return False
++    cache_key = (fn, scope, revision)
+     with _check_fn_cache_lock:
+         _prune_check_fn_caches(now)
+         cached = _check_fn_cache.get(cache_key)
+@@ -375,6 +420,10 @@ def _check_fn_cached(fn: Callable) -> bool:
+         value = False
+         raised = True
+ 
++    # A probe begun before setup/revocation must not seed a new revision or
++    # borrow its last-good grace. The caller may rebuild at the next boundary.
++    if tool_availability_revision() != revision:
++        return False
+     with _check_fn_cache_lock:
+         _prune_check_fn_caches(now)
+         if value:
+@@ -410,9 +459,11 @@ def _check_fn_cached(fn: Callable) -> bool:
+ def invalidate_check_fn_cache() -> None:
+     """Drop all cached ``check_fn`` results. Call after config changes that
+     affect tool availability (e.g. ``hermes tools enable``)."""
++    global _tool_availability_epoch
+     with _check_fn_cache_lock:
+         _check_fn_cache.clear()
+         _check_fn_last_good.clear()
++        _tool_availability_epoch += 1
+ 
+ 
+ def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
+@@ -431,8 +482,11 @@ def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
+         # Unresolved profile identity bypasses the cache entirely; there is no
+         # trustworthy cached verdict to report.
+         return None
++    revision = tool_availability_revision()
++    if revision is None:
++        return None
+     with _check_fn_cache_lock:
+-        cached = _check_fn_cache.get((fn, scope))
++        cached = _check_fn_cache.get((fn, scope, revision))
+         if cached is None:
+             return None
+         ts, value = cached
+diff --git a/tools/mcp_tool.py b/tools/mcp_tool.py
+index f380b8c..fe058e2 100644
+--- a/tools/mcp_tool.py
++++ b/tools/mcp_tool.py
+@@ -7303,6 +7303,8 @@ def refresh_agent_mcp_tools(
+     # computed an OLDER set must not clobber a newer set another caller already
+     # published. ``registry._generation`` bumps on every (de)register.
+     snapshot_generation = registry._generation
++    from tools.registry import tool_availability_revision
++    snapshot_availability = tool_availability_revision()
+ 
+     # Registry-derived tools (built-ins + MCP), filtered to the agent's toolsets.
+     # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
+@@ -7332,6 +7334,11 @@ def refresh_agent_mcp_tools(
+     # with what was actually published, even under concurrent callers, and a
+     # stale (older-generation) rebuild can't overwrite a newer published one.
+     with _agent_tools_lock:
++        # Native setup does not mutate registry generation. A slow pre-auth
++        # rebuild must not overwrite a newer post-auth snapshot (or vice versa
++        # after revocation). Preserve the current snapshot and retry next turn.
++        if tool_availability_revision() != snapshot_availability:
++            return set()
+         # Defensive: the published generation should be an int, but tolerate an
+         # agent that never set it (or set a non-int, e.g. a test mock) rather
+         # than throwing TypeError on the comparison and silently failing the
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index 6bcd97d..9bf2839 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -490,6 +490,32 @@ class TurnContext:
+     preflight_compression_blocked: bool = False
+ 
+ 
++def _refresh_native_tools_between_turns(agent: Any) -> bool:
++    """Refresh Lilith's bound profile only, before assembling the API prefix.
++
++    Reuse the native atomic rebuild so enabled/disabled selections, external
++    memory and context-engine injectors survive. Never enable toolsets here.
++    No background thread or setup callback mutates an active turn's tools.
++    """
++    from tools.native_tool_setup_tool import bound_setup_available
++    if not bound_setup_available() or getattr(agent, "_skip_mcp_refresh", False):
++        return False
++    from tools.registry import tool_availability_revision
++    revision = tool_availability_revision()
++    now = time.monotonic()
++    if (revision is not None and
++            revision == getattr(agent, "_native_tools_revision", None) and
++            now - getattr(agent, "_native_tools_checked_at", float("-inf")) < 30.0):
++        return False
++    from tools.mcp_tool import refresh_agent_mcp_tools
++    refresh_agent_mcp_tools(agent, quiet_mode=True)
++    # If setup raced with the rebuild, do not mark the stale attempt fresh.
++    if tool_availability_revision() == revision:
++        agent._native_tools_revision = revision
++        agent._native_tools_checked_at = now
++    return True
++
++
+ def build_turn_context(
+     agent,
+     user_message: Any,
+@@ -578,6 +604,7 @@ def build_turn_context(
+     # or when the tool set is unchanged (``refresh_agent_mcp_tools`` diffs by
+     # name and leaves the snapshot untouched on no-change).
+     try:
++        native_refreshed = _refresh_native_tools_between_turns(agent)
+         if not getattr(agent, "_skip_mcp_refresh", False):
+             # Import-cost gate: ``tools.mcp_tool`` pulls in the whole ``mcp``
+             # package (~0.4s measured) even when the user has zero MCP servers
+@@ -590,7 +617,7 @@ def build_turn_context(
+             import sys as _sys
+             if "tools.mcp_tool" in _sys.modules:
+                 from tools.mcp_tool import has_registered_mcp_tools, refresh_agent_mcp_tools
+-                if has_registered_mcp_tools():
++                if not native_refreshed and has_registered_mcp_tools():
+                     refresh_agent_mcp_tools(agent, quiet_mode=True)
+     except Exception:
+         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
+diff --git a/agent/secret_scope.py b/agent/secret_scope.py
+index 919fe3e..368b00c 100644
+--- a/agent/secret_scope.py
++++ b/agent/secret_scope.py
+@@ -269,6 +269,40 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
+     return secrets
+ 
+ 
++class _ProfileSecretScope(dict):
++    """A normal secret mapping with a non-secret source revision sidecar."""
++
++    def __init__(self, values, revision):
++        super().__init__(values)
++        self.cache_revision = revision
++
++
++def secret_scope_cache_revision() -> Optional[tuple]:
++    """Identify the loaded snapshot, not just the current on-disk .env.
++
++    Setup can update disk while the active turn still uses an older snapshot.
++    Keep that turn's verdict out of the next turn's cache. Unknown caller-made
++    mappings opt out; no secret values (or mappings) enter cache keys.
++    """
++    scope = current_secret_scope()
++    if scope is None:
++        return ()
++    return scope.cache_revision if isinstance(scope, _ProfileSecretScope) else None
++
++
++def _env_snapshot_revision(home: Path) -> Optional[tuple]:
++    try:
++        path = (home / ".env").resolve()
++        try:
++            stat = path.stat()
++            return (str(path), stat.st_mtime_ns, stat.st_ctime_ns,
++                    stat.st_size, stat.st_ino)
++        except FileNotFoundError:
++            return (str(path), None)
++    except (OSError, RuntimeError):
++        return None
++
++
+ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
+     """Build a profile's secret mapping from its ``<home>/.env``.
+ 
+@@ -277,6 +311,7 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
+     from ``os.environ`` directly, so the scope holds only profile secrets.
+     """
+     home = Path(hermes_home)
++    revision = _env_snapshot_revision(home)
+     secrets = load_env_file(home / ".env")
+ 
+     try:
+@@ -290,4 +325,6 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
+             continue
+         secrets[key] = value
+ 
+-    return secrets
++    if _env_snapshot_revision(home) != revision:
++        revision = None
++    return _ProfileSecretScope(secrets, revision)

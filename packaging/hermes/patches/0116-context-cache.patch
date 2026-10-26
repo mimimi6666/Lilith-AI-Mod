@@ -1,0 +1,623 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index d3ad481..f1988bf 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -3139,6 +3139,11 @@ def run_conversation(
+                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
+                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
+ 
++                # Counts/keyed in-memory comparisons only; never log payloads or
++                # claim these character measurements are provider cache tokens.
++                from agent.request_cache_diagnostics import record_request_prefix
++                record_request_prefix(agent, api_kwargs)
++
+                 # This object is private to the in-process MoA facade.  Add it
+                 # only after middleware, hooks, and debug dumps so none of them
+                 # attempts to serialize it as part of the provider payload.
+diff --git a/agent/history_checkpoint.py b/agent/history_checkpoint.py
+new file mode 100644
+--- /dev/null
++++ b/agent/history_checkpoint.py
+@@ -0,0 +1,55 @@
++"""Pure soft history-size/publication rules. No storage, quotas or authority."""
++import json
++
++
++def detail_chars(rows):
++    """Measure retained text, including reasoning and call arguments, not tokens.
++
++    Count reasoning_content once rather than its duplicate trajectory field.
++    Unknown/structured content is measured but never rewritten here.
++    """
++    total = 0
++    for row in rows:
++        for key in ("content", "reasoning_content", "reasoning_details", "tool_calls"):
++            value = row.get(key)
++            if value is None:
++                continue
++            total += len(value) if isinstance(value, str) else len(
++                json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
++    return total
++
++
++def history_limit(spec):
++    return spec.history_turns * spec.old_tool_chars
++
++
++def select_old_units(projected, units, replacements, spec):
++    """Select a prefix of already-certified exchanges; never individual fields.
++
++    The capture excludes the latest completed exchange. Protect one more here,
++    including from size-triggered selection. Current/unknown/unclosed rows are
++    not in units and cannot become disposable merely because they are large.
++    """
++    sizes = [detail_chars([replacements.get(i, projected[i]) for i in unit])
++             for unit in units]
++    count = max(0, len(units) - (spec.history_turns - 1))
++    retained = sum(sizes[count:])
++    while count < len(units) - 1 and retained > history_limit(spec):
++        retained -= sizes[count]
++        count += 1
++    return count, sizes
++
++
++def publication_reason(state, sizes, spec):
++    covered, pending = len(state["covered"]), len(state["pending_covered"])
++    if pending <= covered:
++        return "unchanged"
++    old_size = sum(sizes[:pending])
++    # A malformed/overlong summary cannot be advertised as a size reduction.
++    if len(state["pending_summary"]) >= old_size:
++        return "not_smaller"
++    if sum(sizes[covered:]) > history_limit(spec):
++        return "history_size"
++    if pending - covered >= max(spec.summary_every, max(1, spec.history_turns // 4)):
++        return "batch"
++    return "staged"
+diff --git a/agent/request_cache_diagnostics.py b/agent/request_cache_diagnostics.py
+new file mode 100644
+--- /dev/null
++++ b/agent/request_cache_diagnostics.py
+@@ -0,0 +1,123 @@
++"""Best-effort assembled-request comparison, never provider cache accounting.
++
++Only keyed digests/lengths survive this call. Logs contain neither prompt text,
++route, URLs, digests nor random keys. No requests, persistence or authority.
++"""
++import hashlib
++import hmac
++import json
++import logging
++import os
++
++logger = logging.getLogger(__name__)
++_MAX_CHARS = 8_000_000
++_MAX_MESSAGES = 4096
++_CHUNK = 1024
++
++
++def _text(value):
++    return json.dumps(value, ensure_ascii=False, sort_keys=True,
++                      separators=(",", ":"), allow_nan=False)
++
++
++def _digest(key, value):
++    return hmac.new(key, value.encode("utf-8"), hashlib.sha256).digest()
++
++
++def _size(value):
++    if value is None:
++        return 0
++    return len(value) if isinstance(value, str) else len(_text(value))
++
++
++def record_request_prefix(agent, request):
++    """Observe the final assembled attempt without retaining or changing it.
++
++    This runs after hooks and before dispatch. Retries/failed sends may appear;
++    the next API usage event, not this diagnostic, owns actual billed tokens.
++    Malformed/huge/unsupported requests remain sendable by the native path.
++    """
++    try:
++        return _record(agent, request)
++    except Exception:
++        # Do not log exceptions: serializers/providers can include private data.
++        try:
++            agent._request_cache_trace = None
++            agent._request_cache_diagnostics_status = {"status": "unavailable"}
++            logger.info("[request_prefix] %s", '{"status":"unavailable"}')
++        except Exception:
++            pass
++        return None
++
++
++def _record(agent, request):
++    if not isinstance(request, dict):
++        raise ValueError("shape")
++    rows = request.get("messages", request.get("input"))
++    if not isinstance(rows, list) or len(rows) > _MAX_MESSAGES:
++        raise ValueError("shape")
++    previous = getattr(agent, "_request_cache_trace", None)
++    key = previous["key"] if isinstance(previous, dict) else os.urandom(32)
++    route = _digest(key, _text(tuple(str(getattr(agent, field, "")) for field in
++                    ("session_id", "provider", "model", "api_mode", "base_url"))))
++    parts = [("setup", None, {field: request[field] for field in
++              ("model", "thinking", "reasoning_effort", "response_format") if field in request}),
++             ("tools", None, request.get("tools")),
++             ("system", None, {field: request[field] for field in
++              ("system", "instructions") if field in request})]
++    counts = {"system_chars": _size(request.get("system")) + _size(request.get("instructions")),
++              "content_chars": 0, "reasoning_chars": 0, "tool_argument_chars": 0,
++              "tool_schema_chars": _size(request.get("tools"))}
++    for index, row in enumerate(rows):
++        if not isinstance(row, dict):
++            raise ValueError("message")
++        role = row.get("role")
++        kind = role if role in ("system", "developer", "user", "assistant", "tool") else "other"
++        parts.append((kind, index, row))
++        counts["system_chars" if kind in ("system", "developer") else "content_chars"] += _size(row.get("content"))
++        counts["reasoning_chars"] += _size(row.get("reasoning_content")) + _size(row.get("reasoning_details"))
++        for call in row.get("tool_calls") or ():
++            if isinstance(call, dict) and isinstance(call.get("function"), dict):
++                counts["tool_argument_chars"] += _size(call["function"].get("arguments"))
++    snapshots, total = [], 0
++    for kind, index, value in parts:
++        text = _text(value)
++        total += len(text)
++        if total > _MAX_CHARS:
++            raise ValueError("size")
++        chunks = tuple(_digest(key, text[start:start + _CHUNK]) for start in range(0, len(text), _CHUNK))
++        snapshots.append((kind, index, len(text), _digest(key, text), chunks))
++    matched, common = 0, 0
++    comparable = isinstance(previous, dict) and previous.get("route") == route
++    if comparable:
++        for old, new in zip(previous["parts"], snapshots):
++            if old[:4] == new[:4]:
++                matched += 1
++                common += new[2]
++                continue
++            if old[:2] == new[:2]:
++                for chunk_index, (old_chunk, new_chunk) in enumerate(zip(old[4], new[4])):
++                    if old_chunk != new_chunk:
++                        break
++                    common += min(_CHUNK, old[2] - chunk_index * _CHUNK, new[2] - chunk_index * _CHUNK)
++            break
++    changed = snapshots[matched] if matched < len(snapshots) else None
++    same = comparable and matched == len(snapshots) == len(previous["parts"])
++    status = {
++        "status": "compared" if comparable else "baseline",
++        "measurement": "assembled_payload_serialized_characters_not_provider_tokens",
++        "attempt": previous.get("attempt", 0) + 1 if comparable else 1,
++        "messages": len(rows), "payload_chars": total,
++        "common_prefix_chars_lower_bound": common,
++        "first_changed_kind": "none" if same else changed[0] if changed else "removed_tail",
++        "first_changed_message": changed[1] if comparable and changed else None,
++        **counts,
++    }
++    projection = getattr(agent, "_usage_budget_context_status", {})
++    publication = projection.get("checkpoint_publication") if isinstance(projection, dict) else None
++    if publication in ("batch", "history_size", "staged", "unchanged"):
++        status["checkpoint_publication"] = publication
++    agent._request_cache_trace = {"key": key, "route": route, "parts": tuple(snapshots), "attempt": status["attempt"]}
++    agent._request_cache_diagnostics_status = status
++    logger.info("[request_prefix] %s", json.dumps(status, sort_keys=True))
++    return status
+diff --git a/agent/usage_strategy_context.py b/agent/usage_strategy_context.py
+index f50f881..256aade 100644
+--- a/agent/usage_strategy_context.py
++++ b/agent/usage_strategy_context.py
+@@ -1,4 +1,4 @@
+-"""Request-local rolling summary and old-result projection. No transcript writes.
++"""Request-local staged summary and stable checkpoints. No transcript writes.
+ 
+ Only immutable, structurally closed pre-turn exchanges are eligible. A failed
+ summary keeps uncovered originals; the next model reply is never budget-blocked.
+@@ -10,6 +10,7 @@ import json
+ import logging
+ 
+ from agent.history_context import semantic_key, summary_scope, dedupe_sidecars, content_counts
++from agent.history_checkpoint import detail_chars, select_old_units, publication_reason, history_limit
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -47,38 +48,44 @@ def _key(rows):
+ def project_context(agent, projected, units, spec, origin, *, source=None, history_offset=0):
+     if spec.history_turns is None or not units:
+         return projected
+-    tool_indices = tuple(i for unit in units[:-1] for i in unit)
+-    excerpts = compact_results([projected[i] for i in tool_indices], spec.old_tool_chars)
+-    replacements = dict(zip(tool_indices, excerpts))
++    # Freeze each old exchange's representation independently. A new duplicate
++    # in a later exchange must not rewrite the first occurrence retroactively.
++    replacements = {}
++    for unit in units[:-1]:
++        excerpts = compact_results([projected[i] for i in unit], spec.old_tool_chars)
++        replacements.update(zip(unit, excerpts))
+     allowed = {i for unit in units for i in unit}
+     summary_added_turns = 0
+     summary_attempted = False
+-    # capture_completed_history already protects the latest completed exchange.
+-    old = units[:max(0, len(units) - (spec.history_turns - 1))]
+-    if not old:
+-        sidecars, saved = dedupe_sidecars(projected, source, history_offset, allowed)
+-        replacements.update(sidecars)
+-        result = [replacements.get(i, row) for i, row in enumerate(projected)]
+-        _record_projection(agent, projected, result, spec, 0, 0, len(sidecars), saved, False, 0)
+-        return result
+     state_key = summary_scope(agent, origin, spec)
+     state = getattr(agent, "_information_summary", None)
+-    if not isinstance(state, dict) or state["key"] != state_key:
++    if not isinstance(state, dict) or state.get("key") != state_key:
+         state = {"key": state_key, "covered": (), "summary": "", "last": None, "attempt_count": None}
+         agent._information_summary = state
+-    keys = tuple(_key([projected[i] for i in unit]) for unit in old)
++    # Background data-only handoff carries the published checkpoint, not pending
++    # work. Defaults preserve that contract and never grant a summarizer to it.
++    state.setdefault("pending_covered", state["covered"])
++    state.setdefault("pending_summary", state["summary"])
++    all_keys = tuple(_key([projected[i] for i in unit]) for unit in units)
+     covered = state["covered"]
+-    if keys[:len(covered)] != covered:
++    pending = state["pending_covered"]
++    if (all_keys[:len(covered)] != covered or all_keys[:len(pending)] != pending):
+         # Rewind/edit/compaction invalidates the old source proof. Never inject
+         # a stale summary into a changed or different conversation.
+-        state.update(covered=(), summary="", attempt_count=None)
+-        covered = ()
++        state.update(covered=(), summary="", pending_covered=(), pending_summary="", attempt_count=None)
++        covered = pending = ()
++    old_count, sizes = select_old_units(projected, units, replacements, spec)
++    # Size can fall without a source edit (e.g. native reasoning transport).
++    # Do not resurrect already summarized originals just because it did.
++    old_count = max(old_count, len(pending))
++    old = units[:old_count]
++    keys = all_keys[:old_count]
+     new_origin = state["last"] != origin.origin_id
+     if new_origin:
+         state["last"] = origin.origin_id
+     due = state["attempt_count"] is None or len(keys) - state["attempt_count"] >= spec.summary_every
+     if (not getattr(agent, "_background_context_readonly", False)
+-            and new_origin and len(keys) > len(covered) and due
++            and new_origin and len(keys) > len(pending) and due
+             and not origin.ledger.snapshot().stopped):
+         # Cadence advances with newly completed exchanges, not failed attempts,
+         # model/tool iterations or multiple requests in the same human turn.
+@@ -91,24 +98,30 @@ def project_context(agent, projected, units, spec, origin, *, source=None, histo
+             recorder = getattr(compressor, "_record_aux_compression_call", None)
+             if callable(recorder):
+                 checkpoint._record_aux_compression_call = recorder
+-            checkpoint._previous_summary = state["summary"] or None
++            checkpoint._previous_summary = state["pending_summary"] or None
+             checkpoint._compute_summary_budget = lambda _rows: spec.summary_target_tokens
+-            indices = [i for unit in old[len(covered):] for i in unit]
++            indices = [i for unit in old[len(pending):] for i in unit]
+             sidecars, _ = dedupe_sidecars(projected, source, history_offset, allowed, indices)
+             rows = [sidecars.get(i, projected[i]) for i in indices]
+             summary_attempted = True
+-            summary_added_turns = len(old) - len(covered)
++            summary_added_turns = len(old) - len(pending)
+             try:
+                 summary = checkpoint._generate_summary(compact_results(rows, spec.old_tool_chars))
+             except Exception:
+                 summary = None
+             if isinstance(summary, str) and summary.strip() and not origin.ledger.snapshot().stopped:
+-                state.update(covered=keys, summary=summary)
+-                covered = keys
++                state.update(pending_covered=keys, pending_summary=summary)
++    publication = publication_reason(state, sizes, spec)
++    if (publication in ("batch", "history_size") and new_origin
++            and not getattr(agent, "_background_context_readonly", False)
++            and not origin.ledger.snapshot().stopped):
++        state.update(covered=state["pending_covered"], summary=state["pending_summary"])
++        covered = state["covered"]
++    else:
++        publication = "staged" if len(state["pending_covered"]) > len(covered) else "unchanged"
+     removed = {i for unit in old[:len(covered)] for i in unit}
+-    sidecars, saved = dedupe_sidecars(projected, source, history_offset, allowed,
+-                                    set(range(len(projected))) - removed)
+-    replacements.update(sidecars)
++    # Do not point an old retained sidecar at a later copy: adding that copy
++    # would invalidate the cached prefix. Cross-unit dedupe is summary-only.
+     # Uncovered exchanges are still sent (with old-result excerpts). Current
+     # input, latest history, non-eligible rows and tool payloads are untouched.
+     result = []
+@@ -118,11 +131,14 @@ def project_context(agent, projected, units, spec, origin, *, source=None, histo
+         if i not in removed:
+             result.append(replacements.get(i, row))
+     _record_projection(agent, projected, result, spec, len(covered), len(old)-len(covered),
+-                       len(sidecars), saved, summary_attempted, summary_added_turns)
++                       0, 0, summary_attempted, summary_added_turns,
++                       pending=len(state["pending_covered"]) - len(covered),
++                       publication=publication, history_chars=sum(sizes))
+     return result
+ 
+ 
+-def _record_projection(agent, before, after, spec, covered, uncovered, deduped, saved, attempted, added):
++def _record_projection(agent, before, after, spec, covered, uncovered, deduped, saved, attempted, added,
++                       *, pending=0, publication="unchanged", history_chars=0):
+     agent._usage_budget_context_status = {
+         "strategy": "information_v1", "history_target_turns": spec.history_turns,
+         "summarized_turns": covered, "uncovered_turns_retained": uncovered,
+@@ -131,5 +147,9 @@ def _record_projection(agent, before, after, spec, covered, uncovered, deduped,
+         "deduplicated_sidecars": deduped, "sidecar_chars_saved": saved,
+         "summary_attempted": attempted, "summary_new_turns": added,
+         "background_readonly": getattr(agent, "_background_context_readonly", False) is True,
++        "checkpoint_mode": "batched_v1", "checkpoint_publication": publication,
++        "pending_summarized_turns": pending, "eligible_history_detail_chars": history_chars,
++        "history_soft_target_chars": history_limit(spec),
++        "before_detail_chars": detail_chars(before), "after_detail_chars": detail_chars(after),
+     }
+     logger.info("[context_projection] %s", json.dumps(agent._usage_budget_context_status, sort_keys=True))
+diff --git a/tests/test_context_cache.py b/tests/test_context_cache.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_context_cache.py
+@@ -0,0 +1,268 @@
++from copy import deepcopy
++import json
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++from agent.usage_budget import NormalBudget, VerifiedModelLimits, resolve_policy, TurnBudgetLedger
++from agent.usage_budget_context import capture_completed_history, _strategy_projection_units
++from agent.usage_strategy import strategy_for_level
++from agent.usage_strategy_context import project_context
++from agent.history_checkpoint import detail_chars
++from agent.request_cache_diagnostics import record_request_prefix
++
++
++def origin(name, level=4, revision=1):
++    policy = resolve_policy(level, NormalBudget(), VerifiedModelLimits(), version=revision)
++    return SimpleNamespace(origin_id=name, ledger=TurnBudgetLedger(name, policy))
++
++
++def history(turns, *, size=0, sidecars=False):
++    rows = []
++    for i in range(turns):
++        user = {"role": "user", "content": "question " + str(i)}
++        if sidecars:
++            user["api_content"] = user["content"] + "\n\n[Subordinate operational context: pre_llm_call plugin context]\n" + "stable context " * 40 + "\n[End subordinate operational context: pre_llm_call plugin context]"
++        rows.extend([user,
++            {"role": "assistant", "content": "", "reasoning_content": "r" * size,
++             "tool_calls": [{"id": "c" + str(i), "type": "function", "function": {"name": "fixture", "arguments": "{}"}}]},
++            {"role": "tool", "tool_call_id": "c" + str(i), "content": "result " + str(i)},
++            {"role": "assistant", "content": "answer " + str(i), "reasoning_content": "required reasoning"}])
++    rows.append({"role": "user", "content": "current"})
++    return rows
++
++
++class Compressor:
++    def __init__(self):
++        self.calls = []
++        self._previous_summary = "original compressor must not change"
++
++    def _generate_summary(self, rows):
++        self.calls.append((deepcopy(rows), self._previous_summary))
++        return "Synthetic summary checkpoint " + str(len(self.calls))
++
++
++class CheckpointTests(unittest.TestCase):
++    def setUp(self):
++        self.agent = SimpleNamespace(session_id="fixture", model="model", provider="provider",
++            api_mode="chat_completions", context_compressor=Compressor())
++
++    def project(self, rows, name="first", handle=None):
++        handle = handle or origin(name)
++        selected = capture_completed_history(rows, len(rows)-1)
++        projected = [{"role": "system", "content": "protected system"}] + deepcopy(rows)
++        from agent.turn_context import substitute_api_content
++        for row in projected[1:]:
++            substitute_api_content(row)
++        units = _strategy_projection_units(self.agent, selected, rows, projected, 1)
++        return project_context(self.agent, projected, units, strategy_for_level(handle.ledger.policy.level),
++                               handle, source=rows, history_offset=1)
++
++    def test_small_updates_keep_published_prefix_and_two_turn_summary_cadence(self):
++        base = self.project(history(36, sidecars=True))
++        for n in (37, 38, 39, 40, 41):
++            result = self.project(history(n, sidecars=True), str(n))
++            self.assertEqual(result[:len(base)-1], base[:-1])
++            self.assertEqual(self.agent._information_summary["covered"].__len__(), 12)
++        calls = self.agent.context_compressor.calls
++        self.assertEqual([len(rows) for rows, _ in calls], [48, 8, 8])
++        self.assertEqual(calls[-1][1], "Synthetic summary checkpoint 2")
++
++    def test_six_new_old_turns_publish_together_and_retain_latest_24(self):
++        base = self.project(history(36))
++        for n in range(37, 43):
++            out = self.project(history(n), str(n))
++        self.assertNotEqual(out[1], base[1])
++        status = self.agent._usage_budget_context_status
++        self.assertEqual(status["summarized_turns"], 18)
++        self.assertEqual(status["pending_summarized_turns"], 0)
++        self.assertEqual(status["checkpoint_publication"], "batch")
++        self.assertEqual([r["content"] for r in out if r["role"] == "user" and r["content"].startswith("question")],
++                         ["question " + str(i) for i in range(18, 42)])
++
++    def test_reasoning_size_triggers_whole_exchange_summary_before_age_limit(self):
++        rows = history(24, size=15000)
++        before = deepcopy(rows)
++        out = self.project(rows)
++        self.assertGreater(self.agent._usage_budget_context_status["summarized_turns"], 0)
++        self.assertEqual(self.agent._usage_budget_context_status["checkpoint_publication"], "history_size")
++        self.assertLess(detail_chars(out), detail_chars(rows) * .6)
++        self.assertEqual(rows, before)
++        self.assertEqual(out[-9:], rows[-9:])  # two latest exchanges + current
++        calls = {c["id"] for r in out for c in r.get("tool_calls", ())}
++        self.assertEqual(calls, {r["tool_call_id"] for r in out if r["role"] == "tool"})
++        for r in out:
++            if r["role"] == "assistant": self.assertIn("reasoning_content", r)
++
++    def test_current_and_unverifiable_rows_are_never_discarded_for_size(self):
++        rows = history(5)
++        rows[1]["tool_calls"][0]["function"]["arguments"] = "bad JSON"
++        rows[1]["reasoning_content"] = "private current task " * 20000
++        rows[-1]["content"] = "large current " * 20000
++        out = self.project(rows)
++        self.assertEqual(out[-1], rows[-1])
++        self.assertIn(rows[1], out)
++
++    def test_latest_two_huge_turns_preserved_without_hard_rejection(self):
++        rows = history(4, size=200000)
++        out = self.project(rows)
++        self.assertEqual(out[-9:], rows[-9:])
++        self.assertGreater(detail_chars(out), 144000)
++
++    def test_summary_failure_keeps_all_original_reasoning_and_pairs(self):
++        self.agent.context_compressor._generate_summary = lambda _: None
++        rows = history(24, size=15000)
++        self.assertEqual(self.project(rows)[1:], rows)
++        self.assertEqual(self.agent._information_summary["covered"], ())
++
++    def test_stop_during_summary_does_not_publish_or_accept_pending(self):
++        handle = origin("stopped")
++        def stopped(_):
++            handle.ledger.stop()
++            return "must not publish"
++        self.agent.context_compressor._generate_summary = stopped
++        rows = history(36)
++        self.assertEqual(self.project(rows, handle=handle)[1:], rows)
++        self.assertEqual(self.agent._information_summary["pending_covered"], ())
++
++    def test_staged_summary_is_not_duplicated_in_payload(self):
++        self.project(history(36))
++        out = self.project(history(38), "second")
++        self.assertEqual(self.agent._usage_budget_context_status["pending_summarized_turns"], 2)
++        self.assertNotIn("Synthetic summary checkpoint 2", json.dumps(out))
++        self.assertIn("question 12", json.dumps(out))
++
++    def test_edit_invalidates_pending_and_committed_proof(self):
++        self.project(history(36))
++        self.project(history(38), "second")
++        rows = history(38)
++        rows[0]["content"] = "corrected source"
++        self.project(rows, "third")
++        self.assertIsNone(self.agent.context_compressor.calls[-1][1])
++        self.assertIn("corrected source", json.dumps(self.agent.context_compressor.calls[-1][0]))
++
++    def test_rewind_never_injects_deleted_summary(self):
++        self.project(history(36))
++        out = self.project(history(2), "rewind")
++        self.assertNotIn("Synthetic summary", json.dumps(out))
++        self.assertEqual(self.agent._information_summary["covered"], ())
++
++    def test_scope_change_never_reuses_old_pending_summary(self):
++        self.project(history(36))
++        self.project(history(38), "second")
++        self.agent.session_id = "different session"
++        self.project(history(38), "third")
++        self.assertIsNone(self.agent.context_compressor.calls[-1][1])
++
++    def test_repeated_tool_passes_never_generate_twice(self):
++        handle = origin("one")
++        for _ in range(5): self.project(history(24, size=15000), handle=handle)
++        self.assertEqual(len(self.agent.context_compressor.calls), 1)
++
++    def test_new_duplicate_does_not_rewrite_earlier_tool_result(self):
++        rows = history(5)
++        rows[2]["content"] = "repeated result " * 100
++        before = self.project(rows)
++        later = history(6)
++        later[2]["content"] = later[18]["content"] = rows[2]["content"]
++        after = self.project(later, "later")
++        self.assertEqual(before[3], after[3])
++
++    def test_background_never_generates_or_publishes_pending(self):
++        self.project(history(36))
++        self.agent._background_context_readonly = True
++        before = len(self.agent.context_compressor.calls)
++        out = self.project(history(48), "background")
++        self.assertEqual(len(self.agent.context_compressor.calls), before)
++        self.assertEqual(len(self.agent._information_summary["covered"]), 12)
++        self.assertIn("question 12", json.dumps(out))
++
++    def test_normal_and_unleashed_are_identity_passthrough(self):
++        rows = history(50, size=20000)
++        for level in (5, 6):
++            self.assertIs(project_context(self.agent, rows, (), strategy_for_level(level), origin(str(level), level)), rows)
++
++    def test_detailed_size_does_not_double_count_reasoning_alias(self):
++        self.assertEqual(detail_chars([{"role": "assistant", "content": "a", "reasoning_content": "xyz", "reasoning": "xyz"}]), 4)
++
++
++class DiagnosticTests(unittest.TestCase):
++    def setUp(self):
++        self.agent = SimpleNamespace(session_id="s", model="model", provider="provider", api_mode="chat_completions", base_url="https://example.test")
++        self.request = {"model": "fixture", "tools": [{"type": "function", "function": {"name": "fixture"}}],
++            "messages": [{"role": "system", "content": "stable policy"},
++                         {"role": "user", "content": "private sentry "+"a"*3000},
++                         {"role": "assistant", "content": "answer", "reasoning_content": "reasoning sentry"}]}
++
++    def test_identical_request_is_counted_and_never_mutated(self):
++        before = deepcopy(self.request)
++        first = record_request_prefix(self.agent, self.request)
++        second = record_request_prefix(self.agent, self.request)
++        self.assertEqual(first["status"], "baseline")
++        self.assertEqual(second["first_changed_kind"], "none")
++        self.assertEqual(second["payload_chars"], second["common_prefix_chars_lower_bound"])
++        self.assertEqual(self.request, before)
++        self.assertEqual(second["reasoning_chars"], len("reasoning sentry"))
++
++    def test_tail_append_keeps_full_old_prefix(self):
++        first = record_request_prefix(self.agent, self.request)
++        self.request["messages"].append({"role": "user", "content": "new input"})
++        last = record_request_prefix(self.agent, self.request)
++        self.assertEqual(last["common_prefix_chars_lower_bound"], first["payload_chars"])
++        self.assertEqual(last["first_changed_message"], 3)
++
++    def test_system_tool_and_old_history_changes_classified(self):
++        for kind, index in (("system", 0), ("user", 1), ("tools", None)):
++            with self.subTest(kind=kind):
++                self.setUp()
++                record_request_prefix(self.agent, self.request)
++                if index is None: self.request["tools"].append({"type": "function", "function": {"name": "second"}})
++                else: self.request["messages"][index]["content"] = "changed"
++                status = record_request_prefix(self.agent, self.request)
++                self.assertEqual(status["first_changed_kind"], kind)
++                self.assertEqual(status["first_changed_message"], index)
++
++    def test_inner_message_chunk_prefix_is_lower_bound(self):
++        first = record_request_prefix(self.agent, self.request)
++        self.request["messages"][1]["content"] += "new tail"
++        last = record_request_prefix(self.agent, self.request)
++        self.assertGreater(last["common_prefix_chars_lower_bound"], 2000)
++        self.assertLess(last["common_prefix_chars_lower_bound"], first["payload_chars"])
++
++    def test_no_content_digests_routes_or_salts_in_logs(self):
++        with self.assertLogs("agent.request_cache_diagnostics", level="INFO") as logs:
++            record_request_prefix(self.agent, self.request)
++        logged = "\n".join(logs.output)
++        for sentry in ("private sentry", "reasoning sentry", "example.test", "stable policy", "fixture"):
++            self.assertNotIn(sentry, logged)
++        stored = repr(self.agent._request_cache_trace)
++        self.assertNotIn("private sentry", stored)
++        self.assertNotIn("reasoning sentry", stored)
++        self.assertNotIn(self.agent._request_cache_trace["key"].hex(), logged)
++
++    def test_route_or_session_change_rebaselines(self):
++        record_request_prefix(self.agent, self.request)
++        self.agent.session_id = "new"
++        self.assertEqual(record_request_prefix(self.agent, self.request)["status"], "baseline")
++
++    def test_unsupported_and_oversized_requests_do_not_raise_or_mutate(self):
++        for value in ({"messages": "unsupported"}, {"messages": [{"content": object()}]}, {"messages": [{}]*4097}):
++            self.assertIsNone(record_request_prefix(self.agent, value))
++        before = deepcopy(self.request)
++        with patch("agent.request_cache_diagnostics._MAX_CHARS", 20):
++            self.assertIsNone(record_request_prefix(self.agent, self.request))
++        self.assertEqual(before, self.request)
++
++    def test_log_failure_does_not_break_send(self):
++        with patch("agent.request_cache_diagnostics.logger.info", side_effect=RuntimeError("private error sentry")):
++            self.assertIsNone(record_request_prefix(self.agent, self.request))
++
++    def test_reasoning_and_tool_arguments_counted_separately(self):
++        self.request["messages"][-1]["tool_calls"] = [{"id": "c", "function": {"name": "fixture", "arguments": "{\"x\":1}"}}]
++        status = record_request_prefix(self.agent, self.request)
++        self.assertEqual(status["tool_argument_chars"], 7)
++        self.assertEqual(status["reasoning_chars"], len("reasoning sentry"))
++
++
++if __name__ == "__main__":
++    unittest.main()

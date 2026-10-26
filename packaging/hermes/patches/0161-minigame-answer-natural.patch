@@ -1,0 +1,898 @@
+diff --git a/agent/minigame_answer_repair.py b/agent/minigame_answer_repair.py
+index c5e51f3..3a1c511 100644
+--- a/agent/minigame_answer_repair.py
++++ b/agent/minigame_answer_repair.py
+@@ -23,6 +23,7 @@ MAX_OUTPUT_CHARS = 8192
+ MAX_OUTPUT_TOKENS = 2048
+ MAX_TOTAL_OUTPUT_TOKENS = 4096
+ DEADLINE_SECONDS = 20.0
++MAX_ASSERTIONS = 256
+ _ISSUER = object()
+ _TURN = ContextVar("lilith_game_answer_repair_turn", default=None)
+ _ACTIVE = ContextVar("lilith_game_answer_repair_dispatch", default=None)
+@@ -107,6 +108,57 @@ def _has_turn_question(question):
+     return False
+ 
+ 
++def _has_query_intent(q):
++    return _has(q, "?", "？", "嗎", "吗", "呢", "誰", "谁", "幾", "几", "多少", "什麼", "什么", "哪些", "哪張", "哪张", "哪個", "哪个",
++        "告訴我", "告诉我", "報給我", "报给我", "報一下", "报一下", "說一下", "说一下", "說出", "说出", "列出", "指出", "請按照", "请按照", "請依", "请依",
++        "what", "which", "whose", "how many", "tell me", "list ", "show me", "name ", "are you", "am i", "is it",
++        "何", "どれ", "誰", "教えて", "見せて", "挙げて", "ですか")
++
++
++def _hand_count_question(q):
++    return (_has(q, "幾張牌", "几张牌", "幾張手牌", "几张手牌", "手牌數", "手牌数", "牌數", "牌数", "how many cards", "hand counts", "手札の数")
++        or _has(q, "手牌", "手札", "カード") and _has(q, "幾張", "几张", "多少", "いくつ", "何枚")
++        or _has(q, "抽牌", "牌局") and _has(q, "各剩幾張", "各剩几张", "各有幾張", "各有几张"))
++
++
++def _own_hand_reference(q):
++    return any(re.search(pattern, q) for pattern in (
++        r"(?:你|妳|莉莉絲|莉莉丝)(?:\s*(?:自己|目前|現在|现在|當前|当前|手上|手中|持有|拿著|拿着|的|有|哪些|什麼|什么)){0,5}\s*(?:手牌|牌)",
++        r"\b(?:your|lilith['’]s)\s+(?:(?:own|current|remaining)\s+){0,3}(?:cards|hand)\b|\bcards\s+in\s+your\s+(?:own\s+)?hand\b",
++        r"(?:あなた|君|リリス|自分)(?:(?:自身|自分|現在|今|手元|の)){0,5}(?:手札|カード)"))
++
++
++def _other_hand_reference(q):
++    return any(re.search(pattern, q) for pattern in (
++        r"(?:我|玩家|他|她|他們|他们|她們|她们)(?:\s*(?:自己|目前|現在|现在|手上|手中|的)){0,5}\s*(?:手牌|牌)",
++        r"\b(?:my|his|her|their|player['’]s)\s+(?:(?:own|current|remaining|hidden)\s+){0,3}(?:cards|hand)\b",
++        r"(?:私|僕|彼|彼女|プレイヤー)(?:(?:自身|自分|現在|今|手元|の)){0,5}(?:手札|カード)"))
++
++
++def _self_hand_question(q):
++    own_scope = False
++    for part in re.split(r"[,，、]", q):
++        own = _own_hand_reference(part)
++        if _other_hand_reference(part):
++            own_scope = False
++            continue
++        if own:
++            own_scope = True
++        if not own_scope:
++            continue
++        detail = _has(part, "牌色", "花色", "點數", "点数", "牌序", "順序", "顺序", "什麼牌", "什么牌", "哪些牌", "鬼牌", "suit", "rank", "order", "joker", "スート", "順番", "並び", "ジョーカー")
++        report = _has(part, "報給我", "报给我", "報一下", "报一下", "說一下", "说一下", "說出", "说出", "告訴我", "告诉我", "列出", "指出", "tell me", "list ", "show me", "name ", "教えて", "見せて", "挙げて")
++        question = _has(part, "是什麼", "是什么", "有什麼", "有什么", "有哪些", "哪張", "哪张", "哪裡", "哪里", "何", "どれ") or re.search(r"\b(?:what|which)\s+(?:are|cards|suits|ranks|is\s+in)\b", part)
++        directed = detail and (_has(part, "請按照", "请按照", "請依", "请依", "按順序", "按顺序") or _has(part, "?", "？", "嗎", "吗", "呢", "ですか"))
++        continuation = _has(part, "每張牌", "每张牌", "這些牌", "这些牌", "它們", "它们", "each card", "them", "それぞれ", "それら") or any(re.search(pattern, part) for pattern in (
++            r"^\s*(?:請|请)?(?:依序|按順序|按顺序)?(?:報給我|报给我|報一下|报一下|列出)(?:吧|就好)?[.!?？！]?\s*$",
++            r"^\s*(?:牌色|花色|點數|点数|牌序|順序|顺序)(?:是什麼|是什么|有哪些|在哪裡|在哪里|呢|嗎|吗)?[?？！]?\s*$",
++            r"^\s*(?:スート|順番|並び)(?:は|が)?(?:何|どれ)(?:ですか|なの|か)?[?？！]?\s*$"))
++        if (own or continuation) and (report or question or directed) and (not _hand_count_question(part) or detail):
++            return True
++    return False
++
++
+ def _classify_question(question, kind):
+     """Mirror GameFactQueryPlan's compiled finite grammar, not provider output."""
+     q=question.strip().lower()
+@@ -114,23 +166,21 @@ def _classify_question(question, kind):
+             "don't","do not","not asking","used to","hypothetical","for example","suppose","ignore",
+             "previous game","last game","yesterday","言わない","教えない","報告しない","昔","前の対局","前回","もし","たとえば","「","」",'"',"“","”","`"):
+         return set()
+-    if not _has(q,"?","？","嗎","吗","呢","誰","谁","幾","几","多少","什麼","什么","哪些","哪張","哪张","哪個","哪个",
+-            "告訴我","告诉我","報給我","报给我","報一下","报一下","說一下","说一下","列出",
+-            "what","which","whose","how many","tell me","list ","are you","am i","is it",
+-            "何","どれ","誰","教えて","見せて","か？","ですか"):
+-        return set()
++    facts = set()
++    for sentence in re.finditer(r"[^。.!?？！;；\r\n]+[.!?？！]?", q):
++        clause = sentence.group().strip()
++        if _has_query_intent(clause):
++            facts.update(_classify_clause(clause, kind))
++    return facts
++
++
++def _classify_clause(q, kind):
+     facts=set()
+     if _has_turn_question(q):
+         facts.add("turn")
+     if kind=="old-maid":
+-        count=(_has(q,"幾張牌","几张牌","幾張手牌","几张手牌","手牌數","手牌数","牌數","牌数","how many cards","hand counts","手札の数")
+-               or _has(q,"手牌","手札","カード") and _has(q,"幾張","几张","多少","いくつ","何枚")
+-               or _has(q,"抽牌","牌局") and _has(q,"各剩幾張","各剩几张","各有幾張","各有几张"))
+-        if count:facts.add("hand-counts")
+-        own=_has(q,"你的手牌","妳的手牌","你的牌","妳的牌","你手上的牌","妳手上的牌","你有哪些牌","妳有哪些牌","莉莉絲的手牌","莉莉丝的手牌","your cards","your hand","あなたの手札","リリスの手札","自分の手札")
+-        detail=_has(q,"牌色","花色","點數","点数","牌序","順序","顺序","什麼牌","什么牌","哪些牌","suits","ranks","order","スート","順番")
+-        contents=detail or _has(q,"是什麼","是什么","有什麼","有什么","有哪些","哪張","哪张","報給我","报给我","報一下","报一下","告訴我","告诉我","列出","what are your cards","which cards","tell me","list ","教えて","見せて","何")
+-        if own and contents and (not count or detail):facts.add("self-hand")
++        if _hand_count_question(q):facts.add("hand-counts")
++        if _self_hand_question(q):facts.add("self-hand")
+     elif kind=="chess":
+         recent=_has(q,"剛剛走","刚刚走","剛才走","刚才走","剛剛吃","刚刚吃","剛才吃","刚才吃","just move","just capture")
+         if (_has(q,"上一手","上一步","last move","直前の手","最後の手","さっきの手")
+@@ -138,7 +188,7 @@ def _classify_question(question, kind):
+             facts.add("last-move")
+         if _has(q,"被將軍","被将军","將軍了","将军了","in check","チェックされ","王手され","王手です"):facts.add("check")
+         if _has(q,"棋子在哪","棋子位置","棋盤上有哪些","棋盘上有哪些","棋子剩","剩哪些棋","pieces on","where are the pieces","where is my king","where is your king","駒の位置","盤上の駒","駒はどこ"):facts.add("pieces")
+-        if (_has(q,"能將軍","能将军","可以將軍","可以将军","快將軍","快将军","哪個棋子有危險","哪个棋子有危险","capture targets","取れる駒","王手でき","危険な駒")
++        if (_has(q,"能將軍","能将军","可以將軍","可以将军","快將軍","快将军","哪個棋子有危險","哪个棋子有危险","哪些棋子有危險","哪些棋子有危险","capture targets","取れる駒","王手でき","危険な駒")
+                 or _has(q,"棋","piece","king","queen","rook","bishop","knight","pawn")
+                 and _has(q,"能吃哪","可以吃哪","can you capture","can i capture","can you check","can i check")):
+             facts.add("awareness")
+@@ -160,7 +210,7 @@ def _facts(data, ids):
+                 return None
+             result[key] = payload["lilithHand"]
+         elif key == "last-move":
+-            result[key] = payload["lastMoveUci"]
++            result[key] = {"uci": payload["lastMoveUci"], "details": (payload.get("awareness") or {}).get("lastMove")}
+         elif key == "check":
+             result[key] = {"actor": data["actor"], "inCheck": payload["inCheck"]}
+         elif key == "pieces":
+@@ -168,7 +218,7 @@ def _facts(data, ids):
+         elif key == "awareness":
+             if "awareness" not in payload:
+                 return None
+-            result[key] = payload["awareness"]
++            result[key] = dict(payload["awareness"], board=payload["board"], playerSide=payload["playerSide"])
+         else:
+             return None
+     return result
+@@ -344,7 +394,7 @@ def _coverage(key, value, text):
+     """Finite positive recognizers. Never equate absence of Arabic digits to missing."""
+     if key == "turn":
+         actor = (r"(?:我|私|me|my)" if value == "lilith" else r"(?:你|妳|あなた|you|your)")
+-        if re.search(r"輪到\s*"+actor+r"|轮到\s*"+actor+r"|"+actor+r"(?:的)?(?:回合|番|の番|の手番)|"+actor+r"(?:r)?\s+(?:turn|move)",text,re.I):
++        if re.search(r"輪到\s*"+actor+r"|轮到\s*"+actor+r"|(?:turn\s*:\s*|手番は)"+actor+r"|"+actor+r"(?:的)?(?:回合|番|の番|の手番)|"+actor+r"(?:r)?\s+(?:turn|move)",text,re.I):
+             return "covered"
+         cue=r"輪到|轮到|回合|手番|の番|turn|move"
+     elif key == "hand-counts":
+@@ -426,17 +476,22 @@ def requested_items(plan):
+     for key in plan.ids:
+         value = facts[key]
+         if key == "hand-counts":
+-            both = _has(q, "我們", "我们", "各", "雙方", "双方", "both", "each", "we ", "それぞれ", "お互い")
+-            own = _has(q, "你的手牌", "妳的手牌", "你的牌", "妳的牌", "你有", "妳有", "你剩", "妳剩", "your", "do you", "あなた", "リリス")
+-            player = _has(q, "我的手牌", "我的牌", "我有", "我剩", "my ", "do i", "私の")
+-            actors = ("player", "lilith") if both or own == player else (("lilith",) if own else ("player",))
++            actors = _requested_count_actors(q)
+             result.update({"hand-counts." + actor: value[actor] for actor in actors})
+         elif key == "self-hand":
+-            if _has(q, "順序", "顺序", "牌序", "左", "order", "順番", "並び"):
++            scopes = "。".join(m.group() for m in re.finditer(r"[^。.!?？！;；\r\n]+[.!?？！]?", q) if _self_hand_question(m.group()))
++            ordered = _has(scopes, "順序", "顺序", "牌序", "左", "order", "順番", "並び")
++            joker_position = _has(scopes, "鬼牌", "joker", "ジョーカー") and _has(scopes, "哪", "位置", "第", "where", "position", "どこ", "何番")
++            if ordered:
+                 result["self-hand.order"] = value
++            elif joker_position and not _has(scopes, "花色", "點數", "点数", "每張", "每张", "suit", "rank", "each card", "スート"):
++                pass
+             else:
+                 for i, card in enumerate(value["cards"]):
+                     result["self-hand.card." + str(i)] = card
++            if joker_position:
++                position = next((i+1 for i, card in enumerate(value["cards"]) if card["rank"] == "JOKER"), None)
++                result["self-hand.joker-position"] = {"order": "screen-left-to-right", "position": position}
+         elif key == "pieces":
+             # Narrow the explicitly supported singular king questions. Other
+             # admitted position questions retain the registered board scope.
+@@ -448,18 +503,108 @@ def requested_items(plan):
+             for i, piece in enumerate(value["board"]):
+                 if piece != "." and (king is None or piece == king):
+                     result[f"pieces.{chr(97+i%8)}{i//8+1}"] = piece
++        elif key == "last-move":
++            result["last-move.uci"] = value["uci"]
++            if value["uci"]:
++                details = value["details"]
++                for field_name in ("actor", "piece"):
++                    result["last-move." + field_name] = ({"status": "available", field_name: details[field_name]}
++                        if details is not None else {"status": "unavailable", "reason": "metadata-absent"})
++                if details is not None and details["capturedPiece"] != ".":
++                    result["last-move.capture"] = {"status": "available", "piece": details["capturedPiece"], "square": details["capturedSquare"]}
++                if len(value["uci"]) == 5:
++                    result["last-move.promotion"] = value["uci"][4:]
++        elif key == "check":
++            for actor in _requested_check_actors(q, value["actor"]):
++                result["check." + actor] = ({"actor": actor, "status": "available", "inCheck": value["inCheck"]}
++                    if actor == value["actor"] else {"actor": actor, "status": "unavailable", "reason": "not-current-turn"})
+         elif key == "awareness":
+-            capture = _has(q, "能吃", "可以吃", "可吃", "capture", "取れる", "危險", "危险", "danger", "危険")
+-            checking = _has(q, "將軍", "将军", "check", "王手")
+-            if capture or not checking:
+-                result["awareness.capture-targets"] = {"actor": value["turnActor"], "squares": value["captureTargetSquares"]}
+-            if checking or not capture:
+-                result["awareness.checking-move"] = {"actor": value["turnActor"], "available": value["checkingMoveAvailable"]}
++            for relation, actors in _requested_tactics(q, value["turnActor"]):
++                for actor in actors:
++                    item = {"actor": actor, "relation": relation}
++                    available = actor != value["turnActor"] if relation == "danger" else actor == value["turnActor"]
++                    if not available:
++                        item.update(status="unavailable", reason="opponent-not-current-turn" if relation == "danger" else "not-current-turn")
++                    elif relation == "checking-move":
++                        item.update(status="available", available=value["checkingMoveAvailable"])
++                    elif relation == "capture-targets":
++                        item.update(status="available", squares=value["captureTargetSquares"])
++                    else:
++                        # These are victim squares, including the en-passant
++                        # victim, NOT landing squares or general attack maps.
++                        victims = [{"square": square, "piece": value["board"][(int(square[1])-1)*8+ord(square[0])-97]}
++                            for square in value["captureTargetSquares"]]
++                        item.update(status="available", victims=victims)
++                    result["awareness." + relation + "." + actor] = item
+         else:
+             result[key] = value
+     return result
+ 
+ 
++def _requested_count_actors(question):
++    actors = []
++    for sentence in re.finditer(r"[^。.!?？！;；\r\n]+[.!?？！]?", question):
++        q = sentence.group()
++        if not _hand_count_question(q) or not _has_query_intent(q):
++            continue
++        scope = ()
++        for part in re.split(r"[,，、]", q):
++            own = _own_hand_reference(part) or _has(part, "你有", "妳有", "你剩", "妳剩", "your", "do you", "あなた", "リリス")
++            player = bool(re.search(r"(?:我|玩家)(?:自己|目前|現在|现在|手上|手中|的|有|剩){0,5}(?:手牌|牌)|\bmy\b|do i|私の", part)) or _has(part, "我有", "我剩")
++            both = _has(part, "我們", "我们", "各", "雙方", "双方", "both", "each", "we ", "それぞれ", "お互い")
++            if own or player or both:
++                scope = ("player", "lilith") if both or own and player else ("lilith",) if own else ("player",)
++            if _hand_count_question(part) or scope and _has(part, "幾張", "几张", "多少", "何枚", "how many"):
++                for actor in scope or ("player", "lilith"):
++                    if actor not in actors:
++                        actors.append(actor)
++    return actors
++
++
++def _question_actors(text):
++    """Question perspective: you=Lilith, I=player; target pronouns are excluded by callers."""
++    own = re.search(r"你|妳|莉莉絲|莉莉丝|\byou\b|\byour\b|\blilith\b|あなた|リリス|君", text, re.I)
++    player = re.search(r"我|玩家|\bi\b|\bmy\b|\bme\b|\bplayer\b|私|僕|プレイヤー", text, re.I)
++    if re.search(r"我們|我们|雙方|双方|彼此|both|either|お互い|両方", text, re.I):
++        return ("player", "lilith")
++    return tuple(actor for actor, found in (("player", player), ("lilith", own)) if found)
++
++
++def _requested_check_actors(question, current):
++    actors = []
++    for clause in re.split(r"[。.!！?？;；\n]", question):
++        marker = re.search(r"被將軍|被将军|將軍了|将军了|in check|チェックされ|王手され|王手です", clause, re.I)
++        if marker:
++            for actor in _question_actors(clause[:marker.start()]) or (current,):
++                if actor not in actors:
++                    actors.append(actor)
++    return actors or [current]
++
++
++def _requested_tactics(question, current):
++    result = []
++    for sentence in re.split(r"[。.!！?？;；\n]", question):
++        inherited = ()
++        for clause in re.split(r"[,，]", sentence):
++            danger = re.search(r"危險|危险|danger|threatened|危険", clause, re.I)
++            capture = re.search(r"能吃|可以吃|可吃|capture|取れる", clause, re.I)
++            checking = re.search(r"(?:能|可以|快|可)將軍|(?:能|可以|快|可)将军|(?:can|could).{0,12}check|checking move|王手でき", clause, re.I)
++            for relation, marker in (("danger", danger), ("capture-targets", capture), ("checking-move", checking)):
++                if not marker:
++                    continue
++                # Only subjects BEFORE the ability predicate count; in
++                # '妳能將軍我嗎' the trailing 我 is the target, not the actor.
++                prefix = clause[:marker.start()]
++                if relation == "checking-move" and re.match(r"(?:can|could)\b", marker.group(), re.I):
++                    prefix += marker.group().rsplit("check", 1)[0]
++                actors = _question_actors(prefix) or inherited or (current,)
++                inherited = actors
++                row = (relation, actors)
++                if row not in result:
++                    result.append(row)
++    return result or [("capture-targets", (current,)), ("checking-move", (current,))]
++
++
+ _QUOTED = re.compile(r'"[^"\n]*"|“[^”\n]*”|「[^」\n]*」|『[^』\n]*』|`[^`\n]*`')
+ _EXPLICIT_ABSENCE = re.compile(
+     r"(?:沒帶|没带|沒有帶|没有带|未帶|未带|沒有附|没有附|未附|沒有|没有|缺少|沒有收到|没收到|未收到|沒有取得|没得到|沒有得到|沒得到|看不到|不知道).{0,25}(?:對局資料|对局资料|牌局資訊|牌局信息|牌局資料|牌局资料|棋局資料|棋局资料|遊戲資料|游戏资料|局面|手牌)|"
+@@ -475,6 +620,20 @@ def _assertions(text):
+     parts = re.split(r"([。.!！?？;；\n])", text)
+     for i in range(0, len(parts), 2):
+         part = parts[i]
++        # Privacy statements are clause-local: a true hidden-player disclaimer
++        # must not hide an adjacent false denial of the whole game snapshot.
++        privacy_parts = re.split(r"([,，])", part)
++        for j in range(0, len(privacy_parts), 2):
++            fragment = privacy_parts[j]
++            if _NEGATED_DENIAL.search(fragment) and not re.search(r"但是|但|然而|\bbut\b|however|けれど|けど", fragment, re.I):
++                privacy_parts[j] = ""
++                continue
++            if (_HIDDEN_DENIAL.search(fragment) and (_DENIAL.search(fragment) or _EXPLICIT_ABSENCE.search(fragment))
++                    and not re.search(r"對局資料|对局资料|牌局資訊|牌局信息|棋局資料|棋局资料|遊戲資料|游戏资料|局面|game data|board data", fragment, re.I)
++                    and not re.search(r"幾張|几张|多少張|多少张|牌數|牌数|how many|card counts?|枚数|何枚", fragment, re.I)):
++                privacy_parts[j] = ""
++        part = "".join(privacy_parts)
++        parts[i] = part
+         future = re.search(r"下一步|下一手|下回合|之後|之后|稍後|稍后|未來|未来|接下來|接下来|即將|即将|將會|将会|next (?:move|turn)|\blater\b|\bwill\b|going to|次の手|次の番|次は|後で", part, re.I)
+         if future:
+             # Preserve an earlier complete current assertion, not the proposed
+@@ -482,11 +641,8 @@ def _assertions(text):
+             part = part[:future.start()]
+             parts[i] = part
+         if ((i + 1 < len(parts) and parts[i + 1] in {"?", "？"})
+-                or _NEGATED_DENIAL.search(part)
+                 or re.search(r"假如|假設|假设|如果|例如|\bif\b|suppose|hypothetical|仮に|たとえば", part, re.I)
+-                or re.search(r"上一局|上局|上次|以前|昨天|previous game|last game|yesterday|前の対局|前回", part, re.I)
+-                or (_HIDDEN_DENIAL.search(part) and (_DENIAL.search(part) or _EXPLICIT_ABSENCE.search(part))
+-                    and not re.search(r"幾張|几张|多少張|多少张|牌數|牌数|how many|card counts?|枚数|何枚", part, re.I))):
++                or re.search(r"上一局|上局|上次|以前|昨天|previous game|last game|yesterday|前の対局|前回", part, re.I)):
+             parts[i] = ""
+     return "".join(parts)
+ 
+@@ -531,23 +687,23 @@ _CARD = re.compile(r"(?P<suit>紅心|红心|♥|hearts?|ハート|黑桃|♠|spa
+ def _own_cards(text):
+     # Without an explicit own-hand scope a suit mention may describe a public
+     # discard or the player's cards and cannot prove Lilith's hand.
+-    scope = re.search(r"(?:我的手牌|我的牌|我手上(?:的牌)?|我有|my (?:hand|cards)|I (?:have|hold)|私の手札|リリスの手札)", text, re.I)
+-    if scope is None:
+-        return None
+-    prefix = re.split(r"[。.!！?？;；,，\n]", text[:scope.start()])[-1]
+-    if re.search(r"不是|並非|并非|\bnot\b|isn't|不確定|不确定|可能|maybe|perhaps", prefix, re.I):
+-        return None
+-    tail = re.split(r"[。.!！?？\n]|(?:你|妳)(?:有|的手牌)|your hand", text[scope.end():], maxsplit=1)[0]
+-    if re.search(r"不是|沒有|没有|沒|\bnot\b|don't|do not|without|ありません|ではない", tail, re.I):
+-        return None
+     cards = []
+-    for match in _CARD.finditer(tail):
+-        if match.group("joker"):
+-            cards.append({"rank": "JOKER", "suit": "none"})
+-        else:
+-            suit = "hearts" if re.fullmatch(r"紅心|红心|♥|hearts?|ハート", match.group("suit"), re.I) else "spades"
+-            cards.append({"rank": match.group("rank").upper(), "suit": suit})
+-    return cards
++    saw_scope = False
++    for scope in re.finditer(r"(?:我的手牌|我的牌|我手上(?:的牌)?|我有|my (?:hand|cards)|(?:in )?my hand|I (?:have|hold)|私の手札|リリスの手札)", text, re.I):
++        prefix = re.split(r"[。.!！?？;；,，\n]", text[:scope.start()])[-1]
++        if re.search(r"不是|並非|并非|\bnot\b|isn't|不確定|不确定|可能|maybe|perhaps", prefix, re.I):
++            continue
++        saw_scope = True
++        tail = re.split(r"[。.!！?？;；\n]|(?:你|妳)(?:有|的手牌)|your hand", text[scope.end():], maxsplit=1)[0]
++        if re.search(r"不是|沒有|没有|沒|\bnot\b|don't|do not|without|ありません|ではない", tail, re.I):
++            continue
++        for match in _CARD.finditer(tail):
++            if match.group("joker"):
++                cards.append({"rank": "JOKER", "suit": "none"})
++            else:
++                suit = "hearts" if re.fullmatch(r"紅心|红心|♥|hearts?|ハート", match.group("suit"), re.I) else "spades"
++                cards.append({"rank": match.group("rank").upper(), "suit": suit})
++    return cards if saw_scope else None
+ 
+ 
+ def _awareness_actor(text, offset, actor):
+@@ -565,6 +721,8 @@ def _awareness_actor(text, offset, actor):
+ 
+ def _item_status(key, value, text):
+     """Positive/contradiction checks are deliberately finite, with an explicit unknown."""
++    if key.startswith(("last-move.", "check.", "awareness.")) and key.count(".") >= (2 if key.startswith("awareness.") else 1):
++        return _chess_item_status(key, value, text)
+     if key.startswith("hand-counts."):
+         values = _count_values(text, key.rsplit(".", 1)[1])
+         return "wrong" if any(v != value for v in values) else "covered" if values else "uncertain"
+@@ -577,6 +735,12 @@ def _item_status(key, value, text):
+             return "wrong"
+         return "covered" if statuses[value] else "uncertain"
+     if key.startswith("self-hand."):
++        if key == "self-hand.joker-position":
++            canonical = any(_canonical_asserted(text, _joker_position_text(value, locale)) for locale in ("zh-Hant", "zh-Hans", "en", "ja"))
++            positions = [int(v) for v in re.findall(r"我的鬼牌在畫面從左到右第(\d+)張|我的鬼牌在画面从左到右第(\d+)张", text) for v in v if v]
++            if any(position != value["position"] for position in positions):
++                return "wrong"
++            return "covered" if canonical else "uncertain"
+         cards = _own_cards(text)
+         if cards is None or not cards:
+             return "uncertain"
+@@ -591,7 +755,7 @@ def _item_status(key, value, text):
+             return "uncertain"
+         return "uncertain"
+     if key == "last-move":
+-        move_pattern = r"\b([a-h][1-8])\s*(?:→|->|到|to)?\s*([a-h][1-8])(?:\s*\(?([qrbn])\)?)?\b"
++        move_pattern = r"\b([a-h][1-8])\s*(?:→|->|走到|到|to)?\s*([a-h][1-8])(?:\s*\(?([qrbn])\)?)?\b"
+         scope = re.search(r"上一手|上一步|上一個已完成的走步|上一个已完成的走步|last (?:committed )?move|直前の手|さっきの手", text, re.I)
+         if scope:
+             candidate = re.split(r"[。.!！?？;；\n]|下一|接著|接着|接下來|接下来|next |could |might |perhaps |次の|次は", text[scope.end():], maxsplit=1, flags=re.I)[0]
+@@ -621,29 +785,104 @@ def _item_status(key, value, text):
+                 values.append(match.group(1))
+         return "wrong" if any(piece != value for piece in values) else "covered" if values else "uncertain"
+     if key == "awareness.capture-targets":
+-        match = re.search(r"(?:可合法吃子的目標格|可合法吃子的目标格|legal capture targets|合法な捕獲対象)\s*[:：]\s*([^。.!\n]+)", text, re.I)
+-        if match:
++        claims = []
++        for match in re.finditer(r"(?:可合法吃子的目標格|可合法吃子的目标格|legal capture targets|合法な捕獲対象)\s*[:：]\s*([^。.!\n]+)", text, re.I):
+             actor_status = _awareness_actor(text, match.start(), value["actor"])
+             if actor_status != "covered":
+-                return actor_status
++                claims.append(actor_status)
++                continue
+             squares = re.findall(r"\b[a-h][1-8]\b", match.group(1), re.I)
+             empty = re.fullmatch(r"\s*(?:無|无|none|なし)\s*", match.group(1), re.I)
+             if squares or empty:
+-                return "covered" if sorted(s.lower() for s in squares) == sorted(value["squares"]) else "wrong"
++                claims.append("covered" if sorted(s.lower() for s in squares) == sorted(value["squares"]) else "wrong")
++        if claims:
++            return "wrong" if "wrong" in claims else "uncertain" if "uncertain" in claims else "covered"
+     if key == "awareness.checking-move":
+-        match = re.search(r"(?:可將軍的合法走法|可将军的合法走法|a legal checking move exists|王手できる合法手)\s*[:：]\s*(沒有|没有|有|yes|no|あり|なし)", text, re.I)
+-        if match:
++        claims = []
++        for match in re.finditer(r"(?:可將軍的合法走法|可将军的合法走法|a legal checking move exists|王手できる合法手)\s*[:：]\s*(沒有|没有|有|yes|no|あり|なし)", text, re.I):
+             actor_status = _awareness_actor(text, match.start(), value["actor"])
+             if actor_status != "covered":
+-                return actor_status
++                claims.append(actor_status)
++                continue
+             positive = match.group(1).lower() in {"有", "yes", "あり"}
+-            return "covered" if positive == value["available"] else "wrong"
++            claims.append("covered" if positive == value["available"] else "wrong")
++        if claims:
++            return "wrong" if "wrong" in claims else "uncertain" if "uncertain" in claims else "covered"
+     return "uncertain"
+ 
+ 
++def _canonical_asserted(text, statement):
++    needle = statement.rstrip("。.!！")
++    if not needle:
++        return False
++    for index, match in enumerate(re.finditer(re.escape(needle), text, re.I)):
++        if index >= 32:
++            return False
++        prefix = re.split(r"[。.!！?？;；\n]", text[:match.start()])[-1]
++        if not re.search(r"不是|並非|并非|\bnot\b|isn't|maybe|可能|不確定|不确定|假如|如果|suppose|仮に", prefix, re.I):
++            return True
++    return False
++
++
++def _chess_item_status(key, value, text):
++    # Exact local limitation text is answer coverage, never evidence that the
++    # requested tactical data exists. Its typed status stays unavailable.
++    canonical = any(_canonical_asserted(text, _assertions(_chess_item_text(key, value, locale)))
++        for locale in ("zh-Hant", "zh-Hans", "en", "ja"))
++    if key == "last-move.uci":
++        status = _item_status("last-move", value, text)
++        return "wrong" if status == "wrong" else "covered" if canonical or status == "covered" else "uncertain"
++    if key.startswith("check."):
++        actor = value["actor"]
++        if value["status"] == "available":
++            status = _item_status("check", {"actor": actor, "inCheck": value["inCheck"]}, text)
++            return "wrong" if status == "wrong" else "covered" if canonical or status == "covered" else "uncertain"
++        # A non-turn claim cannot be confirmed using the turn side's boolean.
++        if any(_coverage("check", {"actor": actor, "inCheck": flag}, text) == "covered" for flag in (False, True)):
++            return "wrong"
++        return "covered" if canonical else "uncertain"
++    if key.startswith("awareness."):
++        relation = value["relation"]
++        if relation in {"capture-targets", "checking-move"}:
++            if value["status"] == "available":
++                old = "awareness." + relation
++                status = _item_status(old, value, text)
++                if status == "wrong":
++                    return "wrong"
++                if status == "covered":
++                    return "covered"
++            else:
++                cue = r"可合法吃子的目標格|可合法吃子的目标格|legal capture targets|合法な捕獲対象" if relation == "capture-targets" else r"可將軍的合法走法|可将军的合法走法|a legal checking move exists|王手できる合法手"
++                for match in re.finditer(cue, text, re.I):
++                    if _awareness_actor(text, match.start(), value["actor"]) == "covered":
++                        return "wrong"
++        return "covered" if canonical else "uncertain"
++    if key == "last-move.actor":
++        claims = []
++        for actor in ("player", "lilith"):
++            claim = {"status": "available", "actor": actor}
++            if any(_canonical_asserted(text, _chess_item_text(key, claim, locale)) for locale in ("zh-Hant", "zh-Hans", "en", "ja")):
++                claims.append(claim)
++        if any(value != claim for claim in claims):
++            return "wrong"
++        if claims:
++            return "covered"
++    elif key in {"last-move.piece", "last-move.capture", "last-move.promotion"}:
++        # Different explicit piece names must dominate a matching coordinate.
++        for piece in "prnbqk":
++            claim = (piece if key.endswith("promotion") else dict(value, status="available", piece=piece))
++            if key.endswith("capture") and "square" not in claim:
++                continue
++            if any(_canonical_asserted(text, _chess_item_text(key, claim, locale)) for locale in ("zh-Hant", "zh-Hans", "en", "ja")):
++                expected = value.lower() if isinstance(value, str) else value.get("piece", "").lower()
++                if piece != expected:
++                    return "wrong"
++    return "covered" if canonical else "uncertain"
++
++
+ def local_checks(plan, text):
+     items = requested_items(plan)
+-    if type(text) is not str or not text.strip() or len(text) > 32768:
++    if type(text) is not str or not text.strip() or len(text) > 32768 or len(re.findall(r"[,，、。.!！?？;；\n]", text)) > MAX_ASSERTIONS:
+         return {key: "uncertain" for key in items}
+     assertions = _assertions(text)
+     statuses = {key: _item_status(key, value, assertions) for key, value in items.items()}
+@@ -654,13 +893,17 @@ def local_checks(plan, text):
+         unexpected = any(card not in expected for card in cards) or len(cards) != len({_json(card) for card in cards})
+         for key, value in card_items.items():
+             statuses[key] = "wrong" if unexpected else "covered" if value in cards else "missing"
+-    denial = _EXPLICIT_ABSENCE.search(assertions) or _DENIAL.search(assertions)
++    denial = _data_denial(assertions, items)
+     # A recognized whole-game denial is an explicit contradicted availability
+     # claim. Only requested, host-visible items can become corrections.
+     if denial:
+-        return {key: status if status in {"covered", "wrong"} else "wrong" for key, status in statuses.items()}
++        return {key: "wrong" for key in statuses}
+     if assertions.strip().rstrip(".!。！～~") in _EMPTY_ANSWERS:
+         return {key: "missing" for key in items}
++    unresolved = _unresolved_claim_families(plan, assertions)
++    for key, status in list(statuses.items()):
++        if key.split(".")[0] in unresolved and status != "wrong":
++            statuses[key] = "uncertain"
+     if "covered" in statuses.values():
+         # Complete affirmative fragments can prove a requested item was simply
+         # omitted. Ambiguous language mentioning that item still goes to audit.
+@@ -668,6 +911,8 @@ def local_checks(plan, text):
+             if status != "uncertain":
+                 continue
+             base = key.split(".")[0]
++            if base in unresolved:
++                continue
+             if base == "hand-counts":
+                 actor = key.rsplit(".", 1)[1]
+                 cue = (r"(?:我|私|\bI\b|my).{0,14}(?:牌|張|张|枚|hand|cards?)" if actor == "lilith" else
+@@ -679,7 +924,51 @@ def local_checks(plan, text):
+     return statuses
+ 
+ 
+-def _trace(stage, status, checks=None, reason="none"):
++def _data_denial(assertions, items=None):
++    # Diagnostic patterns are sentence-local. 'not in check' must not combine
++    # with a later sentence's 'snapshot' into a fictitious data denial.
++    for key, value in (items or {}).items():
++        if isinstance(value, dict) and value.get("status") == "unavailable":
++            for locale in ("zh-Hant", "zh-Hans", "en", "ja"):
++                limitation = _assertions(_chess_item_text(key, value, locale))
++                if _canonical_asserted(assertions, limitation):
++                    assertions = assertions.replace(limitation.rstrip("。.!！"), "")
++    return any(_EXPLICIT_ABSENCE.search(part) or _DENIAL.search(part)
++        for part in re.split(r"[。.!！?？;；\n]", assertions))
++
++
++def _unresolved_claim_families(plan, assertions):
++    """Recognized game-local unknown prose cannot be laundered by appending facts.
++
++    This is deliberately a finite residual gate, not universal semantic
++    verification. Quotes, hypothetical and privacy-limited clauses were already
++    excluded by _assertions. Unrelated role prose is left byte-identical.
++    """
++    items = requested_items(plan)
++    residual = assertions
++    for key, value in items.items():
++        for locale in ("zh-Hant", "zh-Hans", "en", "ja"):
++            rendered = _assertions(_render_items(replace(plan, locale=locale), {key: value}, "supplement")).rstrip("。.!！")
++            if rendered and _canonical_asserted(residual, rendered):
++                residual = residual.replace(rendered, "")
++    for start, end, atom in reversed(list(_merge_atoms(residual))):
++        negated = re.sub(r"^(?:不是|並非|并非|not (?:that )?)\s*", "", atom, count=1, flags=re.I)
++        if ((negated != atom and _pure_fact_atom(negated))
++                or _pure_fact_atom(atom) and any(_item_status(key, value, atom) in {"covered", "wrong"} for key, value in items.items())):
++            residual = residual[:start] + residual[end:]
++    cues = {
++        "turn": r"輪到|轮到|(?:my|your|whose) turn|手番|の番",
++        "hand-counts": r"(?:我|你|妳).{0,10}(?:[0-9零一二兩两三四五六七八九十]+\s*[張张])|(?:have|hold).{0,12}cards|(?:私|あなた).{0,8}枚",
++        "self-hand": r"我的手牌|我的牌|我手上|my hand|my cards|私の手札|我的鬼牌|my joker|私のジョーカー",
++        "last-move": r"上一手|上一步|剛剛|刚刚|剛才|刚才|last (?:moving|committed|move)|just now|who moved|直前|さっき",
++        "check": r"被將軍|被将军|in check|王手され",
++        "pieces": r"\b[a-h][1-8]\s*:\s*[prnbqkPRNBQK]|棋子位置|piece positions|駒の位置",
++        "awareness": r"(?:能|可以|可|快)將軍|(?:能|可以|可|快)将军|合法吃|能吃|可以吃|(?:棋子|駒).{0,12}(?:危險|危险|安全|危険)|(?:my|your).{0,20}pieces.{0,25}(?:safe|risk|danger)|(?:can|could).{0,15}(?:check|capture)|legal (?:checking|capture)|王手でき|取れる駒",
++    }
++    return {family for family in plan.ids if re.search(cues.get(family, r"(?!)"), residual, re.I)}
++
++
++def _trace(stage, status, checks=None, reason="none", disclosed_unavailable=0):
+     # Fixed enums and counts only. Never include question, answer, evidence,
+     # card facts, match IDs, provider identity, exception text or request data.
+     if stage not in {"local", "audit", "repair", "final"} or status not in {"checked", "attempted", "accepted", "unresolved", "failed", "skipped", "completed"}:
+@@ -687,9 +976,11 @@ def _trace(stage, status, checks=None, reason="none"):
+     if reason not in {"none", "complete", "ineligible", "already-used", "invalid-answer", "invalid-response", "unavailable", "cancelled", "deadline", "remaining-uncertain", "correction", "supplement"}:
+         reason = "unavailable"
+     values = list((checks or {}).values())
++    if type(disclosed_unavailable) is not int or not 0 <= disclosed_unavailable <= 128:
++        disclosed_unavailable = 0
+     try:
+-        _LOG.info("minigame_answer_judge stage=%s status=%s reason=%s covered=%d missing=%d wrong=%d uncertain=%d",
+-            stage, status, reason, values.count("covered"), values.count("missing"), values.count("wrong"), values.count("uncertain"))
++        _LOG.info("minigame_answer_judge stage=%s status=%s reason=%s covered=%d missing=%d wrong=%d uncertain=%d disclosed_unavailable=%d",
++            stage, status, reason, values.count("covered"), values.count("missing"), values.count("wrong"), values.count("uncertain"), disclosed_unavailable)
+     except Exception:
+         pass
+ 
+@@ -745,13 +1036,14 @@ def _evidence_assertions(text, evidence):
+     return scopes
+ 
+ 
+-def assess_audit(response, items, checks, text):
++def assess_audit(response, items, checks, text, *, plan=None):
+     result = _response_object(response)
+     uncertain = {key for key, status in checks.items() if status == "uncertain"}
+     if (type(result) is not dict or set(result) != {"verdicts"}
+             or type(result["verdicts"]) is not list or len(result["verdicts"]) != len(uncertain)):
+         _fail()
+     merged, seen = dict(checks), set()
++    unresolved = _unresolved_claim_families(plan, _assertions(text)) if plan is not None else set()
+     for verdict in result["verdicts"]:
+         if type(verdict) is not dict or set(verdict) != {"id", "status", "evidence"}:
+             _fail()
+@@ -767,7 +1059,7 @@ def assess_audit(response, items, checks, text):
+         # Where finite checks cannot ground its coverage claim, keep unknown.
+         scopes = _evidence_assertions(text, evidence)
+         if status == "covered":
+-            merged[key] = "covered" if scopes and all(_item_status(key, items[key], scope) == "covered" for scope in scopes) else "uncertain"
++            merged[key] = "covered" if key.split(".")[0] not in unresolved and scopes and all(_item_status(key, items[key], scope) == "covered" for scope in scopes) else "uncertain"
+         elif status == "wrong":
+             proved = scopes and all(_item_status(key, items[key], scope) == "wrong"
+                 or _EXPLICIT_ABSENCE.search(scope) is not None for scope in scopes)
+@@ -779,12 +1071,91 @@ def assess_audit(response, items, checks, text):
+     return merged
+ 
+ 
++def _hans(text):
++    for old, new in zip("輪張紅畫從個將軍寫車馬當標無這勝斷補訊時準證後動對僅資夠擊險敵雙現態記錄升變", "轮张红画从个将军写车马当标无这胜断补讯时准证后动对仅资够击险敌双现态记录升变"):
++        text = text.replace(old, new)
++    return text
++
++
++def _piece_name(piece, locale):
++    names = {"zh-Hant": ("兵", "車", "馬", "象", "后", "王"), "en": ("pawn", "rook", "knight", "bishop", "queen", "king"), "ja": ("ポーン", "ルーク", "ナイト", "ビショップ", "クイーン", "キング")}
++    name = names.get(locale, names["zh-Hant"])["prnbqk".index(piece.lower())]
++    return _hans(name) if locale == "zh-Hans" else name
++
++
++def _joker_position_text(value, locale):
++    position = value["position"]
++    if position is None:
++        text = "私の手札にジョーカーはありません。" if locale == "ja" else "There is no Joker in my hand." if locale == "en" else "我的手牌裡沒有鬼牌。"
++    else:
++        text = f"私のジョーカーは画面の左から右へ{position}枚目です。" if locale == "ja" else f"My Joker is card {position}, counting screen left to right." if locale == "en" else f"我的鬼牌在畫面從左到右第{position}張。"
++    return _hans(text) if locale == "zh-Hans" else text
++
++
++def _chess_item_text(key, value, locale):
++    ja, en = locale == "ja", locale == "en"
++    who = {"lilith": "私" if ja else "I" if en else "我", "player": "あなた" if ja else "you" if en else "你"}
++    possessive = {"lilith": "my", "player": "your"}
++    if key == "last-move.uci":
++        if not value:
++            text = "まだ指された手はありません。" if ja else "No move has been committed yet." if en else "目前尚未走出第一步。"
++        else:
++            move = value[:2] + " → " + value[2:4] + (" (" + value[4:] + ")" if len(value) == 5 else "")
++            text = ("直前の手：" if ja else "Last move: " if en else "上一手：") + move + "。"
++    elif key.startswith("last-move."):
++        field = key.split(".")[1]
++        if isinstance(value, dict) and value["status"] == "unavailable":
++            label = ("指した側" if field == "actor" else "動かした駒") if ja else ("who moved" if field == "actor" else "which piece moved") if en else ("走棋的一方" if field == "actor" else "移動的棋子")
++            text = f"直前の手の{label}は、この記録だけでは確認できません。" if ja else f"This move record does not identify {label}." if en else f"這份走步記錄尚未提供上一手{label}的細節。"
++        elif field == "actor":
++            text = f"直前の手を指したのは{who[value['actor']]}です。" if ja else f"{'I made' if value['actor']=='lilith' else 'You made'} the last move." if en else f"上一手是{who[value['actor']]}走的。"
++        elif field == "piece":
++            piece = _piece_name(value["piece"], locale)
++            text = f"直前に動かした駒は{piece}です。" if ja else f"The last moving piece was a {piece}." if en else f"上一手移動的是{piece}。"
++        elif field == "capture":
++            piece, square = _piece_name(value["piece"], locale), value["square"]
++            text = f"その手で{square}の{piece}を取りました。" if ja else f"That move captured the {piece} on {square}." if en else f"那一步吃掉了{square}的{piece}。"
++        else:
++            piece = _piece_name(value, locale)
++            text = f"そのポーンは{piece}に昇格しました。" if ja else f"The pawn promoted to a {piece}." if en else f"那個兵升變成了{piece}。"
++    elif key.startswith("check."):
++        actor = value["actor"]
++        if value["status"] == "unavailable":
++            text = f"{who[actor]}の王手状態について、この局面記録は手番側だけを扱うため、手番でない側は判定できません。" if ja else f"For {possessive[actor]} check status, this snapshot covers only the side to move; the other side's status is unavailable." if en else f"至於{who[actor]}有沒有被將軍，這份局面記錄只提供行棋方的狀態，非行棋方的狀態尚不能判定。"
++        else:
++            text = (f"{who[actor]}の王は" + ("王手されています。" if value["inCheck"] else "王手されていません。")) if ja else (f"{'I am' if actor=='lilith' else 'You are'} " + ("in check." if value["inCheck"] else "not in check.")) if en else f"{who[actor]}" + ("正被將軍。" if value["inCheck"] else "沒有被將軍。")
++    else:
++        actor, relation = value["actor"], value["relation"]
++        if value["status"] == "unavailable":
++            topic = {"capture-targets": "吃子機會", "checking-move": "將軍機會", "danger": "棋子受吃威脅"}[relation]
++            topic_en = {"capture-targets": "capture opportunities", "checking-move": "checking opportunities", "danger": "pieces at immediate capture risk"}[relation]
++            topic_ja = {"capture-targets": "捕獲の機会", "checking-move": "王手の機会", "danger": "駒が取られる危険"}[relation]
++            text = f"{who[actor]}の{topic_ja}について、この記録は手番側の合法手だけを扱うため、必要なもう一方の手は判定できません。" if ja else f"For {possessive[actor]} {topic_en}, this snapshot covers only the current side's legal moves; the needed other side's moves are unavailable." if en else f"至於{who[actor]}的{topic}，這份記錄只有目前行棋方的合法走法，尚不能判定所需的另一方走法。"
++        elif relation == "capture-targets":
++            targets = ", ".join(value["squares"]) or ("なし" if ja else "none" if en else "無")
++            text = f"{who[actor]}の合法な捕獲対象：{targets}。" if ja else f"{'My' if actor=='lilith' else 'Your'} legal capture targets: {targets}." if en else f"{who[actor]}可合法吃子的目標格：{targets}。"
++        elif relation == "checking-move":
++            yes = ("あり" if value["available"] else "なし") if ja else ("yes" if value["available"] else "no") if en else ("有" if value["available"] else "沒有")
++            text = f"{who[actor]}の王手できる合法手：{yes}。" if ja else f"For {'me' if actor=='lilith' else 'you'}, a legal checking move exists: {yes}." if en else f"{who[actor]}可將軍的合法走法：{yes}。"
++        else:
++            victims = "、".join(v["square"] + " " + _piece_name(v["piece"], locale) for v in value["victims"])
++            if victims:
++                text = f"{who[actor]}の駒で相手が今合法的に取れるもの：{victims}。" if ja else f"{'My' if actor=='lilith' else 'Your'} pieces the opponent can legally capture now: {victims}." if en else f"{who[actor]}目前可能被對方合法吃掉的棋子：{victims}。"
++            else:
++                text = f"{who[actor]}の駒を相手が今合法的に取る手はありませんが、今後の安全を保証するものではありません。" if ja else f"The opponent has no legal capture of {possessive[actor]} pieces now; this does not guarantee future safety." if en else f"對方目前沒有能合法吃掉{who[actor]}棋子的走法，但這不代表之後沒有危險。"
++    return _hans(text) if locale == "zh-Hans" else text
++
++
+ def _render_items(plan, values, kind):
+     """Render only host-confirmed items. Model prose never enters the response."""
+     ja, en, hans = plan.locale == "ja", plan.locale == "en", plan.locale == "zh-Hans"
+     lines = []
+     for key, value in values.items():
+-        if key in {"turn", "check", "last-move"}:
++        if key == "self-hand.joker-position":
++            lines.append(_joker_position_text(value, plan.locale))
++        elif key.startswith(("last-move.", "check.", "awareness.")):
++            lines.append(_chess_item_text(key, value, plan.locale))
++        elif key in {"turn", "check", "last-move"}:
+             single = replace(plan, ids=(key,))
+             lines.extend(_render(single, {key: value}, kind).split("\n")[1:])
+         elif key.startswith("hand-counts."):
+@@ -806,8 +1177,9 @@ def _render_items(plan, values, kind):
+         elif key == "awareness.checking-move":
+             yes = ("あり" if value["available"] else "なし") if ja else ("yes" if value["available"] else "no") if en else ("有" if value["available"] else "沒有")
+             lines.append(f"手番側の王手できる合法手：{yes}。詰みの保証ではありません。" if ja else f"Side to move, a legal checking move exists: {yes}. This does not guarantee mate." if en else f"當前行棋方可將軍的合法走法：{yes}；這不保證將死。")
+-    header = _render(replace(plan, ids=()), {}, kind)
+-    text = header + "\n" + "\n".join(lines)
++    # No visible correction label or second answer: this is merged before the
++    # one existing final/history/speech publication boundary.
++    text = " ".join(lines)
+     if hans:
+         for old, new in (("張", "张"), ("紅", "红"), ("寫", "写"), ("當", "当"), ("將", "将"), ("軍", "军"), ("標", "标"), ("無", "无"), ("這", "这"), ("證", "证")):
+             text = text.replace(old, new)
+@@ -851,6 +1223,121 @@ def _render(plan, values, kind):
+     return text
+ 
+ 
++def _pure_data_denial(text):
++    """Whole finite clauses only. The broad diagnostic regex never deletes prose."""
++    s = text.strip()
++    subject = r"(?:(?:這次|这次|本次)?(?:訊息|消息)|我(?:這邊|这边)?|目前|現在|现在|這邊|这边)?"
++    verb = r"(?:沒帶|没带|沒有帶|没有带|沒有收到|没收到|未收到|沒有取得|沒得到|没有取得|没得到|沒有|没有|缺少|看不到|不知道|無法得知|无法得知)"
++    data = r"(?:(?:最新|新的|當前|当前|目前|這次|这次|完整)(?:的)?){0,2}(?:對局資料|对局资料|牌局資訊|牌局信息|牌局資料|牌局资料|棋局資料|棋局资料|遊戲資料|游戏资料|局面|棋盤|棋盘|自己的手牌|我的手牌|手牌)"
++    zh = subject + r"\s*" + verb + r"\s*" + data + r"(?:呢|喔|哦|呀|啊)?"
++    games = r"(?:抽鬼牌|西洋棋)(?:(?:和|與|与|、)(?:抽鬼牌|西洋棋))?(?:都)?(?:沒有|没有|沒提供|没提供)"
++    fields = r"(?:輪到誰|轮到谁|各剩幾張|各剩几张|我的手牌|上一手|棋子位置|誰被將軍|谁被将军)"
++    listed = fields + r"(?:、" + fields + r"){0,8}(?:——|—|：|:)(?:全部|全都|都)(?:都)?(?:沒有|没有)"
++    en = r"(?:I (?:cannot|can't) see|I (?:did not|didn't) receive|I (?:do not|don't) have|there is no|no)(?: (?:the|any|current|new|latest)){0,3} (?:game|card|board|chess|hand)(?: (?:data|information|state))?"
++    ja = r"(?:私は|こちらは)?(?:現在の|今の)?(?:対局|手札|盤面|ゲーム)(?:の)?(?:情報|データ)(?:が|を|は)?(?:ない|ありません|届いていない|受け取っていません|受け取っていない)"
++    return re.fullmatch(zh + "|" + games + "|" + listed + "|" + en + "|" + ja, s, re.I) is not None
++
++
++def _pure_fact_atom(text):
++    """Small affirmative fact language, not a prose classifier or rewrite model."""
++    s = text.strip()
++    n = r"(?:[0-9零一二兩两三四五六七八九十]{1,3}|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen)"
++    count = (r"(?:我|你|妳|私|あなた)(?:目前|現在|现在|手上|手裡|手里|的手牌|手牌|剩下|還剩|还剩|剩|還有|还有|有|は|の手札は|\s)*" + n + r"\s*(?:張|张|枚)"
++        + r"|(?:I|you|my hand|your hand|Lilith)\s+(?:(?:have|hold|has|holds|still have|currently have)\s+)?" + n + r"\s+cards?")
++    turn = r"(?:(?:目前|現在|现在|所以|那|是)\s*)?(?:輪到|轮到)\s*(?:我|你|妳)(?:抽牌|出牌|走棋|下棋)?(?:了)?|(?:it is |it's )?(?:my|your) (?:turn|move)|(?:Turn: )?(?:me|you)|(?:私|あなた)(?:の番|の手番)|手番は(?:私|あなた)"
++    card = _CARD.pattern.replace("?P<suit>", "?:").replace("?P<rank>", "?:").replace("?P<joker>", "?:")
++    hand = r"(?:我的手牌|我的牌|我手上(?:的牌)?|my hand|my cards|私の手札)(?:中有|是|有|に|は|、画面の左から右へ|，畫面從左到右|，画面从左到右|, screen left to right)?\s*[:：]?\s*(?:" + card + r")(?:\s*[,，、]\s*(?:" + card + r"))*"
++    check = r"(?:我|你|妳)(?:目前|現在|现在|的王|正)*(?:被將軍|被将军|沒有被將軍|没有被将军|沒被將軍|没被将军)|(?:I am|you are) (?:not )?in check|(?:私|あなた)の王は王手されて(?:います|いません)"
++    move = r"(?:上一手|上一步|上一個已完成的走步|上一个已完成的走步|last (?:committed )?move|直前の手|さっきの手)\s*[:：]?\s*[a-h][1-8]\s*(?:→|->|到|to)?\s*[a-h][1-8](?:\s*\(?[qrbn]\)?)?"
++    actor = r"上一手是(?:我|你|妳)走的|(?:I|You) made the last move|直前の手を指したのは(?:私|あなた)です"
++    piece = r"上一手移動的是[兵車车馬马象后王]|The last moving piece was a (?:pawn|rook|knight|bishop|queen|king)|直前に動かした駒は(?:ポーン|ルーク|ナイト|ビショップ|クイーン|キング)です"
++    position = r"(?:棋子(?:位置)?[:：]\s*)?[a-h][1-8]\s*:\s*[prnbqk]"
++    return re.fullmatch("(?:" + "|".join((count, turn, hand, check, move, actor, piece, position)) + ")", s, re.I) is not None
++
++
++def _merge_atoms(text):
++    """Return exact original ranges; never normalize text outside replacements."""
++    for sentence in re.finditer(r"[^。.!！?？;；\n]+(?:[。.!！?？;；\n]|$)", text):
++        raw = sentence.group()
++        if _QUOTED.search(raw) or not _assertions(raw).strip().rstrip("。.!！?？;；\n"):
++            continue
++        end = len(raw.rstrip("。.!！?？;；\n"))
++        body = raw[:end]
++        # A whole hand list has commas that are data, not clause boundaries.
++        if _pure_fact_atom(body) or _pure_data_denial(body):
++            parts = [(0, end)]
++        else:
++            parts = [(m.start(), m.end()) for m in re.finditer(r"[^,，]+", body)]
++        for left, right in parts:
++            atom = body[left:right]
++            leading = len(atom) - len(atom.lstrip())
++            trailing = len(atom.rstrip())
++            if trailing > leading:
++                yield sentence.start()+left+leading, sentence.start()+left+trailing, atom.strip()
++
++
++def natural_merge(plan, original_text, confirmed):
++    """Only verified wrong finite clauses are replaced; all other bytes survive.
++
++    No auxiliary model supplies rewritten text. If any needed contradiction
++    cannot be isolated safely, this function fails without publishing success.
++    """
++    if type(original_text) is not str or len(original_text) > 32768 or len(re.findall(r"[,，、。.!！?？;；\n]", original_text)) > MAX_ASSERTIONS:
++        _fail()
++    items = requested_items(plan)
++    if (type(confirmed) is not dict or not confirmed or set(confirmed) - set(items)
++            or any(_json(value) != _json(items[key]) for key, value in confirmed.items())):
++        _fail()
++    original_checks = local_checks(plan, original_text)
++    atoms = list(_merge_atoms(original_text))
++    consumed, edits = set(), []
++    # Already correct independent fact atoms need no replacement merely because
++    # a different clause denied the entire snapshot. Keep them exactly once.
++    for _, _, atom in atoms:
++        if _pure_fact_atom(atom):
++            consumed.update(key for key, value in confirmed.items() if _item_status(key, value, _assertions(atom)) == "covered")
++    for start, end, atom in atoms:
++        pure_denial = _pure_data_denial(atom)
++        atom_checks = local_checks(plan, atom)
++        affected = {key: value for key, value in confirmed.items() if atom_checks[key] == "wrong"}
++        if not pure_denial and not affected:
++            continue
++        if not pure_denial and not _pure_fact_atom(atom):
++            # Unknown/mixed role prose is never deleted just because it has a
++            # recognized wrong number somewhere in the sentence.
++            _fail()
++        if pure_denial:
++            affected = dict(confirmed)
++        remaining = {key: value for key, value in affected.items() if key not in consumed}
++        replacement = _render_items(plan, remaining, "correction").rstrip("。.!！") if remaining else ""
++        if not replacement and end < len(original_text) and original_text[end] in ",，。.!！;；":
++            end += 1  # Only this removed atom's adjacent delimiter is owned.
++        edits.append((start, end, replacement))
++        consumed.update(affected)
++    result, offset = [], 0
++    for start, end, replacement in edits:
++        if start < offset:
++            _fail()
++        result.extend((original_text[offset:start], replacement))
++        offset = end
++    result.append(original_text[offset:])
++    merged = "".join(result)
++    remaining = {key: value for key, value in confirmed.items() if key not in consumed}
++    if remaining:
++        merged += (" " if merged.endswith(("。", ".", "!", "！", "?", "？")) else "\n") + _render_items(plan, remaining, "supplement")
++    if len(merged) > 32768 or len(merged) - len(original_text) > MAX_OUTPUT_CHARS:
++        _fail()
++    final = local_checks(plan, merged)
++    if (any(status != "covered" for status in final.values())
++            or _data_denial(_assertions(merged), items)):
++        _fail()
++    # Successful repair must preserve already verified fields; they are not a
++    # licence for full-answer replacement or another model-generation call.
++    if any(final[key] != "covered" for key, status in original_checks.items() if status == "covered"):
++        _fail()
++    return merged
++
++
+ @dataclass(eq=False, repr=False)
+ class _Capability:
+     state: _Turn
+@@ -1032,7 +1519,8 @@ def maybe_repair(agent, original_text):
+         _trace("final", "skipped", reason="already-used")
+         return unchanged
+     state.used = True
+-    if type(original_text) is not str or not original_text.strip() or len(original_text) > 32768:
++    if (type(original_text) is not str or not original_text.strip() or len(original_text) > 32768
++            or len(re.findall(r"[,，、。.!！?？;；\n]", original_text)) > MAX_ASSERTIONS):
+         _trace("final", "skipped", reason="invalid-answer")
+         return unchanged
+     items = requested_items(state.plan)
+@@ -1088,7 +1576,7 @@ def maybe_repair(agent, original_text):
+                         "question": state.plan.question, "answer": original_text,
+                         "facts": uncertain, "checks": {key: "uncertain" for key in uncertain}})
+                     try:
+-                        assessed = assess_audit(response, items, checks, original_text)
++                        assessed = assess_audit(response, items, checks, original_text, plan=state.plan)
+                     except Exception:
+                         _trace("audit", "failed", reason="invalid-response")
+                         raise
+@@ -1124,16 +1612,22 @@ def maybe_repair(agent, original_text):
+             _fail()
+         result = outcome["result"]
+         if "facts" not in result:
+-            _trace("final", "completed", result["checks"], "complete")
++            final_checks = local_checks(state.plan, original_text)
++            if (any(status != "covered" for status in final_checks.values())
++                    or not state.valid() or time.monotonic() >= deadline):
++                _fail()
++            _trace("final", "completed", final_checks, "complete")
+             return unchanged
+         kind = result["kind"]
+-        supplement = _render_items(state.plan, result["facts"], kind)
+-        if len(supplement) > MAX_OUTPUT_CHARS:
++        combined = natural_merge(state.plan, original_text, result["facts"])
++        final_checks = local_checks(state.plan, combined)
++        if (any(status != "covered" for status in final_checks.values())
++                or not state.valid() or time.monotonic() >= deadline):
+             _fail()
+-        combined = original_text.rstrip() + "\n\n" + supplement
+         receipt = AcceptedRepair(_ISSUER, agent, state.origin, _digest(combined), _digest(state.plan.context.wire))
+         state.receipt = receipt
+-        _trace("final", "completed", result["checks"], kind)
++        limitations = sum(isinstance(value, dict) and value.get("status") == "unavailable" for value in items.values())
++        _trace("final", "completed", final_checks, kind, limitations)
+         return RepairResult(combined, True, kind, receipt)
+     except Exception:
+         reason = "cancelled" if not state.valid() else "deadline" if time.monotonic() >= deadline else "unavailable"

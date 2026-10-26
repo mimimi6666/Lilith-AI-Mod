@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>LilithCursorGuard</AssemblyName>
+    <BepInExCoreDir>$(LILITH_BEPINEX_CORE_DIR)</BepInExCoreDir>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="BepInEx.Core" HintPath="$(BepInExCoreDir)\BepInEx.Core.dll" Private="false" />
+    <Reference Include="BepInEx.Unity.IL2CPP" HintPath="$(BepInExCoreDir)\BepInEx.Unity.IL2CPP.dll" Private="false" />
+    <EmbeddedResource Include="..\..\packaging\legal\LilithCursorGuard-MIT.txt" LogicalName="LilithCursorGuard.UpstreamLicense.txt" />
+  </ItemGroup>
+</Project>

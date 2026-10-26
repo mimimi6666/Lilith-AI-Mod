@@ -1,0 +1,28 @@
+<Window x:Class="LilithControlCenter.D046HermesImagePreviewWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:LilithControlCenter"
+        Title="{local:UiText chat.image.preview}" WindowStyle="None"
+        ResizeMode="CanResizeWithGrip" WindowStartupLocation="CenterOwner"
+        Width="900" Height="660" MinWidth="360" MinHeight="240"
+        Background="{DynamicResource PanelBrush}" Foreground="{DynamicResource TextBrush}"
+        ShowInTaskbar="False" PreviewKeyDown="Preview_KeyDown">
+    <Border BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" Padding="16">
+        <Grid>
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+            <Grid Margin="0,0,0,12" MouseLeftButtonDown="Heading_MouseLeftButtonDown">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <TextBlock x:Name="FileNameLabel" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" FontSize="16" Margin="0,0,16,0"/>
+                <Button Grid.Column="1" Content="×" Style="{StaticResource DialogCloseButtonStyle}"
+                        AutomationProperties.Name="{local:UiText ui.cancel}" IsCancel="True" Click="Close_Click"/>
+            </Grid>
+            <Border Grid.Row="1" Background="{DynamicResource InputBrush}" CornerRadius="8" Padding="12">
+                <Grid>
+                    <TextBlock x:Name="UnavailableLabel" Text="{local:UiText chat.image.unavailable}"
+                               MaxWidth="440" TextWrapping="Wrap" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    <Image x:Name="PreviewImage" Stretch="Uniform"/>
+                </Grid>
+            </Border>
+        </Grid>
+    </Border>
+</Window>

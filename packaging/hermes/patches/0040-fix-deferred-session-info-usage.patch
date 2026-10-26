@@ -1,0 +1,191 @@
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index de5fb7c..9ab8faa 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -6421,11 +6421,16 @@ def _current_profile_name() -> str:
+ DESKTOP_BACKEND_CONTRACT = 6
+ 
+ 
+-def _session_usage_snapshot(session: dict | None) -> dict:
+-    agent = (session or {}).get("agent")
++def _session_usage_snapshot(session: dict | None, agent=None) -> dict:
+     mirror_usage = _metadata_mirror(session).get("usage")
+     if (session or {}).get("_compute_host_active") and isinstance(mirror_usage, dict):
+         return dict(mirror_usage)
++    # A deferred create/resume build renders session.info before publishing its
++    # candidate into session["agent"]. Prefer that explicit candidate so the
++    # first ready event carries the canonical numeric usage shape instead of {}.
++    if agent is not None:
++        return _get_usage(agent)
++    agent = (session or {}).get("agent")
+     if agent is not None:
+         return _get_usage(agent)
+     return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
+@@ -6543,7 +6548,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
+         "release_date": "",
+         "update_behind": None,
+         "update_command": "",
+-        "usage": _session_usage_snapshot(session),
++        "usage": _session_usage_snapshot(session, agent),
+         "profile_name": _response_profile_name(
+             Path(session["profile_home"]).name
+             if isinstance(session, dict) and session.get("profile_home")
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index 27d8e42..5cf558f 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -468,6 +468,26 @@ def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
+         server._sessions.pop("iso-sid", None)
+ 
+ 
++def test_session_usage_snapshot_keeps_compute_host_mirror_authoritative():
++    mirror_usage = {"calls": 5, "input": 40, "output": 2, "total": 42}
++    candidate = types.SimpleNamespace(
++        session_api_calls=1,
++        session_input_tokens=3,
++        session_output_tokens=4,
++        session_total_tokens=7,
++    )
++    session = {
++        "agent": None,
++        "_compute_host_active": True,
++        "_metadata_mirror": {"usage": mirror_usage},
++    }
++
++    snapshot = server._session_usage_snapshot(session, candidate)
++
++    assert snapshot == mirror_usage
++    assert snapshot is not mirror_usage
++
++
+ def test_slash_exec_compress_flag_on_applies_host_control_mirror(monkeypatch):
+     class _ExplodingWorker:
+         def __init__(self, *args, **kwargs):
+@@ -16580,6 +16600,127 @@ def test_start_agent_build_passes_session_model_override(
+         server._sessions.clear()
+ 
+ 
++@pytest.mark.parametrize("record_kind", ["create", "resume"])
++def test_deferred_build_session_info_uses_candidate_usage_for_create_and_resume(
++    monkeypatch, tmp_path, record_kind
++):
++    """Both deferred entry points publish the built candidate's usage shape."""
++
++    class CandidateAgent:
++        model = "test-model"
++        provider = "test-provider"
++        session_id = "stored-session"
++        service_tier = None
++        reasoning_config = None
++        request_overrides = {}
++        session_input_tokens = 11
++        session_output_tokens = 7
++        session_reasoning_tokens = 0
++        session_prompt_tokens = 11
++        session_completion_tokens = 7
++        session_total_tokens = 18
++        session_api_calls = 2
++        context_compressor = None
++        tools = []
++        api_key = "configured"
++        _cached_system_prompt = ""
++
++    events = []
++    override = {"model": "test-model", "provider": "test-provider"}
++
++    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
++    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
++    monkeypatch.setattr(server, "_make_agent", lambda *_args, **_kwargs: CandidateAgent())
++    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
++    monkeypatch.setattr(
++        server,
++        "_emit",
++        lambda event, sid, payload=None: events.append((event, sid, payload)),
++    )
++    monkeypatch.setattr(
++        server, "_start_notification_poller", lambda *_args, **_kwargs: threading.Event()
++    )
++    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_probe_config_health", lambda *_args: None)
++    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
++    monkeypatch.setattr(server, "_load_memory_notifications", lambda: [])
++    monkeypatch.setattr(server, "_load_cfg", lambda: {})
++    monkeypatch.setattr(server, "_load_approval_mode", lambda: "manual")
++    monkeypatch.setattr(server, "_git_branch_for_cwd", lambda _cwd: "")
++    monkeypatch.setattr(server, "_project_info_for_cwd", lambda _cwd: None)
++    monkeypatch.setattr(server, "_effective_terminal_backend", lambda: "local")
++    monkeypatch.setattr(server, "_session_live_title", lambda *_args, **_kwargs: "")
++    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
++    monkeypatch.setattr(server, "_probe_credentials", lambda _agent: "")
++    monkeypatch.setattr(
++        server,
++        "_resolve_session_create_model_pair",
++        lambda **_kwargs: ("test-model", "test-provider"),
++    )
++    monkeypatch.setattr(server, "_completion_cwd", lambda _params=None: str(tmp_path))
++    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
++    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
++    monkeypatch.setattr("tui_gateway.entry.ensure_mcp_discovery_started", lambda: None)
++    monkeypatch.setattr("tools.approval.register_gateway_notify", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr("tools.approval.load_permanent_allowlist", lambda: None)
++    monkeypatch.setattr("agent.credits_tracker.seed_credits_at_session_start", lambda _agent: None)
++    monkeypatch.setattr("hermes_cli.banner.get_available_skills", lambda: {})
++    monkeypatch.setattr("hermes_cli.banner.get_update_result", lambda timeout=0.5: None)
++    monkeypatch.setattr("hermes_cli.config.recommended_update_command", lambda: "")
++    monkeypatch.setattr("tools.mcp_tool.get_mcp_status", lambda: [])
++
++    sid = ""
++    try:
++        if record_kind == "create":
++            response = server._methods["session.create"]("create", {"cols": 80})
++            assert "error" not in response
++            sid = response["result"]["session_id"]
++            session = server._sessions[sid]
++        else:
++            sid = "resume-deferred"
++            session = server._deferred_session_record(
++                "stored-session",
++                cols=80,
++                cwd=str(tmp_path),
++                history=[],
++                lease=None,
++                model_override=override,
++                resume_runtime_overrides={
++                    "model_override": override,
++                    "provider_override": "test-provider",
++                },
++            )
++            server._sessions[sid] = session
++
++        server._start_agent_build(sid, session)
++        build_thread = session["_agent_build_thread"]
++        build_thread.join(timeout=3)
++        assert not build_thread.is_alive(), "agent build did not finish"
++
++        infos = [
++            payload
++            for event, event_sid, payload in events
++            if event == "session.info" and event_sid == sid
++        ]
++        assert len(infos) == 1
++        usage = infos[0]["usage"]
++        assert {key: usage[key] for key in ("calls", "input", "output", "total")} == {
++            "calls": 2,
++            "input": 11,
++            "output": 7,
++            "total": 18,
++        }
++        assert all(
++            type(usage[key]) is int and usage[key] >= 0
++            for key in ("calls", "input", "output", "total")
++        )
++        assert infos[0]["runtime_ready"] is True
++    finally:
++        if sid:
++            server._sessions.pop(sid, None)
++
++
+ # ── billing/subscription state + error serialization ─────────────────
+ 
+ 

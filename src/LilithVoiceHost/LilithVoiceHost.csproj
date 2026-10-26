@@ -15,4 +15,8 @@
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="managed_voice_startup.py" LogicalName="LilithVoiceHost.managed_voice_startup.py" />
+    <None Update="japanese_interjections.py" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+  </ItemGroup>
 </Project>

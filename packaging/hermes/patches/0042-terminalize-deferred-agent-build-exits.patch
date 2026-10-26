@@ -1,0 +1,326 @@
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index c0d98d9..d5eb325 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -677,7 +677,15 @@ def _(rid, params: dict) -> dict:
+                 with _session_resume_lock:
+                     current = _find_live_session_by_key(target)
+                     if current is not None:
+-                        return _ok(rid, _attest_payload(_reuse_live_payload(*current)))
++                        # Rebind the caller's transport before a retry can emit
++                        # session.info.  A prior deferred worker may have died
++                        # outside the ordinary Exception rail and published a
++                        # terminal initialization error; _start_agent_build's
++                        # per-session authority lock makes ready/building agents
++                        # no-ops while allowing that exact live record to retry.
++                        payload = _attest_payload(_reuse_live_payload(*current))
++                        _start_agent_build(*current)
++                        return _ok(rid, payload)
+ 
+         # Lazy/watch resume: register the live session WITHOUT building an agent.
+         # Used by the desktop's subagent windows — the child runs inside the
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index f28f10d..977fa58 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -3320,7 +3320,78 @@ def _start_agent_build(sid: str, session: dict) -> None:
+             except Exception:
+                 pass
+ 
+-    build_thread = threading.Thread(target=_build, daemon=True)
++    def _run_build_worker() -> None:
++        """Never leave an attached deferred session waiting on a dead worker.
++
++        The build body handles ordinary ``Exception`` failures itself so it can
++        preserve runtime-revision retry semantics.  A ``BaseException`` raised
++        by a first-import dependency (for example ``SystemExit``) bypasses that
++        handler and would otherwise kill this daemon thread with ``agent_ready``
++        permanently unset.  Also guard future accidental fall-throughs from the
++        body: if this exact session record is still attached and unpublished
++        when the worker exits, publish one terminal initialization failure.
++
++        Session close/replacement is the normal cancellation path.  It removes
++        or replaces the record before the worker unwinds, so it is deliberately
++        not reported as an initialization failure.
++        """
++        unexpected: BaseException | None = None
++        try:
++            _build()
++        except BaseException as exc:
++            unexpected = exc
++
++        safe_error = "agent initialization terminated before completing"
++        if unexpected is not None:
++            try:
++                safe_error = _safe_turn_error(None, unexpected)
++            except BaseException:
++                # This boundary exists specifically for failures outside the
++                # normal Exception rail.  Error formatting must not reopen the
++                # permanent-wait bug it is closing.
++                safe_error = "agent initialization terminated unexpectedly"
++
++        runtime_revision = 0
++        terminalized = False
++        with _sessions_lock:
++            current = _sessions.get(sid)
++            if current is session and not current.get("_finalized"):
++                with lock:
++                    if current.get("agent") is None and not ready.is_set():
++                        runtime_revision = _runtime_revision_locked(current)
++                        current["agent_error"] = safe_error
++                        current["agent_error_revision"] = runtime_revision
++                        current["agent_build_started"] = False
++                        ready.set()
++                        terminalized = True
++
++        if not terminalized:
++            return
++        try:
++            logger.error(
++                "agent build worker terminated before readiness (%s): %s",
++                type(unexpected).__name__ if unexpected is not None else "early return",
++                safe_error,
++            )
++        except BaseException:
++            # A custom logging handler must not prevent the protocol terminal.
++            pass
++        try:
++            _emit(
++                "error",
++                sid,
++                {
++                    "message": f"agent init failed: {safe_error}",
++                    "runtime_revision": runtime_revision,
++                    "runtime_ready": False,
++                },
++            )
++        except BaseException:
++            # Readiness and the retained error are authoritative even if the
++            # client transport disappears while the terminal frame is emitted.
++            logger.debug("agent build terminal error emit failed", exc_info=True)
++
++    build_thread = threading.Thread(target=_run_build_worker, daemon=True)
+     # Handle for _wait_agent_for_prompt: a dead build thread with agent_ready
+     # still unset means the build died hard — waiters must not sit out the
+     # full cap on a corpse.
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index 5cf558f..b0736e4 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -16600,6 +16600,216 @@ def test_start_agent_build_passes_session_model_override(
+         server._sessions.clear()
+ 
+ 
++def test_start_agent_build_baseexception_publishes_terminal_readiness(monkeypatch):
++    """A hard first-import exit must not leave agent_ready unset forever."""
++    events = []
++
++    def fail_before_agent(*_args, **_kwargs):
++        raise SystemExit("first import aborted")
++
++    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
++    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
++    monkeypatch.setattr(server, "_make_agent", fail_before_agent)
++    monkeypatch.setattr(
++        server,
++        "_emit",
++        lambda event, sid, payload=None: events.append((event, sid, payload)),
++    )
++    monkeypatch.setattr("tui_gateway.entry.ensure_mcp_discovery_started", lambda: None)
++
++    sid = "baseexception-build"
++    ready = threading.Event()
++    session = {
++        "agent": None,
++        "agent_error": None,
++        "agent_ready": ready,
++        "agent_runtime_revision": 7,
++        "session_key": "stored-session",
++        "profile_home": None,
++    }
++    server._sessions[sid] = session
++    try:
++        server._start_agent_build(sid, session)
++        build_thread = session["_agent_build_thread"]
++        build_thread.join(timeout=3)
++
++        assert not build_thread.is_alive(), "agent build did not terminate"
++        assert ready.is_set()
++        assert session["agent"] is None
++        assert "first import aborted" in session["agent_error"]
++        assert session["agent_error_revision"] == 7
++        assert session["agent_build_started"] is False
++        assert events == [
++            (
++                "error",
++                sid,
++                {
++                    "message": "agent init failed: first import aborted",
++                    "runtime_revision": 7,
++                    "runtime_ready": False,
++                },
++            )
++        ]
++    finally:
++        server._sessions.pop(sid, None)
++
++
++def test_live_durable_resume_retries_terminal_build_and_publishes_session_info(
++    monkeypatch, tmp_path
++):
++    """The hidden-session live fast path must recover a dead first worker."""
++    from hermes_state import SessionDB
++
++    class CandidateAgent:
++        model = "test-model"
++
++    events = []
++    build_calls = 0
++    stored_id = "durable-game-session"
++    sid = "live-durable-retry"
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session(stored_id, source="lilith-game", archived=True)
++
++    def make_agent(*_args, **_kwargs):
++        nonlocal build_calls
++        build_calls += 1
++        if build_calls == 1:
++            raise SystemExit("first import aborted")
++        return CandidateAgent()
++
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
++    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
++    monkeypatch.setattr(server, "_make_agent", make_agent)
++    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
++    monkeypatch.setattr(
++        server,
++        "_emit",
++        lambda event, event_sid, payload=None: events.append(
++            (event, event_sid, payload)
++        ),
++    )
++    monkeypatch.setattr(
++        server, "_session_info", lambda agent, *_args: {"model": agent.model}
++    )
++    monkeypatch.setattr(
++        server, "_start_notification_poller", lambda *_args, **_kwargs: threading.Event()
++    )
++    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_probe_config_health", lambda *_args: None)
++    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
++    monkeypatch.setattr(server, "_load_memory_notifications", lambda: [])
++    monkeypatch.setattr(server, "_load_cfg", lambda: {})
++    monkeypatch.setattr(server, "_git_branch_for_cwd", lambda _cwd: "")
++    monkeypatch.setattr(server, "_project_info_for_cwd", lambda _cwd: None)
++    monkeypatch.setattr("tui_gateway.entry.ensure_mcp_discovery_started", lambda: None)
++    monkeypatch.setattr("tools.approval.register_gateway_notify", lambda *_args: None)
++    monkeypatch.setattr("tools.approval.load_permanent_allowlist", lambda: None)
++    monkeypatch.setattr("agent.credits_tracker.seed_credits_at_session_start", lambda _agent: None)
++
++    session = server._deferred_session_record(
++        stored_id,
++        cols=80,
++        cwd=str(tmp_path),
++        history=[],
++        lease=None,
++        source="lilith-game",
++        model_override={"model": "test-model", "provider": "test-provider"},
++    )
++    server._sessions[sid] = session
++    try:
++        server._start_agent_build(sid, session)
++        first_worker = session["_agent_build_thread"]
++        first_worker.join(timeout=3)
++        assert not first_worker.is_alive(), "first agent build did not terminate"
++        assert session["agent_ready"].is_set()
++        assert session["agent"] is None
++        assert session["agent_build_started"] is False
++        assert [event for event, _sid, _payload in events] == ["error"]
++
++        resumed = server._methods["session.resume"](
++            "resume-live-durable",
++            {
++                "session_id": stored_id,
++                "source": "lilith-game",
++                "require_durable_lineage": True,
++                "expected_source": "lilith-game",
++                "expected_archived": True,
++                "omit_messages": True,
++            },
++        )
++        assert "error" not in resumed
++        assert resumed["result"]["session_id"] == sid
++
++        second_worker = session["_agent_build_thread"]
++        assert second_worker is not first_worker
++        second_worker.join(timeout=3)
++        assert not second_worker.is_alive(), "retried agent build did not finish"
++        assert build_calls == 2
++        assert session["agent_ready"].is_set()
++        assert session["agent_error"] is None
++        assert isinstance(session["agent"], CandidateAgent)
++        assert [event for event, _sid, _payload in events] == [
++            "error",
++            "session.info",
++        ]
++        assert events[-1][1] == sid
++        assert events[-1][2]["runtime_ready"] is True
++    finally:
++        server._sessions.pop(sid, None)
++        db.close()
++
++
++def test_start_agent_build_detached_session_is_normal_cancellation(monkeypatch):
++    """Closing/replacing a session during build must not emit a false failure."""
++    build_entered = threading.Event()
++    release_build = threading.Event()
++    events = []
++
++    def cancelled_build(*_args, **_kwargs):
++        build_entered.set()
++        assert release_build.wait(timeout=3), "test did not release build"
++        raise SystemExit("cancelled worker")
++
++    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
++    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
++    monkeypatch.setattr(server, "_make_agent", cancelled_build)
++    monkeypatch.setattr(
++        server,
++        "_emit",
++        lambda event, sid, payload=None: events.append((event, sid, payload)),
++    )
++    monkeypatch.setattr("tui_gateway.entry.ensure_mcp_discovery_started", lambda: None)
++
++    sid = "cancelled-build"
++    ready = threading.Event()
++    session = {
++        "agent": None,
++        "agent_error": None,
++        "agent_ready": ready,
++        "session_key": "stored-session",
++        "profile_home": None,
++    }
++    server._sessions[sid] = session
++    try:
++        server._start_agent_build(sid, session)
++        assert build_entered.wait(timeout=2), "agent build did not start"
++        with server._sessions_lock:
++            assert server._sessions.pop(sid) is session
++        release_build.set()
++        build_thread = session["_agent_build_thread"]
++        build_thread.join(timeout=3)
++
++        assert not build_thread.is_alive(), "cancelled build did not terminate"
++        assert not ready.is_set()
++        assert session["agent_error"] is None
++        assert events == []
++    finally:
++        release_build.set()
++        server._sessions.pop(sid, None)
++
++
+ @pytest.mark.parametrize("record_kind", ["create", "resume"])
+ def test_deferred_build_session_info_uses_candidate_usage_for_create_and_resume(
+     monkeypatch, tmp_path, record_kind

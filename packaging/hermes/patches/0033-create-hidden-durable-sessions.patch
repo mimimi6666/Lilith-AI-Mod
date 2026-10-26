@@ -1,0 +1,361 @@
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 2761592..12c38fc 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -13,6 +13,9 @@ _profile_scoped = _registry.profile_scoped
+ 
+ @method("session.create")
+ def _(rid, params: dict) -> dict:
++    archived = params.get("archived", False)
++    if type(archived) is not bool:
++        return _err(rid, 4004, "archived must be a boolean")
+     sid = uuid.uuid4().hex[:8]
+     key = _new_session_key()
+     cols = int(params.get("cols", 80))
+@@ -111,6 +114,7 @@ def _(rid, params: dict) -> dict:
+             "agent_error": None,
+             "agent_ready": ready,
+             "attached_images": [],
++            "archived": archived,
+             "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
+             "active_session_lease": lease,
+             "cols": cols,
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 2a76edc..5f2637c 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -3617,6 +3617,10 @@ def _ensure_session_db_row(session: dict) -> None:
+             # into one list can't rely on which file a row came from alone. NULL
+             # means the launch/default profile (matches run_agent's convention).
+             profile_name=Path(profile_home).name if profile_home else None,
++            # Omitted sessions keep the historical call shape as well as the
++            # historical visible default. The opt-in flag reaches the INSERT
++            # itself, so an archived row is never briefly listable.
++            **({"archived": True} if session.get("archived") is True else {}),
+         )
+     except Exception as exc:
+         # Disk-full is not a soft failure: if we swallow it here, prompt.submit
+diff --git a/hermes_state.py b/hermes_state.py
+index 260a382..823eb9a 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -4051,6 +4051,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         git_repo_root: str = None,
+         origin_json: str = None,
+         display_name: str = None,
++        archived: bool = False,
+     ) -> None:
+         """Insert a session row, enriching NULL metadata on conflict.
+ 
+@@ -4087,6 +4088,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         crash before the gateway re-records the peer can't strand the child
+         without a recoverable routing mapping (#59527).
+         """
++        if type(archived) is not bool:
++            raise TypeError("archived must be a boolean")
++
+         def _do(conn):
+             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+             conn.execute(
+@@ -4094,9 +4098,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
+                    model, model_config, system_prompt, system_prompt_hash,
+                    parent_session_id, cwd, profile_name, git_repo_root,
+-                   origin_json, display_name, started_at
++                   origin_json, display_name, archived, started_at
+                 )
+-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
++                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        model = COALESCE(sessions.model, excluded.model),
+                        model_config = CASE
+@@ -4155,6 +4159,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     git_repo_root,
+                     origin_json,
+                     display_name,
++                    1 if archived else 0,
+                     time.time(),
+                 ),
+             )
+@@ -4191,7 +4196,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 # traffic into a subagent's session.
+                 conn.execute(
+                     """UPDATE sessions
+-                       SET user_id = COALESCE(sessions.user_id,
++                       SET archived = CASE
++                               WHEN COALESCE(
++                                   (SELECT p.archived FROM sessions p
++                                      WHERE p.id = sessions.parent_session_id),
++                                   0
++                               ) = 1
++                               THEN 1
++                               ELSE sessions.archived
++                           END,
++                           user_id = COALESCE(sessions.user_id,
+                                      (SELECT p.user_id FROM sessions p
+                                        WHERE p.id = sessions.parent_session_id)),
+                            session_key = COALESCE(sessions.session_key,
+@@ -5068,7 +5082,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     f"Compression lease lost before publication: {parent_session_id}"
+                 )
+             parent = conn.execute(
+-                """SELECT ended_at, cwd, git_branch, git_repo_root,
++                """SELECT ended_at, cwd, git_branch, git_repo_root, archived,
+                           user_id, session_key, chat_id, chat_type,
+                           thread_id, display_name, origin_json, profile_name
+                    FROM sessions WHERE id = ?""",
+@@ -5088,8 +5102,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                    system_prompt_hash,
+                    parent_session_id, cwd, git_branch, git_repo_root,
+                    profile_name, user_id, session_key, chat_id, chat_type,
+-                   thread_id, display_name, origin_json, started_at
+-                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++                   thread_id, display_name, origin_json, archived, started_at
++                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 (
+                     child_session_id,
+                     source,
+@@ -5113,6 +5127,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     parent["thread_id"],
+                     parent["display_name"],
+                     parent["origin_json"],
++                    int(parent["archived"] or 0),
+                     time.time(),
+                 ),
+             )
+diff --git a/tests/hermes_state/test_session_archiving.py b/tests/hermes_state/test_session_archiving.py
+index 36ecb95..84d052e 100644
+--- a/tests/hermes_state/test_session_archiving.py
++++ b/tests/hermes_state/test_session_archiving.py
+@@ -49,3 +49,69 @@ def test_unarchiving_compression_tip_unarchives_projected_root(db):
+     assert db.get_session("root")["archived"] == 0
+     assert db.get_session("tip")["archived"] == 0
+     assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True)] == ["tip"]
++
++
++def test_archived_parent_publishes_archived_compression_child(db):
++    db.create_session("root", source="tui", archived=True)
++    db.append_message("root", role="user", content="before compression")
++
++    db.publish_compression_child(
++        parent_session_id="root",
++        child_session_id="tip",
++        source="tui",
++        messages=[
++            {"role": "user", "content": "compressed context"},
++            {"role": "assistant", "content": "after compression"},
++        ],
++        require_compression_lease=False,
++    )
++
++    root = db.get_session("root")
++    tip = db.get_session("tip")
++    assert root["end_reason"] == "compression"
++    assert tip["parent_session_id"] == "root"
++    assert root["archived"] == 1
++    assert tip["archived"] == 1
++    assert db.list_sessions_rich(order_by_last_active=True) == []
++    assert [
++        session["id"]
++        for session in db.list_sessions_rich(
++            order_by_last_active=True, archived_only=True
++        )
++    ] == ["tip"]
++
++    # Existing lineage operations still treat the rotated conversation as one
++    # logical session rather than leaving a hidden ancestor behind.
++    assert db.set_session_archived("tip", False) is True
++    assert db.get_session("root")["archived"] == 0
++    assert db.get_session("tip")["archived"] == 0
++
++
++def test_archived_create_has_no_cross_transaction_visibility_window(tmp_path):
++    writer = SessionDB(tmp_path / "state.db")
++    reader = SessionDB(tmp_path / "state.db")
++    visible_during_writes = []
++    original_execute_write = writer._execute_write
++
++    def observing_execute_write(work, *args, **kwargs):
++        def observe_before_commit(conn):
++            result = work(conn)
++            visible_during_writes.extend(
++                session["id"] for session in reader.list_sessions_rich()
++            )
++            return result
++
++        return original_execute_write(observe_before_commit, *args, **kwargs)
++
++    writer._execute_write = observing_execute_write
++    try:
++        writer.create_session("hidden", source="tui", archived=True)
++
++        # A two-transaction implementation (visible INSERT followed by archive)
++        # would expose `hidden` to the reader between those writes.
++        assert visible_during_writes == []
++        assert reader.list_sessions_rich() == []
++        assert reader.get_session("hidden")["archived"] == 1
++    finally:
++        writer.close()
++        reader.close()
+diff --git a/tests/tui_gateway/test_archived_session_create.py b/tests/tui_gateway/test_archived_session_create.py
+new file mode 100644
+index 0000000..293f5d2
+--- /dev/null
++++ b/tests/tui_gateway/test_archived_session_create.py
+@@ -0,0 +1,156 @@
++"""Behavior contract for hidden-but-durable TUI gateway sessions."""
++
++import threading
++
++import pytest
++
++from hermes_state import SessionDB
++from tui_gateway import server
++
++
++@pytest.fixture
++def gateway_db(tmp_path, monkeypatch):
++    db = SessionDB(tmp_path / "state.db")
++    existing_sids = set(server._sessions)
++    turn_settled = threading.Event()
++
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(
++        server,
++        "_resolve_session_create_model_pair",
++        lambda **_kwargs: ("test-model", "test-provider"),
++    )
++    monkeypatch.setattr(server, "_completion_cwd", lambda _params=None: str(tmp_path))
++    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(
++        server, "_schedule_session_cap_enforcement", lambda *_args, **_kwargs: None
++    )
++    monkeypatch.setattr(
++        server, "_native_authority_quarantine_rpc_error", lambda _rid: None
++    )
++    monkeypatch.setattr(
++        server, "_ensure_active_session_slot", lambda _sid, _session: None
++    )
++    monkeypatch.setattr(
++        server, "_load_dashboard_process_isolation_config", lambda: {}
++    )
++    monkeypatch.setattr(
++        server, "_session_uses_compute_host", lambda _session, _cfg: False
++    )
++    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_start_agent_build", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(
++        server, "_wait_agent_for_prompt", lambda _session, _rid, _sid: None
++    )
++    monkeypatch.setattr(
++        server, "_maybe_schedule_auto_continue", lambda *_args, **_kwargs: None
++    )
++
++    def settle_turn(_rid, _sid, session, _text):
++        with session["history_lock"]:
++            session["running"] = False
++            server._clear_inflight_turn(session)
++        turn_settled.set()
++
++    monkeypatch.setattr(server, "_run_prompt_submit", settle_turn)
++
++    try:
++        yield db, turn_settled
++    finally:
++        for sid in set(server._sessions) - existing_sids:
++            server._sessions.pop(sid, None)
++        db.close()
++
++
++def _create_and_submit(gateway_db, *, archived=None):
++    db, turn_settled = gateway_db
++    params = {"cols": 80}
++    if archived is not None:
++        params["archived"] = archived
++
++    created = server._methods["session.create"]("create", params)
++    assert "error" not in created
++    sid = created["result"]["session_id"]
++    stored_id = created["result"]["stored_session_id"]
++
++    # Drafts remain ephemeral regardless of visibility policy.
++    assert db.get_session(stored_id) is None
++
++    submitted = server._methods["prompt.submit"](
++        "submit", {"session_id": sid, "text": "hello"}
++    )
++    assert submitted["result"]["status"] == "streaming"
++    assert turn_settled.wait(2), "prompt worker did not settle"
++    return sid, stored_id
++
++
++def _listed_ids():
++    response = server._methods["session.list"]("list", {})
++    assert "error" not in response
++    return {item["id"] for item in response["result"]["sessions"]}
++
++
++def test_session_create_default_persists_visible_on_first_prompt(gateway_db):
++    db, _ = gateway_db
++    sid, stored_id = _create_and_submit(gateway_db)
++
++    assert server._sessions[sid]["archived"] is False
++    assert db.get_session(stored_id)["archived"] == 0
++    assert stored_id in _listed_ids()
++
++
++def test_archived_session_is_hidden_after_first_prompt_but_resumable_with_history(
++    gateway_db,
++):
++    db, _ = gateway_db
++    sid, stored_id = _create_and_submit(gateway_db, archived=True)
++
++    assert server._sessions[sid]["archived"] is True
++    assert db.get_session(stored_id)["archived"] == 1
++    assert stored_id not in _listed_ids()
++
++    db.append_message(stored_id, role="user", content="hello")
++    db.append_message(stored_id, role="assistant", content="hello back")
++
++    # Force the cold path: archive is a visibility flag, not a resume ban.
++    server._sessions.pop(sid)
++    resumed = server._methods["session.resume"](
++        "resume", {"session_id": stored_id}
++    )
++    assert "error" not in resumed
++    resumed_sid = resumed["result"]["session_id"]
++    assert resumed["result"]["resumed"] == stored_id
++    assert [message["text"] for message in resumed["result"]["messages"]] == [
++        "hello",
++        "hello back",
++    ]
++
++    history = server._methods["session.history"](
++        "history", {"session_id": resumed_sid}
++    )
++    assert "error" not in history
++    assert [message["text"] for message in history["result"]["messages"]] == [
++        "hello",
++        "hello back",
++    ]
++    assert db.get_session(stored_id)["archived"] == 1
++    assert stored_id not in _listed_ids()
++
++
++@pytest.mark.parametrize(
++    "malicious_value",
++    [None, 0, 1, "false", "true", [], {}],
++)
++def test_session_create_rejects_non_boolean_archived_without_allocating_session(
++    malicious_value,
++):
++    before = set(server._sessions)
++
++    response = server._methods["session.create"](
++        "invalid", {"archived": malicious_value}
++    )
++
++    assert response["error"]["code"] == 4004
++    assert response["error"]["message"] == "archived must be a boolean"
++    assert set(server._sessions) == before
++

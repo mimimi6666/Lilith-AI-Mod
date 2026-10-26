@@ -1,0 +1,2391 @@
+diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
+index 51f92ab7..586292ad 100644
+--- a/hermes_cli/inventory.py
++++ b/hermes_cli/inventory.py
+@@ -107,10 +107,25 @@ def _authenticated_pair_rows(rows: list[dict]) -> list[tuple[str, list[str], dic
+         raw_models = row.get("models")
+         if not slug or not isinstance(raw_models, (list, tuple)):
+             continue
++        raw_unavailable = row.get("unavailable_models")
++        unavailable = {
++            item
++            for item in (
++                raw_unavailable
++                if isinstance(raw_unavailable, (list, tuple, set, frozenset))
++                else ()
++            )
++            if isinstance(item, str) and item
++        }
+         models: list[str] = []
+         for item in raw_models:
+             model = item if isinstance(item, str) else ""
+-            if model and model not in models:
++            # ``authenticated`` proves the provider credential, not that every
++            # catalog entry is executable for this account.  Tier/quota probes
++            # publish the latter as ``unavailable_models``; allowing one of
++            # those ids to attest a runtime pair makes a non-interactive startup
++            # dispatch a request that the provider already told us cannot run.
++            if model and model not in unavailable and model not in models:
+                 models.append(model)
+         if models:
+             normalized.append((slug, models, row))
+@@ -270,6 +285,7 @@ def build_models_payload(
+     picker_hints: bool = False,
+     canonical_order: bool = False,
+     pricing: bool = False,
++    runtime_availability: bool = False,
+     capabilities: bool = False,
+     featured: bool = False,
+     force_fresh_nous_tier: bool = False,
+@@ -300,6 +316,11 @@ def build_models_payload(
+       show $/Mtok columns and gate paid models on free accounts —
+       mirroring the ``hermes model`` CLI picker. Adds network calls
+       (pricing fetch + Nous tier check); only set for interactive pickers.
++    - ``runtime_availability``: attach the authoritative account-level
++      ``unavailable_models`` set without formatting price chrome.  This uses
++      the same cached Nous entitlement/catalog seam as ``pricing`` and is for
++      non-interactive runtime resolution (for example ``session.create``), so
++      a model the picker disables cannot still be dispatched by the gateway.
+     - ``capabilities``: add a per-row ``capabilities`` map
+       ``{model: {fast, reasoning}}`` so pickers can gate the model-options
+       controls (fast toggle / reasoning) to what each model actually
+@@ -419,6 +440,10 @@ def build_models_payload(
+         rows = _reorder_canonical(rows)
+     if pricing:
+         _apply_pricing(rows, force_fresh_nous_tier=force_fresh_nous_tier)
++    elif runtime_availability:
++        _apply_runtime_availability(
++            rows, force_fresh_nous_tier=force_fresh_nous_tier
++        )
+     if capabilities:
+         _apply_capabilities(rows)
+     if featured:
+@@ -890,6 +915,58 @@ def _reorder_canonical(rows: list[dict]) -> list[dict]:
+     return canon + extras
+ 
+ 
++def _apply_runtime_availability(
++    rows: list[dict],
++    *,
++    force_fresh_nous_tier: bool = False,
++) -> dict[str, dict]:
++    """Attach account-authoritative model availability to provider rows.
++
++    Availability is a runtime contract, not presentation metadata.  Keep the
++    network-bearing sources shared with the picker, though: both the Nous
++    entitlement check and model catalog are already TTL/process cached in
++    ``hermes_cli.models``.  Returning the raw catalog lets ``_apply_pricing``
++    reuse the same fetch in its formatting pass.
++
++    Unknown/error states deliberately fail open, matching the established
++    picker behaviour; a positively identified free account, however, may only
++    dispatch zero-cost models from the live catalog.
++    """
++    from hermes_cli.models import (
++        check_nous_free_tier,
++        get_pricing_for_provider,
++        partition_nous_models_by_tier,
++    )
++
++    pricing_by_provider: dict[str, dict] = {}
++    for row in rows:
++        slug = str(row.get("slug", "")).lower()
++        models = list(row.get("models") or [])
++        if slug != "nous" or not models:
++            continue
++        try:
++            raw_pricing = get_pricing_for_provider(slug) or {}
++        except Exception:
++            raw_pricing = {}
++        pricing_by_provider[slug] = raw_pricing
++        try:
++            free_tier = check_nous_free_tier(
++                force_fresh=force_fresh_nous_tier
++            )
++            row["free_tier"] = bool(free_tier)
++            if free_tier:
++                _selectable, unavailable = partition_nous_models_by_tier(
++                    models, raw_pricing, free_tier=True
++                )
++                row["unavailable_models"] = unavailable
++            else:
++                row["unavailable_models"] = []
++        except Exception:
++            row["free_tier"] = False
++            row["unavailable_models"] = []
++    return pricing_by_provider
++
++
+ def _apply_pricing(
+     rows: list[dict],
+     *,
+@@ -914,24 +991,26 @@ def _apply_pricing(
+     """
+     from hermes_cli.models import (
+         _format_price_per_mtok,
+-        check_nous_free_tier,
+         compute_sale_discount,
+         get_pricing_for_provider,
+-        partition_nous_models_by_tier,
+     )
+ 
+-    # Resolve Nous free-tier once (cached in models.py for the TTL window).
+-    nous_free_tier: Optional[bool] = None
++    availability_pricing = _apply_runtime_availability(
++        rows, force_fresh_nous_tier=force_fresh_nous_tier
++    )
+ 
+     for row in rows:
+         slug = str(row.get("slug", "")).lower()
+         models = row.get("models") or []
+         if not models:
+             continue
+-        try:
+-            raw_pricing = get_pricing_for_provider(slug) or {}
+-        except Exception:
+-            raw_pricing = {}
++        if slug in availability_pricing:
++            raw_pricing = availability_pricing[slug]
++        else:
++            try:
++                raw_pricing = get_pricing_for_provider(slug) or {}
++            except Exception:
++                raw_pricing = {}
+         if not raw_pricing:
+             continue
+ 
+@@ -978,27 +1057,6 @@ def _apply_pricing(
+         if formatted:
+             row["pricing"] = formatted
+ 
+-        if slug == "nous":
+-            try:
+-                if nous_free_tier is None:
+-                    nous_free_tier = check_nous_free_tier(
+-                        force_fresh=force_fresh_nous_tier
+-                    )
+-                row["free_tier"] = bool(nous_free_tier)
+-                if nous_free_tier:
+-                    _selectable, unavailable = partition_nous_models_by_tier(
+-                        list(models), raw_pricing, free_tier=True
+-                    )
+-                    row["unavailable_models"] = unavailable
+-                else:
+-                    row["unavailable_models"] = []
+-            except Exception:
+-                # Tier detection failed — fail open (no gating) so the user
+-                # is never blocked from picking a model.
+-                row["free_tier"] = False
+-                row["unavailable_models"] = []
+-
+-
+ def _moa_provider_row(current_provider: str = "") -> dict | None:
+     """Build the virtual ``moa`` provider row for model pickers.
+ 
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index fae0332f..b38712a5 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -1,3 +1,4 @@
++import copy
+ import json
+ import os
+ import subprocess
+@@ -7395,10 +7396,8 @@ def test_config_set_verbose_updates_session_mode_and_agent(tmp_path, monkeypatch
+ 
+ 
+ 
+-def test_config_set_model_waits_for_lazy_agent_before_switch(monkeypatch):
+-    """A model switch against a lazy-created live session must apply to the
+-    real agent, not just process env, before the prompt is dispatched.
+-    """
++def test_config_set_model_linearizes_selection_before_lazy_build(monkeypatch):
++    """A cold selection builds the selected pair, never the stale default."""
+ 
+     agent_ready = threading.Event()
+     agent = types.SimpleNamespace(model="old/model", provider="old-provider")
+@@ -7411,13 +7410,21 @@ def test_config_set_model_waits_for_lazy_agent_before_switch(monkeypatch):
+     def fake_start(sid, target):
+         calls.append(("start", sid))
+         target["agent"] = agent
++        target["agent_build_runtime_revision"] = target["agent_runtime_revision"]
+         agent_ready.set()
+ 
+     def fake_apply(sid, target, raw, **kwargs):
+         calls.append(("apply", sid, target.get("agent"), raw))
+-        if target.get("agent") is not agent:
+-            raise AssertionError("model switch ran before lazy agent was ready")
+-        return {"value": "new/model", "warning": ""}
++        assert target.get("agent") is None
++        revision = server._commit_runtime_desire(
++            target,
++            model_override={"model": "new/model", "provider": "new-provider"},
++        )
++        return {
++            "value": "new/model",
++            "warning": "",
++            "runtime_revision": revision,
++        }
+ 
+     monkeypatch.setattr(server, "_start_agent_build", fake_start)
+     monkeypatch.setattr(server, "_apply_model_switch", fake_apply)
+@@ -7432,10 +7439,222 @@ def test_config_set_model_waits_for_lazy_agent_before_switch(monkeypatch):
+         )
+ 
+         assert resp["result"]["value"] == "new/model"
+-        assert calls == [("start", "sid"), ("apply", "sid", agent, "new/model")]
++        assert resp["result"]["runtime_revision"] == 1
++        assert resp["result"]["runtime_ready"] is True
++        assert calls == [("apply", "sid", None, "new/model"), ("start", "sid")]
+     finally:
+         server._sessions.pop("sid", None)
+ 
++
++def test_config_set_model_replaces_cold_resume_identity_before_build(monkeypatch):
++    """A pre-build pick is the newest authority, not the resumed DB pair."""
++    captured = {}
++
++    class _Agent:
++        model = "new-model"
++        provider = "new-provider"
++
++    result = types.SimpleNamespace(
++        success=True,
++        new_model="new-model",
++        target_provider="new-provider",
++        api_key="new-key",
++        base_url="https://new.invalid/v1",
++        api_mode="chat_completions",
++        warning_message="",
++        model_info=None,
++    )
++
++    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **_kwargs: result)
++    monkeypatch.setattr(server, "_set_session_context", lambda _key: [])
++    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
++    monkeypatch.setattr(
++        server,
++        "_make_agent",
++        lambda *_args, **kwargs: captured.update(kwargs) or _Agent(),
++    )
++    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
++    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
++    monkeypatch.setattr(server, "_start_notification_poller", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_probe_config_health", lambda *_args: None)
++
++    sid = "prebuild-authority"
++    session = {
++        "agent": None,
++        "agent_ready": threading.Event(),
++        "session_key": "resume-key",
++        "history": [],
++        "profile_home": None,
++        "running": False,
++        "model_override": {"model": "old-model", "provider": "old-provider"},
++        "resume_runtime_overrides": {
++            "model_override": {"model": "old-model", "provider": "old-provider"},
++            "provider_override": "old-provider",
++            "reasoning_config_override": {"enabled": True, "effort": "high"},
++        },
++    }
++    server._sessions[sid] = session
++    try:
++        response = server.handle_request(
++            {
++                "id": "set-before-build",
++                "method": "config.set",
++                "params": {
++                    "session_id": sid,
++                    "key": "model",
++                    "value": "new-model --provider new-provider",
++                    "confirm_expensive_model": True,
++                },
++            }
++        )
++        assert response["result"]["value"] == "new-model"
++        assert session["model_override_revision"] == 1
++        assert session["resume_runtime_overrides"]["provider_override"] == "new-provider"
++
++        server._start_agent_build(sid, session)
++        assert session["agent_ready"].wait(timeout=3), "agent build did not finish"
++        assert captured["model_override"]["model"] == "new-model"
++        assert captured["model_override"]["provider"] == "new-provider"
++        assert captured["provider_override"] == "new-provider"
++        assert captured["reasoning_config_override"] == {
++            "enabled": True,
++            "effort": "high",
++        }
++        assert session["agent_build_model_revision"] == 1
++    finally:
++        server._sessions.pop(sid, None)
++
++
++def test_config_set_model_linearizes_after_inflight_deferred_build(monkeypatch):
++    """Forced interleave: an older build cannot overwrite a successful pick."""
++    build_entered = threading.Event()
++    release_build = threading.Event()
++    request_done = threading.Event()
++    response_box = {}
++    build_kwargs = []
++    built_agents = []
++    emitted = []
++
++    class _Agent:
++        def __init__(self, model, provider):
++            self.model = model
++            self.provider = provider
++            self.api_key = "old-key"
++            self.base_url = "https://old.invalid/v1"
++            self.api_mode = "chat_completions"
++            self.closed = False
++
++        def close(self):
++            self.closed = True
++
++        def switch_model(self, *, new_model, new_provider, api_key, base_url, api_mode):
++            self.model = new_model
++            self.provider = new_provider
++            self.api_key = api_key
++            self.base_url = base_url
++            self.api_mode = api_mode
++
++    def _blocked_make_agent(*_args, **kwargs):
++        build_kwargs.append(copy.deepcopy(kwargs))
++        build_entered.set()
++        assert release_build.wait(timeout=3), "test did not release deferred build"
++        override = kwargs["model_override"]
++        agent = _Agent(override["model"], override["provider"])
++        built_agents.append(agent)
++        return agent
++
++    result = types.SimpleNamespace(
++        success=True,
++        new_model="new-model",
++        target_provider="new-provider",
++        api_key="new-key",
++        base_url="https://new.invalid/v1",
++        api_mode="chat_completions",
++        warning_message="",
++        model_info=None,
++    )
++    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **_kwargs: result)
++    monkeypatch.setattr(server, "_set_session_context", lambda _key: [])
++    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
++    monkeypatch.setattr(server, "_make_agent", _blocked_make_agent)
++    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
++    monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
++    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
++    monkeypatch.setattr(server, "_start_notification_poller", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_probe_config_health", lambda *_args: None)
++    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *_args: None)
++    monkeypatch.setattr(server, "_persist_live_session_system_prompt", lambda *_args: None)
++    monkeypatch.setattr(server, "_append_model_switch_marker", lambda *_args, **_kwargs: None)
++
++    sid = "forced-model-interleave"
++    session = {
++        "agent": None,
++        "agent_ready": threading.Event(),
++        "session_key": "resume-key",
++        "history": [],
++        "profile_home": None,
++        "running": False,
++        "model_override": {"model": "old-model", "provider": "old-provider"},
++        "resume_runtime_overrides": {
++            "model_override": {"model": "old-model", "provider": "old-provider"},
++            "provider_override": "old-provider",
++        },
++    }
++    server._sessions[sid] = session
++    try:
++        server._start_agent_build(sid, session)
++        assert build_entered.wait(timeout=2), "deferred build did not start"
++
++        def _set_model():
++            response_box["response"] = server.handle_request(
++                {
++                    "id": "set-during-build",
++                    "method": "config.set",
++                    "params": {
++                        "session_id": sid,
++                        "key": "model",
++                        "value": "new-model --provider new-provider",
++                        "confirm_expensive_model": True,
++                    },
++                }
++            )
++            request_done.set()
++
++        setter = threading.Thread(target=_set_model)
++        setter.start()
++        assert not request_done.wait(timeout=0.1), "setter returned before old build settled"
++        release_build.set()
++        setter.join(timeout=3)
++        assert not setter.is_alive(), "linearized setter did not complete"
++
++        assert [kw["model_override"]["model"] for kw in build_kwargs] == [
++            "old-model",
++            "new-model",
++        ]
++        assert built_agents[0].closed is True
++        assert built_agents[1].closed is False
++        assert response_box["response"]["result"]["value"] == "new-model"
++        assert response_box["response"]["result"]["runtime_ready"] is True
++        assert response_box["response"]["result"]["runtime_revision"] == 1
++        assert session["agent"].model == "new-model"
++        assert session["agent"].provider == "new-provider"
++        assert session["model_override"]["model"] == "new-model"
++        assert session["model_override_revision"] == 1
++        assert session["agent_build_runtime_revision"] == 1
++        assert any(
++            event == "session.info"
++            and payload.get("runtime_revision") == 1
++            and payload.get("runtime_ready") is True
++            for event, _sid, payload in emitted
++        )
++    finally:
++        release_build.set()
++        server._sessions.pop(sid, None)
++
+ def test_config_set_model_uses_live_switch_path(monkeypatch):
+     server._sessions["sid"] = _session()
+     seen = {}
+@@ -7585,8 +7804,21 @@ def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatc
+     session["agent"] = None
+     server._sessions["sid"] = session
+     monkeypatch.setattr(server, "_load_cfg", lambda: {"model": {"default": "broken/model", "provider": "openrouter"}})
+-    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: seen.__setitem__("build", seen["build"] + 1))
+-    monkeypatch.setattr(server, "_wait_agent", lambda *_args: seen.__setitem__("wait", seen["wait"] + 1))
++    def fake_start(_sid, target):
++        seen["build"] += 1
++        target["agent"] = types.SimpleNamespace(
++            model=target["model_override"]["model"],
++            provider=target["model_override"]["provider"],
++        )
++        target["agent_build_runtime_revision"] = target["agent_runtime_revision"]
++        target.setdefault("agent_ready", threading.Event()).set()
++
++    def fake_wait(*_args, **_kwargs):
++        seen["wait"] += 1
++        return None
++
++    monkeypatch.setattr(server, "_start_agent_build", fake_start)
++    monkeypatch.setattr(server, "_wait_agent", fake_wait)
+     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+     monkeypatch.setattr(server, "_restart_slash_worker", lambda *args, **kwargs: None)
+ 
+@@ -7618,8 +7850,9 @@ def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatc
+         )
+ 
+         assert resp["result"]["value"] == "claude-sonnet-4-6"
+-        assert seen["build"] == 0
+-        assert seen["wait"] == 0
++        assert resp["result"]["runtime_ready"] is True
++        assert seen["build"] == 1
++        assert seen["wait"] == 1
+         assert seen["requested"] == [("anthropic", "claude-sonnet-4.6")]
+         assert session["model_override"]["provider"] == "anthropic"
+         assert session["model_override"]["model"] == "claude-sonnet-4-6"
+diff --git a/tests/tui_gateway/test_authenticated_model_pairing.py b/tests/tui_gateway/test_authenticated_model_pairing.py
+index 4a2b2963..357ebc56 100644
+--- a/tests/tui_gateway/test_authenticated_model_pairing.py
++++ b/tests/tui_gateway/test_authenticated_model_pairing.py
+@@ -5,7 +5,11 @@ from __future__ import annotations
+ import pytest
+ 
+ import tui_gateway.server as server
+-from hermes_cli.inventory import ConfigContext
++from hermes_cli.inventory import (
++    AuthenticatedModelPairError,
++    ConfigContext,
++    build_model_options_payload,
++)
+ 
+ 
+ def _row(slug: str, *models: str) -> dict:
+@@ -21,7 +25,13 @@ def _row(slug: str, *models: str) -> dict:
+     }
+ 
+ 
+-def _install_inventory(monkeypatch, *, rows: list[dict], configured: set[str]) -> None:
++def _install_inventory(
++    monkeypatch,
++    *,
++    rows: list[dict],
++    configured: set[str],
++    stub_pricing: bool = True,
++) -> None:
+     ctx = ConfigContext(
+         current_provider="",
+         current_model="",
+@@ -42,7 +52,10 @@ def _install_inventory(monkeypatch, *, rows: list[dict], configured: set[str]) -
+         "hermes_cli.models.get_default_model_for_provider",
+         lambda slug: f"{slug}-default",
+     )
+-    monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_a, **_k: None)
++    if stub_pricing:
++        monkeypatch.setattr(
++            "hermes_cli.inventory._apply_pricing", lambda *_a, **_k: None
++        )
+     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_a, **_k: None)
+     monkeypatch.setattr("hermes_cli.inventory._apply_featured", lambda *_a, **_k: None)
+ 
+@@ -149,3 +162,62 @@ def test_session_create_requires_selection_before_allocating_or_building(
+     assert response["error"]["message"] == "model selection required"
+     assert response["error"]["data"]["type"] == "model_selection_required"
+     assert set(server._sessions) == before
++
++
++def test_authenticated_pair_excludes_unavailable_models(monkeypatch):
++    row = _row("nous", "nous-default", "nous-free")
++    _install_inventory(
++        monkeypatch, rows=[row], configured={"nous"}, stub_pricing=False
++    )
++    monkeypatch.setattr("hermes_cli.models.check_nous_free_tier", lambda **_k: True)
++    monkeypatch.setattr(
++        "hermes_cli.models.get_pricing_for_provider",
++        lambda _slug: {
++            "nous-default": {"prompt": "0.000001", "completion": "0.000001"},
++            "nous-free": {"prompt": "0", "completion": "0"},
++        },
++    )
++
++    picker = build_model_options_payload(
++        ConfigContext(
++            current_provider="",
++            current_model="",
++            current_base_url="",
++            user_providers={},
++            custom_providers=[],
++        ),
++        explicit_only=True,
++    )
++    assert picker["providers"][0]["unavailable_models"] == ["nous-default"]
++
++    # The provider helper's nominal default is unavailable for this account;
++    # provider-only resolution deterministically selects the sole runnable id.
++    assert server._resolve_session_create_model_pair(
++        requested_provider="nous", requested_model=""
++    ) == ("nous-free", "nous")
++
++    # An explicit unavailable pair is not authenticated runtime authority.
++    with pytest.raises(AuthenticatedModelPairError) as exc_info:
++        server._resolve_session_create_model_pair(
++            requested_provider="nous",
++            requested_model="nous-default",
++        )
++    assert getattr(exc_info.value, "code", "") == "model_selection_required"
++
++
++def test_authenticated_pair_requires_selection_when_all_models_unavailable(monkeypatch):
++    row = _row("nous", "nous-default")
++    _install_inventory(
++        monkeypatch, rows=[row], configured={"nous"}, stub_pricing=False
++    )
++    monkeypatch.setattr("hermes_cli.models.check_nous_free_tier", lambda **_k: True)
++    monkeypatch.setattr(
++        "hermes_cli.models.get_pricing_for_provider",
++        lambda _slug: {
++            "nous-default": {"prompt": "0.000001", "completion": "0.000001"}
++        },
++    )
++
++    with pytest.raises(AuthenticatedModelPairError) as exc_info:
++        server._resolve_session_create_model_pair()
++    assert getattr(exc_info.value, "code", "") == "model_selection_required"
+diff --git a/tests/tui_gateway/test_runtime_authority_races.py b/tests/tui_gateway/test_runtime_authority_races.py
+new file mode 100644
+index 00000000..5b63c59d
+--- /dev/null
++++ b/tests/tui_gateway/test_runtime_authority_races.py
+@@ -0,0 +1,526 @@
++"""Forced interleavings for deferred-session runtime authority."""
++
++from __future__ import annotations
++
++import threading
++import time
++import types
++
++from agent.secret_scope import current_secret_scope
++from hermes_constants import get_hermes_home
++from tui_gateway import server
++
++
++class _Agent:
++    def __init__(self, kwargs):
++        override = kwargs.get("model_override") or {}
++        self.model = override.get("model", "")
++        self.provider = override.get("provider", "")
++        self.base_url = override.get("base_url", "")
++        self.api_key = override.get("api_key", "")
++        self.api_mode = override.get("api_mode", "")
++        self.reasoning_config = kwargs.get("reasoning_config_override")
++        self.service_tier = kwargs.get("service_tier_override") or None
++        self.request_overrides = {}
++        self.closed = False
++
++    def close(self):
++        self.closed = True
++
++    def switch_model(self, *, new_model, new_provider, api_key, base_url, api_mode):
++        self.model = new_model
++        self.provider = new_provider
++        self.api_key = api_key
++        self.base_url = base_url
++        self.api_mode = api_mode
++
++
++def _switch_result(model: str, provider: str):
++    return types.SimpleNamespace(
++        success=True,
++        new_model=model,
++        target_provider=provider,
++        api_key=f"{provider}-key",
++        base_url=f"https://{provider}.invalid/v1",
++        api_mode="responses" if provider.endswith("b") else "chat_completions",
++        warning_message="",
++        model_info=None,
++    )
++
++
++def _session(*, profile_home=None):
++    return {
++        "agent": None,
++        "agent_ready": threading.Event(),
++        "session_key": "resume-key",
++        "history": [],
++        "profile_home": str(profile_home) if profile_home else None,
++        "running": False,
++        "model_override": {"model": "model-a", "provider": "provider-a"},
++        "resume_runtime_overrides": {
++            "model_override": {"model": "model-a", "provider": "provider-a"},
++            "provider_override": "provider-a",
++        },
++    }
++
++
++def _install_build_stubs(monkeypatch, make_agent, switch_model=None):
++    events = []
++    monkeypatch.setattr(server, "_set_session_context", lambda _key: [])
++    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
++    monkeypatch.setattr(server, "_make_agent", make_agent)
++    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
++    monkeypatch.setattr(
++        server, "_emit", lambda event, sid, payload: events.append((event, sid, payload))
++    )
++    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
++    monkeypatch.setattr(
++        server, "_start_notification_poller", lambda *_args, **_kwargs: threading.Event()
++    )
++    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_probe_config_health", lambda *_args: None)
++    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args: None)
++    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *_args: None)
++    monkeypatch.setattr(server, "_persist_live_session_system_prompt", lambda *_args: None)
++    monkeypatch.setattr(server, "_append_model_switch_marker", lambda *_args, **_kwargs: None)
++    if switch_model is None:
++        switch_model = lambda **kwargs: _switch_result(
++            kwargs["raw_input"].split()[0], kwargs["explicit_provider"]
++        )
++    monkeypatch.setattr("hermes_cli.model_switch.switch_model", switch_model)
++    return events
++
++
++def _wait_revision(session, revision: int):
++    deadline = time.monotonic() + 3
++    while time.monotonic() < deadline:
++        if int(session.get("agent_runtime_revision", 0) or 0) >= revision:
++            return
++        time.sleep(0.005)
++    raise AssertionError(f"runtime revision {revision} was not committed")
++
++
++def _set_model(sid: str, model: str, provider: str):
++    return server.handle_request(
++        {
++            "id": f"set-{model}",
++            "method": "config.set",
++            "params": {
++                "session_id": sid,
++                "key": "model",
++                "value": f"{model} --provider {provider}",
++                "confirm_expensive_model": True,
++            },
++        }
++    )
++
++
++def test_old_build_failure_is_stale_and_valid_new_provider_becomes_ready(monkeypatch):
++    entered = threading.Event()
++    release = threading.Event()
++    attempts = []
++
++    def make_agent(*_args, **kwargs):
++        attempts.append(kwargs["model_override"]["model"])
++        if len(attempts) == 1:
++            entered.set()
++            assert release.wait(3)
++            raise RuntimeError("old provider credentials unavailable")
++        return _Agent(kwargs)
++
++    events = _install_build_stubs(monkeypatch, make_agent)
++    sid = "stale-failure-new-provider"
++    session = _session()
++    server._sessions[sid] = session
++    response = {}
++    try:
++        server._start_agent_build(sid, session)
++        assert entered.wait(2)
++        setter = threading.Thread(
++            target=lambda: response.setdefault(
++                "value", _set_model(sid, "model-b", "provider-b")
++            )
++        )
++        setter.start()
++        _wait_revision(session, 1)
++        release.set()
++        setter.join(3)
++
++        assert response["value"]["result"]["runtime_ready"] is True
++        assert attempts == ["model-a", "model-b"]
++        assert session["agent"].model == "model-b"
++        assert session["agent_error"] is None
++        assert not any(
++            event == "error" and "old provider" in payload.get("message", "")
++            for event, _sid, payload in events
++        )
++    finally:
++        release.set()
++        server._sessions.pop(sid, None)
++
++
++def test_selected_provider_failure_is_typed_then_later_revision_recovers(monkeypatch):
++    entered = threading.Event()
++    release = threading.Event()
++
++    def make_agent(*_args, **kwargs):
++        model = kwargs["model_override"]["model"]
++        if model == "model-a":
++            entered.set()
++            assert release.wait(3)
++            raise RuntimeError("stale A auth failure")
++        if model == "model-b":
++            raise RuntimeError("selected B auth failure")
++        return _Agent(kwargs)
++
++    _install_build_stubs(monkeypatch, make_agent)
++    sid = "selected-failure-recovers"
++    session = _session()
++    server._sessions[sid] = session
++    first = {}
++    try:
++        server._start_agent_build(sid, session)
++        assert entered.wait(2)
++        setter = threading.Thread(
++            target=lambda: first.setdefault(
++                "value", _set_model(sid, "model-b", "provider-b")
++            )
++        )
++        setter.start()
++        _wait_revision(session, 1)
++        release.set()
++        setter.join(3)
++
++        assert first["value"]["error"]["code"] == 5032
++        assert "selected B auth failure" in first["value"]["error"]["message"]
++        assert "stale A" not in first["value"]["error"]["message"]
++        assert session["agent_error_revision"] == 1
++
++        recovered = _set_model(sid, "model-c", "provider-c")
++        assert recovered["result"]["runtime_revision"] == 2
++        assert recovered["result"]["runtime_ready"] is True
++        assert session["agent"].model == "model-c"
++        assert session["agent_error"] is None
++    finally:
++        release.set()
++        server._sessions.pop(sid, None)
++
++
++def test_tail_initialization_failure_cannot_publish_stale_candidate(monkeypatch):
++    tail_entered = threading.Event()
++    release_tail = threading.Event()
++    agents = []
++    wire_calls = 0
++
++    def make_agent(*_args, **kwargs):
++        agent = _Agent(kwargs)
++        agents.append(agent)
++        return agent
++
++    _install_build_stubs(monkeypatch, make_agent)
++
++    def wire(_sid):
++        nonlocal wire_calls
++        wire_calls += 1
++        if wire_calls == 1:
++            tail_entered.set()
++            assert release_tail.wait(3)
++            raise RuntimeError("tail initialization failed")
++
++    monkeypatch.setattr(server, "_wire_callbacks", wire)
++    sid = "tail-failure-stale"
++    session = _session()
++    server._sessions[sid] = session
++    response = {}
++    try:
++        server._start_agent_build(sid, session)
++        assert tail_entered.wait(2)
++        setter = threading.Thread(
++            target=lambda: response.setdefault(
++                "value", _set_model(sid, "model-b", "provider-b")
++            )
++        )
++        setter.start()
++        _wait_revision(session, 1)
++        assert session["agent"] is None
++        release_tail.set()
++        setter.join(3)
++
++        assert response["value"]["result"]["runtime_ready"] is True
++        assert [agent.model for agent in agents] == ["model-a", "model-b"]
++        assert agents[0].closed is True
++        assert session["agent"] is agents[1]
++        assert session["agent_error"] is None
++    finally:
++        release_tail.set()
++        server._sessions.pop(sid, None)
++
++
++def test_concurrent_model_setters_publish_only_latest_complete_revision(monkeypatch):
++    build_entered = threading.Event()
++    release_build = threading.Event()
++    b_resolution_entered = threading.Event()
++    release_b_resolution = threading.Event()
++    built = []
++
++    def make_agent(*_args, **kwargs):
++        built.append(_Agent(kwargs))
++        if len(built) == 1:
++            build_entered.set()
++            assert release_build.wait(3)
++        return built[-1]
++
++    def switch_model(**kwargs):
++        model = kwargs["raw_input"].split()[0]
++        if model == "model-b":
++            b_resolution_entered.set()
++            assert release_b_resolution.wait(3)
++        return _switch_result(model, kwargs["explicit_provider"])
++
++    _install_build_stubs(monkeypatch, make_agent, switch_model)
++    sid = "concurrent-b-c"
++    session = _session()
++    server._sessions[sid] = session
++    responses = {}
++    try:
++        server._start_agent_build(sid, session)
++        assert build_entered.wait(2)
++        b = threading.Thread(
++            target=lambda: responses.setdefault(
++                "b", _set_model(sid, "model-b", "provider-b")
++            )
++        )
++        c = threading.Thread(
++            target=lambda: responses.setdefault(
++                "c", _set_model(sid, "model-c", "provider-c")
++            )
++        )
++        b.start()
++        assert b_resolution_entered.wait(2)
++        c.start()
++        release_b_resolution.set()
++        _wait_revision(session, 2)
++        release_build.set()
++        b.join(3)
++        c.join(3)
++
++        assert responses["c"]["result"]["runtime_revision"] == 2
++        assert responses["c"]["result"]["runtime_ready"] is True
++        assert responses["b"]["error"]["code"] == 5032
++        assert session["agent"].model == "model-c"
++        assert session["agent"].provider == "provider-c"
++        assert session["agent_build_runtime_revision"] == 2
++        assert all(agent is session["agent"] or agent.closed for agent in built)
++    finally:
++        release_b_resolution.set()
++        release_build.set()
++        server._sessions.pop(sid, None)
++
++
++def test_model_reasoning_and_tier_interleave_rebuild_one_complete_snapshot(monkeypatch):
++    entered = threading.Event()
++    release = threading.Event()
++    kwargs_seen = []
++
++    def make_agent(*_args, **kwargs):
++        kwargs_seen.append(kwargs)
++        if len(kwargs_seen) == 1:
++            entered.set()
++            assert release.wait(3)
++        return _Agent(kwargs)
++
++    _install_build_stubs(monkeypatch, make_agent)
++    monkeypatch.setattr(
++        "hermes_cli.models.resolve_fast_mode_overrides",
++        lambda _model: {"speed": "fast"},
++    )
++    sid = "orthogonal-runtime-fields"
++    session = _session()
++    server._sessions[sid] = session
++    model_response = {}
++    try:
++        server._start_agent_build(sid, session)
++        assert entered.wait(2)
++        reasoning = server.handle_request(
++            {
++                "id": "reasoning",
++                "method": "config.set",
++                "params": {"session_id": sid, "key": "reasoning", "value": "high"},
++            }
++        )
++        fast = server.handle_request(
++            {
++                "id": "fast",
++                "method": "config.set",
++                "params": {"session_id": sid, "key": "fast", "value": "fast"},
++            }
++        )
++        setter = threading.Thread(
++            target=lambda: model_response.setdefault(
++                "value", _set_model(sid, "model-b", "provider-b")
++            )
++        )
++        setter.start()
++        _wait_revision(session, 3)
++        release.set()
++        setter.join(3)
++
++        assert reasoning["result"]["value"] == "high"
++        assert fast["result"]["value"] == "fast"
++        final = kwargs_seen[-1]
++        assert final["model_override"] == {
++            "model": "model-b",
++            "provider": "provider-b",
++            "base_url": "https://provider-b.invalid/v1",
++            "api_key": "provider-b-key",
++            "api_mode": "responses",
++        }
++        assert final["reasoning_config_override"]["effort"] == "high"
++        assert final["service_tier_override"] == "priority"
++        assert session["agent_build_runtime_revision"] == 3
++        assert model_response["value"]["result"]["runtime_revision"] == 3
++    finally:
++        release.set()
++        server._sessions.pop(sid, None)
++
++
++def test_prebuild_explicit_provider_uses_non_launch_profile_scope(monkeypatch, tmp_path):
++    profile = tmp_path / "other-profile"
++    profile.mkdir()
++    (profile / ".env").write_text("PROFILE_ONLY_KEY=profile-secret\n", encoding="utf-8")
++    observed = {}
++
++    def switch_model(**kwargs):
++        observed["switch_home"] = get_hermes_home()
++        observed["switch_secret"] = dict(current_secret_scope() or {})
++        return _switch_result("model-b", "provider-b")
++
++    def make_agent(*_args, **kwargs):
++        observed["build_home"] = get_hermes_home()
++        observed["build_secret"] = dict(current_secret_scope() or {})
++        return _Agent(kwargs)
++
++    _install_build_stubs(monkeypatch, make_agent, switch_model)
++    sid = "non-launch-profile"
++    session = _session(profile_home=profile)
++    server._sessions[sid] = session
++    try:
++        response = _set_model(sid, "model-b", "provider-b")
++        assert response["result"]["runtime_ready"] is True
++        assert observed["switch_home"] == profile
++        assert observed["build_home"] == profile
++        assert observed["switch_secret"]["PROFILE_ONLY_KEY"] == "profile-secret"
++        assert observed["build_secret"]["PROFILE_ONLY_KEY"] == "profile-secret"
++    finally:
++        server._sessions.pop(sid, None)
++
++
++def test_live_model_reasoning_and_tier_setters_publish_one_serial_order(monkeypatch):
++    switch_entered = threading.Event()
++    release_switch = threading.Event()
++
++    class ResettingAgent(_Agent):
++        def switch_model(self, **kwargs):
++            switch_entered.set()
++            assert release_switch.wait(3)
++            super().switch_model(**kwargs)
++            # Hostile provider rebuild: simulate a client factory that resets
++            # every orthogonal runtime knob while switching model identity.
++            self.reasoning_config = {"effort": "low"}
++            self.service_tier = None
++            self.request_overrides = {}
++
++    _install_build_stubs(monkeypatch, lambda *_args, **kwargs: _Agent(kwargs))
++    monkeypatch.setattr(
++        "hermes_cli.models.resolve_fast_mode_overrides",
++        lambda _model: {"speed": "fast"},
++    )
++    sid = "live-runtime-linearization"
++    session = _session()
++    agent = ResettingAgent(
++        {"model_override": {"model": "model-a", "provider": "provider-a"}}
++    )
++    agent.reasoning_config = {"effort": "medium"}
++    session.update(
++        {
++            "agent": agent,
++            "agent_runtime_revision": 0,
++            "agent_build_runtime_revision": 0,
++        }
++    )
++    session["agent_ready"].set()
++    server._sessions[sid] = session
++    responses = {}
++    try:
++        model_thread = threading.Thread(
++            target=lambda: responses.setdefault(
++                "model", _set_model(sid, "model-b", "provider-b")
++            )
++        )
++        reasoning_thread = threading.Thread(
++            target=lambda: responses.setdefault(
++                "reasoning",
++                server.handle_request(
++                    {
++                        "id": "live-reasoning",
++                        "method": "config.set",
++                        "params": {
++                            "session_id": sid,
++                            "key": "reasoning",
++                            "value": "high",
++                        },
++                    }
++                ),
++            )
++        )
++        fast_thread = threading.Thread(
++            target=lambda: responses.setdefault(
++                "fast",
++                server.handle_request(
++                    {
++                        "id": "live-fast",
++                        "method": "config.set",
++                        "params": {
++                            "session_id": sid,
++                            "key": "fast",
++                            "value": "fast",
++                        },
++                    }
++                ),
++            )
++        )
++
++        model_thread.start()
++        assert switch_entered.wait(2)
++        reasoning_thread.start()
++        fast_thread.start()
++        time.sleep(0.05)
++        assert session["agent_runtime_revision"] == 1
++        assert session["agent_build_runtime_revision"] == 0
++        assert server._runtime_ready_for_revision(session, 1) is False
++        release_switch.set()
++        model_thread.join(3)
++        reasoning_thread.join(3)
++        fast_thread.join(3)
++
++        assert responses["model"]["result"]["runtime_revision"] == 1
++        assert responses["model"]["result"]["runtime_ready"] is True
++        later_revisions = {
++            responses["reasoning"]["result"]["runtime_revision"],
++            responses["fast"]["result"]["runtime_revision"],
++        }
++        assert later_revisions == {2, 3}
++        assert responses["reasoning"]["result"]["runtime_ready"] is True
++        assert responses["fast"]["result"]["runtime_ready"] is True
++        assert agent.model == "model-b"
++        assert agent.provider == "provider-b"
++        assert agent.reasoning_config["effort"] == "high"
++        assert agent.service_tier == "priority"
++        assert agent.request_overrides["speed"] == "fast"
++        assert session["agent_runtime_revision"] == 3
++        assert session["agent_build_runtime_revision"] == 3
++        assert server._runtime_ready_for_revision(session, 3) is True
++    finally:
++        release_switch.set()
++        server._sessions.pop(sid, None)
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index a0e9f019..884dd13b 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -1552,6 +1552,32 @@ def _profile_scoped(handler):
+     return wrapper
+ 
+ 
++@contextlib.contextmanager
++def _session_profile_runtime_scope(session: dict | None):
++    """Bind config and credentials to the session's owning profile.
++
++    Model selection is allowed before an agent exists.  In app-global remote
++    mode that means there is no agent from which to infer the profile, so a
++    pre-build switch must explicitly enter the saved profile's HERMES_HOME and
++    secret scope.  The scope is context-local and safe to use around the
++    network/config work performed outside the runtime-authority lock.
++    """
++    profile_home = str((session or {}).get("profile_home") or "").strip()
++    if not profile_home:
++        yield
++        return
++    home = Path(profile_home)
++    home_token = set_hermes_home_override(home)
++    secret_token = None
++    try:
++        secret_token = set_secret_scope(build_profile_secret_scope(home))
++        yield
++    finally:
++        if secret_token is not None:
++            reset_secret_scope(secret_token)
++        reset_hermes_home_override(home_token)
++
++
+ # Placeholder ``terminal.cwd`` values that don't name a real directory — the
+ # gateway resolves these to the home dir at runtime, so they must NOT be treated
+ # as an explicit workspace (mirrors gateway/run.py's config bridge).
+@@ -2775,6 +2801,163 @@ def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
+     return _err(rid, 5032, err) if err else None
+ 
+ 
++_RUNTIME_UNSET = object()
++
++
++def _runtime_authority_lock(session: dict) -> threading.Lock:
++    """Short-held lock protecting desired runtime identity and publication."""
++    return session.setdefault("agent_build_lock", threading.Lock())
++
++
++def _runtime_setter_lock(session: dict) -> threading.Lock:
++    """Serialize slow setter resolution without holding the authority lock."""
++    return session.setdefault("agent_runtime_setter_lock", threading.Lock())
++
++
++def _runtime_revision_locked(session: dict) -> int:
++    return int(session.get("agent_runtime_revision", 0) or 0)
++
++
++def _runtime_ready_for_revision(session: dict, revision: int | None = None) -> bool:
++    """True only when the published live agent embodies the exact revision."""
++    lock = _runtime_authority_lock(session)
++    with lock:
++        expected = (
++            _runtime_revision_locked(session)
++            if revision is None
++            else int(revision)
++        )
++        return bool(
++            session.get("agent") is not None
++            and not session.get("agent_error")
++            and _runtime_revision_locked(session) == expected
++            and int(session.get("agent_build_runtime_revision", -1) or 0)
++            == expected
++        )
++
++
++def _publish_live_runtime_revision(session: dict, agent, revision: int) -> bool:
++    """Publish a completed in-place mutation against its desired revision."""
++    lock = _runtime_authority_lock(session)
++    with lock:
++        if (
++            session.get("agent") is not agent
++            or _runtime_revision_locked(session) != int(revision)
++        ):
++            return False
++        # The historical name is retained for compatibility; after a live
++        # setter it means "last fully applied runtime revision", whether the
++        # agent was rebuilt or mutated in place.
++        session["agent_build_runtime_revision"] = int(revision)
++        session["agent_error"] = None
++        session["agent_error_revision"] = None
++        return True
++
++
++def _runtime_build_snapshot_locked(session: dict) -> tuple[int, dict]:
++    """Capture one immutable desired-runtime revision for agent construction."""
++    revision = _runtime_revision_locked(session)
++    resume_runtime_overrides = session.get("resume_runtime_overrides")
++    overrides = (
++        copy.deepcopy(resume_runtime_overrides)
++        if isinstance(resume_runtime_overrides, dict)
++        else {}
++    )
++    model_override = session.get("model_override")
++    if isinstance(model_override, dict) and model_override:
++        overrides["model_override"] = copy.deepcopy(model_override)
++        provider = str(model_override.get("provider") or "").strip()
++        if provider:
++            overrides["provider_override"] = provider
++        else:
++            overrides.pop("provider_override", None)
++    if (reasoning := session.get("create_reasoning_override")) is not None:
++        overrides["reasoning_config_override"] = copy.deepcopy(reasoning)
++    if (tier := session.get("create_service_tier_override")) is not None:
++        overrides["service_tier_override"] = tier
++    return revision, overrides
++
++
++def _commit_runtime_desire(
++    session: dict,
++    *,
++    model_override: Any = _RUNTIME_UNSET,
++    reasoning_override: Any = _RUNTIME_UNSET,
++    service_tier_override: Any = _RUNTIME_UNSET,
++    _capture_agent: bool = False,
++) -> int | tuple[int, Any]:
++    """Atomically publish desired runtime fields and advance their revision.
++
++    Resolution, persistence, worker shutdown, and event emission belong outside
++    this lock.  A builder may therefore do expensive work concurrently, but it
++    can publish only if this revision still matches at commit time.
++    """
++    lock = _runtime_authority_lock(session)
++    with lock:
++        resume = session.get("resume_runtime_overrides")
++        resume = copy.deepcopy(resume) if isinstance(resume, dict) else {}
++        if model_override is not _RUNTIME_UNSET:
++            override = copy.deepcopy(model_override)
++            if override:
++                session["model_override"] = override
++                resume["model_override"] = copy.deepcopy(override)
++                provider = str(override.get("provider") or "").strip()
++                if provider:
++                    resume["provider_override"] = provider
++                else:
++                    resume.pop("provider_override", None)
++            else:
++                session.pop("model_override", None)
++                resume.pop("model_override", None)
++                resume.pop("provider_override", None)
++            session["model_override_revision"] = (
++                int(session.get("model_override_revision", 0) or 0) + 1
++            )
++        if reasoning_override is not _RUNTIME_UNSET:
++            if reasoning_override is None:
++                session.pop("create_reasoning_override", None)
++                resume.pop("reasoning_config_override", None)
++            else:
++                value = copy.deepcopy(reasoning_override)
++                session["create_reasoning_override"] = value
++                resume["reasoning_config_override"] = copy.deepcopy(value)
++        if service_tier_override is not _RUNTIME_UNSET:
++            if service_tier_override is None:
++                session.pop("create_service_tier_override", None)
++                resume.pop("service_tier_override", None)
++            else:
++                session["create_service_tier_override"] = service_tier_override
++                resume["service_tier_override"] = service_tier_override
++        session["resume_runtime_overrides"] = resume or None
++        revision = _runtime_revision_locked(session) + 1
++        session["agent_runtime_revision"] = revision
++        # A failure belongs only to the revision that produced it.  A newer
++        # setter immediately makes that error non-authoritative; the existing
++        # worker will observe staleness and retry, or the caller will start a
++        # fresh worker after a terminal failure.
++        session["agent_error"] = None
++        session["agent_error_revision"] = None
++        ready = session.get("agent_ready")
++        build_thread = session.get("_agent_build_thread")
++        if (
++            session.get("agent") is None
++            and ready is not None
++            and (build_thread is None or not build_thread.is_alive())
++        ):
++            session["agent_build_started"] = False
++            ready.clear()
++        if _capture_agent:
++            return revision, session.get("agent")
++        return revision
++
++
++def _close_candidate_agent(agent) -> None:
++    """Dispose an unpublished or superseded candidate outside authority locks."""
++    if agent is not None and hasattr(agent, "close"):
++        with contextlib.suppress(Exception):
++            agent.close()
++
++
+ # The deferred prompt path waits in short slices so a cancel is honored
+ # promptly and a slow build can be reported to the client exactly once.
+ _AGENT_BUILD_WAIT_SLICE = 5.0
+@@ -2916,10 +3099,18 @@ def _start_agent_build(sid: str, session: dict) -> None:
+     # prompt/RPC builds the agent normally so the user can talk to the session.
+     if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+         return
+-    lock = session.setdefault("agent_build_lock", threading.Lock())
++    lock = _runtime_authority_lock(session)
+     with lock:
+-        if ready.is_set() or session.get("agent_build_started"):
++        if session.get("agent") is not None and ready.is_set():
++            return
++        if session.get("agent_build_started"):
+             return
++        # A terminal failure may have set the event.  A newer runtime desire is
++        # allowed to retry the deferred build; only a published agent makes a
++        # set event final.
++        ready.clear()
++        session["agent_error"] = None
++        session["agent_error_revision"] = None
+         session["agent_build_started"] = True
+         # An upgrading lazy session is now genuinely mid-construction — restore
+         # its "still starting" eviction exemption.
+@@ -2927,193 +3118,207 @@ def _start_agent_build(sid: str, session: dict) -> None:
+     key = session["session_key"]
+ 
+     def _build() -> None:
+-        with _sessions_lock:
+-            current = _sessions.get(sid)
+-        if current is None:
+-            ready.set()
+-            return
+-
+         notify_registered = False
+-        home_token = None
+-        secret_token = None
+-        session_db = None
+-        owns_db = False
+-        profile_home = current.get("profile_home")
+-        try:
+-            tokens = _set_session_context(key)
+-            # Build against the session's profile (global-remote): bind its
+-            # HERMES_HOME so config/skills/model resolve to it, and hand the
+-            # agent that profile's db so turns persist to the right state.db.
++        while True:
++            with _sessions_lock:
++                current = _sessions.get(sid)
++            if current is not session:
++                break
++            with lock:
++                build_revision, build_runtime_overrides = (
++                    _runtime_build_snapshot_locked(current)
++                )
++
++            candidate = None
+             session_db = None
+-            if profile_home:
+-                home_token = set_hermes_home_override(profile_home)
+-                try:
+-                    from agent.secret_scope import build_profile_secret_scope, set_secret_scope
++            owns_db = False
++            info = None
++            config_seen = None
++            try:
++                # Every retry re-enters the session's own config + secret
++                # scope.  This is essential when one global gateway serves a
++                # non-launch profile and a setter replaces an unavailable
++                # provider while an older candidate is still building.
++                with _session_profile_runtime_scope(current):
++                    profile_home = str(current.get("profile_home") or "").strip()
++                    if profile_home:
++                        try:
++                            from hermes_state import SessionDB
+ 
+-                    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+-                except Exception:
+-                    pass
+-                try:
+-                    from hermes_state import SessionDB
+-
+-                    # DEDICATED handle — ours until _transfer_db_to_agent hands
+-                    # it to the built agent in the finally below. Every path
+-                    # that leaves this build without that transfer (the except
+-                    # below, and a session reaped mid-build) must close it.
+-                    session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+-                    owns_db = True
+-                except Exception:
+-                    session_db = None
++                            session_db = SessionDB(
++                                db_path=Path(profile_home) / "state.db"
++                            )
++                            owns_db = True
++                        except Exception:
++                            session_db = None
+ 
+-            try:
+-                from tui_gateway.entry import ensure_mcp_discovery_started
++                    try:
++                        from tui_gateway.entry import ensure_mcp_discovery_started
+ 
+-                ensure_mcp_discovery_started()
+-            except Exception:
+-                logger.warning("MCP discovery startup failed", exc_info=True)
++                        ensure_mcp_discovery_started()
++                    except Exception:
++                        logger.warning("MCP discovery startup failed", exc_info=True)
+ 
+-            try:
+-                # Lazy-resumed (watch) sessions carry the stored conversation
+-                # id — pass it through so the upgrade continues that session
+-                # instead of starting a fresh one under the same key.
+-                kw = {"session_db": session_db}
+-                if resume_sid := current.get("resume_session_id"):
+-                    kw["session_id"] = resume_sid
+-                kw["platform_override"] = _session_source(current)
+-                resume_overrides = current.get("resume_runtime_overrides")
+-                if isinstance(resume_overrides, dict) and resume_overrides:
+-                    # Cold deferred resume: restore the full persisted runtime
+-                    # identity (model/provider/base_url/api_mode/reasoning/tier)
+-                    # exactly as the eager resume path's _stored_session_runtime_
+-                    # overrides splat did, so a deferred build can't drop the
+-                    # provider and fail with "No LLM provider configured".
+-                    kw.update(resume_overrides)
+-                else:
+-                    # Model/effort/fast the desktop picked for a brand-new chat
+-                    # ride in as per-session overrides so the first build uses
+-                    # them directly (no global config, no build-then-switch).
+-                    if override := current.get("model_override"):
+-                        kw["model_override"] = override
+-                    if (reasoning := current.get("create_reasoning_override")) is not None:
+-                        kw["reasoning_config_override"] = reasoning
+-                    if (tier := current.get("create_service_tier_override")) is not None:
+-                        kw["service_tier_override"] = tier
+-                agent = _make_agent(sid, key, **kw)
+-            finally:
+-                _clear_session_context(tokens)
+-
+-            # Session DB row deferred to first run_conversation() call.
+-            # pending_title applied post-first-message (see cli.exec handler).
+-            current["agent"] = agent
+-            # Baseline for the per-turn config sync; the profile home
+-            # override is still active here.
+-            current["config_model_seen"] = _config_model_target()
+-
+-            # No eager slash-worker pre-warm: slash.exec spawns one on demand
+-            # (its error path already relies on that respawn to recover from a
+-            # dead worker). Each worker child runs its own MCP discovery
+-            # (#61891), so pre-warming one per session forks the full stdio
+-            # MCP fleet — ~20 OS processes per retained session on a config
+-            # with a few stdio servers — even for sessions that never run a
+-            # worker-routed command. Sessions held by a live transport are
+-            # never reaped, so with the desktop app open for days those
+-            # fleets accumulate until the OS refuses new process spawns.
++                    tokens = _set_session_context(key)
++                    try:
++                        kw = {"session_db": session_db}
++                        if resume_sid := current.get("resume_session_id"):
++                            kw["session_id"] = resume_sid
++                        kw["platform_override"] = _session_source(current)
++                        kw.update(build_runtime_overrides)
++                        candidate = _make_agent(sid, key, **kw)
++                    finally:
++                        _clear_session_context(tokens)
++
++                    # Candidate-only tail initialization.  Nothing stores the
++                    # agent in the public session record until every operation
++                    # in this block has succeeded and the revision is rechecked.
++                    if not notify_registered:
++                        try:
++                            from tools.approval import (
++                                register_gateway_notify,
++                                load_permanent_allowlist,
++                            )
+ 
+-            try:
+-                from tools.approval import (
+-                    register_gateway_notify,
+-                    load_permanent_allowlist,
+-                )
++                            register_gateway_notify(
++                                key, lambda data: _emit_approval_request(sid, data)
++                            )
++                            notify_registered = True
++                            load_permanent_allowlist()
++                        except Exception:
++                            pass
+ 
+-                register_gateway_notify(
+-                    key, lambda data: _emit_approval_request(sid, data)
+-                )
+-                notify_registered = True
+-                load_permanent_allowlist()
+-            except Exception:
+-                pass
++                    _wire_callbacks(sid)
++                    try:
++                        candidate.background_review_callback = _turn_owned_callback(
++                            "",
++                            lambda message, _sid=sid: _emit(
++                                "review.summary", _sid, {"text": str(message)}
++                            ),
++                        )
++                        candidate.memory_notifications = _load_memory_notifications()
++                    except Exception:
++                        pass
++                    try:
++                        from agent.credits_tracker import seed_credits_at_session_start
+ 
+-            _wire_callbacks(sid)
+-            # Surface the self-improvement review's "💾 …" summary as an event
+-            # the TUI/desktop render in-transcript, honoring
+-            # display.memory_notifications. _init_session wires this for the
+-            # eager/branch paths; deferred-built sessions (session.create and the
+-            # default cold resume) build through here, so without this their
+-            # review summaries would leak to stdout instead of the chat.
+-            try:
+-                agent.background_review_callback = _turn_owned_callback(
+-                    "",
+-                    lambda message, _sid=sid: _emit(
+-                        "review.summary", _sid, {"text": str(message)}
+-                    ),
+-                )
+-                agent.memory_notifications = _load_memory_notifications()
+-            except Exception:
+-                pass
+-            # Hydrate credits notices at session OPEN (not just on the first
+-            # message), so depletion / usage-band warnings show at "ready". Runs
+-            # off the build thread, after the notice_callback is wired. Fail-open.
+-            try:
+-                from agent.credits_tracker import seed_credits_at_session_start
++                        seed_credits_at_session_start(candidate)
++                    except Exception:
++                        pass
+ 
+-                seed_credits_at_session_start(agent)
+-            except Exception:
+-                pass
+-            with _sessions_lock:
+-                if sid in _sessions:
+-                    _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+-            _notify_session_boundary("on_session_reset", key, _session_source(current))
+-
+-            info = _session_info(agent, current)
+-            cfg_warn = _probe_config_health(_load_cfg())
+-            if cfg_warn:
+-                info["config_warning"] = cfg_warn
+-                logger.warning(cfg_warn)
+-            _emit("session.info", sid, info)
+-            # If MCP discovery is still in flight (a server slower than the
+-            # bounded wait_for_mcp_discovery join in _make_agent), the agent
+-            # was built without those tools. Catch up once they land — see
+-            # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
+-            _schedule_mcp_late_refresh(sid, agent)
+-        except Exception as e:
+-            safe_error = _safe_turn_error(current.get("agent"), e)
+-            current["agent_error"] = safe_error
+-            _emit("error", sid, {"message": f"agent init failed: {safe_error}"})
+-        finally:
+-            if home_token is not None:
+-                reset_hermes_home_override(home_token)
+-            if secret_token is not None:
+-                try:
+-                    from agent.secret_scope import reset_secret_scope
++                    config_seen = _config_model_target()
++                    info = _session_info(candidate, current)
++                    cfg_warn = _probe_config_health(_load_cfg())
++                    if cfg_warn:
++                        info["config_warning"] = cfg_warn
++                        logger.warning(cfg_warn)
++            except Exception as exc:
++                safe_error = _safe_turn_error(candidate, exc)
++                if owns_db and session_db is not None:
++                    if not _transfer_db_to_agent(candidate, session_db):
++                        with contextlib.suppress(Exception):
++                            session_db.close()
++                _close_candidate_agent(candidate)
+ 
+-                    reset_secret_scope(secret_token)
+-                except Exception:
+-                    pass
+-            # _attach_worker already closed the worker if this session was
+-            # reaped mid-build; only the late notify registration can still
+-            # leak (session.close unregistered before _build registered it).
+-            with _sessions_lock:
+-                replaced = _sessions.get(sid) is not current
+-            if replaced and notify_registered:
+-                try:
+-                    from tools.approval import unregister_gateway_notify
++                with _sessions_lock:
++                    attached = _sessions.get(sid) is current
++                    with lock:
++                        stale = (
++                            attached
++                            and _runtime_revision_locked(current) != build_revision
++                        )
++                        if attached and not stale:
++                            current["agent_error"] = safe_error
++                            current["agent_error_revision"] = build_revision
++                            current["agent_build_started"] = False
++                            ready.set()
++                if stale:
++                    continue
++                if attached:
++                    _emit(
++                        "error",
++                        sid,
++                        {
++                            "message": f"agent init failed: {safe_error}",
++                            "runtime_revision": build_revision,
++                            "runtime_ready": False,
++                        },
++                    )
++                break
+ 
+-                    unregister_gateway_notify(key)
+-                except Exception:
+-                    pass
+-            # Dedicated profile handle: hand it to the agent that will actually
+-            # be torn down, or close it here when no such agent exists. Both
+-            # non-transfer cases are real: the except above (build raised, so
+-            # nothing holds the handle) and `replaced` (the session was reaped
+-            # mid-build, so this agent is discarded and _teardown_session will
+-            # never reach it). Transferring to a discarded agent would leak the
+-            # handle exactly as before.
+             if owns_db and session_db is not None:
+-                built = None if replaced else current.get("agent")
+-                if not _transfer_db_to_agent(built, session_db):
++                if not _transfer_db_to_agent(candidate, session_db):
+                     with contextlib.suppress(Exception):
+                         session_db.close()
+-            ready.set()
++
++            committed = False
++            attached = False
++            with _sessions_lock:
++                attached = _sessions.get(sid) is current
++                with lock:
++                    if (
++                        attached
++                        and _runtime_revision_locked(current) == build_revision
++                    ):
++                        current["agent"] = candidate
++                        current["agent_build_runtime_revision"] = build_revision
++                        current["agent_build_model_revision"] = int(
++                            current.get("model_override_revision", 0) or 0
++                        )
++                        current["config_model_seen"] = config_seen
++                        current["agent_error"] = None
++                        current["agent_error_revision"] = None
++                        current["agent_build_started"] = False
++                        ready.set()
++                        committed = True
++
++            if not committed:
++                _close_candidate_agent(candidate)
++                if not attached:
++                    break
++                # A setter committed a newer model/reasoning/tier while this
++                # candidate initialized.  It was never observable; rebuild the
++                # newest complete snapshot in this same worker.
++                continue
++
++            # Post-publication notifications are best-effort and deliberately
++            # outside the authority lock.  They cannot turn a ready agent into
++            # a permanent initialization error.
++            try:
++                stop = _start_notification_poller(sid, current)
++                with _sessions_lock:
++                    if _sessions.get(sid) is current:
++                        current["_notif_stop"] = stop
++                    else:
++                        stop.set()
++            except Exception:
++                logger.debug("notification poller startup failed", exc_info=True)
++            try:
++                with _session_profile_runtime_scope(current):
++                    _notify_session_boundary(
++                        "on_session_reset", key, _session_source(current)
++                    )
++            except Exception:
++                logger.debug("session boundary notification failed", exc_info=True)
++            if info is not None:
++                info["runtime_revision"] = build_revision
++                info["runtime_ready"] = True
++                _emit("session.info", sid, info)
++            _schedule_mcp_late_refresh(sid, candidate)
++            break
++
++        # A close can race after approval registration but before publication.
++        # Its teardown already attempted to unregister, so unregister once more
++        # when this worker discovers that the record was replaced.
++        with _sessions_lock:
++            replaced = _sessions.get(sid) is not session
++        if replaced and notify_registered:
++            try:
++                from tools.approval import unregister_gateway_notify
++
++                unregister_gateway_notify(key)
++            except Exception:
++                pass
+ 
+     build_thread = threading.Thread(target=_build, daemon=True)
+     # Handle for _wait_agent_for_prompt: a dead build thread with agent_ready
+@@ -4477,6 +4682,7 @@ def _resolve_authenticated_runtime_pair(
+             explicit_only=True,
+             include_unconfigured=False,
+             picker_hints=True,
++            runtime_availability=True,
+             probe_custom_providers=False,
+             probe_current_custom_provider=True,
+         )
+@@ -5462,11 +5668,16 @@ def _apply_model_switch(
+         current_base_url = getattr(agent, "base_url", "") or ""
+         current_api_key = getattr(agent, "api_key", "") or ""
+     else:
+-        current_model = _resolve_model()
+-        current_provider = explicit_provider.strip()
+-        current_base_url = ""
+-        current_api_key = ""
+-        if not explicit_provider:
++        desired = session.get("model_override")
++        desired = desired if isinstance(desired, dict) else {}
++        current_model = str(desired.get("model") or "").strip() or _resolve_model()
++        current_provider = (
++            explicit_provider.strip()
++            or str(desired.get("provider") or "").strip()
++        )
++        current_base_url = str(desired.get("base_url") or "").strip()
++        current_api_key = desired.get("api_key", "") or ""
++        if not current_provider:
+             runtime = resolve_runtime_provider(requested=None)
+             current_provider = str(runtime.get("provider", "") or "")
+             current_base_url = str(runtime.get("base_url", "") or "")
+@@ -5509,7 +5720,10 @@ def _apply_model_switch(
+     if not result.success:
+         raise ValueError(result.error_message or "model switch failed")
+ 
+-    restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
++    # Resolution may overlap a deferred build. Re-read for preflight only;
++    # the desired-revision commit below captures the published agent under the
++    # authority lock, closing the final candidate-publication race.
++    agent = session.get("agent")
+ 
+     if agent:
+         try:
+@@ -5554,6 +5768,44 @@ def _apply_model_switch(
+                 "confirm_message": confirm_msg,
+             }
+ 
++    # Record the switch as a PER-SESSION desired override before live mutation.
++    # The short authority-lock commit atomically captures any old candidate
++    # that published during provider resolution. That agent is then switched
++    # below; a still-private old candidate sees the newer revision and can
++    # neither publish nor poison it.
++    committed_revision = None
++    previous_model_override = copy.deepcopy(session.get("model_override"))
++    if pin_session_override and isinstance(session, dict) and not one_turn:
++        override = {
++            "model": result.new_model,
++            "provider": result.target_provider,
++            "base_url": result.base_url,
++            "api_key": result.api_key,
++            "api_mode": result.api_mode,
++        }
++        committed_revision, agent = _commit_runtime_desire(
++            session,
++            model_override=override,
++            _capture_agent=True,
++        )
++    else:
++        agent = session.get("agent")
++
++    restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
++    orthogonal_runtime = None
++    if agent is not None:
++        request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
++        orthogonal_runtime = {
++            "reasoning_config": copy.deepcopy(
++                getattr(agent, "reasoning_config", None)
++            ),
++            "service_tier": getattr(agent, "service_tier", None),
++            "service_tier_request": request_overrides.get(
++                "service_tier", _RUNTIME_UNSET
++            ),
++            "speed_request": request_overrides.get("speed", _RUNTIME_UNSET),
++        }
++
+     if agent:
+         try:
+             agent.switch_model(
+@@ -5564,58 +5816,78 @@ def _apply_model_switch(
+                 api_mode=result.api_mode,
+             )
+         except Exception as exc:
+-            # The in-place swap rolled the agent back to the old working
+-            # model/client and re-raised.  Abort the commit: do NOT restart the
+-            # slash worker, persist runtime, append the switch marker, set a
+-            # session model_override, or persist to config — all of which would
+-            # otherwise leave the session pinned to a broken model and kill the
+-            # conversation on the next turn (#50163).  A failed switch is a
+-            # no-op; surface a clean error to the client.
++            # switch_model rolls the live agent back before re-raising. Restore
++            # desired authority too, as a newer revision, so a failed selected
++            # provider cannot leave the session pinned to a broken pair.
++            if committed_revision is not None:
++                rollback_revision, rollback_agent = _commit_runtime_desire(
++                    session,
++                    model_override=(
++                        previous_model_override
++                        if isinstance(previous_model_override, dict)
++                        else {}
++                    ),
++                    _capture_agent=True,
++                )
++                if rollback_agent is agent:
++                    _publish_live_runtime_revision(
++                        session, agent, rollback_revision
++                    )
+             logger.warning("In-place model switch failed for TUI agent: %s", exc)
+             raise ValueError(
+                 f"Model switch to {result.new_model} failed ({exc}); "
+                 f"staying on {getattr(agent, 'model', current_model)}."
+             ) from exc
++        # Some provider/client rebuilds reset orthogonal request state. Keep
++        # model identity, reasoning and service tier as one serialized runtime
++        # transaction so a paused model switch cannot overwrite a concurrent
++        # reasoning/fast setter after that setter has returned success.
++        agent.reasoning_config = copy.deepcopy(
++            orthogonal_runtime["reasoning_config"]
++        )
++        agent.service_tier = orthogonal_runtime["service_tier"]
++        current_requests = dict(getattr(agent, "request_overrides", {}) or {})
++        for name, preserved in (
++            ("service_tier", orthogonal_runtime["service_tier_request"]),
++            ("speed", orthogonal_runtime["speed_request"]),
++        ):
++            current_requests.pop(name, None)
++            if preserved is not _RUNTIME_UNSET:
++                current_requests[name] = preserved
++        agent.request_overrides = current_requests
++        if committed_revision is not None and not _publish_live_runtime_revision(
++            session, agent, committed_revision
++        ):
++            raise RuntimeError("model runtime revision was superseded before publication")
++    if persist_global:
++        _persist_model_switch(result)
++    if agent:
+         _restart_slash_worker(sid, session)
+         _persist_live_session_runtime(session)
+         _persist_live_session_system_prompt(session)
+         _append_model_switch_marker(
+             session, model=result.new_model, provider=result.target_provider
+         )
+-        _emit("session.info", sid, _session_info(agent, session))
+         if one_turn:
+             session["one_turn_model_restore"] = restore_snapshot
+         else:
+             session.pop("one_turn_model_restore", None)
+-
+-    # Record the switch as a PER-SESSION override so a later rebuild of THIS
+-    # session (e.g. /new via _reset_session_agent, or resume) re-derives the
+-    # user's chosen model/provider instead of falling back to global config.
+-    #
+-    # We deliberately do NOT write process-global env vars (HERMES_MODEL /
+-    # HERMES_INFERENCE_MODEL / HERMES_TUI_PROVIDER / HERMES_INFERENCE_PROVIDER)
+-    # here. The desktop backend hosts every same-profile session in ONE process,
+-    # so mutating os.environ on a /model switch leaked the new model/provider
+-    # into every OTHER live session's next agent rebuild — switching the model
+-    # in one session silently changed it in the others (the cross-session
+-    # contamination bug). agent.switch_model() above already mutated the right
+-    # agent in place; the override dict makes that choice survive a rebuild
+-    # without touching shared process state.
+-    if pin_session_override and isinstance(session, dict) and not one_turn:
+-        session["model_override"] = {
+-            "model": result.new_model,
+-            "provider": result.target_provider,
+-            "base_url": result.base_url,
+-            "api_key": result.api_key,
+-            "api_mode": result.api_mode,
+-        }
+-    if persist_global:
+-        _persist_model_switch(result)
++        # Emit only after the desired-runtime revision commits.  Consumers can
++        # correlate this publication with the config.set receipt and never
++        # accept a pre-commit/stale model snapshot.
++        _emit("session.info", sid, _session_info(agent, session))
+     return {
+         "value": result.new_model,
+         "warning": result.warning_message or "",
+         "confirm_required": False,
+         "scope": "once" if one_turn else ("global" if persist_global else "session"),
++        "runtime_revision": (
++            committed_revision
++            if committed_revision is not None
++            else _runtime_revision_locked(session)
++            if isinstance(session, dict)
++            else 0
++        ),
+     }
+ 
+ 
+@@ -5645,19 +5917,20 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
+         return
+     raw = f"{model} --provider {provider}" if provider else model
+     try:
+-        _apply_model_switch(
+-            sid,
+-            session,
+-            raw,
+-            confirm_expensive_model=True,
+-            pin_session_override=False,
+-            # This sync ADOPTS a config.yaml change into the live session; it
+-            # must never write config back. Without this, the flag/config
+-            # default (persist_switch_by_default=True) re-persisted whatever
+-            # target the sync computed — the path that leaked `hermes --tui -m`
+-            # into config.yaml as the permanent global model.
+-            persist_override=False,
+-        )
++        with _runtime_setter_lock(session):
++            _apply_model_switch(
++                sid,
++                session,
++                raw,
++                confirm_expensive_model=True,
++                pin_session_override=False,
++                # This sync ADOPTS a config.yaml change into the live session; it
++                # must never write config back. Without this, the flag/config
++                # default (persist_switch_by_default=True) re-persisted whatever
++                # target the sync computed — the path that leaked `hermes --tui -m`
++                # into config.yaml as the permanent global model.
++                persist_override=False,
++            )
+     except Exception as e:
+         _emit(
+             "error",
+@@ -5681,12 +5954,13 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
+     if not pending or session.get("agent") is None:
+         return
+     try:
+-        result = _apply_model_switch(
+-            sid,
+-            session,
+-            pending["raw"],
+-            confirm_expensive_model=bool(pending.get("confirm_expensive_model")),
+-        )
++        with _runtime_setter_lock(session):
++            result = _apply_model_switch(
++                sid,
++                session,
++                pending["raw"],
++                confirm_expensive_model=bool(pending.get("confirm_expensive_model")),
++            )
+         # A queued pick is a deliberate user action; honour the expensive-model
+         # confirm by NOT applying it silently — surface the warning and drop the
+         # switch rather than spend on a pricey model the user never confirmed.
+@@ -6256,6 +6530,14 @@ def _session_info(agent, session: dict | None = None) -> dict:
+         "running": bool((session or {}).get("running")),
+         "title": _session_live_title(session or {}, session_key) if session_key else "",
+         "stored_session_id": session_key or "",
++        "runtime_revision": _runtime_revision_locked(session or {}),
++        "runtime_ready": bool(
++            session is not None
++            and session.get("agent") is agent
++            and not session.get("agent_error")
++            and int(session.get("agent_build_runtime_revision", -1) or 0)
++            == _runtime_revision_locked(session)
++        ),
+         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+         "version": "",
+         "release_date": "",
+@@ -12341,16 +12623,17 @@ def _run_prompt_submit(
+                             else _prev_model
+                         )
+                         try:
+-                            _apply_model_switch(
+-                                sid,
+-                                session,
+-                                _raw,
+-                                confirm_expensive_model=False,
+-                                pin_session_override=bool(_prev_override),
+-                                # Session-internal restore after the /moa
+-                                # one-shot — never persist to config.yaml.
+-                                persist_override=False,
+-                            )
++                            with _runtime_setter_lock(session):
++                                _apply_model_switch(
++                                    sid,
++                                    session,
++                                    _raw,
++                                    confirm_expensive_model=False,
++                                    pin_session_override=bool(_prev_override),
++                                    # Session-internal restore after the /moa
++                                    # one-shot — never persist to config.yaml.
++                                    persist_override=False,
++                                )
+                         except Exception as _moa_restore_exc:
+                             logger.warning(
+                                 "MoA one-shot model restore failed: %s",
+@@ -13204,6 +13487,112 @@ def _respond(rid, params, key, *, allow_expired=False):
+ # ── Methods: config ──────────────────────────────────────────────────
+ 
+ 
++def _set_fast_runtime(rid: str, key: str, value: Any, params: dict, session) -> dict:
++    """Apply service tier as one serialized desired+live runtime transaction."""
++    transaction = (
++        _runtime_setter_lock(session)
++        if session is not None
++        else contextlib.nullcontext()
++    )
++    with transaction:
++        raw = str(value or "").strip().lower()
++        agent = session.get("agent") if session else None
++        if agent is not None:
++            current_fast = getattr(agent, "service_tier", None) == "priority"
++        elif (
++            session is not None
++            and session.get("create_service_tier_override") is not None
++        ):
++            current_fast = session["create_service_tier_override"] == "priority"
++        else:
++            current_fast = _load_service_tier() == "priority"
++
++        if raw == "status":
++            return _ok(
++                rid,
++                {"key": key, "value": "fast" if current_fast else "normal"},
++            )
++        if raw in {"", "toggle"}:
++            nv = "normal" if current_fast else "fast"
++        elif raw in {"fast", "on"}:
++            nv = "fast"
++        elif raw in {"normal", "off"}:
++            nv = "normal"
++        else:
++            return _err(rid, 4002, f"unknown fast mode: {value}")
++
++        overrides = None
++        if nv == "fast":
++            from hermes_cli.models import resolve_fast_mode_overrides
++
++            if agent is not None:
++                target_model = getattr(agent, "model", None)
++            else:
++                session_override = (session or {}).get("model_override") or {}
++                target_model = (
++                    session_override.get("model")
++                    if isinstance(session_override, dict)
++                    else None
++                ) or _resolve_model()
++            if not target_model:
++                return _err(
++                    rid,
++                    4002,
++                    "fast mode is not available without a selected model",
++                )
++            overrides = resolve_fast_mode_overrides(target_model)
++            if overrides is None:
++                return _err(
++                    rid,
++                    4002,
++                    "fast mode is not available for this model",
++                )
++
++        runtime_revision = 0
++        runtime_ready = session is None
++        if session is not None:
++            runtime_revision = _commit_runtime_desire(
++                session,
++                service_tier_override=("priority" if nv == "fast" else ""),
++            )
++            # A deferred builder may have published while fast-mode support was
++            # being resolved. Re-read after the commit and either mutate that
++            # exact live agent or let the stale candidate rebuild from the new
++            # desired snapshot.
++            agent = session.get("agent")
++        else:
++            _write_config_key("agent.service_tier", nv)
++
++        if agent is not None:
++            agent.service_tier = "priority" if nv == "fast" else None
++            current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
++            current_overrides.pop("service_tier", None)
++            current_overrides.pop("speed", None)
++            if nv == "fast":
++                current_overrides.update(overrides)
++            agent.request_overrides = current_overrides
++            if not _publish_live_runtime_revision(
++                session, agent, runtime_revision
++            ):
++                return _err(rid, 5032, "service-tier runtime was superseded")
++            runtime_ready = True
++            _persist_live_session_runtime(session)
++            _emit(
++                "session.info",
++                params.get("session_id", ""),
++                _session_info(agent, session),
++            )
++        return _ok(
++            rid,
++            {
++                "key": key,
++                "value": nv,
++                "runtime_revision": runtime_revision,
++                "runtime_ready": runtime_ready,
++            },
++        )
++
++
+ # NOTE: config.set intentionally stays in server.py for now — the in-flight
+ # opt/model-resolution-core PR touches its body; move it to methods_config.py
+ # in a follow-up once that PR lands.
+@@ -13276,24 +13665,42 @@ def _(rid, params: dict) -> dict:
+                         },
+                     )
+                 parsed_flags = parse_model_switch_args(value)
+-                explicit_provider = parsed_flags.explicit_provider
+-                if session.get("agent") is None and not explicit_provider.strip():
+-                    session_id = params.get("session_id", "")
+-                    _start_agent_build(session_id, session)
+-                    init_err = _wait_agent(session, rid)
++                # Slow provider/catalog resolution is serialized with other
++                # runtime setters but stays outside the short authority lock.
++                # If a deferred build is already in flight, this commits a new
++                # desired revision immediately; the old candidate can neither
++                # publish nor poison the new revision, and rebuilds in place.
++                with _runtime_setter_lock(session):
++                    with _session_profile_runtime_scope(session):
++                        result = _apply_model_switch(
++                            params.get("session_id", ""),
++                            session,
++                            value,
++                            confirm_expensive_model=bool(
++                                params.get("confirm_expensive_model", False)
++                            ),
++                            parsed_flags=parsed_flags,
++                        )
++                if (
++                    not result.get("confirm_required", False)
++                    and session.get("agent") is None
++                ):
++                    _start_agent_build(params.get("session_id", ""), session)
++                    init_err = _wait_agent(session, rid, timeout=120.0)
+                     if init_err:
+                         return init_err
+-                    if session.get("agent") is None:
+-                        return _err(rid, 5032, "agent initialization failed")
+-                result = _apply_model_switch(
+-                    params.get("session_id", ""),
+-                    session,
+-                    value,
+-                    confirm_expensive_model=bool(
+-                        params.get("confirm_expensive_model", False)
+-                    ),
+-                    parsed_flags=parsed_flags,
+-                )
++                    if (
++                        session.get("agent") is None
++                        or int(
++                            session.get("agent_build_runtime_revision", -1) or 0
++                        )
++                        != int(result.get("runtime_revision", -2) or 0)
++                    ):
++                        return _err(
++                            rid,
++                            5032,
++                            "selected runtime did not become ready",
++                        )
+             else:
+                 result = _apply_model_switch(
+                     "",
+@@ -13312,98 +13719,23 @@ def _(rid, params: dict) -> dict:
+                     "confirm_required": result.get("confirm_required", False),
+                     "confirm_message": result.get("confirm_message", ""),
+                     "scope": result.get("scope", "session"),
++                    "runtime_revision": int(
++                        result.get("runtime_revision", 0) or 0
++                    ),
++                    "runtime_ready": bool(
++                        session is None
++                        or _runtime_ready_for_revision(
++                            session,
++                            int(result.get("runtime_revision", 0) or 0),
++                        )
++                    ),
+                 },
+             )
+         except Exception as e:
+             return _err(rid, 5001, str(e))
+ 
+     if key == "fast":
+-        raw = str(value or "").strip().lower()
+-        agent = session.get("agent") if session else None
+-        if agent is not None:
+-            current_fast = getattr(agent, "service_tier", None) == "priority"
+-        elif session is not None and session.get("create_service_tier_override") is not None:
+-            # Pre-build session with a pinned tier (desktop draft pick or an
+-            # earlier session-scoped toggle) — report/toggle from the pin, not
+-            # the global default.
+-            current_fast = session["create_service_tier_override"] == "priority"
+-        else:
+-            current_fast = _load_service_tier() == "priority"
+-
+-        if raw in {"status"}:
+-            return _ok(
+-                rid,
+-                {"key": key, "value": "fast" if current_fast else "normal"},
+-            )
+-
+-        if raw in {"", "toggle"}:
+-            nv = "normal" if current_fast else "fast"
+-        elif raw in {"fast", "on"}:
+-            nv = "fast"
+-        elif raw in {"normal", "off"}:
+-            nv = "normal"
+-        else:
+-            return _err(rid, 4002, f"unknown fast mode: {value}")
+-
+-        overrides = None
+-        if nv == "fast":
+-            from hermes_cli.models import resolve_fast_mode_overrides
+-
+-            if agent is not None:
+-                target_model = getattr(agent, "model", None)
+-            else:
+-                # A pre-build session may already have a picked model riding in
+-                # model_override (desktop draft) — validate fast support against
+-                # THAT model, not the global default it will never use.
+-                session_override = (session or {}).get("model_override") or {}
+-                target_model = (
+-                    session_override.get("model")
+-                    if isinstance(session_override, dict)
+-                    else None
+-                ) or _resolve_model()
+-            if not target_model:
+-                return _err(
+-                    rid,
+-                    4002,
+-                    "fast mode is not available without a selected model",
+-                )
+-            overrides = resolve_fast_mode_overrides(target_model)
+-            if overrides is None:
+-                return _err(
+-                    rid,
+-                    4002,
+-                    "fast mode is not available for this model",
+-                )
+-
+-        if session is not None:
+-            # Session-scoped, like `reasoning` below (global persistence is
+-            # `--global` / Settings → Model territory). Writing config.yaml
+-            # here let every desktop model-menu selection (per-model fast
+-            # preset) rewrite the user's global agent.service_tier — flipping
+-            # fast mode for every OTHER session, profile, CLI, and gateway
+-            # build ("switch one session, switches everywhere"). Pin the
+-            # create override so lazily-built sessions and rebuilds (/new,
+-            # deferred resume) keep the choice; "" pins normal explicitly.
+-            session["create_service_tier_override"] = (
+-                "priority" if nv == "fast" else ""
+-            )
+-        else:
+-            _write_config_key("agent.service_tier", nv)
+-        if agent is not None:
+-            agent.service_tier = "priority" if nv == "fast" else None
+-            current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+-            current_overrides.pop("service_tier", None)
+-            current_overrides.pop("speed", None)
+-            if nv == "fast":
+-                current_overrides.update(overrides)
+-            agent.request_overrides = current_overrides
+-            _persist_live_session_runtime(session)
+-            _emit(
+-                "session.info",
+-                params.get("session_id", ""),
+-                _session_info(agent, session),
+-            )
+-        return _ok(rid, {"key": key, "value": nv})
++        return _set_fast_runtime(rid, key, value, params, session)
+ 
+     if key == "busy":
+         raw = str(value or "").strip().lower()
+@@ -13682,26 +14014,52 @@ def _(rid, params: dict) -> dict:
+             parsed = parse_reasoning_effort(arg)
+             if parsed is None:
+                 return _err(rid, 4002, f"unknown reasoning value: {value}")
+-            if global_scope or session is None:
++            runtime_revision = 0
++            runtime_ready = session is None
++            if session is None:
+                 _write_config_key("agent.reasoning_effort", arg)
+-                if session is not None:
+-                    session.pop("create_reasoning_override", None)
+             else:
+-                # Session-scoped, like the messaging gateway's `/reasoning
+-                # <level>` (global persistence is `--global` / Settings →
+-                # Model territory). Writing config.yaml here let every
+-                # desktop model-menu selection rewrite the user's global
+-                # agent.reasoning_effort to the preset default.
+-                session["create_reasoning_override"] = parsed
+-            if session and session.get("agent") is not None:
+-                session["agent"].reasoning_config = parsed
+-                _persist_live_session_runtime(session)
+-                _emit(
+-                    "session.info",
+-                    params.get("session_id", ""),
+-                    _session_info(session["agent"], session),
+-                )
+-            return _ok(rid, {"key": key, "value": arg})
++                # Model, reasoning and service-tier setters share this
++                # transaction. Provider resolution stays outside the short
++                # authority lock, while no live-agent mutation can overtake a
++                # paused model/client rebuild and later be overwritten by it.
++                with _runtime_setter_lock(session):
++                    if global_scope:
++                        _write_config_key("agent.reasoning_effort", arg)
++                        runtime_revision = _commit_runtime_desire(
++                            session, reasoning_override=None
++                        )
++                    else:
++                        runtime_revision = _commit_runtime_desire(
++                            session, reasoning_override=parsed
++                        )
++                    agent = session.get("agent")
++                    if agent is not None:
++                        agent.reasoning_config = parsed
++                        if not _publish_live_runtime_revision(
++                            session, agent, runtime_revision
++                        ):
++                            return _err(
++                                rid,
++                                5032,
++                                "reasoning runtime was superseded",
++                            )
++                        runtime_ready = True
++                        _persist_live_session_runtime(session)
++                        _emit(
++                            "session.info",
++                            params.get("session_id", ""),
++                            _session_info(agent, session),
++                        )
++            return _ok(
++                rid,
++                {
++                    "key": key,
++                    "value": arg,
++                    "runtime_revision": runtime_revision,
++                    "runtime_ready": runtime_ready,
++                },
++            )
+         except Exception as e:
+             return _err(rid, 5001, str(e))
+ 
+@@ -15346,7 +15704,8 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
+ 
+     try:
+         if name == "model" and arg and agent:
+-            result = _apply_model_switch(sid, session, arg)
++            with _runtime_setter_lock(session):
++                result = _apply_model_switch(sid, session, arg)
+             return result.get("warning", "")
+         elif name == "personality" and arg and agent:
+             pname, new_prompt = _validate_personality(arg, _load_cfg())
+

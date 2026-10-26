@@ -1,0 +1,3493 @@
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index edb97cb..847c348 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -2395,6 +2395,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
+     # copy locks the contract so future transport/keepalive work can't reintroduce
+     # the same class of bug.
+     client_kwargs = dict(client_kwargs)
++    from hermes_cli.provider_setup import is_setup_identity, prepare_client_kwargs, normalize_setup_identity
++    setup_identity = normalize_setup_identity(str(getattr(agent, "requested_provider", "") or getattr(agent, "provider", "")))
++    if is_setup_identity(setup_identity):
++        client_kwargs = prepare_client_kwargs(setup_identity, client_kwargs)
+     ssl_ca_cert = client_kwargs.pop("ssl_ca_cert", None)
+     ssl_verify_cfg = client_kwargs.pop("ssl_verify", None)
+     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
+@@ -2493,7 +2497,20 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
+         _ra().logger.debug("Copilot default-header guard skipped", exc_info=True)
+     # Uses the module-level `OpenAI` name, resolved lazily on first
+     # access via __getattr__ below. Tests patch via `run_agent.OpenAI`.
+-    client = _ra().OpenAI(**client_kwargs)
++    try:
++        client = _ra().OpenAI(**client_kwargs)
++    except BaseException:
++        owned_http = client_kwargs.get("http_client")
++        if is_setup_identity(setup_identity) and getattr(owned_http, "_lilith_provider_setup_owned", False):
++            owned_http.close()
++        raise
++    if is_setup_identity(setup_identity):
++        from agent.managed_custom_dispatch import register_managed_compatible_client
++        try:
++            register_managed_compatible_client(client, setup_identity, agent.model)
++        except BaseException:
++            client.close()
++            raise
+     _ra().logger.info(
+         "OpenAI client created (%s, shared=%s) %s",
+         reason,
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 214f4d0..f07faa1 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -259,6 +259,29 @@ def _openai_http_client_kwargs(
+     return {"http_client": client}
+ 
+ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
++    setup_identity = kwargs.pop("_lilith_provider_id", "")
++    setup_model = kwargs.pop("_lilith_model", "")
++    if setup_identity:
++        from hermes_cli.provider_setup import prepare_client_kwargs
++        prepared = prepare_client_kwargs(setup_identity,
++            {**kwargs, "api_key": api_key, "base_url": base_url})
++        if _aux_probe_active():
++            prepared["http_client"].close()
++            return _AuxProbeClientStub(api_key=api_key, base_url=base_url)
++        prepared.setdefault("max_retries", 0)
++        try:
++            client = OpenAI(**prepared)
++        except BaseException:
++            if getattr(prepared.get("http_client"), "_lilith_provider_setup_owned", False):
++                prepared["http_client"].close()
++            raise
++        from agent.managed_custom_dispatch import register_managed_compatible_client
++        try:
++            register_managed_compatible_client(client, setup_identity, setup_model)
++        except BaseException:
++            client.close()
++            raise
++        return client
+     if _aux_probe_active():
+         # Availability probe: credentials/base_url resolved — that is the
+         # answer. Skip the openai import + httpx/SSL construction entirely.
+@@ -4128,6 +4151,11 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
+         if field == "api_key" and callable(value) and not isinstance(value, str):
+             normalized[field] = value
+             continue
++        if field == "api_key" and value == "":
++            # Explicit empty is distinct from absent. Only an exact owned
++            # no-auth route may pass the concrete-route gate below.
++            normalized[field] = ""
++            continue
+         if isinstance(value, str) and value.strip():
+             normalized[field] = value.strip()
+     for identity_field in ("provider", "requested_provider"):
+@@ -4318,6 +4346,12 @@ def _auxiliary_runtime_is_concrete(runtime: Any) -> bool:
+     has_api_key = (
+         callable(api_key) and not isinstance(api_key, str)
+     ) or bool(isinstance(api_key, str) and api_key.strip())
++    if not has_api_key and api_key == "" and api_mode == "chat_completions":
++        from hermes_cli.provider_setup import allows_empty_key, SetupError
++        try:
++            has_api_key = allows_empty_key(provider, base_url, api_key)
++        except SetupError:
++            return False
+     return bool(
+         provider not in {"", "auto", "moa"}
+         and model
+@@ -4361,6 +4395,13 @@ def _freeze_auxiliary_task_config(
+         task_config.get("extra_body"),
+         required=True,
+     )
++    if "api_key" in task_config and task_config["api_key"] is None:
++        from hermes_cli.provider_setup import normalize_setup_identity, is_setup_identity
++        declared_setup = normalize_setup_identity(task_config.get("provider"))
++        if declared_setup and is_setup_identity(declared_setup):
++            # Omission means resolve the saved entry. An explicit null is not
++            # the concrete empty string required by a saved no-auth route.
++            raise RuntimeError("strict owned auxiliary task credential was null")
+     task_token = _AUXILIARY_TASK_CONFIG_CONTEXT.set((task, task_config))
+     try:
+         provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+@@ -4398,9 +4439,21 @@ def _freeze_auxiliary_task_config(
+     main_provider = str(main_runtime.get("provider") or "").strip().lower()
+     main_base_url = str(main_runtime.get("base_url") or "").strip().rstrip("/")
+     task_base_url = str(base_url or "").strip().rstrip("/")
++    owned_noauth = False
++    if task_base_url and api_key in (None, ""):
++        from hermes_cli.provider_setup import allows_empty_key, SetupError
++        try:
++            owned_noauth = allows_empty_key(provider_name, task_base_url, "")
++        except SetupError:
++            owned_noauth = False
++        if owned_noauth:
++            # Missing task credentials may resolve only to this explicitly
++            # saved local-none route, never to the main/ambient credential.
++            api_key = ""
+     if (
+         task_base_url
+         and not api_key
++        and not owned_noauth
+         and not (
+             provider_name == main_provider
+             and task_base_url == main_base_url
+@@ -4427,7 +4480,7 @@ def _freeze_auxiliary_task_config(
+         ("api_key", api_key),
+         ("api_mode", api_mode),
+     ):
+-        if field == "api_key" and callable(value) and not isinstance(value, str):
++        if field == "api_key" and (value == "" or callable(value) and not isinstance(value, str)):
+             candidate[field] = value
+         elif isinstance(value, str) and value.strip():
+             candidate[field] = value.strip()
+@@ -4469,12 +4522,9 @@ def _freeze_auxiliary_task_config(
+         for field in ("base_url", "api_key", "api_mode"):
+             explicit = candidate.get(field)
+             resolved = resolved_runtime.get(field)
+-            if field == "api_key" and callable(explicit) and not isinstance(
+-                explicit,
+-                str,
+-            ):
++            if field == "api_key" and (explicit == "" or callable(explicit) and not isinstance(explicit, str)):
+                 continue
+-            if not explicit and resolved:
++            if not explicit and (resolved or field == "api_key" and resolved == ""):
+                 candidate[field] = resolved
+ 
+     if not _auxiliary_runtime_is_concrete(candidate):
+@@ -4757,7 +4807,7 @@ def _materialize_host_required_auxiliary_route(
+         runtime_provider,
+         model or runtime_model or None,
+         runtime_base_url or None,
+-        runtime_api_key or None,
++        runtime_api_key if runtime_api_key == "" else runtime_api_key or None,
+         runtime_api_mode or None,
+     )
+ 
+@@ -6878,6 +6928,26 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
+ 
+     if isinstance(sync_client, _AuxProbeClientStub):
+         return sync_client, model
++    from agent.managed_custom_dispatch import get_verified_managed_route, register_managed_compatible_client
++    managed_route = get_verified_managed_route(sync_client, model)
++    if managed_route is not None:
++        # Transfer route identity only from the native factory's opaque proof,
++        # never from a matching URL or public client attribute. Revalidate the
++        # saved route and independently register the new actual async SDK.
++        from hermes_cli.provider_setup import prepare_client_kwargs
++        provider_id, verified_model = managed_route
++        kwargs = prepare_client_kwargs(provider_id, {
++            "api_key": sync_client.api_key, "base_url": str(sync_client.base_url),
++            "max_retries": 0, "timeout": sync_client.timeout,
++        }, async_mode=True)
++        client = None
++        try:
++            client = AsyncOpenAI(**kwargs)
++            register_managed_compatible_client(client, provider_id, verified_model)
++        except BaseException:
++            _close_cached_client(client if client is not None else kwargs["http_client"])
++            raise
++        return client, model
+     if isinstance(sync_client, CodexAuxiliaryClient):
+         return AsyncCodexAuxiliaryClient(sync_client), model
+     if isinstance(sync_client, AnthropicAuxiliaryClient):
+@@ -7365,6 +7435,25 @@ def resolve_provider_client(
+         if custom_entry is None:
+             custom_entry = _get_named_custom_provider(provider)
+         if custom_entry:
++            if custom_entry.get("lilith_setup") is True:
++                from hermes_cli.provider_setup import exact_route, model_id, SetupError
++                route = exact_route(custom_entry["provider_id"],
++                    expected_base_url=explicit_base_url if explicit_base_url is not None else custom_entry["base_url"])
++                if explicit_api_key is not None and explicit_api_key != route["api_key"]:
++                    raise SetupError("key_required")
++                if api_mode not in {None, "", "chat_completions"}:
++                    raise SetupError("invalid_request")
++                selected_model = model_id(model or route["model"])
++                client = _create_openai_client(api_key=route["api_key"], base_url=route["base_url"],
++                    _lilith_provider_id=route["provider_id"], _lilith_model=selected_model)
++                if async_mode:
++                    try:
++                        return _to_async_client(client, selected_model, is_vision=is_vision)
++                    finally:
++                        # This resolver owns the temporary sync factory client;
++                        # direct conversion callers retain their own clients.
++                        client.close()
++                return client, selected_model
+             custom_base = (custom_entry.get("base_url") or "").strip()
+             custom_key = (custom_entry.get("api_key") or "").strip()
+             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
+@@ -8624,6 +8713,13 @@ def _build_strict_exact_auxiliary_client(
+     mode = str(api_mode or "").strip().lower()
+     if not provider_name or provider_name in {"auto", "moa"}:
+         raise RuntimeError("strict auxiliary provider is not concrete")
++    from hermes_cli.provider_setup import is_setup_identity, exact_route, SetupError
++    if is_setup_identity(provider):
++        route = exact_route(provider, expected_base_url=raw_base_url)
++        if not model_name or mode != "chat_completions" or api_key != route["api_key"]:
++            raise SetupError("invalid_request")
++        return _create_openai_client(api_key=api_key, base_url=raw_base_url,
++            _lilith_provider_id=provider, _lilith_model=model_name)
+     if not model_name or not raw_base_url or not api_key:
+         raise RuntimeError("strict auxiliary client route is incomplete")
+ 
+@@ -9069,10 +9165,20 @@ def _resolve_task_provider_model(
+         raw_cfg_api_key = task_config.get("api_key")
+         if callable(raw_cfg_api_key) and not isinstance(raw_cfg_api_key, str):
+             cfg_api_key = raw_cfg_api_key
++        elif (raw_cfg_api_key == "" and cfg_base_url
++              and task_config.get("api_mode") == "chat_completions"
++              and _AUXILIARY_TASK_CONFIG_CONTEXT.get() is not None):
++            # Preserve no-auth only in a concrete captured task route. The
++            # native provider/model picker writes empty base_url/api_key as
++            # unset fields; those still resolve the selected entry's own key.
++            # Capture/materialization must validate this complete route.
++            frozen_task = _AUXILIARY_TASK_CONFIG_CONTEXT.get()
++            from agent.identity_policy import identity_lock_required_by_host
++            cfg_api_key = "" if frozen_task[0] == task and identity_lock_required_by_host() else None
+         else:
+             cfg_api_key = str(raw_cfg_api_key or "").strip() or None
+         # Resolve key_env → env var when api_key is not set directly
+-        if not cfg_api_key:
++        if cfg_api_key is None:
+             cfg_key_env = str(
+                 task_config.get("key_env") or task_config.get("api_key_env") or ""
+             ).strip()
+@@ -9176,7 +9282,7 @@ def _resolve_task_provider_model(
+         provider, base_url = _expand_direct_api_alias(provider, base_url)
+     if cfg_provider:
+         cfg_provider, cfg_base_url = _expand_direct_api_alias(cfg_provider, cfg_base_url)
+-    if not cfg_api_key and cfg_key_env:
++    if cfg_api_key is None and cfg_key_env:
+         key_provider = cfg_provider or provider or ""
+         cfg_api_key = _provider_scoped_key_env(key_provider, cfg_key_env) or None
+ 
+@@ -9201,7 +9307,7 @@ def _resolve_task_provider_model(
+ 
+     if task:
+         # Config.yaml is the primary source for per-task overrides.
+-        if cfg_base_url and cfg_api_key:
++        if cfg_base_url and (cfg_api_key or cfg_api_key == ""):
+             # A strict frozen task already carries a complete origin route.
+             # Preserve its concrete provider identity so transport shaping and
+             # the bound exact-client capability agree. Generic hosts retain the
+@@ -9223,7 +9329,8 @@ def _resolve_task_provider_model(
+                         resolved_api_mode,
+                     )
+             # Generic complete base+key routes remain custom endpoints.
+-            return "custom", resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
++            if cfg_api_key:
++                return "custom", resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
+         if cfg_base_url and cfg_provider and cfg_provider != "auto":
+             # base_url set without api_key but with a known provider — use
+             # the provider so it can resolve credentials from env vars
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 4a36f1a..8787993 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -60,8 +60,9 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
+         parent_api_mode = "codex_responses"
+     parent = {
+         "provider": agent.provider,
++        "requested_provider": parent_runtime.get("requested_provider") or getattr(agent, "_requested_provider", None),
+         "model": agent.model,
+-        "api_key": parent_runtime.get("api_key") or None,
++        "api_key": parent_runtime.get("api_key"),
+         "base_url": parent_runtime.get("base_url") or None,
+         "api_mode": parent_api_mode,
+         "credential_pool": getattr(agent, "_credential_pool", None),
+@@ -84,7 +85,9 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
+     task_api_key = (str(task.get("api_key", "")).strip() or None)
+     if not (task_provider and task_provider != "auto" and task_model):
+         return parent
+-    if task_provider == (agent.provider or "") and task_model == (agent.model or ""):
++    if (task_provider == (agent.provider or "") and task_model == (agent.model or "")
++            and (not task_base_url or task_base_url.rstrip("/") == str(parent.get("base_url") or "").rstrip("/"))
++            and (not task_api_key or task_api_key == parent.get("api_key"))):
+         return parent  # same model/provider as parent -> not routed
+     try:
+         from hermes_cli.runtime_provider import resolve_runtime_provider
+@@ -94,8 +97,14 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
+             explicit_api_key=task_api_key,
+             explicit_base_url=task_base_url,
+         )
++        from agent.identity_policy import identity_lock_required_by_host
++        if identity_lock_required_by_host() and (
++                not isinstance(rp, dict) or not rp.get("provider")
++                or not rp.get("api_mode")):
++            raise RuntimeError("background_review_route_unavailable")
+         return {
+             "provider": rp.get("provider") or task_provider,
++            "requested_provider": task_provider,
+             "model": rp.get("model") or task_model,
+             "api_key": rp.get("api_key"),
+             "base_url": rp.get("base_url"),
+@@ -108,6 +117,11 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
+             "routed": True,
+         }
+     except Exception as e:
++        from agent.identity_policy import identity_lock_required_by_host
++        if identity_lock_required_by_host():
++            # Explicit auxiliary selection is not permission to send its
++            # context to the main provider when the chosen route fails.
++            raise RuntimeError("background_review_route_unavailable") from None
+         logger.debug("background-review aux routing failed (%s); using main model", e)
+         return parent
+ 
+@@ -862,10 +876,12 @@ def _run_review_in_thread(
+                 max_iterations=_review_max_iterations,
+                 quiet_mode=True,
+                 platform=agent.platform,
+-                provider=_rt.get("provider") or agent.provider,
++                provider=(_rt.get("requested_provider")
++                          if str(_rt.get("requested_provider") or "").startswith("custom:")
++                          else _rt.get("provider") or agent.provider),
+                 api_mode=_rt.get("api_mode"),
+                 base_url=_rt.get("base_url") or None,
+-                api_key=_rt.get("api_key") or None,
++                api_key=_rt.get("api_key"),
+                 credential_pool=_rt.get("credential_pool"),
+                 request_overrides=_rt.get("request_overrides") or {},
+                 parent_session_id=agent.session_id,
+diff --git a/agent/identity_policy.py b/agent/identity_policy.py
+index 6578f4a..2c2003c 100644
+--- a/agent/identity_policy.py
++++ b/agent/identity_policy.py
+@@ -85,6 +85,7 @@ _NATIVE_RECEIPT_MAX_BYTES = 64 * 1024
+ _NATIVE_RECEIPT_SOURCE_TOOLS_SET = "hermes.tools.set"
+ _NATIVE_RECEIPT_SOURCE_APPROVAL_ALWAYS = "hermes.approval.respond.always"
+ _NATIVE_RECEIPT_SOURCE_MODEL_DEFAULT_SET = "hermes.model.default.set"
++_NATIVE_RECEIPT_SOURCE_PROVIDER_SETUP = "hermes.provider.setup"
+ _NATIVE_RECEIPT_SOURCE_CANONICAL_PROFILE_MIGRATION = (
+     "canonical.profile_migration"
+ )
+@@ -92,6 +93,7 @@ _NATIVE_RECEIPT_SOURCES_WITHOUT_OPERATION_NONCE = frozenset(
+     {
+         _NATIVE_RECEIPT_SOURCE_TOOLS_SET,
+         _NATIVE_RECEIPT_SOURCE_MODEL_DEFAULT_SET,
++        _NATIVE_RECEIPT_SOURCE_PROVIDER_SETUP,
+         _NATIVE_RECEIPT_SOURCE_CANONICAL_PROFILE_MIGRATION,
+     }
+ )
+@@ -1432,6 +1434,58 @@ def verify_native_model_default_commit_receipt(
+         )
+ 
+ 
++def verify_native_provider_setup_commit_receipt(
++    base: NativeConfigReceiptBase,
++    *,
++    previous_config_sha256: str,
++    config_sha256: str,
++    receipt_sha256: str,
++) -> None:
++    """Verify the exact durable provider-setup receipt before generation retire.
++
++    The process-local setup operation binds the operation id; the durable
++    receipt binds the previous/new config digests and all unchanged identity,
++    toolset and approval pins. A key-only edit carries a non-secret operation
++    stamp in config, so it cannot share the previous config digest.
++    """
++    require_native_runtime_parent_authority()
++    previous = _native_receipt_digest(previous_config_sha256, "previous config digest")
++    current = _native_receipt_digest(config_sha256, "config digest")
++    receipt_digest = _native_receipt_digest(receipt_sha256, "raw receipt digest")
++    if previous == current or not hmac.compare_digest(base.config_sha256, previous):
++        raise IdentityPolicyError("native setup receipt digest pair was invalid")
++    snapshot = capture_strict_authority_snapshot()
++    if snapshot is None or not hmac.compare_digest(snapshot.config_sha256, current):
++        raise IdentityPolicyError("native setup live config changed")
++    receipt = next(item for item in snapshot.files
++                   if item.label == "runtime/native-config-receipt.v1.json")
++    if not receipt.existed or receipt.raw is None:
++        raise IdentityPolicyError("native setup durable receipt was missing")
++    if not hmac.compare_digest(hashlib.sha256(receipt.raw).hexdigest(), receipt_digest):
++        raise IdentityPolicyError("native setup durable receipt hash mismatched")
++    value = _decode_native_config_receipt(receipt.raw)
++    expected = {
++        "schema_version": 1,
++        "source": _NATIVE_RECEIPT_SOURCE_PROVIDER_SETUP,
++        "sequence": base.sequence + 1,
++        "canonical_base_sha256": base.canonical_base_sha256,
++        "previous_config_sha256": previous,
++        "config_sha256": current,
++        "identity_fingerprint_sha256": base.identity_fingerprint_sha256,
++        "soul_sha256": base.soul_sha256,
++        "personality_sha256": base.personality_sha256,
++        "approval_mode": base.approval_mode,
++        "enabled_toolsets": list(base.enabled_toolsets),
++    }
++    if value != expected:
++        raise IdentityPolicyError("native setup receipt did not match prepared transition")
++    preflight = preflight_aia_agent_identity(request_overrides={})
++    if (not hmac.compare_digest(preflight.policy.fingerprint, base.identity_fingerprint_sha256)
++            or not hmac.compare_digest(preflight.soul_sha256, base.soul_sha256)
++            or not hmac.compare_digest(preflight.personality_sha256, base.personality_sha256)):
++        raise IdentityPolicyError("native setup receipt identity pins changed")
++
++
+ def _authority_parent_matches(snapshot: StrictAuthorityFileSnapshot) -> bool:
+     try:
+         realpath, device, inode = _strict_authority_parent_identity(
+diff --git a/agent/image_routing.py b/agent/image_routing.py
+index a3762fc..5cddd99 100644
+--- a/agent/image_routing.py
++++ b/agent/image_routing.py
+@@ -177,6 +177,19 @@ def _coerce_capability_bool(raw: Any) -> Optional[bool]:
+     return None
+ 
+ 
++def _managed_custom_capability_identity(provider: str, requested_provider: str) -> Optional[str]:
++    """A strict host's custom capability belongs to its selected identity."""
++    from agent.identity_policy import identity_lock_required_by_host
++
++    if not identity_lock_required_by_host():
++        return None
++    resolved = str(provider or "").strip().lower()
++    requested = str(requested_provider or "").strip().lower()
++    if resolved == "custom" or resolved.startswith("custom:") or requested.startswith("custom:"):
++        return requested or resolved
++    return None
++
++
+ def _supports_vision_override(
+     cfg: Optional[Dict[str, Any]],
+     provider: str,
+@@ -209,8 +222,18 @@ def _supports_vision_override(
+     # 1. Top-level shortcut
+     model_cfg_raw = cfg.get("model")
+     model_cfg: Dict[str, Any] = model_cfg_raw if isinstance(model_cfg_raw, dict) else {}
++    managed_identity = _managed_custom_capability_identity(provider, requested_provider)
++    if managed_identity == "custom":
++        return None  # A resolved billing class is not a configured route.
++    config_provider = str(model_cfg.get("provider") or "").strip()
++    exact_global_route = (
++        managed_identity is None or (
++            config_provider.lower().removeprefix("custom:") == managed_identity.removeprefix("custom:")
++            and str(model_cfg.get("default") or model_cfg.get("model") or "").strip() == model
++        )
++    )
+     top = _coerce_capability_bool(model_cfg.get("supports_vision"))
+-    if top is not None:
++    if top is not None and exact_global_route:
+         return top
+ 
+     # 2. Per-provider, per-model. Named custom providers (e.g. "my-vllm")
+@@ -219,9 +242,10 @@ def _supports_vision_override(
+     # config still holds the user-declared name under model.provider. Try
+     # both as candidate provider keys. Either identity may use the
+     # "custom:<name>" form while providers: is keyed by bare <name>.
+-    config_provider = str(model_cfg.get("provider") or "").strip()
+     provider_candidates: List[str] = []
+-    for candidate in (requested_provider, provider, config_provider):
++    candidates = ((managed_identity,) if managed_identity is not None
++                  else (requested_provider, provider, config_provider))
++    for candidate in candidates:
+         if not candidate:
+             continue
+         provider_candidates.append(candidate)
+@@ -427,6 +451,11 @@ def _lookup_supports_vision(
+     )
+     if override is not None:
+         return override
++    if _managed_custom_capability_identity(provider, requested_provider) is not None:
++        # Same model names on public catalogs or the current global endpoint
++        # do not attest a private/custom deployment. Unknown stays unknown;
++        # no automatic catalog fetch, endpoint probe or cloud substitution.
++        return None
+     if not provider or not model:
+         return None
+     caps = None
+diff --git a/agent/managed_custom_dispatch.py b/agent/managed_custom_dispatch.py
+new file mode 100644
+--- /dev/null
++++ b/agent/managed_custom_dispatch.py
+@@ -0,0 +1,125 @@
++"""Factory-attested Chat Completions bindings for owned custom setup entries.
++
++This attests the native SDK, selected route and final request seam, not a
++provider's model capacity or compliance with a requested output limit. It
++does not change information strategies, approve tools, or discover models.
++Only the native setup factories call registration; no RPC accepts a proof.
++"""
++from dataclasses import dataclass
++import hashlib
++import json
++from threading import RLock
++from weakref import ref
++
++from agent.usage_budget import BudgetError
++
++
++@dataclass(frozen=True)
++class _FactoryProof:
++    client: object
++    provider_id: str
++    model: str
++    state_digest: bytes
++    transport_fingerprint: tuple
++
++
++_PROOFS = {}
++_LOCK = RLock()
++
++
++def _state(client):
++    import httpx
++    import openai
++    from agent.usage_budget_official_routes import reviewed_http_transport_state
++
++    if type(client) not in (openai.OpenAI, openai.AsyncOpenAI):
++        raise BudgetError("managed_custom_factory_unverified")
++    http = getattr(client, "_client", None)
++    if (type(http) not in (httpx.Client, httpx.AsyncClient)
++            or getattr(http, "_trust_env", None) is not False
++            or http.follow_redirects is not False
++            or http.auth is not None or bool(http.cookies)
++            or any(http.event_hooks.values())
++            or type(client.max_retries) is not int or client.max_retries != 0
++            or reviewed_http_transport_state(client) is None
++            or type(client.api_key) is not str
++            or client._custom_headers or client.default_query
++            or client.organization or client.project):
++        raise BudgetError("managed_custom_factory_unverified")
++    # Hash the additional mutable auth state not included in the existing
++    # native transport fingerprint. No credential/header value is retained.
++    values = [str(client.base_url), client.api_key, sorted(http.headers.multi_items())]
++    return hashlib.sha256(json.dumps(values, ensure_ascii=True,
++                                    separators=(",", ":")).encode()).digest()
++
++
++def register_managed_compatible_client(client, provider_id, model):
++    """Called after actual SDK construction from the native owned setup route."""
++    from hermes_cli.provider_setup import exact_route, is_setup_identity
++    from agent.usage_budget_dispatch import WireCapability, WireRoute
++    from agent.usage_budget_native_dispatch import NativeDispatchBinding, register_native_dispatch_binding, _client_fingerprint
++    from agent.usage_budget_official_routes import estimate_final_input
++    from agent.usage_budget_usage import read_usage
++
++    if not is_setup_identity(provider_id):
++        raise BudgetError("managed_custom_factory_unverified")
++    route = exact_route(provider_id, expected_base_url=str(getattr(client, "base_url", "")))
++    if (model != route["model"] or route["api_mode"] != "chat_completions"
++            or getattr(client, "api_key", None) != route["api_key"]):
++        raise BudgetError("managed_custom_factory_unverified")
++    digest = _state(client)
++    binding = NativeDispatchBinding(
++        WireCapability("chat_max_tokens", evidence_id="managed-openai-compatible-factory-v1",
++                       output_cap_verified=False, all_output_counted=False,
++                       sdk_max_retries=0, final_wire_verified=True,
++                       route=WireRoute(provider_id, model, "managed-chat-completions")),
++        estimate_final_input, lambda value: read_usage(value, "chat_max_tokens"),
++        output_control="requested")
++    identity = id(client)
++    with _LOCK:
++        previous = _PROOFS.get(identity)
++        if previous is not None and previous.client() is client and (
++                previous.provider_id != provider_id or previous.model != model
++                or previous.state_digest != digest):
++            raise BudgetError("managed_custom_route_changed")
++    def retire(weak):
++        with _LOCK:
++            previous = _PROOFS.get(identity)
++            if previous is not None and previous.client is weak:
++                _PROOFS.pop(identity, None)
++    proof = _FactoryProof(ref(client, retire), provider_id, model, digest, _client_fingerprint(client))
++    register_native_dispatch_binding(client, binding)
++    with _LOCK:
++        _PROOFS[identity] = proof
++    return binding
++
++
++def get_verified_managed_route(client, model):
++    """Return immutable provider/model metadata only for a still-exact factory client.
++
++    Async conversion uses this proof, never a hostname or caller-supplied label.
++    The new SDK instance must be independently registered by its own factory.
++    """
++    from agent.usage_budget_native_dispatch import _client_fingerprint
++    with _LOCK:
++        proof = _PROOFS.get(id(client))
++    if proof is None or proof.client() is not client:
++        return None
++    if (model != proof.model or _state(client) != proof.state_digest
++            or _client_fingerprint(client) != proof.transport_fingerprint):
++        raise BudgetError("managed_custom_route_changed")
++    return (proof.provider_id, proof.model)
++
++
++def validate_managed_compatible_client(client, request, wire_format, model_id=None):
++    """Extra exact-route check at the existing guarded native dispatch seam."""
++    with _LOCK:
++        proof = _PROOFS.get(id(client))
++    if proof is None or proof.client() is not client:
++        return
++    if (_state(client) != proof.state_digest
++            or wire_format != "chat_max_tokens"
++            or request.get("model") != proof.model
++            or (model_id is not None and model_id != proof.model)
++            or request.get("extra_headers") or request.get("extra_query")):
++        raise BudgetError("managed_custom_route_changed")
+diff --git a/agent/speech_projection.py b/agent/speech_projection.py
+index 214b9a8..17b42fd 100644
+--- a/agent/speech_projection.py
++++ b/agent/speech_projection.py
+@@ -30,7 +30,9 @@ def capture_speech_projection(agent, *, session_id=None):
+         value = getattr(agent, name, None)
+         if isinstance(value, str) and value.strip():
+             runtime[name] = value.strip()
+-        elif name == "api_key" and callable(value):
++        elif name == "api_key" and (value == "" or callable(value)):
++            # Empty is an explicit no-auth credential, not a missing field.
++            # The frozen-runtime exact owned-route guard still validates it.
+             runtime[name] = value
+     current_session = session_id if session_id is not None else getattr(agent, "session_id", None)
+     if not isinstance(current_session, str) or not current_session:
+diff --git a/agent/usage_budget_native_dispatch.py b/agent/usage_budget_native_dispatch.py
+index 48c92c9..1911f5b 100644
+--- a/agent/usage_budget_native_dispatch.py
++++ b/agent/usage_budget_native_dispatch.py
+@@ -137,6 +137,8 @@ def require_native_dispatch_route(client, request, wire_format, *, expected_hand
+     from agent.speech_recovery import active as speech_recovery_active
+     if ledger is None and not speech_recovery_active():
+         return None
++    from agent.managed_custom_dispatch import validate_managed_compatible_client
++    validate_managed_compatible_client(client, request, wire_format, model_id)
+     model = request.get("model") if model_id is None else model_id
+     with _BINDINGS_LOCK:
+         try:
+diff --git a/gateway/run.py b/gateway/run.py
+index 6b73fe1..bbe7533 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -7671,6 +7671,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 "max_tokens": override.get("max_tokens"),
+                 "credential_pool": override.get("credential_pool"),
+             }
++            # An owned session route is already explicit, including an empty
++            # no-auth key. Do not resolve an unrelated global provider first
++            # or carry an old credential pool into this selected route.
++            from agent.identity_policy import identity_lock_required_by_host
++            if identity_lock_required_by_host():
++                from hermes_cli.provider_setup import is_setup_identity, exact_route, SetupError
++                selected_provider = override_runtime.get("provider")
++                if is_setup_identity(selected_provider):
++                    selected = exact_route(selected_provider,
++                        expected_base_url=override_runtime.get("base_url"))
++                    if (override_runtime.get("api_key") != selected["api_key"]
++                            or override_runtime.get("api_mode") != "chat_completions"
++                            or not override_runtime.get("base_url")
++                            or override_model != selected["model"]):
++                        raise SetupError("stale_config")
++                    override_runtime.update(provider=selected["provider_id"],
++                        requested_provider=selected["provider_id"],
++                        base_url=selected["base_url"], api_key=selected["api_key"],
++                        auth_mode=selected["auth_mode"], credential_pool=None)
++                    return override_model, override_runtime
+             if override_runtime.get("api_key"):
+                 if override_runtime.get("credential_pool") is None:
+                     override_runtime["credential_pool"] = _credential_pool_for_provider(
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index d00de5c..1de6440 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -1274,6 +1274,7 @@ def _normalize_custom_provider_entry(
+         "request_timeout_seconds", "stale_timeout_seconds",
+         "discover_models", "extra_body", "extra_headers",
+         "ssl_ca_cert", "ssl_verify",
++        "auth_mode", "lilith_setup",
+     }
+     for camel, snake in _CAMEL_ALIASES.items():
+         if camel in entry and snake not in entry:
+@@ -1333,6 +1334,11 @@ def _normalize_custom_provider_entry(
+         "name": name,
+         "base_url": base_url,
+     }
++    if "lilith_setup" in entry:
++        from hermes_cli.provider_setup import owned_entry
++        verified = owned_entry({"providers": {provider_key: entry}}, "custom:" + provider_key)
++        normalized["auth_mode"] = verified["auth_mode"]
++        normalized["lilith_setup"] = dict(verified["lilith_setup"])
+ 
+     provider_key = provider_key.strip()
+     if provider_key:
+diff --git a/hermes_cli/model_switch.py b/hermes_cli/model_switch.py
+index b49e693..dc60613 100644
+--- a/hermes_cli/model_switch.py
++++ b/hermes_cli/model_switch.py
+@@ -2888,9 +2888,29 @@ def list_authenticated_providers(
+                 except Exception:
+                     pass
+ 
++            if "lilith_setup" in ep_cfg:
++                from hermes_cli.provider_setup import owned_entry, exact_route, SetupError
++                setup_id = "custom:" + str(ep_name)
++                verified_setup = owned_entry({"providers": {ep_name: ep_cfg}}, setup_id)
++                try:
++                    exact_route(setup_id)
++                except SetupError as exc:
++                    if exc.code == "key_required":
++                        # This function lists authenticated/usable entries.
++                        # Do not turn an externally removed key into a true
++                        # authentication claim or borrow an ambient key.
++                        seen_slugs.add(setup_id)
++                        seen_slugs.add(ep_name.lower())
++                        seen_slugs.update(_ep_aliases)
++                        continue
++                    raise
++                wire_slug = setup_id
++                wire_label = verified_setup["lilith_setup"]["label"]
++            else:
++                wire_slug, wire_label = ep_name, display_name
+             results.append({
+-                "slug": ep_name,
+-                "name": display_name,
++                "slug": wire_slug,
++                "name": wire_label,
+                 "is_current": _ep_is_current,
+                 "is_user_defined": True,
+                 "models": models_list,
+diff --git a/hermes_cli/provider_setup.py b/hermes_cli/provider_setup.py
+new file mode 100644
+--- /dev/null
++++ b/hermes_cli/provider_setup.py
+@@ -0,0 +1,584 @@
++"""Human-owned, exact-route custom endpoint setup. No agent tool or inference.
++
++Only named entries bearing this module's versioned marker are mutable here.
++Secrets stay in Hermes' canonical .env; the metadata has no credential value.
++The gateway supplies strict-profile/CAS/idle/pending-receipt authority around
++mutation. The existing credential lifecycle owns multi-store rollback.
++"""
++from __future__ import annotations
++
++import copy
++import hashlib
++import http.client
++import ipaddress
++import json
++import re
++import socket
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++from types import SimpleNamespace
++
++AUTHORITY = "lilith-provider-setup-v1"
++SOURCE = "hermes.provider.setup"
++SCHEMA = 1
++ENTRY_LIMIT = 128
++MODEL_LIMIT = 256
++MODEL_BODY_LIMIT = 512 * 1024
++MODEL_TIMEOUT = 8.0
++ERROR_CODES = frozenset({
++    "invalid_request", "unauthorized", "stale_config", "busy", "not_found",
++    "limit_reached", "entry_in_use", "key_required", "endpoint_changed_requires_key",
++    "storage_failed", "rollback_unverified", "receipt_required", "receipt_invalid",
++    "catalog_unavailable", "cancelled",
++})
++MODEL_STATUSES = frozenset({
++    "ready", "empty", "auth_required", "request_rejected", "service_failed",
++    "timeout", "unreachable", "invalid_response",
++})
++PRESETS = (
++    {"id": "siliconflow", "label": "SiliconFlow / 硅基流動", "kind": "cloud",
++     "base_url": "https://api.siliconflow.cn/v1", "auth_mode": "api_key"},
++    {"id": "openai-compatible", "label": "OpenAI-compatible cloud", "kind": "cloud",
++     "base_url": "", "auth_mode": "api_key"},
++    {"id": "ollama", "label": "Ollama", "kind": "local",
++     "base_url": "http://127.0.0.1:11434/v1", "auth_mode": "none"},
++    {"id": "lmstudio", "label": "LM Studio", "kind": "local",
++     "base_url": "http://127.0.0.1:1234/v1", "auth_mode": "none"},
++    {"id": "local-openai", "label": "Local OpenAI-compatible service", "kind": "local",
++     "base_url": "http://127.0.0.1:8080/v1", "auth_mode": "none"},
++)
++_PRESET_BY_ID = {p["id"]: p for p in PRESETS}
++_ID = re.compile(r"custom:[0-9a-f]{32}\Z")
++_OP = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
++_SHA = re.compile(r"[0-9a-f]{64}\Z")
++_MODEL = re.compile(r"[A-Za-z0-9_./:@+][A-Za-z0-9_./:@+\-]{0,255}\Z")
++_SAVE_KEYS = frozenset({"authority", "expected_config_sha256", "operation_id",
++    "provider_id", "label", "preset_id", "kind", "base_url", "model_id",
++    "auth_mode", "key_action", "api_key"})
++_REMOVE_KEYS = frozenset({"authority", "expected_config_sha256", "operation_id", "provider_id"})
++
++
++class SetupError(ValueError):
++    def __init__(self, code):
++        self.code = code if code in ERROR_CODES else "storage_failed"
++        super().__init__("setup." + self.code)
++
++
++def _text(value, *, maximum, byte_limit=None, empty=False):
++    if (type(value) is not str or (not value and not empty) or len(value) > maximum
++            or value != value.strip() or any(ord(c) < 32 or ord(c) == 127 for c in value)):
++        raise SetupError("invalid_request")
++    try:
++        if len(value.encode("utf-8")) > (byte_limit or maximum * 4):
++            raise SetupError("invalid_request")
++    except UnicodeError:
++        raise SetupError("invalid_request") from None
++    return value
++
++
++def provider_name(provider_id):
++    if type(provider_id) is not str or not _ID.fullmatch(provider_id):
++        raise SetupError("invalid_request")
++    return provider_id[7:]
++
++
++def model_id(value):
++    if type(value) is not str or not _MODEL.fullmatch(value):
++        raise SetupError("invalid_request")
++    return value
++
++
++def key_env(provider_id):
++    return "HERMES_CUSTOM_" + provider_name(provider_id).upper() + "_API_KEY"
++
++
++def canonical_url(value, kind):
++    value = _text(value, maximum=2048, byte_limit=8192)
++    if "\\" in value or any(c in value for c in "{}"):
++        raise SetupError("invalid_request")
++    try:
++        url = urllib.parse.urlsplit(value)
++        host, port = url.hostname, url.port
++    except ValueError:
++        raise SetupError("invalid_request") from None
++    if (not host or url.username is not None or url.password is not None
++            or url.query or url.fragment or "?" in value or "#" in value
++            or url.scheme not in {"http", "https"} or (port is not None and not 1 <= port <= 65535)):
++        raise SetupError("invalid_request")
++    loopback = host.lower() in {"localhost", "127.0.0.1", "::1"}
++    if kind == "local":
++        if not loopback:
++            raise SetupError("invalid_request")
++    elif kind == "cloud":
++        if url.scheme != "https" or loopback:
++            raise SetupError("invalid_request")
++        try:
++            address = ipaddress.ip_address(host)
++        except ValueError:
++            address = None
++        if address is not None and not address.is_global:
++            raise SetupError("invalid_request")
++    else:
++        raise SetupError("invalid_request")
++    # No destination expansion, host guessing, URL templates, or credentials.
++    if any(c.isspace() for c in host) or "%" in host:
++        raise SetupError("invalid_request")
++    try:
++        host.encode("ascii")
++    except UnicodeError:
++        raise SetupError("invalid_request") from None
++    # Preserve the authenticated UI value byte-for-byte. Runtime post-read
++    # compares the actual saved entry with the accepted request, not a silent
++    # rewrite of case, port notation, or a trailing slash.
++    return value
++
++
++def _endpoint_identity(value):
++    url = urllib.parse.urlsplit(str(value))
++    effective_port = url.port if url.port is not None else {"http": 80, "https": 443}.get(url.scheme.lower())
++    return (url.scheme.lower(), (url.hostname or "").lower(), effective_port,
++            url.path.rstrip("/"), url.query, url.fragment, url.username, url.password)
++
++
++def validate_params(params, action):
++    expected = _SAVE_KEYS if action == "save" else _REMOVE_KEYS
++    if type(params) is not dict or set(params) != expected:
++        raise SetupError("invalid_request")
++    if params["authority"] != AUTHORITY:
++        raise SetupError("unauthorized")
++    if (type(params["expected_config_sha256"]) is not str
++            or not _SHA.fullmatch(params["expected_config_sha256"])
++            or type(params["operation_id"]) is not str or not _OP.fullmatch(params["operation_id"])):
++        raise SetupError("invalid_request")
++    provider_name(params["provider_id"])
++    result = dict(params)
++    if action == "remove":
++        return result
++    _text(params["label"], maximum=128, byte_limit=512)
++    model_id(params["model_id"])
++    preset = _PRESET_BY_ID.get(params["preset_id"])
++    if not preset or params["kind"] != preset["kind"]:
++        raise SetupError("invalid_request")
++    result["base_url"] = canonical_url(params["base_url"], params["kind"])
++    if params["auth_mode"] not in {"api_key", "none"} or params["key_action"] not in {"keep", "replace", "clear"}:
++        raise SetupError("invalid_request")
++    if params["auth_mode"] == "none" and (params["kind"] != "local" or params["key_action"] != "clear"):
++        raise SetupError("invalid_request")
++    if params["auth_mode"] == "api_key" and params["key_action"] == "clear":
++        raise SetupError("invalid_request")
++    secret = params["api_key"]
++    if type(secret) is not str or len(secret) > 16384:
++        raise SetupError("invalid_request")
++    if params["key_action"] == "replace":
++        if not secret or any(ord(c) < 33 or ord(c) > 126 for c in secret):
++            raise SetupError("invalid_request")
++    elif secret:
++        raise SetupError("invalid_request")
++    return result
++
++
++def _raw_config():
++    from hermes_cli.config import read_raw_config
++    value = read_raw_config()
++    if type(value) is not dict:
++        raise SetupError("catalog_unavailable")
++    return value
++
++
++def config_sha256():
++    from hermes_cli.config import get_config_path
++    return hashlib.sha256(get_config_path().read_bytes()).hexdigest()
++
++
++def owned_entry(config, provider_id, *, required=True):
++    name = provider_name(provider_id)
++    providers = config.get("providers") or {}
++    entry = providers.get(name) if type(providers) is dict else None
++    if entry is None and not required:
++        return None
++    if type(entry) is not dict or type(entry.get("lilith_setup")) is not dict:
++        raise SetupError("not_found")
++    marker = entry["lilith_setup"]
++    if (set(marker) != {"schema_version", "label", "preset_id", "kind", "last_operation_id"}
++            or type(marker["schema_version"]) is not int or marker["schema_version"] != SCHEMA
++            or type(marker["last_operation_id"]) is not str or not _OP.fullmatch(marker["last_operation_id"])):
++        raise SetupError("catalog_unavailable")
++    # A mutable entry cannot acquire arbitrary headers, inline credentials,
++    # proxy/TLS overrides, response API modes, or foreign credential slots.
++    if set(entry) != {"name", "base_url", "default_model", "models", "api_mode",
++                      "key_env", "auth_mode", "discover_models", "lilith_setup"}:
++        raise SetupError("catalog_unavailable")
++    synthetic = {"authority": AUTHORITY, "expected_config_sha256": "0" * 64,
++        "operation_id": marker["last_operation_id"], "provider_id": provider_id,
++        "label": marker["label"], "preset_id": marker["preset_id"], "kind": marker["kind"],
++        "base_url": entry["base_url"], "model_id": entry["default_model"],
++        "auth_mode": entry["auth_mode"], "key_action": "clear" if entry["auth_mode"] == "none" else "keep", "api_key": ""}
++    validate_params(synthetic, "save")
++    if (entry["name"] != name or entry["key_env"] != key_env(provider_id)
++            or entry["api_mode"] != "chat_completions" or entry["discover_models"] is not False
++            or entry["models"] != {entry["default_model"]: {}}
++            or canonical_url(entry["base_url"], marker["kind"]) != entry["base_url"]):
++        raise SetupError("catalog_unavailable")
++    return entry
++
++
++def exact_route(provider_id, *, expected_base_url=None):
++    """Return only this saved entry's key; never a pool or ambient credential."""
++    from hermes_cli.config import load_env
++    entry = owned_entry(_raw_config(), provider_id)
++    base_url = entry["base_url"]
++    if expected_base_url is not None and _endpoint_identity(expected_base_url) != _endpoint_identity(base_url):
++        raise SetupError("stale_config")
++    secret = ""
++    if entry["auth_mode"] == "api_key":
++        secret = load_env().get(key_env(provider_id)) or ""
++        if not secret:
++            raise SetupError("key_required")
++    return {"provider": provider_id, "provider_id": provider_id, "base_url": base_url,
++        "api_key": secret, "auth_mode": entry["auth_mode"], "api_mode": "chat_completions",
++        "model": entry["default_model"], "source": "provider_setup:" + provider_id}
++
++
++def is_setup_identity(value):
++    """True only for an existing marked entry, never by hex-shaped name alone.
++
++    Existing manually declared hex names keep their legacy provider behavior.
++    An absent reserved identity fails closed instead of borrowing an ambient
++    route after deletion; a present but malformed ownership marker also fails.
++    """
++    if type(value) is not str or not _ID.fullmatch(value):
++        return False
++    config = _raw_config()
++    name = value[7:]
++    providers = config.get("providers") or {}
++    if type(providers) is not dict:
++        raise SetupError("catalog_unavailable")
++    if name in providers:
++        entry = providers[name]
++        if type(entry) is not dict:
++            raise SetupError("catalog_unavailable")
++        if "lilith_setup" not in entry:
++            return False
++        owned_entry(config, value)
++        return True
++    # Preserve legacy display-name aliases and the older list representation.
++    for key, entry in providers.items():
++        if type(entry) is dict and str(entry.get("name") or key).strip().lower() in {name, value}:
++            if "lilith_setup" in entry:
++                raise SetupError("catalog_unavailable")
++            return False
++    for entry in config.get("custom_providers") or []:
++        if type(entry) is dict and str(entry.get("name") or "").strip().lower() in {name, value}:
++            if "lilith_setup" in entry:
++                raise SetupError("catalog_unavailable")
++            return False
++    raise SetupError("not_found")
++
++
++def normalize_setup_identity(value):
++    """Guard-only recognition of the native legacy bare-name spelling."""
++    if type(value) is not str:
++        return ""
++    lowered = value.strip().lower()
++    if _ID.fullmatch(lowered):
++        return lowered
++    if re.fullmatch(r"[0-9a-f]{32}", lowered):
++        return "custom:" + lowered
++    return ""
++
++
++def allows_empty_key(provider_id, base_url, api_key):
++    if not is_setup_identity(provider_id) or api_key != "":
++        return False
++    route = exact_route(provider_id, expected_base_url=base_url)
++    return route["auth_mode"] == "none" and route["api_key"] == ""
++
++
++def prepare_client_kwargs(provider_id, kwargs, *, async_mode=False):
++    """Exact owned SDK route, including real empty-key no-Authorization mode.
++
++    This executes no request. SDK construction must not inherit environment
++    credentials, attribution ids, redirects, proxy credentials, or a different
++    entry's URL-matched custom headers. The selected identity, not URL lookup,
++    decides whether this managed-only contract applies.
++    """
++    if not is_setup_identity(provider_id):
++        return dict(kwargs)
++    import httpx
++    route = exact_route(provider_id, expected_base_url=kwargs.get("base_url"))
++    if kwargs.get("api_key") != route["api_key"]:
++        raise SetupError("key_required")
++    if kwargs.get("default_query"):
++        raise SetupError("invalid_request")
++    result = dict(kwargs)
++    result.update(api_key=route["api_key"], base_url=route["base_url"],
++                  default_headers={}, organization="", project="")
++    existing = kwargs.get("http_client")
++    client_type = httpx.AsyncClient if async_mode else httpx.Client
++    if existing is not None:
++        allowed_headers = {"accept", "accept-encoding", "connection", "user-agent"}
++        if (type(existing) is not client_type or existing.is_closed
++                or existing._trust_env or existing.follow_redirects
++                or existing._auth is not None or len(existing.cookies)
++                or any(existing.event_hooks.values())
++                or any(key.lower() not in allowed_headers for key in existing.headers)):
++            raise SetupError("invalid_request")
++        result["http_client"] = existing
++    else:
++        result["http_client"] = client_type(trust_env=False, follow_redirects=False,
++            timeout=kwargs.get("timeout", 60.0))
++        result["http_client"]._lilith_provider_setup_owned = True
++    return result
++
++
++def catalog():
++    from hermes_cli.config import load_env
++    config = _raw_config()
++    providers = config.get("providers") or {}
++    if type(providers) is not dict:
++        raise SetupError("catalog_unavailable")
++    env = load_env()
++    model_config = config.get("model") or {}
++    if type(model_config) is not dict:
++        raise SetupError("catalog_unavailable")
++    selected = str(model_config.get("provider") or "")
++    rows = []
++    for name, raw in providers.items():
++        if type(raw) is not dict or "lilith_setup" not in raw:
++            continue
++        provider_id = "custom:" + name
++        entry = owned_entry(config, provider_id)
++        marker = entry["lilith_setup"]
++        rows.append({"provider_id": provider_id, "label": marker["label"],
++            "preset_id": marker["preset_id"], "kind": marker["kind"],
++            "base_url": entry["base_url"], "model_id": entry["default_model"],
++            "auth_mode": entry["auth_mode"], "key_present": bool(env.get(key_env(provider_id))),
++            "is_default": normalize_setup_identity(selected) == provider_id})
++    if len(rows) > ENTRY_LIMIT:
++        raise SetupError("limit_reached")
++    return {"schema_version": SCHEMA, "config_sha256": config_sha256(),
++        "presets": copy.deepcopy(list(PRESETS)), "entries": sorted(rows, key=lambda row: row["provider_id"]),
++        "default_provider": selected, "default_model": str(model_config.get("default") or "")}
++
++
++def _make_entry(params):
++    return {"name": provider_name(params["provider_id"]), "base_url": params["base_url"],
++        "default_model": params["model_id"], "models": {params["model_id"]: {}},
++        "api_mode": "chat_completions", "key_env": key_env(params["provider_id"]),
++        "auth_mode": params["auth_mode"], "discover_models": False,
++        "lilith_setup": {"schema_version": SCHEMA, "label": params["label"],
++            "preset_id": params["preset_id"], "kind": params["kind"],
++            "last_operation_id": params["operation_id"]}}
++
++
++def mutate(action, params, *, finalize, in_use=frozenset()):
++    """Atomic native stores; finalizer prepares the strict digest/receipt gate."""
++    from hermes_cli.config import (load_env, remove_env_value, save_env_value,
++                                   invalidate_env_cache, _CONFIG_LOCK)
++    from hermes_cli.credential_lifecycle import (_run_provider_mutation_transaction,
++        _provider_mutation_paths, _snapshot_path)
++    from hermes_cli.auth import _auth_store_lock
++    from utils import atomic_roundtrip_yaml_update
++    from hermes_cli.config import get_config_path
++    params = validate_params(params, action)
++    provider_id = params["provider_id"]
++    slot = key_env(provider_id)
++    descriptor = SimpleNamespace(slug=provider_id, api_key_env_vars=(slot,))
++    # Same order as the canonical credential lifecycle: auth store first,
++    # config writer second. The lifecycle's inner auth lock is reentrant.
++    with _auth_store_lock(), _CONFIG_LOCK:
++        before = config_sha256()
++        if before != params["expected_config_sha256"]:
++            raise SetupError("stale_config")
++        config = _raw_config()
++        providers = copy.deepcopy(config.get("providers") or {})
++        if type(providers) is not dict:
++            raise SetupError("catalog_unavailable")
++        name = provider_name(provider_id)
++        old = owned_entry(config, provider_id, required=action == "remove")
++        old_key = load_env().get(slot) or ""
++        model_before = copy.deepcopy(config.get("model"))
++        if action == "remove":
++            if provider_id in in_use or normalize_setup_identity((model_before or {}).get("provider")) == provider_id:
++                raise SetupError("entry_in_use")
++            del providers[name]
++            wanted_key = ""
++            changed = True
++        else:
++            if old is None and len(catalog()["entries"]) >= ENTRY_LIMIT:
++                raise SetupError("limit_reached")
++            if old is None and params["key_action"] == "keep":
++                raise SetupError("key_required")
++            if old is not None and old["base_url"] != params["base_url"] and params["key_action"] == "keep":
++                raise SetupError("endpoint_changed_requires_key")
++            wanted_key = (params["api_key"] if params["key_action"] == "replace" else
++                          old_key if params["key_action"] == "keep" else "")
++            if params["auth_mode"] == "api_key" and not wanted_key:
++                raise SetupError("key_required")
++            new = _make_entry(params)
++            comparable = copy.deepcopy(new)
++            if old is not None:
++                comparable["lilith_setup"]["last_operation_id"] = old["lilith_setup"]["last_operation_id"]
++            changed = old != comparable or old_key != wanted_key
++            providers[name] = new
++            if changed and (provider_id in in_use or normalize_setup_identity((model_before or {}).get("provider")) == provider_id):
++                raise SetupError("entry_in_use")
++        receipt = {"schema_version": SCHEMA, "operation_id": params["operation_id"],
++            "provider_id": provider_id, "action": action, "changed": bool(changed),
++            "previous_config_sha256": before, "config_sha256": before}
++        if not changed:
++            return receipt
++
++        def write():
++            if wanted_key:
++                # Remove duplicates first; save_env_value intentionally updates
++                # only the first definition. All steps remain inside rollback.
++                remove_env_value(slot)
++                save_env_value(slot, wanted_key)
++            else:
++                remove_env_value(slot)
++            invalidate_env_cache()
++            if (load_env().get(slot) or "") != wanted_key:
++                raise SetupError("storage_failed")
++            atomic_roundtrip_yaml_update(get_config_path(), "providers", providers)
++            saved = _raw_config()
++            if saved.get("providers") != providers or saved.get("model") != model_before:
++                raise SetupError("storage_failed")
++            after = config_sha256()
++            if after == before:
++                raise SetupError("storage_failed")
++            receipt["config_sha256"] = after
++            finalize(before, after)
++            return receipt
++
++        snapshots = tuple(_snapshot_path(path) for path in _provider_mutation_paths())
++        try:
++            return _run_provider_mutation_transaction(descriptor, write)
++        except BaseException:
++            try:
++                for snapshot in snapshots:
++                    if snapshot.path.exists() != snapshot.existed:
++                        raise RuntimeError()
++                    if snapshot.existed and snapshot.path.read_bytes() != snapshot.payload:
++                        raise RuntimeError()
++                invalidate_env_cache()
++                if (load_env().get(slot) or "") != old_key:
++                    raise RuntimeError()
++            except BaseException:
++                raise SetupError("rollback_unverified") from None
++            # No exception body can cross this boundary: I/O backends can
++            # include a credential or private path in arbitrary error text.
++            raise SetupError("storage_failed") from None
++
++
++class _NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        return None
++
++
++def _unique_json(raw):
++    def pairs(items):
++        value = {}
++        for key, item in items:
++            if key in value:
++                raise ValueError("duplicate")
++            value[key] = item
++        return value
++    return json.loads(raw, object_pairs_hook=pairs,
++        parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("non-finite")))
++
++
++def discover_models(params, *, opener=None, monotonic=time.monotonic, cancelled=lambda: False):
++    """One explicit saved-destination metadata GET; never generation/probing LAN."""
++    if (type(params) is not dict or set(params) != {"authority", "provider_id", "expected_config_sha256"}
++            or params.get("authority") != AUTHORITY):
++        raise SetupError("invalid_request")
++    provider_id = params["provider_id"]
++    provider_name(provider_id)
++    if type(params["expected_config_sha256"]) is not str or not _SHA.fullmatch(params["expected_config_sha256"]):
++        raise SetupError("invalid_request")
++    if config_sha256() != params["expected_config_sha256"]:
++        raise SetupError("stale_config")
++    if cancelled():
++        raise SetupError("cancelled")
++    result = {"schema_version": SCHEMA, "provider_id": provider_id,
++              "status": "invalid_response", "models": [], "catalog_only": True}
++    try:
++        route = exact_route(provider_id)
++    except SetupError as error:
++        if error.code == "key_required":
++            result["status"] = "auth_required"
++            return result
++        raise
++    headers = {"Accept": "application/json"}
++    if route["auth_mode"] == "api_key":
++        headers["Authorization"] = "Bearer " + route["api_key"]
++    request = urllib.request.Request(route["base_url"].rstrip("/") + "/models", headers=headers, method="GET")
++    if opener is None:
++        # Explicit local endpoints must not traverse an ambient HTTP proxy;
++        # remote keys must not follow redirects to a different authority.
++        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect()).open
++    deadline = monotonic() + MODEL_TIMEOUT
++    try:
++        with opener(request, timeout=MODEL_TIMEOUT) as response:
++            if response.getcode() != 200:
++                raise ValueError("status")
++            raw = bytearray()
++            while True:
++                if cancelled():
++                    raise SetupError("cancelled")
++                remaining = deadline - monotonic()
++                if remaining <= 0:
++                    raise TimeoutError()
++                # read1 returns available bytes rather than waiting for a full
++                # 16KiB under a drip-feed response. Narrow the underlying
++                # socket timeout to the remaining overall receive deadline.
++                sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
++                if sock is not None:
++                    sock.settimeout(remaining)
++                reader = getattr(response, "read1", None)
++                if not callable(reader):
++                    raise ValueError("unbounded reader")
++                chunk = reader(min(16384, MODEL_BODY_LIMIT + 1 - len(raw)))
++                if not chunk:
++                    break
++                raw.extend(chunk)
++                if len(raw) > MODEL_BODY_LIMIT:
++                    raise ValueError("limit")
++            value = _unique_json(raw.decode("utf-8"))
++            if type(value) is not dict or type(value.get("data")) is not list or len(value["data"]) > MODEL_LIMIT:
++                raise ValueError("models")
++            ids = []
++            for item in value["data"]:
++                if type(item) is not dict:
++                    raise ValueError("model")
++                item_id = model_id(item.get("id"))
++                if item_id in ids:
++                    raise ValueError("duplicate model")
++                ids.append(item_id)
++            result.update(status="ready" if ids else "empty", models=ids)
++    except SetupError as error:
++        if error.code == "cancelled":
++            raise
++        result["status"] = "invalid_response"
++    except urllib.error.HTTPError as error:
++        code = error.code
++        error.close()
++        result["status"] = ("auth_required" if code in {401, 403} else
++            "request_rejected" if 300 <= code < 500 else "service_failed")
++    except (TimeoutError, socket.timeout):
++        result["status"] = "timeout"
++    except urllib.error.URLError as error:
++        result["status"] = "timeout" if isinstance(error.reason, (TimeoutError, socket.timeout)) else "unreachable"
++    except (OSError, http.client.HTTPException):
++        result["status"] = "unreachable"
++    except Exception:
++        result["status"] = "invalid_response"
++    # A slow catalog must not be reported for a newly edited destination.
++    if config_sha256() != params["expected_config_sha256"]:
++        raise SetupError("stale_config")
++    if cancelled():
++        raise SetupError("cancelled")
++    return result
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index 3af7acd..b9d914e 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -676,6 +676,12 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
+     requested_norm = _normalize_custom_provider_name(requested_provider or "")
+     if not requested_norm:
+         return None
++    from hermes_cli.provider_setup import is_setup_identity, exact_route
++    if is_setup_identity(requested_norm):
++        # Deleted or malformed setup identities never become anonymous custom
++        # routes and never fall through to an ambient provider/key.
++        route = exact_route(requested_norm)
++        return {**route, "name": requested_norm[7:], "lilith_setup": True}
+ 
+     # Bare "custom" is normally an incomplete spec — the canonical form is
+     # "custom:<name>" — and is otherwise owned by the model.base_url "bare
+@@ -738,6 +744,10 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
+                 str(display_name or ep_name),
+                 str(ep_name),
+             ):
++                if "lilith_setup" in entry:
++                    from hermes_cli.provider_setup import exact_route
++                    route = exact_route("custom:" + str(ep_name))
++                    return {**route, "name": str(ep_name), "lilith_setup": True}
+                 # Found match by provider key
+                 base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+                 if base_url:
+@@ -831,7 +841,7 @@ def has_named_custom_provider(requested_provider: str) -> bool:
+ def find_custom_provider_identity(base_url: str) -> Optional[str]:
+     """Map an endpoint URL back to its canonical ``custom:<name>`` menu key.
+ 
+-    Returns the ``custom:<normalized-name>`` slug of the first ``providers:``
++    Returns the unique ``custom:<normalized-name>`` slug of a ``providers:``
+     / ``custom_providers:`` entry whose base_url matches, or ``None`` when no
+     entry owns the URL.
+ 
+@@ -852,16 +862,18 @@ def find_custom_provider_identity(base_url: str) -> Optional[str]:
+     except Exception:
+         return None
+ 
++    matches = set()
+     providers = config.get("providers")
+     if isinstance(providers, dict):
++        from hermes_cli.config import is_provider_enabled
+         for ep_name, entry in providers.items():
+-            if not isinstance(entry, dict):
++            if not isinstance(entry, dict) or not is_provider_enabled(entry):
+                 continue
+             entry_url = (
+                 entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+             )
+             if _normalize_base_url_for_match(entry_url) == target:
+-                return custom_provider_slug(str(ep_name), str(ep_name))
++                matches.add(custom_provider_slug(str(ep_name), str(ep_name)))
+ 
+     try:
+         custom_providers = get_compatible_custom_providers(config)
+@@ -874,18 +886,18 @@ def find_custom_provider_identity(base_url: str) -> Optional[str]:
+         if not isinstance(name, str) or not name.strip():
+             continue
+         if _normalize_base_url_for_match(entry.get("base_url")) == target:
+-            return custom_provider_slug(
++            matches.add(custom_provider_slug(
+                 name,
+                 str(entry.get("provider_key", "") or ""),
+-            )
++            ))
+ 
+-    return None
++    return next(iter(matches)) if len(matches) == 1 else None
+ 
+ 
+ def find_custom_provider_identity_by_model(model: str) -> Optional[str]:
+     """Map a model id back to the ``custom:<name>`` entry that serves it.
+ 
+-    Returns the ``custom:<normalized-name>`` slug of the first ``providers:``
++    Returns the unique ``custom:<normalized-name>`` slug of a ``providers:``
+     / ``custom_providers:`` entry whose ``model`` / ``default_model`` matches,
+     or whose ``models`` catalog (dict or list shape) contains the id.
+     ``None`` when no entry serves the model.
+@@ -897,13 +909,19 @@ def find_custom_provider_identity_by_model(model: str) -> Optional[str]:
+     catalog models on built-in providers, so the model is the last durable
+     fact that can recover the entry identity.
+     """
++    matches = _custom_provider_identities_by_model(model)
++    return next(iter(matches)) if len(matches) == 1 else None
++
++
++def _custom_provider_identities_by_model(model: str) -> set[str]:
++    """Keep absent and ambiguous recovery distinct for config fallback."""
+     target = str(model or "").strip().lower()
+     if not target:
+-        return None
++        return set()
+     try:
+         config = load_config()
+     except Exception:
+-        return None
++        return set()
+ 
+     def _entry_serves_model(entry: Dict[str, Any]) -> bool:
+         for key in ("model", "default_model"):
+@@ -925,13 +943,15 @@ def find_custom_provider_identity_by_model(model: str) -> Optional[str]:
+                         return True
+         return False
+ 
++    matches = set()
+     providers = config.get("providers")
+     if isinstance(providers, dict):
++        from hermes_cli.config import is_provider_enabled
+         for ep_name, entry in providers.items():
+-            if not isinstance(entry, dict):
++            if not isinstance(entry, dict) or not is_provider_enabled(entry):
+                 continue
+             if _entry_serves_model(entry):
+-                return custom_provider_slug(str(ep_name), str(ep_name))
++                matches.add(custom_provider_slug(str(ep_name), str(ep_name)))
+ 
+     try:
+         custom_providers = get_compatible_custom_providers(config)
+@@ -944,19 +964,54 @@ def find_custom_provider_identity_by_model(model: str) -> Optional[str]:
+         if not isinstance(name, str) or not name.strip():
+             continue
+         if _entry_serves_model(entry):
+-            return custom_provider_slug(
++            matches.add(custom_provider_slug(
+                 name,
+                 str(entry.get("provider_key", "") or ""),
+-            )
++            ))
+ 
+-    return None
++    return matches
+ 
++def _custom_identity_by_name(candidate: str, base_url: Optional[str] = None) -> Optional[str]:
++    """Resolve config identity without borrowing another endpoint owner."""
++    normalized = _normalize_custom_provider_name(candidate)
++    if not normalized or normalized in {"custom", "auto", "openrouter"}:
++        return None
++    try:
++        config = load_config()
++        from hermes_cli.config import is_provider_enabled
++        rows = []
++        providers = config.get("providers")
++        if isinstance(providers, dict):
++            for key, entry in providers.items():
++                if isinstance(entry, dict) and is_provider_enabled(entry):
++                    rows.append((str(entry.get("name") or key), str(key),
++                                 entry.get("api") or entry.get("url") or entry.get("base_url")))
++        for entry in get_compatible_custom_providers(config) or []:
++            if isinstance(entry, dict) and is_provider_enabled(entry):
++                rows.append((str(entry.get("name") or ""), str(entry.get("provider_key") or ""),
++                             entry.get("base_url")))
++    except Exception:
++        return None
++    exact_rows = [row for row in rows
++                  if normalized in custom_provider_aliases("", row[1])
++                  or normalized == custom_provider_slug(row[0], row[1])]
++    if exact_rows:
++        rows = exact_rows
++    matches = set()
++    for name, key, endpoint in rows:
++        if not endpoint or normalized not in custom_provider_aliases(name, key):
++            continue
++        if base_url and _normalize_base_url_for_match(endpoint) != _normalize_base_url_for_match(base_url):
++            continue
++        matches.add(custom_provider_slug(name, key))
++    return next(iter(matches)) if len(matches) == 1 else None
+ 
+ def canonical_custom_identity(
+     *,
+     base_url: Optional[str] = None,
+     config_provider: Optional[str] = None,
+     model: Optional[str] = None,
++    requested_provider: Optional[str] = None,
+ ) -> Optional[str]:
+     """Recover a routable ``custom:<name>`` identity for a bare custom provider.
+ 
+@@ -968,40 +1023,46 @@ def canonical_custom_identity(
+ 
+     Any code path that persists or restores a session's provider override
+     must run the resolved provider through this helper so a bare ``"custom"``
+-    is upgraded back to its durable ``custom:<name>`` menu key. Three
++    is upgraded back to its durable ``custom:<name>`` menu key. Four
+     recovery sources, in priority order:
+ 
+-    1. ``base_url`` — reverse-lookup the entry that owns the endpoint URL
++    1. ``requested_provider`` — preserve the actual selected named entry;
++       a supplied URL must still match that entry. No fallback on mismatch.
++    2. ``base_url`` — reverse-lookup the unique owner of the endpoint URL
+        (the one fact that always survives the persistence round-trip when a
+-       URL was recorded).
+-    2. ``model`` — reverse-lookup the entry that serves the session's model
++       URL was recorded). An unknown or ambiguous URL has no name fallback.
++    3. ``model`` — reverse-lookup the unique owner of the session's model
+        (``model``/``default_model``/``models`` catalog). The session row
+        always stores the model name, so when no base_url survived (the
+        recurring Desktop/TUI regression vector) the model is the last
+        session-scoped fact that can recover the entry — and unlike the
+        config fallback below it stays correct after the user points their
+        global default at a different provider.
+-    3. ``config_provider`` — the active ``config.model.provider`` (or its
++    4. ``config_provider`` — the active ``config.model.provider`` (or its
+        ``provider``/``HERMES_INFERENCE_PROVIDER`` equivalent). When neither
+        a base_url nor a model recovered the entry, the configured provider
+        is the only durable identity left, so fall back to it when it names
+-       a real entry.
++       a real entry. An ambiguous model owner never falls back to it.
+ 
+     Returns ``custom:<name>`` when a routable identity is recovered, else
+     ``None`` (caller keeps whatever it had — bare ``"custom"`` only as a last
+     resort, e.g. a genuine ad-hoc endpoint with no config entry).
+     """
+-    # 1. Reverse-lookup by endpoint URL.
++    # The active route's explicit identity outranks lossy URL/model recovery.
++    # A missing or mismatched named entry must not select a different owner.
++    if requested_provider:
++        return _custom_identity_by_name(requested_provider, base_url)
++
++    # A supplied endpoint is authoritative. Ambiguous/unowned endpoints must
++    # not be replaced by another model owner or the current global default.
+     if base_url:
+-        identity = find_custom_provider_identity(base_url)
+-        if identity:
+-            return identity
++        return find_custom_provider_identity(base_url)
+ 
+-    # 2. Reverse-lookup by the session's model name.
++    # Preserve ambiguity rather than borrowing the current global default.
+     if model:
+-        identity = find_custom_provider_identity_by_model(model)
+-        if identity:
+-            return identity
++        identities = _custom_provider_identities_by_model(model)
++        if identities:
++            return next(iter(identities)) if len(identities) == 1 else None
+ 
+     # 3. Fall back to the configured provider when it names a real entry.
+     candidate = str(config_provider or "").strip()
+@@ -1017,28 +1078,7 @@ def canonical_custom_identity(
+     # A bare/non-routable candidate cannot heal a bare custom override.
+     if not candidate_norm or candidate_norm in {"custom", "auto", "openrouter"}:
+         return None
+-    # Only return it when it actually resolves to a configured custom entry,
+-    # so we never invent a `custom:<x>` that resolution can't honor.
+-    try:
+-        entry = _get_named_custom_provider(candidate)
+-        if entry is not None:
+-            # ``candidate`` matched, but it may be the entry's DISPLAY NAME —
+-            # ``_get_named_custom_provider`` accepts either spelling. For a
+-            # keyed ``providers:`` entry the display name is not the durable
+-            # identity, so re-resolve through the endpoint the matched entry
+-            # owns and return the same config-key slug every other path
+-            # returns (7b5a18817). Without this, a display name that differs
+-            # from its key heals to ``custom:<display-name>`` and stops
+-            # matching the persisted identity.
+-            identity = find_custom_provider_identity(str(entry.get("base_url") or ""))
+-            if identity:
+-                return identity
+-            if candidate_norm.startswith("custom:"):
+-                return candidate_norm
+-            return f"custom:{candidate_norm}"
+-    except Exception:
+-        pass
+-    return None
++    return _custom_identity_by_name(candidate)
+ 
+ 
+ def _normalize_base_url_for_match(value) -> str:
+@@ -1113,6 +1153,14 @@ def _resolve_named_custom_runtime(
+     if not custom_provider:
+         return None
+ 
++    if custom_provider.get("lilith_setup") is True:
++        from hermes_cli.provider_setup import exact_route, SetupError
++        route = exact_route(custom_provider["provider_id"],
++            expected_base_url=explicit_base_url if explicit_base_url is not None else custom_provider["base_url"])
++        if explicit_api_key is not None and explicit_api_key != route["api_key"]:
++            raise SetupError("key_required")
++        return route
++
+     base_url = (
+         (explicit_base_url or "").strip()
+         or custom_provider.get("base_url", "")
+diff --git a/tests/test_custom_provider_routing.py b/tests/test_custom_provider_routing.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_custom_provider_routing.py
+@@ -0,0 +1,892 @@
++"""Synthetic exact-route regressions; no provider or player profile access."""
++import unittest
++from contextlib import nullcontext
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from hermes_cli import runtime_provider as rp
++from agent import background_review as br
++from agent import image_routing as ir
++from tui_gateway import server
++
++
++URL = "http://127.0.0.1:11434/v1"
++OTHER = "https://other.invalid/v1"
++MODEL = "synthetic-model"
++
++
++def configured():
++    return {"providers": {
++        "first": {"name": "First", "api": URL, "api_key": "synthetic-first", "models": [MODEL]},
++        "selected": {"name": "Selected", "api": URL, "api_key": "synthetic-selected", "models": [MODEL]},
++    }}
++
++
++class IdentityTests(unittest.TestCase):
++    def setUp(self):
++        self.config = configured()
++        for target in ("hermes_cli.runtime_provider.load_config", "hermes_cli.config.load_config"):
++            mock = patch(target, side_effect=lambda *a, **k: self.config)
++            mock.start(); self.addCleanup(mock.stop)
++        mock = patch.object(rp, "_get_model_config", return_value={})
++        mock.start(); self.addCleanup(mock.stop)
++
++    def test_shared_url_without_name_is_unknown(self):
++        self.assertIsNone(rp.find_custom_provider_identity(URL))
++
++    def test_shared_model_without_name_is_unknown(self):
++        self.assertIsNone(rp.find_custom_provider_identity_by_model(MODEL))
++
++    def test_ambiguous_model_does_not_borrow_global_default(self):
++        self.assertIsNone(rp.canonical_custom_identity(model=MODEL, config_provider="first"))
++
++    def test_disabled_entry_is_not_an_identity_recovery_candidate(self):
++        self.config["providers"]["first"]["enabled"] = False
++        self.assertEqual("custom:selected", rp.find_custom_provider_identity(URL))
++        self.assertEqual("custom:selected", rp.find_custom_provider_identity_by_model(MODEL))
++
++    def test_exact_key_wins_over_another_entry_display_alias(self):
++        self.config["providers"]["first"]["name"] = "selected"
++        self.assertEqual("custom:selected", rp.canonical_custom_identity(
++            base_url=URL, requested_provider="custom:selected"))
++
++    def test_explicit_name_wins_shared_url(self):
++        self.assertEqual("custom:selected", rp.canonical_custom_identity(
++            base_url=URL, model=MODEL, requested_provider="custom:selected"))
++
++    def test_config_key_does_not_turn_into_first_endpoint_owner(self):
++        self.assertEqual("custom:selected", rp.canonical_custom_identity(config_provider="selected"))
++
++    def test_display_name_retains_key_identity(self):
++        self.assertEqual("custom:selected", rp.canonical_custom_identity(config_provider="Selected"))
++
++    def test_unknown_explicit_name_does_not_fall_back(self):
++        self.assertIsNone(rp.canonical_custom_identity(base_url=URL, requested_provider="custom:missing"))
++
++    def test_explicit_name_endpoint_mismatch_is_unknown(self):
++        self.assertIsNone(rp.canonical_custom_identity(base_url=OTHER, requested_provider="custom:selected"))
++
++    def test_ambiguous_url_does_not_borrow_global_default(self):
++        self.assertIsNone(rp.canonical_custom_identity(base_url=URL, config_provider="first", model=MODEL))
++
++    def test_unknown_endpoint_does_not_borrow_model_or_default(self):
++        self.assertIsNone(rp.canonical_custom_identity(base_url=OTHER, model=MODEL, config_provider="first"))
++
++    def test_session_persistence_preserves_actual_selected_name(self):
++        agent = SimpleNamespace(provider="custom", model=MODEL, base_url=URL,
++                                api_mode="chat_completions", _requested_provider="custom:selected")
++        result = server._runtime_model_config(agent)
++        self.assertEqual("custom:selected", result["provider"])
++        self.assertEqual(URL, result["base_url"])
++        self.assertNotIn("api_key", result)
++
++    def test_session_persistence_without_name_does_not_choose_first(self):
++        agent = SimpleNamespace(provider="custom", model=MODEL, base_url=URL,
++                                api_mode="chat_completions")
++        self.assertEqual("custom", server._runtime_model_config(agent)["provider"])
++
++    def test_single_custom_url_and_model_keep_existing_recovery(self):
++        self.config["providers"].pop("first")
++        self.assertEqual("custom:selected", rp.canonical_custom_identity(base_url=URL))
++        self.assertEqual("custom:selected", rp.canonical_custom_identity(model=MODEL))
++
++    def test_legacy_unkeyed_named_custom_keeps_identity(self):
++        self.config.clear()
++        self.config["custom_providers"] = [{"name": "Legacy Local", "base_url": URL, "models": [MODEL]}]
++        self.assertEqual("custom:legacy-local", rp.canonical_custom_identity(config_provider="Legacy Local"))
++
++
++class BackgroundRouteTests(unittest.TestCase):
++    def setUp(self):
++        self.parent = {"provider": "custom", "requested_provider": "custom:selected", "model": MODEL,
++                       "base_url": URL, "api_key": "no-key-required", "api_mode": "chat_completions"}
++        self.agent = SimpleNamespace(provider="custom", model=MODEL, _requested_provider="custom:selected",
++            _current_main_runtime=lambda: dict(self.parent), _credential_pool=None,
++            request_overrides={}, max_tokens=None)
++
++    def route(self, task, result=None, failure=None, managed=True):
++        with patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {"background_review": task}}), \
++             patch("agent.identity_policy.identity_lock_required_by_host", return_value=managed), \
++             patch.object(rp, "resolve_runtime_provider", return_value=result, side_effect=failure) as resolve:
++            route = br._resolve_review_runtime(self.agent)
++            return route, resolve.call_args
++
++    def test_unset_inherits_exact_parent_without_resolve(self):
++        result, called = self.route({})
++        self.assertFalse(result["routed"])
++        self.assertEqual(URL, result["base_url"])
++        self.assertEqual("no-key-required", result["api_key"])
++        self.assertIsNone(called)
++
++    def test_same_route_without_override_reuses_parent(self):
++        result, called = self.route({"provider": "custom", "model": MODEL})
++        self.assertFalse(result["routed"])
++        self.assertIsNone(called)
++
++    def test_same_model_different_endpoint_is_resolved(self):
++        selected = dict(self.parent, base_url=OTHER, api_key="synthetic-other")
++        result, called = self.route({"provider": "custom", "model": MODEL, "base_url": OTHER,
++                                    "api_key": "synthetic-other"}, selected)
++        self.assertTrue(result["routed"])
++        self.assertEqual(OTHER, result["base_url"])
++        self.assertEqual("synthetic-other", result["api_key"])
++        self.assertEqual(OTHER, called.kwargs["explicit_base_url"])
++
++    def test_same_endpoint_different_key_is_resolved(self):
++        selected = dict(self.parent, api_key="synthetic-selected-key")
++        result, called = self.route({"provider": "custom", "model": MODEL,
++                                    "api_key": "synthetic-selected-key"}, selected)
++        self.assertTrue(result["routed"])
++        self.assertEqual("synthetic-selected-key", result["api_key"])
++
++    def test_managed_explicit_resolution_failure_is_closed(self):
++        with self.assertRaisesRegex(RuntimeError, "background_review_route_unavailable"):
++            self.route({"provider": "custom:missing", "model": MODEL}, failure=RuntimeError("synthetic failure"))
++
++    def test_nonmanaged_resolution_failure_keeps_upstream_behavior(self):
++        result, _ = self.route({"provider": "custom:missing", "model": MODEL},
++                               failure=RuntimeError("synthetic failure"), managed=False)
++        self.assertFalse(result["routed"])
++        self.assertEqual(URL, result["base_url"])
++
++    def test_managed_explicit_route_cannot_accept_empty_resolver_result(self):
++        with self.assertRaisesRegex(RuntimeError, "background_review_route_unavailable"):
++            self.route({"provider": "custom:selected", "model": MODEL}, result={})
++
++    def test_resolved_non_key_auth_routes_are_not_reinterpreted(self):
++        for provider, mode in (("bedrock", "bedrock"), ("copilot-acp", "acp")):
++            with self.subTest(provider=provider):
++                selected = {"provider": provider, "api_mode": mode, "command": "synthetic"}
++                result, _ = self.route({"provider": provider, "model": "other-model"}, selected)
++                self.assertTrue(result["routed"])
++                self.assertEqual(provider, result["provider"])
++
++    def test_resolved_noauth_empty_key_is_not_replaced_or_rejected(self):
++        selected = dict(self.parent, api_key="")
++        result, _ = self.route({"provider": "custom:selected", "model": MODEL}, selected)
++        self.assertEqual("", result["api_key"])
++
++    def test_default_noauth_preserves_empty_key(self):
++        self.parent["api_key"] = ""
++        result, _ = self.route({})
++        self.assertEqual("", result["api_key"])
++
++    def test_review_constructor_preserves_named_route_and_noauth(self):
++        self.parent["api_key"] = ""
++        self.agent.platform = "synthetic"
++        self.agent.session_id = "synthetic-session"
++        self.agent._emit_auxiliary_failure = lambda *args: None
++        captured = []
++        def capture(**kwargs):
++            captured.append(kwargs)
++            raise RuntimeError("synthetic-constructor-stop")
++        with patch("hermes_cli.config.load_config_readonly", return_value={}), \
++             patch("run_agent.AIAgent", side_effect=capture), \
++             patch.object(br, "thread_scoped_silence", nullcontext), \
++             patch("agent.identity_policy.reserve_native_authority_terminal_effect", return_value=object()), \
++             patch("agent.identity_policy.release_native_authority_terminal_effect"):
++            br._run_review_in_thread(self.agent, [], "synthetic-review")
++        self.assertEqual(1, len(captured))
++        self.assertEqual("custom:selected", captured[0]["provider"])
++        self.assertEqual("", captured[0]["api_key"])
++        self.assertEqual(URL, captured[0]["base_url"])
++        self.assertEqual(MODEL, captured[0]["model"])
++
++
++class ImageCapabilityTests(unittest.TestCase):
++    def setUp(self):
++        self.config = {"model": {"provider": "custom:first", "default": MODEL, "supports_vision": True},
++                       "providers": {"selected": {"models": {MODEL: {}}},
++                                     "first": {"models": {MODEL: {"supports_vision": True}}}}}
++        guard = patch("agent.identity_policy.identity_lock_required_by_host", return_value=True)
++        guard.start(); self.addCleanup(guard.stop)
++
++    def lookup(self, model=MODEL, requested="custom:selected"):
++        with patch("agent.models_dev.get_model_capabilities", side_effect=AssertionError("unexpected catalog lookup")) as catalog, \
++             patch("agent.model_metadata.query_ollama_supports_vision", side_effect=AssertionError("unexpected endpoint probe")) as probe:
++            result = ir._lookup_supports_vision("custom", model, self.config, requested_provider=requested)
++        self.assertFalse(catalog.called)
++        self.assertFalse(probe.called)
++        return result
++
++    def test_session_override_does_not_borrow_global_true(self):
++        self.assertIsNone(self.lookup())
++
++    def test_explicit_current_capability_wins_foreign_global_false(self):
++        self.config["model"]["supports_vision"] = False
++        self.config["providers"]["selected"]["models"][MODEL]["supports_vision"] = True
++        self.assertIs(self.lookup(), True)
++
++    def test_exact_same_route_retains_declared_top_level_capability(self):
++        self.config["model"]["provider"] = "custom:selected"
++        self.assertIs(self.lookup(), True)
++
++    def test_same_provider_different_model_stays_unknown(self):
++        self.config["model"]["provider"] = "custom:selected"
++        self.assertIsNone(self.lookup(model="other-model"))
++
++    def test_exact_explicit_false_is_not_promoted_to_unknown(self):
++        self.config["providers"]["selected"]["models"][MODEL]["vision"] = False
++        self.assertIs(self.lookup(), False)
++
++    def test_foreign_runtime_identity_is_not_borrowed(self):
++        with patch("agent.auxiliary_client._runtime_main_value", side_effect=lambda key: {
++                "provider": "custom", "model": "other-model", "requested_provider": "custom:first"}.get(key)):
++            self.assertIsNone(self.lookup(requested=""))
++
++    def test_generic_hermes_top_level_semantics_are_unchanged(self):
++        with patch("agent.identity_policy.identity_lock_required_by_host", return_value=False):
++            self.assertIs(ir._supports_vision_override(self.config, "custom", MODEL,
++                                                     requested_provider="custom:selected"), True)
++
++
++class CurrentStrategyDispatchTests(unittest.TestCase):
++    def test_all_six_current_policies_send_custom_chat_and_keep_missing_usage_unknown(self):
++        import json
++        import httpx
++        import openai
++        from agent.usage_budget import TurnBudgetLedger, bind_turn_budget
++        from agent.usage_budget_host_policy import build_host_policy_resolver
++        from agent.usage_budget_preferences import UsagePreference
++        from agent.usage_budget_native_dispatch import native_chat_dispatch_sync
++        from agent.usage_latest import LatestUsage
++        sent = []
++        def reply(request):
++            sent.append(json.loads(request.content))
++            return httpx.Response(200, json={"id": "synthetic", "object": "chat.completion", "created": 0,
++                "model": MODEL, "choices": [{"index": 0, "finish_reason": "stop", "message": {
++                    "role": "assistant", "content": "synthetic reply"}}]})
++        with openai.OpenAI(api_key="", base_url=URL, max_retries=0,
++                http_client=httpx.Client(transport=httpx.MockTransport(reply), trust_env=False)) as client:
++            snapshot = build_host_policy_resolver(SimpleNamespace(model=MODEL, provider="custom:selected",
++                base_url=URL, api_mode="chat_completions", max_tokens=2048, max_iterations=32))
++            for level in range(1, 7):
++                with self.subTest(level=level):
++                    policy = snapshot(UsagePreference(level=level, revision=1))
++                    self.assertFalse(policy.enforce_economy_limits)
++                    ledger = TurnBudgetLedger("synthetic-level-" + str(level), policy)
++                    latest = LatestUsage()
++                    latest.accepted("synthetic"); latest.bound("synthetic", ledger)
++                    with bind_turn_budget(ledger):
++                        result = native_chat_dispatch_sync(client, {"model": MODEL,
++                            "messages": [{"role": "user", "content": "synthetic"}], "max_tokens": 2048},
++                            lambda body: client.chat.completions.create(**body))
++                    self.assertEqual("synthetic reply", result.choices[0].message.content)
++                    self.assertEqual(level, len(sent))
++                    latest.completed("synthetic")
++                    usage = latest.snapshot()
++                    self.assertEqual(1, usage["request_count"])
++                    self.assertIsNone(usage["input_tokens"])
++                    self.assertIsNone(usage["output_tokens"])
++                    self.assertIsNone(usage["cache_read_tokens"])
++                    self.assertEqual("partial", usage["state"])
++
++    def test_custom_speech_binding_gap_is_before_any_transport(self):
++        import httpx
++        import openai
++        from agent.usage_budget import BudgetError, TurnBudgetLedger, bind_turn_budget
++        from agent.usage_budget_host_policy import build_host_policy_resolver
++        from agent.usage_budget_preferences import UsagePreference
++        from agent.usage_budget_native_dispatch import native_chat_dispatch_sync
++        sent = []
++        with openai.OpenAI(api_key="", base_url=URL, max_retries=0,
++                http_client=httpx.Client(transport=httpx.MockTransport(lambda request: sent.append(request)), trust_env=False)) as client:
++            policy = build_host_policy_resolver(SimpleNamespace(model=MODEL, provider="custom:selected",
++                base_url=URL, api_mode="chat_completions"))(UsagePreference(level=6, revision=1))
++            with bind_turn_budget(TurnBudgetLedger("synthetic-speech-gap", policy)), \
++                 patch("agent.speech_recovery.active", return_value=True), \
++                 self.assertRaisesRegex(BudgetError, "native_budget_route_unverified"):
++                native_chat_dispatch_sync(client, {"model": MODEL, "messages": [], "max_tokens": 2048},
++                                          lambda body: client.chat.completions.create(**body))
++        self.assertEqual([], sent)
++
++
++class ManagedBindingTests(unittest.TestCase):
++    """Real SDK/final wire; owned setup metadata is synthetic in these units."""
++    def setUp(self):
++        import sys
++        import json
++        import httpx
++        import openai
++        from agent import managed_custom_dispatch as binding
++        from agent.usage_budget import BudgetError
++        self.binding, self.error = binding, BudgetError
++        self.identity = "custom:" + "a" * 32
++        self.sent = []
++        def reply(request):
++            self.sent.append((request.url, request.headers, json.loads(request.content)))
++            return httpx.Response(200, json={"id": "synthetic", "object": "chat.completion", "created": 0,
++                "model": MODEL, "choices": [{"index": 0, "finish_reason": "stop", "message": {
++                    "role": "assistant", "content": "synthetic reply"}}]})
++        self.client = openai.OpenAI(api_key="", base_url=URL, max_retries=0, organization="", project="",
++            http_client=httpx.Client(transport=httpx.MockTransport(reply), trust_env=False, follow_redirects=False))
++        self.addCleanup(self.client.close)
++        self.route = {"model": MODEL, "api_mode": "chat_completions", "api_key": "", "base_url": URL}
++        def exact(identity, *, expected_base_url=None):
++            if identity != self.identity or str(expected_base_url).rstrip("/") != URL:
++                raise BudgetError("synthetic_setup_route_mismatch")
++            return dict(self.route)
++        stub = SimpleNamespace(exact_route=exact, is_setup_identity=lambda value: value == self.identity)
++        fake = patch.dict(sys.modules, {"hermes_cli.provider_setup": stub})
++        fake.start(); self.addCleanup(fake.stop)
++
++    def register(self):
++        return self.binding.register_managed_compatible_client(self.client, self.identity, MODEL)
++
++    def test_factory_evidence_is_requested_not_a_hard_cap_or_exact_counter(self):
++        from agent.usage_budget_dispatch import prepare_wire_request
++        proof = self.register()
++        self.assertEqual("requested", proof.output_control)
++        self.assertFalse(proof.capability.output_cap_verified)
++        self.assertFalse(proof.capability.all_output_counted)
++        self.assertFalse(proof.count_input({"model": MODEL, "messages": []}).exact)
++        self.assertIsNone(proof.read_usage({}).input_tokens)
++        with self.assertRaisesRegex(self.error, "wire_capability_unverified"):
++            prepare_wire_request({"model": MODEL, "messages": []}, output_limit=10,
++                                 capability=proof.capability, route=proof.capability.route)
++
++    def test_binding_retains_final_speech_wire_and_one_physical_request(self):
++        import threading
++        from agent import speech_recovery as speech
++        from agent.usage_budget import TurnBudgetLedger, bind_turn_budget
++        from agent.usage_budget_host_policy import build_host_policy_resolver
++        from agent.usage_budget_preferences import UsagePreference
++        from agent.usage_budget_native_dispatch import native_chat_dispatch_sync
++        self.register()
++        messages = [{"role": "system", "content": speech.COMPACT_SYSTEM},
++                    {"role": "user", "content": '{"final_display_text":"synthetic"}'}]
++        capability = SimpleNamespace(runtime={"model": MODEL}, attempts=0, lock=threading.RLock(),
++                                     messages=lambda: messages, current=lambda: None)
++        policy = build_host_policy_resolver(SimpleNamespace(model=MODEL, provider=self.identity,
++            base_url=URL, api_mode="chat_completions"))(UsagePreference(level=6, revision=1))
++        request = {"model": MODEL, "messages": messages, "max_tokens": 2048, "timeout": 20}
++        # Only the prior completed-turn claim is synthetic; these are the real
++        # speech final-body checks, native seam, SDK, HTTP serialization and counter.
++        with bind_turn_budget(TurnBudgetLedger("synthetic-managed-speech", policy)), \
++             patch.object(speech, "active", return_value=True), \
++             patch.object(speech, "_capability", return_value=capability):
++            for mutation in ({"extra_body": {"model": "foreign"}},
++                             {"extra_body": {"messages": []}}, {"extra_headers": {"Authorization": "foreign"}},
++                             {"extra_query": {"key": "foreign"}}, {"model": "foreign"}, {"max_tokens": 4096}):
++                with self.subTest(mutation=tuple(mutation)), self.assertRaises((self.error, speech.SpeechRecoveryError)):
++                    native_chat_dispatch_sync(self.client, request | mutation,
++                                              lambda body: self.client.chat.completions.create(**body))
++            self.assertEqual([], self.sent)
++            native_chat_dispatch_sync(self.client, request, lambda body: self.client.chat.completions.create(**body))
++            self.assertEqual(1, len(self.sent))
++            self.assertNotIn("Authorization", self.sent[0][1])
++            self.assertEqual(2048, self.sent[0][2]["max_tokens"])
++            with self.assertRaises(speech.SpeechRecoveryError):
++                native_chat_dispatch_sync(self.client, request, lambda body: self.client.chat.completions.create(**body))
++        self.assertEqual(1, len(self.sent))
++
++    def test_mutated_key_endpoint_retry_headers_and_transport_are_rejected(self):
++        import httpx
++        from agent.usage_budget_native_dispatch import require_native_dispatch_route
++        self.register()
++        for attr, value in (("api_key", "foreign"), ("_base_url", httpx.URL("https://foreign.invalid/v1/")),
++                            ("max_retries", 2), ("_custom_headers", {"Authorization": "foreign"})):
++            with self.subTest(attr=attr), patch.object(self.client, attr, value), \
++                 patch("agent.usage_budget_entrypoints.require_native_origin_for_conversation"), \
++                 patch("agent.speech_recovery.active", return_value=True), self.assertRaises(self.error):
++                require_native_dispatch_route(self.client, {"model": MODEL}, "chat_max_tokens")
++        with httpx.Client(transport=httpx.MockTransport(lambda _: None), trust_env=False) as replacement, \
++             patch.object(self.client, "_client", replacement), \
++             patch("agent.usage_budget_entrypoints.require_native_origin_for_conversation"), \
++             patch("agent.speech_recovery.active", return_value=True), self.assertRaisesRegex(self.error, "native_budget_transport_changed"):
++            require_native_dispatch_route(self.client, {"model": MODEL}, "chat_max_tokens")
++        self.assertEqual([], self.sent)
++
++
++    def test_wrong_model_or_unsafe_factory_cannot_register(self):
++        with self.assertRaises(self.error):
++            self.binding.register_managed_compatible_client(self.client, self.identity, "foreign")
++        with patch.object(self.client, "max_retries", 2), self.assertRaises(self.error):
++            self.register()
++        with patch.object(self.client._client, "follow_redirects", True), self.assertRaises(self.error):
++            self.register()
++        with patch.object(self.client._client, "_trust_env", True), self.assertRaises(self.error):
++            self.register()
++        self.assertEqual([], self.sent)
++
++    def test_late_http_auth_cookies_hooks_and_subclasses_are_rejected(self):
++        import httpx
++        from agent.usage_budget_native_dispatch import require_native_dispatch_route
++        self.register()
++        for attr, value in (("_auth", httpx.BasicAuth("synthetic", "foreign")),
++                            ("_cookies", httpx.Cookies({"credential": "foreign"})),
++                            ("_event_hooks", {"request": [lambda _: None], "response": []})):
++            with self.subTest(attr=attr), patch.object(self.client._client, attr, value), \
++                 patch("agent.usage_budget_entrypoints.require_native_origin_for_conversation"), \
++                 patch("agent.speech_recovery.active", return_value=True), self.assertRaises(self.error):
++                require_native_dispatch_route(self.client, {"model": MODEL}, "chat_max_tokens")
++        class CustomHttp(httpx.Client):
++            pass
++        with CustomHttp(transport=httpx.MockTransport(lambda _: None), trust_env=False) as alternate, \
++             patch.object(self.client, "_client", alternate), self.assertRaises(self.error):
++            self.register()
++        self.assertEqual([], self.sent)
++
++    def test_conversion_proof_requires_the_same_registered_client_model_and_transport(self):
++        import httpx
++        read = self.binding.get_verified_managed_route
++        self.assertIsNone(read(self.client, MODEL))
++        self.register()
++        self.assertEqual((self.identity, MODEL), read(self.client, MODEL))
++        with self.assertRaises(self.error):
++            read(self.client, "foreign")
++        with patch.object(self.client, "api_key", "foreign"), self.assertRaises(self.error):
++            read(self.client, MODEL)
++        with httpx.Client(transport=httpx.MockTransport(lambda _: None), trust_env=False) as replacement, \
++             patch.object(self.client, "_client", replacement), self.assertRaises(self.error):
++            read(self.client, MODEL)
++        self.assertEqual([], self.sent)
++
++
++class GatewayNoAuthTests(unittest.TestCase):
++    def test_owned_noauth_session_override_does_not_resolve_foreign_global(self):
++        from gateway import run as gateway
++        from hermes_cli import provider_setup
++        identity = "custom:" + "e" * 32
++        config = {"providers": {identity[7:]: {
++            "name": identity[7:], "base_url": URL, "default_model": MODEL,
++            "models": {MODEL: {}}, "api_mode": "chat_completions", "discover_models": False,
++            "key_env": provider_setup.key_env(identity), "auth_mode": "none",
++            "lilith_setup": {"schema_version": 1, "label": "Synthetic",
++                "preset_id": "ollama", "kind": "local", "last_operation_id": "synthetic"}}}}
++        override = {"provider": identity, "model": MODEL, "base_url": URL,
++                    "api_mode": "chat_completions", "api_key": "", "credential_pool": object()}
++        state = SimpleNamespace(conversation=SimpleNamespace(model_override=override))
++        runner = SimpleNamespace(_rehydrate_session_model_override=lambda _: None,
++                                 _peek_session_state=lambda _: state)
++        with patch.object(provider_setup, "_raw_config", return_value=config), \
++             patch.object(gateway, "_resolve_gateway_model", return_value="foreign-global"), \
++             patch.object(gateway, "_resolve_runtime_agent_kwargs", side_effect=RuntimeError("global unavailable")) as global_route, \
++             patch.object(gateway, "_credential_pool_for_provider", side_effect=AssertionError("ambient pool")), \
++             patch("agent.identity_policy.identity_lock_required_by_host", return_value=True):
++            model, route = gateway.GatewayRunner._resolve_session_agent_runtime_uncached(
++                runner, session_key="synthetic", user_config=config)
++            self.assertEqual(MODEL, model)
++            self.assertEqual(identity, route["provider"])
++            self.assertEqual("", route["api_key"])
++            self.assertEqual(URL, route["base_url"])
++            self.assertIsNone(route.get("credential_pool"))
++            global_route.assert_not_called()
++            # Bad owned routes cannot borrow a global credential or route.
++            for key, value in (("base_url", OTHER), ("api_key", None), ("api_key", "foreign"),
++                               ("model", "foreign"), ("api_mode", "responses")):
++                with self.subTest(key=key, value=value), patch.dict(override, {key: value}), \
++                     self.assertRaises(provider_setup.SetupError):
++                    gateway.GatewayRunner._resolve_session_agent_runtime_uncached(
++                        runner, session_key="synthetic", user_config=config)
++            global_route.assert_not_called()
++            # The same exact entry in key mode also discards any stale pool;
++            # a missing or foreign supplied key is never replaced by ambient.
++            entry = config["providers"][identity[7:]]
++            entry["auth_mode"] = "api_key"
++            with patch("hermes_cli.config.load_env", return_value={provider_setup.key_env(identity): "owned"}):
++                with patch.dict(override, {"api_key": "owned"}):
++                    _, keyed = gateway.GatewayRunner._resolve_session_agent_runtime_uncached(
++                        runner, session_key="synthetic", user_config=config)
++                    self.assertEqual("owned", keyed["api_key"])
++                    self.assertIsNone(keyed.get("credential_pool"))
++                with self.assertRaises(provider_setup.SetupError):
++                    gateway.GatewayRunner._resolve_session_agent_runtime_uncached(
++                        runner, session_key="synthetic", user_config=config)
++            entry["auth_mode"] = "none"
++            # Unowned legacy routes keep their pre-existing resolution path.
++            config["providers"][identity[7:]] = {"name": identity[7:], "base_url": URL}
++            with self.assertRaisesRegex(RuntimeError, "global unavailable"):
++                gateway.GatewayRunner._resolve_session_agent_runtime_uncached(
++                    runner, session_key="synthetic", user_config=config)
++            self.assertEqual(1, global_route.call_count)
++
++    def test_unowned_or_missing_empty_key_is_not_a_concrete_auxiliary_route(self):
++        from agent import auxiliary_client
++        from hermes_cli import provider_setup
++        runtime = {"provider": "custom:unowned", "model": MODEL, "base_url": URL,
++                   "api_mode": "chat_completions", "api_key": ""}
++        with patch.object(provider_setup, "_raw_config", return_value={}), \
++             patch("agent.identity_policy.identity_lock_required_by_host", return_value=True):
++            self.assertFalse(auxiliary_client._auxiliary_runtime_is_concrete(runtime))
++            with auxiliary_client.scoped_runtime_main(runtime), self.assertRaises(RuntimeError):
++                auxiliary_client.capture_auxiliary_runtime_context()
++            runtime["provider"] = "custom:" + "e" * 32
++            self.assertFalse(auxiliary_client._auxiliary_runtime_is_concrete(runtime))
++            runtime["api_key"] = None
++            self.assertFalse(auxiliary_client._auxiliary_runtime_is_concrete(runtime))
++
++
++class ManagedExplicitAuxiliaryTests(unittest.TestCase):
++    def test_registered_task_capture_consumption_and_exact_sdk_route(self):
++        """Actual capture/clean-context consumption/SDK, synthetic task registration.
++
++        No identity, provider resolver, credential loader, origin, client factory,
++        cache signature or dispatch guard is mocked. Only HTTP and the declared
++        plugin task registry are synthetic; no relationship/private data is read.
++        """
++        import hashlib
++        import json
++        import os
++        from pathlib import Path
++        import uuid
++        import httpx
++        import yaml
++        from agent import auxiliary_client as aux
++        from agent.plugin_llm import PluginLlm
++        from agent.usage_budget_entrypoints import (
++            accept_native_origin, bind_native_agent_origin, native_origin_scope, complete_primary)
++        from agent.usage_budget_runtime import capture_origin
++        from hermes_cli import provider_setup as setup
++        profile = Path(os.environ["HERMES_HOME"])
++        identities = {"main": "custom:" + "a" * 32, "local": "custom:" + "b" * 32,
++                      "keyed_aux": "custom:" + "c" * 32}
++        endpoints = {"main": "https://main.synthetic.invalid/v1", "local": "http://127.0.0.1:1234/v1",
++                     "keyed_aux": "https://aux.synthetic.invalid/v1"}
++        tasks = ("lilith_relationship_review", "lilith_profile_memory_review")
++        config = {"model": {"provider": identities["main"], "default": MODEL}, "providers": {}, "auxiliary": {},
++            "identity": {"require_soul": True, "suppress_kernel_help": True, "personality_allowlist": ["lilith"],
++                "locked_personality": "lilith", "force_soul_for_children": True, "fingerprint": "D" * 64},
++            "display": {"personality": "lilith"},
++            "agent": {"system_prompt": "", "personalities": {"lilith": {"system_prompt": "SYNTHETIC VOICE\n"}}}}
++        for name, identity in identities.items():
++            local = name == "local"
++            config["providers"][identity[7:]] = {
++                "name": identity[7:], "base_url": endpoints[name], "default_model": MODEL,
++                "models": {MODEL: {}}, "api_mode": "chat_completions", "discover_models": False,
++                "key_env": setup.key_env(identity), "auth_mode": "none" if local else "api_key",
++                "lilith_setup": {"schema_version": 1, "label": "Synthetic " + name,
++                    "preset_id": "lmstudio" if local else "openai-compatible", "kind": "local" if local else "cloud",
++                    "last_operation_id": "synthetic-probe"}}
++        (profile / "SOUL.md").write_text("SYNTHETIC SOUL\n", encoding="utf-8", newline="\n")
++        pins = dict(HERMES_IDENTITY_REQUIRED="1", HERMES_IDENTITY_EXPECTED_FINGERPRINT="d" * 64,
++            HERMES_IDENTITY_EXPECTED_SOUL_SHA256=hashlib.sha256(b"SYNTHETIC SOUL\n").hexdigest(),
++            HERMES_IDENTITY_EXPECTED_PERSONALITY_SHA256=hashlib.sha256(b"SYNTHETIC VOICE\n").hexdigest())
++        clients, sent, expected = [], [], {}
++        original_init = httpx.Client.__init__
++        def reply(request):
++            body = json.loads(request.content)
++            sent.append((str(request.url), request.headers.get("Authorization"), body, capture_origin()))
++            self.assertEqual(endpoints[expected["route"]] + "/chat/completions", str(request.url))
++            key = None if expected["route"] == "local" else "Bearer synthetic-" + expected["route"]
++            self.assertEqual(key, request.headers.get("Authorization"))
++            self.assertEqual(MODEL, body["model"])
++            self.assertTrue(body["messages"][0]["content"].startswith("SYNTHETIC SOUL\n\nSYNTHETIC VOICE"))
++            self.assertFalse(body.get("tools") or body.get("stream"))
++            return httpx.Response(200, json={"id": "synthetic", "object": "chat.completion", "created": 0,
++                "model": MODEL, "choices": [{"index": 0, "finish_reason": "stop",
++                    "message": {"role": "assistant", "content": "synthetic auxiliary reply"}}]})
++        def mock_init(client, *a, **kwargs):
++            kwargs["transport"] = httpx.MockTransport(reply)
++            original_init(client, *a, **kwargs)
++            clients.append(client)
++        registrations = [{"key": task, "plugin": "synthetic-aux-fixture", "defaults": {}}
++                         for task in tasks]
++        plugin = PluginLlm(plugin_id="synthetic-aux-fixture")
++        cases = (
++            ("inherited_noauth", "local", None, True),
++            ("same_noauth", "local", "local", True),
++            ("other_noauth", "main", "local", True),
++            ("other_noauth_full", "main", "local", True),
++            ("other_keyed", "main", "keyed_aux", True),
++            ("native_saved_other_noauth", "main", "local", True),
++            ("native_saved_other_keyed", "main", "keyed_aux", True),
++            ("null_key", "main", "local", False),
++            ("foreign_key", "main", "local", False),
++            ("foreign_url", "main", "local", False),
++            ("foreign_model", "main", "local", False),
++            ("unowned_noauth", "main", "local", False),
++            ("missing_owned_key", "main", "keyed_aux", False),
++            ("mismatched_owned_key", "main", "keyed_aux", False),
++        )
++        try:
++            with patch.dict(os.environ, pins), patch.object(httpx.Client, "__init__", mock_init), \
++                 patch("hermes_cli.plugins.get_plugin_auxiliary_tasks", return_value=registrations):
++                for task in tasks:
++                    for case, main_name, target_name, success in cases:
++                        with self.subTest(task=task, case=case):
++                            task_config = {"provider": identities[target_name], "model": MODEL} if target_name else {"provider": "auto", "model": ""}
++                            if case == "other_noauth_full":
++                                task_config.update(base_url=endpoints["local"], api_key="")
++                            if case == "null_key": task_config["api_key"] = None
++                            if case == "foreign_key": task_config["api_key"] = "synthetic-foreign"
++                            if case == "foreign_url": task_config["base_url"] = "https://foreign.synthetic.invalid/v1"
++                            if case == "foreign_model": task_config["model"] = "foreign-model"
++                            if case == "unowned_noauth":
++                                task_config.update(provider="custom:unowned", base_url=endpoints["local"], api_key="")
++                            if case == "mismatched_owned_key": task_config["api_key"] = "synthetic-foreign"
++                            config["auxiliary"] = {task: task_config}
++                            (profile / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
++                            keys = ("main",) if case == "missing_owned_key" else ("main", "keyed_aux")
++                            (profile / ".env").write_text("\n".join(setup.key_env(identities[n]) + "=synthetic-" + n for n in keys), encoding="utf-8")
++                            if case.startswith("native_saved_"):
++                                from hermes_cli.main import _save_aux_choice
++                                from hermes_cli.config import load_config_readonly
++                                # The native menu saves empty URL/key fields when
++                                # only provider/model are selected. Exercise this
++                                # real persisted shape, not a hand-built shortcut.
++                                _save_aux_choice(task, provider=identities[target_name], model=MODEL)
++                                saved = load_config_readonly()["auxiliary"][task]
++                                self.assertEqual(identities[target_name], saved["provider"])
++                                self.assertEqual(MODEL, saved["model"])
++                                self.assertEqual("", saved["base_url"])
++                                self.assertEqual("", saved["api_key"])
++                                self.assertEqual(identities["main"], load_config_readonly()["model"]["provider"])
++                            os.environ["HERMES_IDENTITY_EXPECTED_CONFIG_SHA256"] = hashlib.sha256((profile / "config.yaml").read_bytes()).hexdigest()
++                            route = setup.exact_route(identities[main_name])
++                            runtime = dict(provider=route["provider"], requested_provider=route["provider"], model=MODEL,
++                                api_key=route["api_key"], base_url=route["base_url"], api_mode="chat_completions",
++                                session_id="synthetic-" + uuid.uuid4().hex)
++                            ticket = accept_native_origin(profile, uuid.uuid4().hex)
++                            handle = bind_native_agent_origin(ticket, SimpleNamespace(**runtime, max_tokens=2048, max_iterations=32))
++                            before = len(sent)
++                            expected["route"] = target_name or main_name
++                            def complete():
++                                with native_origin_scope(handle), aux.scoped_runtime_main(runtime):
++                                    snapshot = plugin.capture_runtime_context(task=task)
++                                # The current scope is gone; consumption must use
++                                # only the frozen exact task route and its origin.
++                                self.assertIsNone(capture_origin())
++                                result = plugin.run_in_runtime_context(snapshot, lambda: plugin.complete(
++                                    [{"role": "system", "content": "Synthetic review"},
++                                     {"role": "user", "content": "Synthetic fixture data"}],
++                                    task=task, max_tokens=128, timeout=3))
++                                self.assertEqual("synthetic auxiliary reply", result.text)
++                                self.assertEqual(identities[target_name or main_name], result.provider)
++                                self.assertEqual(MODEL, result.model)
++                            try:
++                                if success:
++                                    complete()
++                                    self.assertEqual(1, len(sent) - before)
++                                    self.assertIs(handle, sent[-1][3])
++                                else:
++                                    with self.assertRaises((RuntimeError, ValueError)):
++                                        complete()
++                                    self.assertEqual(0, len(sent) - before)
++                            finally:
++                                complete_primary(handle)
++                            print("EXPLICIT AUX", task, case, "physical_requests", len(sent) - before)
++        finally:
++            aux.shutdown_cached_clients()
++            for client in clients:
++                client.close()
++
++
++class ManagedFullHostTests(unittest.TestCase):
++    """Real origin/grant, strict identity, RPC and native factories; mock HTTP only.
++
++    Hidden-session attestation and relationship filtering are synthetic fixture
++    evidence. No production identity/budget/speech guard or SDK is substituted.
++    """
++    def test_completed_turn_speech_all_levels_and_noauth_child_factories(self):
++        import copy
++        import hashlib
++        import json
++        import os
++        from pathlib import Path
++        import threading
++        import uuid
++        import httpx
++        import requests
++        import run_agent
++        import yaml
++        import tools.env_probe
++        from agent import auxiliary_client, identity_policy, speech_recovery
++        from agent.paired_speech import PairedSpeech
++        from agent.usage_budget_runtime import get_runtime, capture_origin
++        from agent.usage_budget_preferences import PreferenceUpdate
++        from agent.usage_budget_entrypoints import (
++            accept_native_origin, bind_native_agent_origin, native_origin_scope, complete_primary)
++        from agent.usage_budget_native_dispatch import _identity_entries, _BINDINGS
++        from hermes_cli import provider_setup
++        from tui_gateway import speech_origin, letters_text
++
++        profile = Path(os.environ["HERMES_HOME"])
++        soul, personality, fingerprint = "SYNTHETIC PINNED SOUL\n", "SYNTHETIC LOCKED VOICE\n", "d" * 64
++        identities = {"none": "custom:" + "c" * 32, "api_key": "custom:" + "d" * 32}
++        endpoints = {"none": "http://127.0.0.1:1234/v1", "api_key": "https://synthetic.invalid/v1"}
++        config = {"model": {"default": MODEL, "provider": identities["none"]}, "providers": {},
++            "memory": {"memory_enabled": False, "user_profile_enabled": False},
++            "skills": {"creation_nudge_interval": 0}, "auxiliary": {"title_generation": {"enabled": False}},
++            "identity": {"require_soul": True, "suppress_kernel_help": True, "personality_allowlist": ["lilith"],
++                "locked_personality": "lilith", "force_soul_for_children": True, "fingerprint": fingerprint.upper()},
++            "display": {"personality": "lilith"},
++            "agent": {"system_prompt": "", "personalities": {"lilith": {"system_prompt": personality}}}}
++        for auth, identity in identities.items():
++            config["providers"][identity[7:]] = {
++                "name": identity[7:], "base_url": endpoints[auth], "default_model": MODEL,
++                "models": {MODEL: {}}, "api_mode": "chat_completions", "discover_models": False,
++                "key_env": provider_setup.key_env(identity), "auth_mode": auth,
++                "lilith_setup": {"schema_version": 1, "label": "Synthetic " + auth,
++                    "preset_id": "lmstudio" if auth == "none" else "openai-compatible",
++                    "kind": "local" if auth == "none" else "cloud", "last_operation_id": "synthetic"}}
++        (profile / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
++        (profile / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++        (profile / ".env").write_text(provider_setup.key_env(identities["api_key"])
++                                      + "=synthetic-owned-key\n", encoding="utf-8")
++        pins = dict(HERMES_IDENTITY_REQUIRED="1", HERMES_IDENTITY_EXPECTED_FINGERPRINT=fingerprint,
++            HERMES_IDENTITY_EXPECTED_CONFIG_SHA256=hashlib.sha256((profile / "config.yaml").read_bytes()).hexdigest(),
++            HERMES_IDENTITY_EXPECTED_SOUL_SHA256=hashlib.sha256(soul.encode()).hexdigest(),
++            HERMES_IDENTITY_EXPECTED_PERSONALITY_SHA256=hashlib.sha256(personality.encode()).hexdigest(),
++            OPENAI_API_KEY="synthetic-ambient-must-not-be-used")
++        calls, clients, current = [], [], {}
++        answer, spoken = "晚安，今天辛苦了。", "おやすみなさい。今日はお疲れさまでした。"
++        original_http_init = httpx.Client.__init__
++
++        def reply(request):
++            body = json.loads(request.content)
++            compact = body["messages"][0]["content"] == speech_recovery.COMPACT_SYSTEM
++            calls.append((str(request.url), dict(request.headers), body, capture_origin(), compact))
++            self.assertEqual(endpoints[current["auth"]] + "/chat/completions", str(request.url))
++            expected_auth = "Bearer synthetic-owned-key" if current["auth"] == "api_key" else None
++            self.assertEqual(expected_auth, request.headers.get("Authorization"))
++            self.assertEqual(MODEL, body["model"])
++            if compact:
++                self.assertEqual(2, len(body["messages"]))
++                self.assertEqual({"display_locale": "zh-Hant", "final_display_text": answer},
++                                 json.loads(body["messages"][1]["content"]))
++                self.assertFalse(body.get("tools") or body.get("stream"))
++                self.assertLessEqual(body["max_tokens"], 2048)
++                self.assertNotIn(soul.strip(), json.dumps(body))
++                text = json.dumps({"speech_text": spoken}, ensure_ascii=False)
++            elif current.get("letter"):
++                self.assertTrue(body["messages"][0]["content"].startswith(soul.strip() + "\n\n" + personality.strip()))
++                self.assertFalse(body.get("tools") or body.get("stream"))
++                text = json.dumps({"packet_id": current["letter"], "decisions": []})
++            else:
++                self.assertTrue(body["messages"][0]["content"].startswith(soul.strip() + "\n\n" + personality.strip()))
++                text = answer
++            # Compatible endpoints may omit usage. Do not turn unknown into 0.
++            return httpx.Response(200, json={"id": "synthetic", "object": "chat.completion", "created": 0,
++                "model": MODEL, "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
++                                              "finish_reason": "stop"}]})
++
++        def mock_http_init(instance, *args, **kwargs):
++            kwargs["transport"] = httpx.MockTransport(reply)
++            original_http_init(instance, *args, **kwargs)
++            clients.append(instance)
++
++        def catalog(*args, **kwargs):
++            response = requests.Response()
++            response.status_code, response._content = 200, b'{"data":[]}'
++            return response
++
++        runtime = get_runtime(profile)
++        projection = server._methods["prompt.project_speech"]
++        try:
++            with patch.dict(os.environ, pins), patch.object(httpx.Client, "__init__", mock_http_init), \
++                 patch.object(requests.Session, "request", catalog), \
++                 patch.object(tools.env_probe, "warm_environment_probe_async", lambda *a, **k: None), \
++                 patch.object(tools.env_probe, "get_environment_probe_line", lambda *a, **k: "synthetic environment"):
++                cases = [(auth, level, "missing") for auth in ("api_key", "none") for level in range(1, 7)]
++                cases += [("none", 6, scenario) for scenario in
++                          ("wrong_turn", "wrong_text", "changed_carrier", "hidden_retries", "changed_endpoint", "changed_key")]
++                for auth, level, scenario in cases:
++                    current.update(auth=auth, scenario=scenario)
++                    runtime.store.set(PreferenceUpdate(uuid.uuid4().hex, runtime.store.get().revision, level))
++                    sid, turn = "managed-speech-" + uuid.uuid4().hex, uuid.uuid4().hex
++                    route = provider_setup.exact_route(identities[auth])
++                    agent = run_agent.AIAgent(model=MODEL, provider=identities[auth], api_mode="chat_completions",
++                        api_key=route["api_key"], base_url=route["base_url"], max_tokens=2048,
++                        session_id=sid, enabled_toolsets=[], skip_context_files=True, skip_memory=True,
++                        skip_background_review=True, quiet_mode=True)
++                    self.assertEqual(identities[auth], agent.provider)
++                    self.assertEqual(route["api_key"], agent.client.api_key)
++                    self.assertEqual("requested", _identity_entries(_BINDINGS, agent.client)[(MODEL, "chat_max_tokens")][1].output_control)
++                    agent._persist_disabled, agent._disable_streaming = True, True
++                    agent._relay_pending_turn_id = turn
++                    agent._relay_pending_user_message_id = uuid.uuid4().hex
++                    agent._relay_pending_assistant_message_id = uuid.uuid4().hex
++                    agent._lilith_paired_speech = PairedSpeech(turn, "zh-Hant")
++                    session = dict(agent=agent, archived=True, source="lilith-game", session_key=sid,
++                        _durable_lineage_root=sid, history_lock=threading.RLock(), running=False,
++                        inflight_turn=None, history=[], history_version=1, profile_home=profile)
++                    ticket = accept_native_origin(profile, turn)
++                    runtime.observe_latest_human(ticket)
++                    handle = bind_native_agent_origin(ticket, agent)
++                    with native_origin_scope(handle):
++                        result = agent.run_conversation("晚安", conversation_history=[])
++                        self.assertFalse(result.get("failed"))
++                        self.assertEqual(answer, result["final_response"])
++                        speech_origin.retain_completed(session, sid, turn, answer, handle)
++                    complete_primary(handle)
++                    self.assertTrue(identity_policy.policy_for_agent(agent).enabled)
++                    self.assertEqual(1, runtime.latest_usage.snapshot()["request_count"])
++                    before, history = len(calls), copy.deepcopy(session["history"])
++                    params = dict(session_id=sid, turn_id=turn, text=answer, display_locale="zh-Hant", speech_locale="ja")
++                    if scenario == "wrong_turn": params["turn_id"] = uuid.uuid4().hex
++                    if scenario == "wrong_text": params["text"] += "extra"
++                    original_create = auxiliary_client._budget_aux_sync_create
++                    def altered(client, request):
++                        if scenario == "changed_carrier":
++                            request = copy.deepcopy(request)
++                            request["messages"][0]["content"] = "untrusted replacement"
++                        mutation = {"hidden_retries": ("max_retries", 2),
++                                    "changed_endpoint": ("_base_url", httpx.URL("https://foreign.invalid/v1/")),
++                                    "changed_key": ("api_key", "foreign")}.get(scenario)
++                        with patch.object(client, *mutation) if mutation else nullcontext():
++                            return original_create(client, request)
++                    with patch.object(server, "_sess", return_value=(session, None)), \
++                         patch.object(server, "_attest_durable_lineage_postcondition", return_value={"stored_session_id": sid}), \
++                         patch.object(auxiliary_client, "_budget_aux_sync_create", altered):
++                        response = projection("speech", params)
++                    actual = len(calls) - before
++                    self.assertEqual(1 if scenario == "missing" else 0, actual, (auth, level, scenario, response))
++                    if scenario == "missing":
++                        self.assertEqual(spoken, response.get("result", {}).get("speech_text"), (auth, level, response))
++                        self.assertIs(handle, calls[-1][3])
++                        self.assertTrue(calls[-1][4])
++                    else:
++                        self.assertIn("error", response)
++                    latest = runtime.latest_usage.snapshot()
++                    self.assertEqual(1 + actual, latest["request_count"])
++                    self.assertIsNone(latest["input_tokens"])
++                    self.assertIsNone(latest["output_tokens"])
++                    self.assertIsNone(latest["cache_read_tokens"])
++                    self.assertEqual(history, session["history"])
++                    self.assertIsNone(capture_origin())
++                    print("MANAGED FULL HOST", auth, level, scenario, "recovery_requests", actual)
++
++                # Exercise the actual review-child constructor/native SDK factory.
++                # Stop at its conversation boundary: no memory tools are called.
++                forked = []
++                def capture_fork(child, *args, **kwargs):
++                    forked.append(child)
++                    self.assertEqual(identities["none"], child.provider)
++                    self.assertEqual("", child.api_key)
++                    self.assertEqual(endpoints["none"], child.base_url.rstrip("/"))
++                    self.assertNotIn("Authorization", child.client.auth_headers)
++                    self.assertEqual("requested", _identity_entries(_BINDINGS, child.client)[(MODEL, "chat_max_tokens")][1].output_control)
++                    return {"messages": [], "final_response": "synthetic review"}
++                from agent.background_context import freeze_history_projection, freeze_summary
++                with patch.object(run_agent.AIAgent, "run_conversation", capture_fork), \
++                     patch.object(br, "thread_scoped_silence", nullcontext):
++                    br._run_review_in_thread(agent, [], "synthetic review",
++                        summary_snapshot=freeze_summary(agent),
++                        history_projection_snapshot=freeze_history_projection(agent, []))
++                self.assertEqual(1, len(forked), "review did not reach actual native child factory")
++
++                # A synthetic authoritative relationship filter admits only this
++                # fixture's DATA; the real letter worker and provider factory run.
++                relationship = SimpleNamespace(name="lilith_relationship", owns_user_profile_writes=lambda: True,
++                                                filter_session_search_result=lambda request, value: value)
++                agent._memory_manager = SimpleNamespace(_providers=[relationship])
++                packet = uuid.uuid4().hex
++                current["letter"] = packet
++                params = dict(session_id=sid, expected_stored_session_id=sid, expected_lineage_root=sid,
++                    operation_id=uuid.uuid4().hex, packet_id=packet, stage="classify",
++                    system_prompt=letters_text._PROMPTS["classify"], data_json=json.dumps({"packet_id": packet}),
++                    maximum_reply_characters=2000)
++                before = len(calls)
++                letter = letters_text.complete_text(params, session,
++                    attest=lambda _: {"stored_session_id": sid}, authority_ok=lambda: True)
++                self.assertEqual("ready", letter["status"], letter)
++                self.assertEqual(1, len(calls) - before)
++                self.assertIsNot(handle, calls[-1][3], "letters borrowed a completed human origin")
++                self.assertNotIn("authorization", calls[-1][1])
++                self.assertEqual(history, session["history"])
++                print("MANAGED FULL HOST noauth review native factory + letters physical_requests 1")
++        finally:
++            auxiliary_client.shutdown_cached_clients()
++            for client in clients:
++                client.close()
+diff --git a/tests/test_provider_setup.py b/tests/test_provider_setup.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_provider_setup.py
+@@ -0,0 +1,754 @@
++"""Synthetic store, transport and strict-control-plane regression tests."""
++import contextlib
++import copy
++import hashlib
++import io
++import json
++import os
++from pathlib import Path
++import tempfile
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++import urllib.error
++
++from hermes_cli import provider_setup as setup
++from hermes_cli import config
++
++FIXTURE = None
++ID = "custom:" + "a" * 32
++SECOND = "custom:" + "b" * 32
++
++
++class SetupFixture(unittest.TestCase):
++    def setUp(self):
++        self.home = Path(tempfile.mkdtemp(prefix="case-", dir=FIXTURE))
++        from hermes_constants import set_hermes_home_override
++        self.home_token = set_hermes_home_override(self.home)
++        self.old_home = os.environ.get("HERMES_HOME")
++        os.environ["HERMES_HOME"] = str(self.home)
++        self.path = self.home / "config.yaml"
++        self.path.write_text('model:\n  provider: openai\n  default: gpt-4o\nproviders: {}\ntoolsets: [hermes-cli]\n', encoding="utf-8")
++        config.invalidate_env_cache()
++        self.finalized = []
++
++    def tearDown(self):
++        from hermes_constants import reset_hermes_home_override
++        reset_hermes_home_override(self.home_token)
++        if self.old_home is None:
++            os.environ.pop("HERMES_HOME", None)
++        else:
++            os.environ["HERMES_HOME"] = self.old_home
++        for value in (ID, SECOND):
++            os.environ.pop(setup.key_env(value), None)
++        config.invalidate_env_cache()
++
++    def request(self, **changes):
++        result = {"authority": setup.AUTHORITY, "expected_config_sha256": setup.config_sha256(),
++            "operation_id": "synthetic-operation-1", "provider_id": ID,
++            "label": "Synthetic local model", "preset_id": "local-openai", "kind": "local",
++            "base_url": "http://127.0.0.1:8080/v1", "model_id": "synthetic-model",
++            "auth_mode": "none", "key_action": "clear", "api_key": ""}
++        result.update(changes)
++        return result
++
++    def save(self, **changes):
++        return setup.mutate("save", self.request(**changes), finalize=lambda a, b: self.finalized.append((a, b)))
++
++    def remove(self, provider_id=ID, **kwargs):
++        return setup.mutate("remove", {"authority": setup.AUTHORITY,
++            "expected_config_sha256": setup.config_sha256(), "operation_id": "remove-1", "provider_id": provider_id},
++            finalize=lambda a, b: self.finalized.append((a, b)), **kwargs)
++
++    def test_save_catalog_has_exact_nonsecret_metadata_and_unchanged_default(self):
++        before = setup.config_sha256()
++        receipt = self.save()
++        self.assertTrue(receipt["changed"])
++        self.assertNotEqual(before, receipt["config_sha256"])
++        result = setup.catalog()
++        self.assertEqual(("openai", "gpt-4o"), (result["default_provider"], result["default_model"]))
++        self.assertEqual(ID, result["entries"][0]["provider_id"])
++        self.assertFalse(result["entries"][0]["key_present"])
++        self.assertEqual("none", result["entries"][0]["auth_mode"])
++        self.assertEqual(5, len(result["presets"]))
++        self.assertNotIn("api_key", result["entries"][0])
++
++    def test_noop_does_not_write_or_finalize(self):
++        self.save()
++        before = self.path.read_bytes()
++        result = self.save(operation_id="other-ignored-if-nochange")
++        self.assertFalse(result["changed"])
++        self.assertEqual(before, self.path.read_bytes())
++        self.assertEqual(1, len(self.finalized))
++
++    def test_key_only_changes_digest_and_roundtrips_only_own_slot(self):
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic-key-1")
++        before = setup.config_sha256()
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic-key-2", operation_id="rotate-2")
++        self.assertNotEqual(before, setup.config_sha256())
++        self.assertEqual("synthetic-key-2", config.load_env()[setup.key_env(ID)])
++        self.assertNotIn("synthetic-key", self.path.read_text())
++
++    def test_keep_key_preserves_value_and_same_effective_save_is_noop(self):
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic-key")
++        result = self.save(auth_mode="api_key", key_action="keep", operation_id="keep-2")
++        self.assertFalse(result["changed"])
++        self.assertEqual("synthetic-key", config.load_env()[setup.key_env(ID)])
++
++    def test_orphan_env_slot_cannot_supply_key_for_new_endpoint(self):
++        config.save_env_value(setup.key_env(ID), "synthetic-orphan")
++        before = self.path.read_bytes()
++        with self.assertRaisesRegex(setup.SetupError, "key_required"):
++            self.save(auth_mode="api_key", key_action="keep")
++        self.assertEqual(before, self.path.read_bytes())
++        self.assertEqual("synthetic-orphan", config.load_env()[setup.key_env(ID)])
++
++    def test_two_same_url_routes_have_distinct_keys_and_no_cross_borrow(self):
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic-a")
++        self.save(provider_id=SECOND, auth_mode="api_key", key_action="replace", api_key="synthetic-b")
++        self.assertEqual("synthetic-a", setup.exact_route(ID)["api_key"])
++        self.assertEqual("synthetic-b", setup.exact_route(SECOND)["api_key"])
++        self.assertEqual(2, len(setup.catalog()["entries"]))
++
++    def test_noauth_never_borrows_ambient_or_slot_key(self):
++        self.save()
++        with patch.dict(os.environ, {"OPENAI_API_KEY": "unrelated-synthetic", setup.key_env(ID): "inherited-synthetic"}):
++            self.assertEqual("", setup.exact_route(ID)["api_key"])
++            self.assertTrue(setup.allows_empty_key(ID, "http://127.0.0.1:8080/v1", ""))
++            self.assertFalse(setup.allows_empty_key("custom:legacy", "http://127.0.0.1:8080/v1", ""))
++
++    def test_url_change_cannot_keep_key(self):
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic")
++        with self.assertRaisesRegex(setup.SetupError, "endpoint_changed_requires_key"):
++            self.save(base_url="http://127.0.0.1:8001/v1", auth_mode="api_key", key_action="keep")
++
++    def test_none_removes_key_and_noauth_is_loopback_only(self):
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic")
++        self.save(operation_id="clear-2")
++        self.assertNotIn(setup.key_env(ID), config.load_env())
++        for url in ("http://192.168.1.2/v1", "https://example.test/v1", "http://127.0.0.2/v1"):
++            with self.subTest(url=url), self.assertRaises(setup.SetupError):
++                self.save(base_url=url)
++
++    def test_invalid_inputs_do_not_write(self):
++        before = self.path.read_bytes()
++        for changes in ({"api_key": "unexpected"}, {"kind": "cloud"}, {"model_id": "-bad"},
++                        {"model_id": "with space"}, {"model_id": "中文"}, {"label": "bad\nlabel"},
++                        {"base_url": "http://u:p@localhost/v1"}, {"base_url": "http://localhost/v1?key=x"},
++                        {"provider_id": "openai"}, {"auth_mode": "auto"}, {"operation_id": "op bad"}):
++            with self.subTest(changes=changes), self.assertRaises(setup.SetupError):
++                self.save(**changes)
++        self.assertEqual(before, self.path.read_bytes())
++
++    def test_stale_and_unknown_fields_reject_before_write(self):
++        before = self.path.read_bytes()
++        with self.assertRaisesRegex(setup.SetupError, "stale_config"):
++            self.save(expected_config_sha256="0" * 64)
++        with self.assertRaises(setup.SetupError):
++            self.save(profile_home="not-authority")
++        self.assertEqual(before, self.path.read_bytes())
++
++    def test_url_spelling_and_trailing_slash_roundtrip_without_hidden_change(self):
++        self.save(base_url="http://LOCALHOST:8080/v1/")
++        self.assertEqual("http://LOCALHOST:8080/v1/", setup.catalog()["entries"][0]["base_url"])
++        route = setup.exact_route(ID, expected_base_url="http://localhost:8080/v1")
++        self.assertEqual("http://LOCALHOST:8080/v1/", route["base_url"])
++        result, calls = self.discover()
++        self.assertEqual("ready", result["status"])
++        self.assertEqual("http://LOCALHOST:8080/v1/models", calls[0][0].full_url)
++
++    def test_active_or_default_entry_cannot_be_edited(self):
++        self.save()
++        with self.assertRaisesRegex(setup.SetupError, "entry_in_use"):
++            setup.mutate("save", self.request(label="Changed"), finalize=lambda *a: None, in_use={ID})
++        from utils import atomic_roundtrip_yaml_update
++        atomic_roundtrip_yaml_update(self.path, "model.provider", ID)
++        with self.assertRaisesRegex(setup.SetupError, "entry_in_use"):
++            self.save(label="Changed")
++        self.assertFalse(self.save()["changed"])
++
++    def test_api_key_clear_is_rejected_before_any_write(self):
++        before = self.path.read_bytes()
++        with self.assertRaisesRegex(setup.SetupError, "invalid_request"):
++            self.save(auth_mode="api_key", key_action="clear")
++        self.assertEqual(before, self.path.read_bytes())
++
++    def test_missing_cloud_key_not_satisfied_by_other_provider(self):
++        with patch.dict(os.environ, {"OPENAI_API_KEY": "unrelated-synthetic"}):
++            with self.assertRaisesRegex(setup.SetupError, "key_required"):
++                self.save(preset_id="openai-compatible", kind="cloud", base_url="https://example.test/v1",
++                          auth_mode="api_key", key_action="keep")
++
++    def test_remove_only_selected_provider_and_key(self):
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic-a")
++        self.save(provider_id=SECOND, auth_mode="api_key", key_action="replace", api_key="synthetic-b")
++        self.remove()
++        self.assertEqual([SECOND], [x["provider_id"] for x in setup.catalog()["entries"]])
++        self.assertNotIn(setup.key_env(ID), config.load_env())
++        self.assertEqual("synthetic-b", config.load_env()[setup.key_env(SECOND)])
++
++    def test_referenced_entry_cannot_be_removed(self):
++        self.save()
++        with self.assertRaisesRegex(setup.SetupError, "entry_in_use"):
++            self.remove(in_use={ID})
++
++    def test_finalize_failure_restores_config_env_and_native_caches(self):
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic-before")
++        paths = [self.path, config.get_env_path()]
++        before = {p: p.read_bytes() for p in paths}
++        def fail(*_):
++            raise RuntimeError("must-not-escape synthetic-secret")
++        with self.assertRaisesRegex(setup.SetupError, "^setup.storage_failed$"):
++            setup.mutate("save", self.request(auth_mode="api_key", key_action="replace", api_key="synthetic-after",
++                operation_id="rotation-failed"), finalize=fail)
++        self.assertEqual(before, {p: p.read_bytes() for p in paths})
++        self.assertEqual("synthetic-before", config.load_env()[setup.key_env(ID)])
++
++    def test_rollback_failure_has_distinct_closed_unverified_code(self):
++        import hermes_cli.credential_lifecycle
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic-before")
++        def fail(*_):
++            raise RuntimeError("synthetic failure")
++        with patch.object(hermes_cli.credential_lifecycle, "_restore_path", side_effect=OSError("synthetic")):
++            with self.assertRaisesRegex(setup.SetupError, "^setup.rollback_unverified$"):
++                setup.mutate("save", self.request(auth_mode="api_key", key_action="replace", api_key="synthetic-after",
++                    operation_id="failed-rollback"), finalize=fail)
++
++    def test_duplicate_env_slot_removed_before_replace(self):
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic-before")
++        with config.get_env_path().open("a", encoding="utf-8") as stream:
++            stream.write(setup.key_env(ID) + "=synthetic-duplicate\n")
++        config.invalidate_env_cache()
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic-after", operation_id="dedup-2")
++        self.assertEqual(1, config.get_env_path().read_text().count(setup.key_env(ID) + "="))
++
++    def test_marker_tampering_cannot_enable_header_override(self):
++        self.save()
++        from utils import atomic_roundtrip_yaml_update
++        atomic_roundtrip_yaml_update(self.path, "providers." + ID[7:] + ".extra_headers", {"Authorization": "synthetic"})
++        with self.assertRaisesRegex(setup.SetupError, "catalog_unavailable"):
++            setup.exact_route(ID)
++
++    def discover(self, body=None, error=None, **changes):
++        calls = []
++        class Response(io.BytesIO):
++            def getcode(self):
++                return 200
++        def open_mock(request, timeout):
++            calls.append((request, timeout))
++            if error is not None:
++                raise error
++            return Response(body if body is not None else b'{"data":[{"id":"synthetic-model"}]}')
++        params = {"authority": setup.AUTHORITY, "provider_id": ID, "expected_config_sha256": setup.config_sha256()}
++        params.update(changes)
++        return setup.discover_models(params, opener=open_mock), calls
++
++    def test_models_single_get_no_authorization_for_none(self):
++        self.save()
++        result, calls = self.discover()
++        self.assertEqual("ready", result["status"])
++        self.assertTrue(result["catalog_only"])
++        self.assertEqual(1, len(calls))
++        request, timeout = calls[0]
++        self.assertEqual("GET", request.method)
++        self.assertEqual("http://127.0.0.1:8080/v1/models", request.full_url)
++        self.assertIsNone(request.get_header("Authorization"))
++        self.assertEqual(8.0, timeout)
++
++    def test_models_uses_only_selected_saved_key(self):
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic-owned")
++        with patch.dict(os.environ, {"OPENAI_API_KEY": "synthetic-other"}):
++            result, calls = self.discover()
++        self.assertEqual("Bearer synthetic-owned", calls[0][0].get_header("Authorization"))
++        self.assertNotIn("synthetic-owned", json.dumps(result))
++
++    def test_models_failures_closed_no_raw_bodies_or_retry(self):
++        self.save()
++        for code, expected in ((301, "request_rejected"), (401, "auth_required"), (429, "request_rejected"), (503, "service_failed")):
++            error = urllib.error.HTTPError("https://private.invalid/key", code, "private", {}, io.BytesIO(b'private body'))
++            result, calls = self.discover(error=error)
++            self.assertEqual(expected, result["status"])
++            self.assertEqual(1, len(calls))
++            self.assertNotIn("private", json.dumps(result))
++        result, _ = self.discover(error=TimeoutError("private"))
++        self.assertEqual("timeout", result["status"])
++
++    def test_models_reject_duplicate_fields_invalid_ids_or_oversized(self):
++        self.save()
++        bodies = (b'{"data":[],"data":[]}', b'{"data":[{"id":"bad id"}]}',
++                  b'{"data":[{"id":"a"},{"id":"a"}]}', b'x' * (setup.MODEL_BODY_LIMIT + 1),
++                  json.dumps({"data": [{"id": str(i)} for i in range(257)]}).encode())
++        for body in bodies:
++            result, calls = self.discover(body=body)
++            self.assertEqual("invalid_response", result["status"])
++            self.assertEqual([], result["models"])
++            self.assertEqual(1, len(calls))
++
++    def test_models_cas_before_transport(self):
++        self.save()
++        with self.assertRaisesRegex(setup.SetupError, "stale_config"):
++            self.discover(expected_config_sha256="0" * 64)
++
++    def test_models_cancellation_before_io_and_during_receive(self):
++        self.save()
++        params = {"authority": setup.AUTHORITY, "provider_id": ID, "expected_config_sha256": setup.config_sha256()}
++        calls = []
++        def forbidden(*a, **k):
++            calls.append(1)
++            raise AssertionError("not called")
++        with self.assertRaisesRegex(setup.SetupError, "cancelled"):
++            setup.discover_models(params, opener=forbidden, cancelled=lambda: True)
++        self.assertEqual([], calls)
++        class Response(io.BytesIO):
++            def getcode(self): return 200
++        response = Response(b'{"data":[]}')
++        flags = iter((False, True))
++        with self.assertRaisesRegex(setup.SetupError, "cancelled"):
++            setup.discover_models(params, opener=lambda *a, **k: response, cancelled=lambda: next(flags))
++        self.assertTrue(response.closed)
++
++    def test_models_drip_reader_uses_read1_deadline_and_closes(self):
++        self.save()
++        params = {"authority": setup.AUTHORITY, "provider_id": ID, "expected_config_sha256": setup.config_sha256()}
++        calls = []
++        class Response(io.BytesIO):
++            def getcode(self): return 200
++            def read(self, *_): raise AssertionError("unbounded read forbidden")
++            def read1(self, size):
++                calls.append(size)
++                return b" "
++        response = Response()
++        ticks = iter((0, 1, 9))
++        result = setup.discover_models(params, opener=lambda *a, **k: response, monotonic=lambda: next(ticks))
++        self.assertEqual("timeout", result["status"])
++        self.assertEqual([16384], calls)
++        self.assertTrue(response.closed)
++
++    def test_actual_resolver_preserves_full_named_identity_and_empty_key(self):
++        self.save()
++        from hermes_cli import runtime_provider
++        with patch.dict(os.environ, {"OPENAI_API_KEY": "unrelated-synthetic"}), \
++             patch.object(runtime_provider, "_try_resolve_from_custom_pool", side_effect=AssertionError("pool must not run")):
++            result = runtime_provider._resolve_named_custom_runtime(requested_provider=ID)
++        self.assertEqual(ID, result["provider"])
++        self.assertEqual("", result["api_key"])
++        self.assertEqual("chat_completions", result["api_mode"])
++
++    def test_actual_resolver_deleted_identity_never_falls_back(self):
++        from hermes_cli.runtime_provider import resolve_runtime_provider
++        self.save()
++        self.remove()
++        with patch.dict(os.environ, {"OPENAI_API_KEY": "synthetic-foreign", "OPENROUTER_API_KEY": "synthetic-foreign"}):
++            with self.assertRaisesRegex(setup.SetupError, "not_found"):
++                resolve_runtime_provider(requested=ID, target_model="synthetic-model")
++
++    def test_manual_32hex_provider_is_not_adopted_by_setup_factory(self):
++        from utils import atomic_roundtrip_yaml_update
++        from hermes_cli import runtime_provider
++        name = ID[7:]
++        legacy = {"name": name, "base_url": "http://127.0.0.1:8080/v1",
++                  "api_key": "synthetic-legacy", "default_model": "legacy-model"}
++        for section, payload in (("providers", {name: legacy}), ("custom_providers", [legacy])):
++            with self.subTest(section=section):
++                atomic_roundtrip_yaml_update(self.path, "providers", {})
++                atomic_roundtrip_yaml_update(self.path, "custom_providers", [])
++                atomic_roundtrip_yaml_update(self.path, section, payload)
++                self.assertFalse(setup.is_setup_identity(ID))
++                self.assertFalse(setup.allows_empty_key(ID, legacy["base_url"], ""))
++                kwargs = {"api_key": "synthetic-legacy", "base_url": legacy["base_url"]}
++                self.assertEqual(kwargs, setup.prepare_client_kwargs(ID, kwargs))
++                entry = runtime_provider._get_named_custom_provider(ID)
++                self.assertEqual("synthetic-legacy", entry["api_key"])
++                self.assertNotIn("lilith_setup", entry)
++
++    def test_malformed_owned_marker_cannot_fall_back_to_manual_provider(self):
++        self.save()
++        from utils import atomic_roundtrip_yaml_update
++        entry = copy.deepcopy(config.read_raw_config()["providers"][ID[7:]])
++        entry["lilith_setup"] = None
++        atomic_roundtrip_yaml_update(self.path, "providers", {ID[7:]: entry})
++        with self.assertRaises(setup.SetupError):
++            setup.is_setup_identity(ID)
++        from hermes_cli import runtime_provider
++        with self.assertRaises(setup.SetupError):
++            runtime_provider._get_named_custom_provider(ID)
++
++    def test_legacy_bare_default_remains_protected_as_same_owned_entry(self):
++        self.save()
++        from utils import atomic_roundtrip_yaml_update
++        atomic_roundtrip_yaml_update(self.path, "model.provider", ID[7:])
++        self.assertTrue(setup.catalog()["entries"][0]["is_default"])
++        with self.assertRaisesRegex(setup.SetupError, "entry_in_use"):
++            self.save(label="Cannot rename active bare alias")
++        with self.assertRaisesRegex(setup.SetupError, "entry_in_use"):
++            self.remove()
++
++    def test_actual_picker_has_two_distinct_noauth_saved_model_pairs(self):
++        self.save()
++        self.save(provider_id=SECOND, label="Another same-url endpoint")
++        from hermes_cli.inventory import build_models_payload, load_picker_context
++        from hermes_cli import model_catalog
++        import requests
++        with patch.object(model_catalog, "_fetch_manifest", return_value=None), \
++             patch.object(requests, "get", side_effect=RuntimeError("synthetic offline metadata")):
++            payload = build_models_payload(load_picker_context(), explicit_only=True, picker_hints=True,
++                include_unconfigured=False, probe_custom_providers=False, probe_current_custom_provider=False)
++        rows = {row["slug"]: row for row in payload["providers"]}
++        self.assertIn(ID, rows)
++        self.assertIn(SECOND, rows)
++        for provider_id in (ID, SECOND):
++            self.assertTrue(rows[provider_id]["authenticated"])
++            self.assertEqual(["synthetic-model"], [item["id"] if isinstance(item, dict) else item
++                                                  for item in rows[provider_id]["models"]])
++
++    def test_actual_picker_never_claims_owned_missing_key_is_authenticated(self):
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic-owned")
++        config.remove_env_value(setup.key_env(ID))
++        config.invalidate_env_cache()
++        from hermes_cli.inventory import build_models_payload, load_picker_context
++        from hermes_cli import model_catalog
++        import requests
++        with patch.object(model_catalog, "_fetch_manifest", return_value=None), \
++             patch.object(requests, "get", side_effect=RuntimeError("synthetic offline metadata")):
++            payload = build_models_payload(load_picker_context(), explicit_only=True, picker_hints=True,
++                include_unconfigured=False, probe_custom_providers=False, probe_current_custom_provider=False)
++        self.assertNotIn(ID, {row["slug"] for row in payload["providers"]})
++
++    def test_actual_sdk_noauth_has_no_authorization_or_ambient_ids(self):
++        self.save()
++        import openai
++        import httpx
++        with patch.dict(os.environ, {"OPENAI_API_KEY": "unrelated-synthetic", "OPENAI_ORG_ID": "other-org"}):
++            kwargs = setup.prepare_client_kwargs(ID, {"api_key": "", "base_url": "http://127.0.0.1:8080/v1",
++                "default_headers": {"Authorization": "Bearer other"}})
++            client = openai.OpenAI(**kwargs)
++            try:
++                self.assertEqual({}, client.auth_headers)
++                self.assertNotIn("Authorization", client.default_headers)
++                self.assertEqual("", client.organization)
++                self.assertFalse(client._client.follow_redirects)
++                self.assertFalse(client._client._trust_env)
++            finally:
++                client.close()
++
++    def test_actual_sdk_default_ports_preserve_saved_url_and_exact_binding(self):
++        from agent import auxiliary_client
++        for url in ("http://localhost:80/v1", "https://localhost:443/v1"):
++            with self.subTest(url=url):
++                self.save(base_url=url)
++                self.assertEqual(url, setup.catalog()["entries"][0]["base_url"])
++                client, selected = auxiliary_client.resolve_provider_client(ID, model="synthetic-model")
++                try:
++                    self.assertEqual("synthetic-model", selected)
++                    self.assertEqual({}, client.auth_headers)
++                    self.assertEqual(url, setup.exact_route(ID, expected_base_url=str(client.base_url))["base_url"])
++                finally:
++                    client.close()
++
++    def test_existing_http_client_reused_or_rejected_without_leak(self):
++        self.save()
++        import httpx
++        good = httpx.Client(trust_env=False, follow_redirects=False)
++        bad = httpx.Client(trust_env=False, follow_redirects=True)
++        try:
++            result = setup.prepare_client_kwargs(ID, {"api_key": "", "base_url": "http://127.0.0.1:8080/v1", "http_client": good})
++            self.assertIs(good, result["http_client"])
++            with self.assertRaisesRegex(setup.SetupError, "invalid_request"):
++                setup.prepare_client_kwargs(ID, {"api_key": "", "base_url": "http://127.0.0.1:8080/v1", "http_client": bad})
++            self.assertFalse(bad.is_closed)
++        finally:
++            good.close()
++            bad.close()
++
++    def test_actual_aux_named_noauth_constructs_exact_sdk_client(self):
++        self.save()
++        from agent import auxiliary_client
++        client, model = auxiliary_client.resolve_provider_client(ID, model="synthetic-model")
++        try:
++            self.assertEqual("synthetic-model", model)
++            self.assertEqual("", client.api_key)
++            self.assertEqual({}, client.auth_headers)
++            self.assertEqual("http://127.0.0.1:8080/v1/", str(client.base_url))
++        finally:
++            client.close()
++
++    def test_actual_frozen_aux_noauth_accepts_only_matching_owned_route(self):
++        self.save()
++        from agent import auxiliary_client
++        client = auxiliary_client._build_strict_exact_auxiliary_client(provider=ID, model="synthetic-model",
++            base_url="http://127.0.0.1:8080/v1", api_key="", api_mode="chat_completions")
++        try:
++            self.assertEqual({}, client.auth_headers)
++        finally:
++            client.close()
++        with self.assertRaises(setup.SetupError):
++            auxiliary_client._build_strict_exact_auxiliary_client(provider=ID, model="synthetic-model",
++                base_url="http://127.0.0.1:8081/v1", api_key="", api_mode="chat_completions")
++
++    def test_actual_auxiliary_capture_preserves_explicit_owned_noauth(self):
++        self.save()
++        from agent import auxiliary_client as auxiliary
++        runtime = {"provider": ID, "model": "synthetic-model", "api_key": "",
++                   "base_url": "http://127.0.0.1:8080/v1", "api_mode": "chat_completions"}
++        normalized = auxiliary._normalize_main_runtime(runtime)
++        self.assertEqual("", normalized["api_key"])
++        self.assertTrue(auxiliary._auxiliary_runtime_is_concrete(normalized))
++        from agent import identity_policy
++        with patch.object(identity_policy, "identity_lock_required_by_host", return_value=True):
++            materialized = auxiliary._materialize_host_required_auxiliary_route(
++                "auto", None, None, None, None, main_runtime=normalized)
++        self.assertEqual((ID, "synthetic-model", runtime["base_url"], "", "chat_completions"), materialized)
++        token = auxiliary._RUNTIME_MAIN_CONTEXT.set(runtime)
++        try:
++            captured = auxiliary.capture_auxiliary_runtime_context()
++            self.assertEqual("", captured._materialize_for_host()["api_key"])
++        finally:
++            auxiliary._RUNTIME_MAIN_CONTEXT.reset(token)
++        for changes in ({"api_key": None}, {"base_url": "http://127.0.0.1:9000/v1"},
++                        {"provider": "custom:legacy"}, {"api_mode": "codex_responses"}):
++            self.assertFalse(auxiliary._auxiliary_runtime_is_concrete({**runtime, **changes}))
++
++    def test_actual_async_sdk_retains_proven_identity_noauth_and_isolation(self):
++        self.save()
++        import asyncio
++        import httpx
++        from agent import auxiliary_client as auxiliary
++        from agent.managed_custom_dispatch import get_verified_managed_route
++        from agent.usage_budget_native_dispatch import require_native_dispatch_route
++        class NoNetworkLoop(asyncio.SelectorEventLoop):
++            def _make_self_pipe(self): pass
++            def _close_self_pipe(self): pass
++            def _write_to_self(self): pass
++        observed = []
++        async def mock_wire(_transport, request):
++            observed.append(request)
++            return httpx.Response(200, request=request, json={"id": "synthetic", "object": "chat.completion",
++                "model": "synthetic-model", "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
++                "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
++        async def run():
++            sync, _ = auxiliary.resolve_provider_client(ID, model="synthetic-model")
++            async_client = None
++            try:
++                with patch.dict(os.environ, {"OPENAI_API_KEY": "synthetic-foreign", "OPENAI_ORG_ID": "foreign-org"}), \
++                     patch.object(auxiliary, "_apply_user_default_headers", side_effect=AssertionError("ambient headers forbidden")):
++                    async_client, model = auxiliary._to_async_client(sync, "synthetic-model", is_vision=True)
++                self.assertEqual((ID, model), get_verified_managed_route(async_client, model))
++                self.assertFalse(async_client._client._trust_env)
++                self.assertFalse(async_client._client.follow_redirects)
++                self.assertEqual(0, async_client.max_retries)
++                self.assertEqual("", async_client.organization)
++                request = {"model": model, "messages": [{"role": "user", "content": "synthetic"}], "max_tokens": 2}
++                require_native_dispatch_route(async_client, request, "chat_max_tokens", model_id=model)
++                with patch.object(httpx.AsyncHTTPTransport, "handle_async_request", mock_wire):
++                    result = await async_client.chat.completions.create(**request)
++                self.assertEqual("ok", result.choices[0].message.content)
++                self.assertNotIn("authorization", observed[0].headers)
++                import openai
++                closed = []
++                original_close = openai.OpenAI.close
++                def record_close(client):
++                    closed.append(client)
++                    return original_close(client)
++                with patch.object(openai.OpenAI, "close", record_close):
++                    resolved_async, selected = auxiliary.resolve_provider_client(ID,
++                        model="synthetic-model", async_mode=True)
++                try:
++                    self.assertEqual(1, len(closed))
++                    self.assertTrue(closed[0].is_closed())
++                    self.assertEqual((ID, selected), get_verified_managed_route(resolved_async, selected))
++                finally:
++                    await resolved_async.close()
++                sync.api_key = "synthetic-mutated"
++                with self.assertRaises(Exception):
++                    auxiliary._to_async_client(sync, model)
++            finally:
++                sync.close()
++                if async_client is not None:
++                    await async_client.close()
++        loop = NoNetworkLoop()
++        # No descriptors exist in this immediate mock-only loop. Windows
++        # select([]) is invalid, so explicitly provide the empty readiness set.
++        loop._selector.select = lambda timeout=None: []
++        try:
++            loop.run_until_complete(run())
++        finally:
++            loop.close()
++
++    def test_actual_agent_noauth_and_final_mock_sdk_wire(self):
++        self.save()
++        import httpx
++        import tools.env_probe
++        from run_agent import AIAgent
++        import agent.agent_init
++        import agent.model_metadata
++        with patch.object(tools.env_probe, "warm_environment_probe_async", return_value=None), \
++             patch.object(agent.model_metadata, "get_model_context_length", return_value=32768), \
++             patch.object(agent.model_metadata, "fetch_endpoint_model_metadata", return_value={}), \
++             patch.object(agent.model_metadata, "_query_local_context_length", return_value=None), \
++             patch.object(agent.model_metadata, "_query_ollama_api_show", return_value=None), \
++             patch.object(agent.model_metadata.requests, "get", side_effect=RuntimeError("synthetic offline metadata")), \
++             patch.object(agent.agent_init, "query_ollama_num_ctx", return_value=None):
++            agent = AIAgent(model="synthetic-model", provider=ID, api_mode="chat_completions",
++                api_key="", base_url="http://127.0.0.1:8080/v1", session_id="synthetic-setup",
++                enabled_toolsets=[], skip_context_files=True, skip_memory=True,
++                skip_background_review=True, quiet_mode=True)
++        self.assertEqual("", agent.api_key)
++        self.assertEqual("", agent._client_kwargs["api_key"])
++        sent = []
++        def transport(request):
++            sent.append((dict(request.headers), json.loads(request.content)))
++            return httpx.Response(200, json={"id": "synthetic", "object": "chat.completion", "created": 0,
++                "model": "synthetic-model", "choices": [{"index": 0, "message": {"role": "assistant", "content": "mock"}, "finish_reason": "stop"}]})
++        agent.client._client.close()
++        agent.client._client = httpx.Client(transport=httpx.MockTransport(transport), trust_env=False)
++        try:
++            agent.client.chat.completions.create(model="synthetic-model", messages=[{"role": "user", "content": "synthetic"}])
++        finally:
++            agent.release_clients()
++        self.assertEqual(1, len(sent))
++        self.assertNotIn("authorization", sent[0][0])
++        self.assertEqual("synthetic-model", sent[0][1]["model"])
++
++    @contextlib.contextmanager
++    def gateway(self):
++        from tui_gateway import server, methods_provider_setup
++        from agent import identity_policy as identity
++        import tools.approval
++        state = {"pending": None, "quarantined": None, "verified": [], "rebound": []}
++        base = SimpleNamespace(approval_mode="manual", enabled_toolsets=("hermes-cli",))
++        @contextlib.contextmanager
++        def idle(_digest):
++            yield ()
++        def begin(value):
++            if state["pending"] is not None:
++                raise identity.NativeAuthorityTransitionBusyError("synthetic busy")
++            state["pending"] = value
++        def clear(_nonce):
++            state["pending"] = None
++        with contextlib.ExitStack() as stack:
++            replacements = {
++                "identity_lock_required_by_host": lambda: True,
++                "require_native_runtime_parent_authority": lambda: None,
++                "native_authority_quarantine_state": lambda: state["quarantined"],
++                "native_authority_dispatch_block_state": lambda: state["pending"],
++                "prepare_host_config_digest_rotation": setup.config_sha256,
++                "capture_native_config_receipt_base": lambda *a, **k: base,
++                "begin_native_authority_commit_pending": begin,
++                "clear_native_authority_commit_pending": clear,
++                "update_native_authority_commit_pending": lambda *a: None,
++                "commit_host_config_digest_rotation": lambda _previous: setup.config_sha256(),
++                "verify_native_provider_setup_commit_receipt": lambda *a, **k: state["verified"].append(k),
++                "latch_native_authority_quarantine": lambda *a, **k: state.update(quarantined={"synthetic": True}),
++            }
++            for name, value in replacements.items():
++                stack.enter_context(patch.object(identity, name, value))
++            stack.enter_context(patch.object(tools.approval, "_capture_native_approval_policy", return_value=("manual", ["hermes-cli"])))
++            stack.enter_context(patch.object(server, "_hermes_home", self.home))
++            stack.enter_context(patch.object(server, "current_transport", return_value=SimpleNamespace(lilith_runtime_attested=True, _closed=False)))
++            stack.enter_context(patch.object(server, "_sessions", {}))
++            stack.enter_context(patch.object(server, "_paused_live_strict_sessions_for_native_model", idle))
++            stack.enter_context(patch.object(server, "_rebind_prepared_native_model_sessions", lambda value: state["rebound"].append(value)))
++            methods_provider_setup.register(server)
++            def rpc(name, params):
++                return server._methods["provider.setup." + name](1, params)["result"]
++            yield rpc, state, server
++
++    def test_actual_gateway_prepare_catalog_commit_and_busy(self):
++        with self.gateway() as (rpc, state, server):
++            saved = rpc("save", self.request())
++            self.assertTrue(saved["changed"])
++            self.assertIsNotNone(state["pending"])
++            self.assertEqual(ID, rpc("catalog", {"authority": setup.AUTHORITY})["entries"][0]["provider_id"])
++            self.assertEqual("setup.busy", rpc("models", {"authority": setup.AUTHORITY,
++                "provider_id": ID, "expected_config_sha256": saved["config_sha256"]})["code"])
++            committed = rpc("commit", {"authority": setup.AUTHORITY, "operation_id": saved["operation_id"],
++                "previous_config_sha256": saved["previous_config_sha256"], "config_sha256": saved["config_sha256"],
++                "receipt_sha256": "c" * 64})
++            self.assertTrue(committed["committed"])
++            self.assertIsNone(state["pending"])
++            self.assertEqual(1, len(state["verified"]))
++            self.assertEqual(1, len(state["rebound"]))
++
++    def test_actual_gateway_noop_does_not_require_receipt(self):
++        self.save()
++        with self.gateway() as (rpc, state, _):
++            result = rpc("save", self.request(operation_id="noop-2"))
++            self.assertFalse(result["changed"])
++            self.assertIsNone(state["pending"])
++            self.assertEqual("setup.receipt_required", rpc("commit", {"authority": setup.AUTHORITY})["code"])
++            self.assertIsNone(state["quarantined"])
++
++    def test_actual_gateway_wrong_receipt_identity_quarantines(self):
++        with self.gateway() as (rpc, state, _):
++            result = rpc("save", self.request())
++            rejected = rpc("commit", {"authority": setup.AUTHORITY, "operation_id": "wrong",
++                "previous_config_sha256": result["previous_config_sha256"], "config_sha256": result["config_sha256"],
++                "receipt_sha256": "c" * 64})
++            self.assertEqual("setup.receipt_invalid", rejected["code"])
++            self.assertIsNotNone(state["quarantined"])
++            self.assertEqual([], state["verified"])
++
++    def test_actual_gateway_rejects_unattested_transport_or_supplied_home(self):
++        with self.gateway() as (rpc, state, server):
++            with patch.object(server, "current_transport", return_value=SimpleNamespace(_closed=False)):
++                self.assertEqual("setup.unauthorized", rpc("save", self.request())["code"])
++            self.assertEqual("setup.invalid_request", rpc("save", self.request(profile_home="untrusted"))["code"])
++            self.assertIsNone(state["pending"])
++
++    def test_actual_receipt_decoder_binds_source_digests_policy_and_identity(self):
++        from agent import identity_policy as identity
++        before, after = "a" * 64, "b" * 64
++        base = identity.NativeConfigReceiptBase(sequence=2, canonical_base_sha256="c" * 64,
++            config_sha256=before, identity_fingerprint_sha256="d" * 64,
++            soul_sha256="e" * 64, personality_sha256="f" * 64,
++            approval_mode="manual", enabled_toolsets=("hermes-cli",))
++        value = {"schema_version": 1, "source": setup.SOURCE, "sequence": 3,
++            "canonical_base_sha256": "c" * 64, "previous_config_sha256": before, "config_sha256": after,
++            "identity_fingerprint_sha256": "d" * 64, "soul_sha256": "e" * 64,
++            "personality_sha256": "f" * 64, "approval_mode": "manual", "enabled_toolsets": ["hermes-cli"]}
++        preflight = SimpleNamespace(policy=SimpleNamespace(fingerprint="d" * 64), soul_sha256="e" * 64, personality_sha256="f" * 64)
++        def verify(candidate):
++            raw = json.dumps(candidate).encode()
++            snapshot = SimpleNamespace(config_sha256=after, files=[SimpleNamespace(
++                label="runtime/native-config-receipt.v1.json", existed=True, raw=raw)])
++            with patch.object(identity, "require_native_runtime_parent_authority", return_value=None), \
++                 patch.object(identity, "capture_strict_authority_snapshot", return_value=snapshot), \
++                 patch.object(identity, "preflight_aia_agent_identity", return_value=preflight):
++                identity.verify_native_provider_setup_commit_receipt(base, previous_config_sha256=before,
++                    config_sha256=after, receipt_sha256=hashlib.sha256(raw).hexdigest())
++        verify(value)
++        for key, altered in (("source", "hermes.model.default.set"), ("sequence", 4),
++                             ("approval_mode", "off"), ("enabled_toolsets", []),
++                             ("previous_config_sha256", "0" * 64)):
++            changed = {**value, key: altered}
++            with self.subTest(key=key), self.assertRaises(identity.IdentityPolicyError):
++                verify(changed)
++
++    def test_actual_fresh_receipt_capture_preserves_nonempty_policy(self):
++        from agent import identity_policy as identity
++        before, after = "a" * 64, "b" * 64
++        preflight = SimpleNamespace(policy=SimpleNamespace(fingerprint="d" * 64),
++                                    soul_sha256="e" * 64, personality_sha256="f" * 64)
++        snapshot = SimpleNamespace(config_sha256=before, soul_sha256="e" * 64,
++            personality_sha256="f" * 64, files=[SimpleNamespace(
++                label="runtime/native-config-receipt.v1.json", existed=False, raw=None)])
++        with patch.object(identity, "require_native_runtime_parent_authority", return_value=None), \
++             patch.object(identity, "capture_strict_authority_snapshot", return_value=snapshot), \
++             patch.object(identity, "preflight_aia_agent_identity", return_value=preflight):
++            base = identity.capture_native_config_receipt_base(before,
++                approval_mode="smart", enabled_toolsets=("hermes-cli",))
++            self.assertEqual(0, base.sequence)
++            self.assertEqual(("smart", ("hermes-cli",)), (base.approval_mode, base.enabled_toolsets))
++            receipt = {"schema_version": 1, "source": setup.SOURCE, "sequence": 1,
++                "canonical_base_sha256": before, "previous_config_sha256": before, "config_sha256": after,
++                "identity_fingerprint_sha256": "d" * 64, "soul_sha256": "e" * 64,
++                "personality_sha256": "f" * 64, "approval_mode": "smart", "enabled_toolsets": ["hermes-cli"]}
++            snapshot.config_sha256 = after
++            snapshot.files[0].existed = True
++            def verify(value):
++                snapshot.files[0].raw = json.dumps(value).encode()
++                identity.verify_native_provider_setup_commit_receipt(base, previous_config_sha256=before,
++                    config_sha256=after, receipt_sha256=hashlib.sha256(snapshot.files[0].raw).hexdigest())
++            verify(receipt)
++            with self.assertRaises(identity.IdentityPolicyError):
++                verify({**receipt, "approval_mode": "manual", "enabled_toolsets": []})
+diff --git a/tui_gateway/letters_text.py b/tui_gateway/letters_text.py
+index 5116bed..f1d7bd4 100644
+--- a/tui_gateway/letters_text.py
++++ b/tui_gateway/letters_text.py
+@@ -256,10 +256,14 @@ def complete_text(params, session, *, attest, authority_ok):
+             # In particular: Gemini's registered mode and DeepSeek's inherited
+             # ProviderProfile mode are both chat_completions. No SDK is replaced.
+             state["failure"] = "unavailable_route"
++            from hermes_cli.provider_setup import allows_empty_key
++            setup_noauth = allows_empty_key(
++                str(getattr(agent, "requested_provider", "") or getattr(agent, "provider", "")),
++                getattr(agent, "base_url", None), getattr(agent, "api_key", None))
+             if (getattr(agent, "api_mode", None) != "chat_completions"
+                     or getattr(agent, "provider", "") in {"", "auto", "moa", "copilot-acp"}
+                     or not isinstance(getattr(agent, "api_key", None), str)
+-                    or not getattr(agent, "api_key", "")
++                    or (not getattr(agent, "api_key", "") and not setup_noauth)
+                     or not isinstance(getattr(agent, "model", None), str)
+                     or not agent.model.strip()
+                     or not isinstance(getattr(agent, "base_url", None), str)
+diff --git a/tui_gateway/methods_provider_setup.py b/tui_gateway/methods_provider_setup.py
+new file mode 100644
+--- /dev/null
++++ b/tui_gateway/methods_provider_setup.py
+@@ -0,0 +1,156 @@
++"""Authenticated human setup RPCs, isolated from model/tool command dispatch."""
++from __future__ import annotations
++
++import secrets
++import threading
++from hermes_cli import provider_setup as setup
++
++
++def register(server):
++    # Capture launch profile, not a client path or session profile override.
++    profile_root = server._hermes_home
++    stdio = server._stdio_transport
++    lock = threading.RLock()
++    pending = None
++
++    def fail(rid, code):
++        return server._ok(rid, {"schema_version": 1, "code": "setup." + code})
++
++    def quarantine():
++        from agent.identity_policy import latch_native_authority_quarantine
++        latch_native_authority_quarantine("native provider setup recovery was not verified",
++            drifted_labels=("config.yaml", "runtime/native-config-receipt.v1.json"))
++
++    def _in_use():
++        result = set()
++        for session in server._sessions.values():
++            agent = session.get("agent")
++            for value in (session.get("provider"), getattr(agent, "provider", None),
++                          getattr(agent, "requested_provider", None),
++                          (getattr(agent, "_session_init_model_config", None) or {}).get("provider")):
++                normalized = setup.normalize_setup_identity(value)
++                if normalized:
++                    result.add(normalized)
++        return frozenset(result)
++
++    def _mutate(params, action):
++        nonlocal pending
++        from agent import identity_policy as identity
++        from tools.approval import _capture_native_approval_policy
++        params = setup.validate_params(params, action)
++        if pending is not None or identity.native_authority_dispatch_block_state() is not None:
++            raise setup.SetupError("busy")
++        before = identity.prepare_host_config_digest_rotation()
++        if before != params["expected_config_sha256"]:
++            raise setup.SetupError("stale_config")
++        policy_mode, toolsets = _capture_native_approval_policy()
++        base = identity.capture_native_config_receipt_base(before,
++            approval_mode=policy_mode, enabled_toolsets=toolsets)
++        nonce = secrets.token_hex(32)
++        identity.begin_native_authority_commit_pending({"session_key": "provider.setup",
++            "commit_nonce": nonce, "source": setup.SOURCE})
++        rotated = False
++        try:
++            with server._paused_live_strict_sessions_for_native_model(before) as bindings:
++                def finalize(previous, after):
++                    nonlocal pending, rotated
++                    current = identity.commit_host_config_digest_rotation(previous)
++                    rotated = True
++                    if current != after:
++                        raise setup.SetupError("storage_failed")
++                    prepared = server._PreparedNativeModelDefaultCommit(
++                        commit_nonce=nonce, previous_config_sha256=previous,
++                        config_sha256=after, receipt_base=base, bindings=bindings)
++                    identity.update_native_authority_commit_pending(nonce, {
++                        "previous_config_sha256": previous, "config_sha256": after})
++                    pending = (params["operation_id"], prepared)
++                result = setup.mutate(action, params, finalize=finalize, in_use=_in_use())
++            if not result["changed"]:
++                identity.clear_native_authority_commit_pending(nonce)
++            return result
++        except BaseException as error:
++            pending = None
++            if rotated or isinstance(error, setup.SetupError) and error.code == "rollback_unverified":
++                quarantine()
++            try:
++                identity.clear_native_authority_commit_pending(nonce)
++            except BaseException:
++                quarantine()
++                raise setup.SetupError("rollback_unverified") from None
++            if isinstance(error, identity.NativeAuthorityTransitionBusyError):
++                raise setup.SetupError("busy") from None
++            if isinstance(error, setup.SetupError):
++                raise
++            raise setup.SetupError("storage_failed") from None
++
++    def _commit(params):
++        nonlocal pending
++        from agent import identity_policy as identity
++        from tools.approval import _capture_native_approval_policy
++        if pending is None:
++            raise setup.SetupError("receipt_required")
++        try:
++            if type(params) is not dict or set(params) != {
++                "authority", "operation_id", "previous_config_sha256", "config_sha256", "receipt_sha256"}:
++                raise setup.SetupError("invalid_request")
++            operation_id, prepared = pending
++            if (params["authority"] != setup.AUTHORITY or params["operation_id"] != operation_id
++                    or params["previous_config_sha256"] != prepared.previous_config_sha256
++                    or params["config_sha256"] != prepared.config_sha256):
++                raise setup.SetupError("receipt_invalid")
++            identity.require_native_runtime_parent_authority()
++            mode, toolsets = _capture_native_approval_policy()
++            if mode != prepared.receipt_base.approval_mode or tuple(toolsets) != prepared.receipt_base.enabled_toolsets:
++                raise setup.SetupError("receipt_invalid")
++            identity.verify_native_provider_setup_commit_receipt(prepared.receipt_base,
++                previous_config_sha256=prepared.previous_config_sha256,
++                config_sha256=prepared.config_sha256, receipt_sha256=params["receipt_sha256"])
++            server._rebind_prepared_native_model_sessions(prepared)
++            identity.clear_native_authority_commit_pending(prepared.commit_nonce)
++            pending = None
++            return {"schema_version": 1, "operation_id": operation_id, "committed": True}
++        except BaseException:
++            quarantine()
++            raise setup.SetupError("receipt_invalid") from None
++
++    def invoke(rid, params, name):
++        from agent import identity_policy as identity
++        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++        try:
++            transport = server.current_transport()
++            if (not (transport is None or transport is stdio or
++                     getattr(transport, "lilith_runtime_attested", False) is True)
++                    or getattr(transport, "_closed", False)
++                    or identity.identity_lock_required_by_host() is not True):
++                return fail(rid, "unauthorized")
++            identity.require_native_runtime_parent_authority()
++            if identity.native_authority_quarantine_state() is not None:
++                return fail(rid, "rollback_unverified")
++            if type(params) is not dict or params.get("authority") != setup.AUTHORITY:
++                return fail(rid, "unauthorized")
++            token = set_hermes_home_override(profile_root)
++            try:
++                with lock:
++                    if name == "catalog":
++                        if set(params) != {"authority"}:
++                            raise setup.SetupError("invalid_request")
++                        # Phase-one readback is allowed; no resolver/network.
++                        return server._ok(rid, setup.catalog())
++                    if name == "commit":
++                        return server._ok(rid, _commit(params))
++                    if identity.native_authority_dispatch_block_state() is not None:
++                        raise setup.SetupError("busy")
++                    if name == "models":
++                        return server._ok(rid, setup.discover_models(params,
++                            cancelled=lambda: getattr(transport, "_closed", False) is True))
++                    return server._ok(rid, _mutate(params, name))
++            finally:
++                reset_hermes_home_override(token)
++        except setup.SetupError as error:
++            return fail(rid, error.code)
++        except Exception:
++            return fail(rid, "catalog_unavailable" if name == "catalog" else "storage_failed")
++
++    for name in ("catalog", "models", "save", "remove", "commit"):
++        server._methods["provider.setup." + name] = (
++            lambda rid, params, name=name: invoke(rid, params, name))
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index c1136f9..7d8db9a 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -5433,10 +5433,13 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
+                     canonical_custom_identity,
+                 )
+ 
++                requested = str(getattr(agent, "_requested_provider", "") or "").strip()
++                named = requested if requested.lower().startswith("custom:") else None
+                 provider = (
+                     canonical_custom_identity(
+-                        base_url=base_url, model=model or None
++                        base_url=base_url, model=model or None, requested_provider=named
+                     )
++                    or named
+                     or provider
+                 )
+             except Exception:
+@@ -21977,6 +21980,7 @@ from . import (  # noqa: E402
+     methods_session as _methods_session,
+     methods_tools as _methods_tools,
+     methods_usage_budget as _methods_usage_budget,
++    methods_provider_setup as _methods_provider_setup,
+ )
+ 
+ for _m in (
+@@ -21989,6 +21993,7 @@ for _m in (
+     _methods_profiles,
+     _methods_images,
+     _methods_usage_budget,
++    _methods_provider_setup,
+ ):
+     _m.register(sys.modules[__name__])
+ del _m

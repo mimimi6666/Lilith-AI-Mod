@@ -1,0 +1,246 @@
+diff --git a/tests/tui_gateway/test_history_timestamp_projection.py b/tests/tui_gateway/test_history_timestamp_projection.py
+new file mode 100644
+index 0000000..03ad5c3
+--- /dev/null
++++ b/tests/tui_gateway/test_history_timestamp_projection.py
+@@ -0,0 +1,39 @@
++from tui_gateway import server
++
++
++def test_history_to_messages_preserves_numeric_timestamps_for_durable_roles():
++    history = [
++        {"role": "user", "content": "question", "timestamp": 1_720_000_000},
++        {
++            "role": "assistant",
++            "content": "answer",
++            "timestamp": 1_720_000_001.25,
++        },
++        {
++            "role": "tool",
++            "content": "done",
++            "tool_name": "terminal",
++            "timestamp": 1_720_000_002,
++        },
++    ]
++
++    projected = server._history_to_messages(history)
++
++    assert [(row["role"], row["timestamp"]) for row in projected] == [
++        ("user", 1_720_000_000),
++        ("assistant", 1_720_000_001.25),
++        ("tool", 1_720_000_002),
++    ]
++
++
++def test_history_to_messages_does_not_fabricate_invalid_timestamps():
++    history = [
++        {"role": "user", "content": "missing"},
++        {"role": "assistant", "content": "string", "timestamp": "1720000003"},
++        {"role": "tool", "content": "bool", "timestamp": True},
++        {"role": "assistant", "content": "nan", "timestamp": float("nan")},
++    ]
++
++    projected = server._history_to_messages(history)
++
++    assert all("timestamp" not in row for row in projected)
+diff --git a/tests/tui_gateway/test_inline_rpc_gil_starvation.py b/tests/tui_gateway/test_inline_rpc_gil_starvation.py
+index e6cfa14..ca9cf81 100644
+--- a/tests/tui_gateway/test_inline_rpc_gil_starvation.py
++++ b/tests/tui_gateway/test_inline_rpc_gil_starvation.py
+@@ -78,6 +78,12 @@ def capture(server):
+ FRONTEND_POLLED_RPCS = [
+     "session.active_list",   # live-session rehydrate — in-memory registry
+     "session.list",          # loads session list — SQLite query
++    "tools.catalog",         # native tool/config projection — config/provider reads
++    "session.status",        # active turn projection — SQLite/session read
++    "session.history",       # durable transcript — SQLite/history lock
++    "session.context_breakdown",  # large transcript analysis
++    "model.credential_status",  # credential backend read
++    "delegation.status",      # delegated-task registry/state projection
+     "pet.info",              # petdex poll — file/network read
+     "process.list",          # background process status — process registry scan
+     "setup.runtime_check",   # runtime readiness — resolve_runtime_provider() I/O
+@@ -130,6 +136,35 @@ def test_dispatch_inline_rpc_does_not_block_under_gil_pressure(server):
+     released.set()
+ 
+ 
++def test_slow_workbench_history_never_blocks_session_interrupt(server):
++    """A projection refresh may be slow, but emergency stop stays inline."""
++    released = threading.Event()
++
++    def slow_history(rid, params):
++        released.wait(timeout=5)
++        return server._ok(rid, {"messages": []})
++
++    server._methods["session.history"] = slow_history
++    server._methods["session.interrupt"] = (
++        lambda rid, params: server._ok(rid, {"status": "interrupted"})
++    )
++
++    started = time.monotonic()
++    assert server.dispatch(
++        {"id": "history", "method": "session.history", "params": {}}
++    ) is None
++    interrupt = server.dispatch(
++        {"id": "stop", "method": "session.interrupt", "params": {}}
++    )
++    elapsed = time.monotonic() - started
++
++    assert interrupt["result"] == {"status": "interrupted"}
++    assert elapsed < 2.0
++    assert "session.interrupt" not in server._LONG_HANDLERS
++
++    released.set()
++
++
+ def test_rpc_pool_workers_supports_concurrent_long_handlers(server):
+     """The RPC thread pool must have enough workers to handle concurrent
+     long handlers without queueing. With 6+ frontend-polled RPCs added to
+diff --git a/tests/tui_gateway/test_protocol.py b/tests/tui_gateway/test_protocol.py
+index fc36e43..8f0705f 100644
+--- a/tests/tui_gateway/test_protocol.py
++++ b/tests/tui_gateway/test_protocol.py
+@@ -152,9 +152,17 @@ def test_session_interrupt_uses_explicit_stop_compatibility(server, monkeypatch,
+         "session_key": "session-key",
+         "_run_thread": None,
+     }
+-    monkeypatch.setattr(server, "_tts_stream_stop", lambda: None)
++    audio_stops = []
++    monkeypatch.setattr(server, "_tts_stream_stop", lambda: audio_stops.append("tts"))
++    monkeypatch.setattr(
++        server, "_thinking_sound_stop", lambda: audio_stops.append("thinking")
++    )
+     monkeypatch.setattr(server, "_sess_nowait", lambda _params, _rid: (session, None))
+-    monkeypatch.setattr(server, "_sess", lambda _params, _rid: (session, None))
++    monkeypatch.setattr(
++        server,
++        "_sess",
++        lambda *_args: (_ for _ in ()).throw(AssertionError("interrupt waited for agent")),
++    )
+     monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+     monkeypatch.setattr(server, "_clear_pending", lambda _sid: None)
+     response = server._methods["session.interrupt"](
+@@ -163,6 +171,7 @@ def test_session_interrupt_uses_explicit_stop_compatibility(server, monkeypatch,
+ 
+     assert response["result"]["status"] == "interrupted"
+     assert calls == ["hard" if kind == "hard-only" else "legacy"]
++    assert audio_stops == ["tts", "thinking"]
+ 
+ 
+ # ── write_json ────────────────────────────────────────────────
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 9624e56..f0672be 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -3117,6 +3117,10 @@ def _(rid, params: dict) -> dict:
+     # Keypress barge-in: stopping the turn also silences its streaming TTS
+     # (voice is process-global, so no per-session scoping is needed).
+     _tts_stream_stop()
++    # Ambient thinking audio is independent from streaming TTS and normally
++    # stops in the turn's finally block. Silence it at interrupt admission so
++    # a blocked tool or approval cannot keep sounding after Stop was accepted.
++    _thinking_sound_stop()
+     session, err = _sess_nowait(params, rid)
+     if err:
+         return err
+@@ -3140,7 +3144,10 @@ def _(rid, params: dict) -> dict:
+         except Exception:
+             pass
+         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
+-    session, err = _sess(params, rid)
++    # Stop is an emergency path: never wait for deferred agent initialization.
++    # The cancel flag below prevents a late build from starting the turn; when
++    # an agent already exists, the hard interrupt also reaches its active tool.
++    session, err = _sess_nowait(params, rid)
+     if err:
+         return err
+     # Safety net: if the turn's run thread is already gone but `running` stayed
+@@ -3161,7 +3168,7 @@ def _(rid, params: dict) -> dict:
+     if should_interrupt:
+         from agent.interrupt_compat import request_hard_interrupt
+ 
+-        request_hard_interrupt(session["agent"])
++        request_hard_interrupt(session.get("agent"))
+     if not run_thread_alive:
+         with session["history_lock"]:
+             if session.get("running"):
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 8b598f4..aecbe8d 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -7,6 +7,7 @@ import hashlib
+ import inspect
+ import json
+ import logging
++import math
+ import os
+ import queue
+ import subprocess
+@@ -238,6 +239,17 @@ _LONG_HANDLERS = frozenset(
+         # prompt.submit / session.interrupt sit unread (same class as #21123),
+         # and the Desktop model pill / picker block on it every open.
+         "model.options",
++        # Workbench rehydration reads may touch provider/config state, SQLite,
++        # or a large transcript.  Keep them off the WS reader so the emergency
++        # session.interrupt path can always be admitted while a projection is
++        # refreshing.  These handlers are read-only and already protect their
++        # shared session/config state with the canonical locks.
++        "tools.catalog",
++        "session.status",
++        "session.history",
++        "session.context_breakdown",
++        "model.credential_status",
++        "delegation.status",
+         # Pet RPCs hit the network (manifest fetch / spritesheet download) or do
+         # per-frame PNG decode/encode (pet.cells): inline they serialize on the
+         # reader thread, so picker previews trickle in one at a time and the
+@@ -8473,6 +8485,16 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
+         if source.get("_row_id") is not None:
+             projected["row_id"] = source["_row_id"]
+ 
++    def apply_durable_timestamp(source: dict, projected: dict) -> None:
++        timestamp = source.get("timestamp")
++        if (
++            source.get("role") in {"user", "assistant", "tool"}
++            and isinstance(timestamp, (int, float))
++            and not isinstance(timestamp, bool)
++            and math.isfinite(timestamp)
++        ):
++            projected["timestamp"] = timestamp
++
+     for m in history:
+         if not isinstance(m, dict):
+             continue
+@@ -8545,6 +8567,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
+             if tc_id:
+                 tool_msg["tool_call_id"] = tc_id
+             apply_durable_identity(m, tool_msg)
++            apply_durable_timestamp(m, tool_msg)
+             # This is the display projection, so keep it faithful. `context`
+             # is an 80-char preview for collapsed row titles. A renderer that
+             # shows the full call (the expanded `$` transcript in the desktop)
+@@ -8575,6 +8598,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
+         # anything that addresses a specific persisted message later — message
+         # reactions — needs this instead.
+         apply_durable_identity(m, msg)
++        apply_durable_timestamp(m, msg)
+         if role == "user":
+             invocation = _skill_scaffold_projection(content_text)
+             if invocation:
+@@ -15404,6 +15428,16 @@ def _tts_stream_stop(user_barge: bool = True) -> None:
+         pass
+ 
+ 
++def _thinking_sound_stop() -> None:
++    """Silence the ambient turn sound without waiting for turn teardown."""
++    try:
++        from tools.voice_mode import stop_thinking_sound
++
++        stop_thinking_sound()
++    except Exception:
++        pass
++
++
+ def _tts_stream_barge_in_monitor(stop: threading.Event, done: threading.Event) -> None:
+     """Deprecated shim — playback-only monitor replaced by the full-duplex
+     agent-turn listener (see ``_full_duplex_listener``). Kept as a name so

@@ -1,0 +1,421 @@
+diff --git a/agent/history_checkpoint.py b/agent/history_checkpoint.py
+index f565acf..04bc8a9 100644
+--- a/agent/history_checkpoint.py
++++ b/agent/history_checkpoint.py
+@@ -48,7 +48,13 @@ def publication_reason(state, sizes, spec):
+     # A malformed/overlong summary cannot be advertised as a size reduction.
+     if len(state["pending_summary"]) >= old_size:
+         return "not_smaller"
+-    if sum(sizes[covered:]) > history_limit(spec):
++    # A large retained tail (especially the protected latest turns) is not
++    # evidence that replacing the *front* summary for one tiny update helps.
++    # Bootstrap may publish under pressure; thereafter pressure must include
++    # substantial newly covered material. Otherwise keep the stable checkpoint
++    # and the still-uncovered source rows until the ordinary batch boundary.
++    if (sum(sizes[covered:]) > history_limit(spec)
++            and (not covered or sum(sizes[covered:pending]) > history_limit(spec) // 2)):
+         return "history_size"
+     if pending - covered >= max(spec.summary_every, max(1, spec.history_turns // 4)):
+         return "batch"
+diff --git a/agent/history_checkpoint_cache.py b/agent/history_checkpoint_cache.py
+new file mode 100644
+--- /dev/null
++++ b/agent/history_checkpoint_cache.py
+@@ -0,0 +1,172 @@
++"""Bounded disposable summary cache, never history, identity or budget authority.
++
++Only the authenticated origin supplies the profile. Reads/writes are optional;
++an absent, corrupt, unsafe or unavailable cache is a miss. Every reuse still
++requires exact current certified-unit semantic keys and a matching scope.
++Fixed slots bound retention. Payload digests detect corruption, not establish
++authority; cached prose remains subordinate model-generated summary data.
++"""
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++import time
++
++VERSION = "lilith-context-checkpoint-v1"
++MAX_BYTES = 320 * 1024
++MAX_SUMMARY_CHARS = 48000
++MAX_UNITS = 2048
++SLOTS = 32
++MAX_AGE = 30 * 86400
++_HEX = re.compile(r"[a-f0-9]{64}\Z")
++
++
++def reuse_scope(agent):
++    from agent.identity_policy import policy_for_agent
++    from agent.usage_strategy import STRATEGY_VERSION
++    policy = policy_for_agent(agent)
++    return (VERSION, STRATEGY_VERSION, str(agent.session_id),
++            tuple(str(getattr(agent, key, "")) for key in
++                  ("model", "provider", "api_mode", "base_url")),
++            policy.enabled, policy.fingerprint)
++
++
++def _json(value):
++    return json.dumps(value, sort_keys=True, ensure_ascii=True,
++                      separators=(",", ":"), allow_nan=False).encode("ascii")
++
++
++def _scope_key(scope):
++    return hashlib.sha256(_json(scope)).hexdigest()
++
++
++def _slot(key):
++    return ".lilith-context-checkpoint-%02d.json" % (int(key[:8], 16) % SLOTS)
++
++
++def _root(agent, origin):
++    from agent.identity_policy import policy_for_agent
++    from agent.usage_budget_runtime import OriginBudgetHandle
++    if (type(origin) is not OriginBudgetHandle or not policy_for_agent(agent).enabled
++            or getattr(agent, "_background_context_readonly", False)
++            or origin.ledger.snapshot().stopped):
++        return None
++    origin._owner._validate(origin)
++    root = Path(origin._owner.store.profile_root)
++    return root if root.is_absolute() else None
++
++
++def _pairs(items):
++    result = {}
++    for key, value in items:
++        if key in result:
++            raise ValueError("duplicate_cache_field")
++        result[key] = value
++    return result
++
++
++def _valid_state(covered, summary):
++    return (type(covered) in (list, tuple) and 0 < len(covered) <= MAX_UNITS
++            and all(type(key) is str and _HEX.fullmatch(key) for key in covered)
++            and type(summary) is str and bool(summary.strip())
++            and len(summary) <= MAX_SUMMARY_CHARS)
++
++
++def _decode(data, key, keys):
++    if not 0 < len(data) <= MAX_BYTES:
++        return None
++    value = json.loads(data.decode("utf-8"), object_pairs_hook=_pairs)
++    if (type(value) is not dict or set(value) != {"payload", "sha256"}
++            or type(value["sha256"]) is not str
++            or hashlib.sha256(_json(value["payload"])).hexdigest() != value["sha256"]):
++        return None
++    payload = value["payload"]
++    if (type(payload) is not dict
++            or set(payload) != {"version", "scope", "created", "covered", "summary"}
++            or payload["version"] != VERSION or payload["scope"] != key
++            or type(payload["created"]) not in (int, float)
++            or not 0 <= time.time() - payload["created"] <= MAX_AGE
++            or not _valid_state(payload["covered"], payload["summary"])):
++        return None
++    covered = tuple(payload["covered"])
++    if tuple(keys[:len(covered)]) != covered:
++        return None
++    return {"covered": covered, "summary": payload["summary"]}
++
++
++def _load(root, scope, keys):
++    from agent.usage_budget_store import _Directory
++    key = _scope_key(scope)
++    with _Directory(root) as directory:
++        with os.fdopen(directory.open(_slot(key)), "rb") as stream:
++            return _decode(stream.read(MAX_BYTES + 1), key, keys)
++
++
++def load(agent, origin, scope, keys):
++    try:
++        root = _root(agent, origin)
++        result = _load(root, scope, keys) if root is not None else None
++        return result if root is not None and _root(agent, origin) == root else None
++    except Exception:
++        # No private path/body in diagnostics; optional cache cannot block chat.
++        return None
++
++
++def _save(root, scope, covered, summary, *, can_commit=lambda: True):
++    from agent.usage_budget_store import _Directory, _windows
++    if not _valid_state(covered, summary):
++        return False
++    key = _scope_key(scope)
++    payload = {"version": VERSION, "scope": key, "created": time.time(),
++               "covered": list(covered), "summary": summary}
++    data = _json({"payload": payload, "sha256": hashlib.sha256(_json(payload)).hexdigest()})
++    if len(data) > MAX_BYTES:
++        return False
++    name = _slot(key)
++    # One exclusive temporary per fixed slot: a process crash cannot leave an
++    # unbounded collection of private summaries. A stale temp makes this slot
++    # read-only/unavailable, not permission to remove an unknown file.
++    temporary = name + ".tmp"
++    with _Directory(root) as directory:
++        # Reject aliases/hardlinks for an existing target without modifying it.
++        try:
++            descriptor = directory.open(name, allow_delete=True)
++        except FileNotFoundError:
++            descriptor = None
++        temporary_exists = False
++        try:
++            with os.fdopen(directory.open(temporary, writable=True, exclusive=True, create=True), "wb") as stream:
++                temporary_exists = True
++                stream.write(data)
++                stream.flush()
++                os.fsync(stream.fileno())
++            # Last cancellation/ownership check at the optional publication
++            # boundary. A stop observed before commit cannot publish a cache.
++            if not can_commit():
++                return False
++            if os.name == "nt":
++                ctypes, kernel = _windows()
++                if not kernel.MoveFileExW(str(root / temporary), str(root / name), 1 | 8):
++                    raise OSError(ctypes.get_last_error(), "checkpoint_replace_failed")
++            else:
++                os.replace(temporary, name, src_dir_fd=directory.fd, dst_dir_fd=directory.fd)
++                os.fsync(directory.fd)
++            temporary_exists = False
++            return True
++        finally:
++            if descriptor is not None:
++                os.close(descriptor)
++            if temporary_exists:
++                directory.remove(temporary)
++
++
++def save(agent, origin, scope, state):
++    try:
++        root = _root(agent, origin)
++        if root is None:
++            return False
++        return _save(root, scope, state["covered"], state["summary"],
++                     can_commit=lambda: _root(agent, origin) == root)
++    except Exception:
++        return False
+diff --git a/agent/usage_budget_context.py b/agent/usage_budget_context.py
+index cdacf28..ccaae61 100644
+--- a/agent/usage_budget_context.py
++++ b/agent/usage_budget_context.py
+@@ -68,6 +68,10 @@ def with_efficiency_guidance(system_prompt):
+ class _ObservedRow:
+     message: dict
+     digest: bytes
++    # A retained host event can close the preceding capture segment, but it
++    # must still exist unchanged when that segment is projected. It is never
++    # part of the disposable unit or a substitute for a real user message.
++    boundary: _ObservedRow | None = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -155,6 +159,84 @@ def _completed_unit(rows):
+     return not pending
+ 
+ 
++def _native_message_id(value):
++    return (type(value) is str and len(value) == 32
++            and all(character in "0123456789abcdef" for character in value))
++
++
++def _retained_host_event(row):
++    """Recognize only completed host-authored assistant row shapes.
++
++    The durable native-event and extension builders use these exact synthetic
++    provenance bindings. This is a segmentation hint, not permission to omit
++    the event, infer an action succeeded, or trust a model's matching prose.
++    Unknown notifications/continuations stay in their original segment.
++    """
++    bindings = {
++        "native_assistant_event": ("lilith-native", "lilith_native_event_id"),
++        "native_assistant_extension": ("lilith-native-extension", "lilith_native_extension_event_id"),
++        "foreground_proactive_reply": ("lilith-foreground-proactive", "lilith_foreground_proactive_operation_id"),
++    }
++    kind = row.get("display_kind")
++    if type(kind) is not str or kind not in bindings:
++        return False
++    calls = row.get("tool_calls")
++    if (row.get("role") != "assistant" or type(row.get("content")) is not str
++            or not row["content"].strip()
++            or (calls is not None and (not isinstance(calls, list) or calls))
++            or any(row.get(name) is not None for name in ("tool_call_id", "function_call", "api_content"))
++            or any(row.get(name) for name in (
++                "_thinking_prefill", "_length_continuation_fragment", "_length_continuation_nudge"))
++            or row.get("finish_reason") not in (None, "stop", "end_turn")):
++        return False
++    metadata = row.get("display_metadata")
++    if not isinstance(metadata, dict):
++        return False
++    origin_kind, event_key = bindings[kind]
++    message_id = metadata.get("hermes_message_id")
++    if (metadata.get("hermes_turn_origin") != "synthetic"
++            or metadata.get("hermes_turn_origin_kind") != origin_kind
++            or metadata.get("hermes_message_kind") != "primary"
++            or not all(_native_message_id(metadata.get(key))
++                       for key in (event_key, "hermes_turn_id", "hermes_message_id"))
++            or (row.get("message_id") is not None and row["message_id"] != message_id)):
++        return False
++    if kind == "native_assistant_event":
++        native_turn = hashlib.sha256(
++            f"lilith-native-turn-v1:{message_id}".encode("ascii")).hexdigest()[:32]
++        if native_turn == message_id:
++            native_turn = hashlib.sha256(
++                f"lilith-native-turn-v2:{message_id}".encode("ascii")).hexdigest()[:32]
++        if (message_id != metadata[event_key]
++                or metadata["hermes_turn_id"] != native_turn
++                or metadata.get("lilith_native_source") != "lilith-native"
++                or type(metadata.get("lilith_native_occurred_at_unix_ms")) is not int
++                or metadata["lilith_native_occurred_at_unix_ms"] <= 0
++                or not all(type(metadata.get(key)) is str for key in (
++                    "lilith_native_node_id", "lilith_native_line_id",
++                    "lilith_native_trigger", "lilith_native_locale"))):
++            return False
++    return True
++
++
++def _retained_boundary_unchanged(unit, source, positions, projected, offset):
++    boundary = unit[0].boundary
++    if boundary is None:
++        return True
++    index = positions.get(id(boundary.message))
++    last = positions.get(id(unit[-1].message))
++    if (index is None or last is None or index != last + 1
++            or source[index] is not boundary.message
++            or _digest(source[index]) != boundary.digest):
++        return False
++    actual = projected[offset + index]
++    # The owned assembly removes display bookkeeping; semantic event content
++    # and tool linkage must still be exactly the captured, retained row.
++    fields = ("role", "content", "tool_calls", "tool_call_id", "function_call")
++    return (isinstance(actual, dict)
++            and all(source[index].get(key) == actual.get(key) for key in fields))
++
++
+ def capture_completed_history(messages, current_turn_user_idx):
+     """Capture ONLY before-turn history, never infer a boundary from its text.
+ 
+@@ -169,12 +251,15 @@ def capture_completed_history(messages, current_turn_user_idx):
+         return HistorySelection()
+     units, chunk = [], []
+ 
+-    def append_chunk():
++    def append_chunk(boundary=None):
+         if chunk and _completed_unit(chunk):
+             digests = tuple(_digest(row) for row in chunk)
+-            if all(value is not None for value in digests):
+-                units.append(tuple(_ObservedRow(row, digest)
+-                                   for row, digest in zip(chunk, digests)))
++            boundary_digest = _digest(boundary) if boundary is not None else None
++            if (all(value is not None for value in digests)
++                    and (boundary is None or boundary_digest is not None)):
++                guard = _ObservedRow(boundary, boundary_digest) if boundary is not None else None
++                units.append(tuple(_ObservedRow(row, digest, guard if index == 0 else None)
++                                   for index, (row, digest) in enumerate(zip(chunk, digests))))
+ 
+     for row in messages[:current_turn_user_idx]:
+         if not isinstance(row, dict):
+@@ -182,6 +267,14 @@ def capture_completed_history(messages, current_turn_user_idx):
+             append_chunk()
+             chunk = []
+             continue
++        if _retained_host_event(row):
++            # Native/proactive replies are independent host events appended
++            # while idle, not a continuation of the earlier user exchange.
++            # Keep the event itself and all later non-user rows mandatory.
++            # An incomplete/malformed earlier tool chain still fails closed.
++            append_chunk(boundary=row)
++            chunk = []
++            continue
+         if row.get("role") == "user":
+             append_chunk()
+             chunk = []
+@@ -278,6 +371,8 @@ def _eligible_projection_units(selection, source, projected, history_offset):
+         return ()
+     result = []
+     for unit in selection.units:
++        if not _retained_boundary_unchanged(unit, source, positions, projected, history_offset):
++            continue
+         indices = []
+         for observed in unit:
+             index = positions.get(id(observed.message))
+@@ -424,6 +519,8 @@ def _strategy_projection_units(agent, history, source, projected, offset, *, nor
+     from agent.turn_context import substitute_api_content
+     from agent.identity_policy import scoped_legacy_history_record_type, quarantine_scoped_legacy_assistant_message
+     for unit in history.units:
++        if not _retained_boundary_unchanged(unit, source, positions, projected, offset):
++            continue
+         indices = []
+         for observed in unit:
+             index = positions.get(id(observed.message))
+diff --git a/agent/usage_strategy_context.py b/agent/usage_strategy_context.py
+index 583b808..5d39d40 100644
+--- a/agent/usage_strategy_context.py
++++ b/agent/usage_strategy_context.py
+@@ -11,6 +11,7 @@ import logging
+ 
+ from agent.history_context import semantic_key, summary_scope, dedupe_sidecars, content_counts
+ from agent.history_checkpoint import detail_chars, select_old_units, publication_reason, history_limit
++from agent import history_checkpoint_cache
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -58,15 +59,24 @@ def project_context(agent, projected, units, spec, origin, *, source=None, histo
+     summary_added_turns = 0
+     summary_attempted = False
+     state_key = summary_scope(agent, origin, spec)
++    reuse_key = history_checkpoint_cache.reuse_scope(agent)
++    all_keys = tuple(_key([projected[i] for i in unit]) for unit in units)
+     state = getattr(agent, "_information_summary", None)
+     if not isinstance(state, dict) or state.get("key") != state_key:
++        reusable = (isinstance(state, dict) and state.get("reuse_key") == reuse_key
++                    and state.get("covered") and all_keys[:len(state["covered"])] == state["covered"])
++        prior = state if reusable else history_checkpoint_cache.load(agent, origin, reuse_key, all_keys)
+         state = {"key": state_key, "covered": (), "summary": "", "last": None, "attempt_count": None}
++        if prior:
++            # Reuse data, never the old origin's ledger, pending work or policy.
++            state.update(covered=prior["covered"], summary=prior["summary"],
++                         attempt_count=len(prior["covered"]))
+         agent._information_summary = state
++    state["reuse_key"] = reuse_key
+     # Background data-only handoff carries the published checkpoint, not pending
+     # work. Defaults preserve that contract and never grant a summarizer to it.
+     state.setdefault("pending_covered", state["covered"])
+     state.setdefault("pending_summary", state["summary"])
+-    all_keys = tuple(_key([projected[i] for i in unit]) for unit in units)
+     covered = state["covered"]
+     pending = state["pending_covered"]
+     if (all_keys[:len(covered)] != covered or all_keys[:len(pending)] != pending):
+@@ -75,6 +85,7 @@ def project_context(agent, projected, units, spec, origin, *, source=None, histo
+         state.update(covered=(), summary="", pending_covered=(), pending_summary="", attempt_count=None)
+         covered = pending = ()
+     old_count, sizes = select_old_units(projected, units, replacements, spec)
++    retained_detail_count = old_count
+     # Size can fall without a source edit (e.g. native reasoning transport).
+     # Do not resurrect already summarized originals just because it did.
+     old_count = max(old_count, len(pending))
+@@ -138,9 +149,15 @@ def project_context(agent, projected, units, spec, origin, *, source=None, histo
+             and not origin.ledger.snapshot().stopped):
+         state.update(covered=state["pending_covered"], summary=state["pending_summary"])
+         covered = state["covered"]
++        history_checkpoint_cache.save(agent, origin, reuse_key, state)
+     else:
+         publication = "staged" if len(state["pending_covered"]) > len(covered) else "unchanged"
+-    removed = {i for unit in old[:len(covered)] for i in unit}
++    # Raising the detail level restores the requested raw tail immediately,
++    # even if the reusable summary also mentions some of that tail. Do not
++    # summarize 100 old turns again merely to remove four from its coverage.
++    # The current request's original units remain the sole omission proof.
++    removed_count = min(len(covered), retained_detail_count)
++    removed = {i for unit in old[:removed_count] for i in unit}
+     # Do not point an old retained sidecar at a later copy: adding that copy
+     # would invalidate the cached prefix. Cross-unit dedupe is summary-only.
+     # Uncovered exchanges are still sent (with old-result excerpts). Current
+@@ -151,7 +168,7 @@ def project_context(agent, projected, units, spec, origin, *, source=None, histo
+             result.append({"role": "user", "content": state["summary"]})
+         if i not in removed:
+             result.append(replacements.get(i, row))
+-    _record_projection(agent, projected, result, spec, len(covered), len(old)-len(covered),
++    _record_projection(agent, projected, result, spec, removed_count, max(0, retained_detail_count-removed_count),
+                        0, 0, summary_attempted, summary_added_turns,
+                        pending=len(state["pending_covered"]) - len(covered),
+                        publication=publication, history_chars=sum(sizes))

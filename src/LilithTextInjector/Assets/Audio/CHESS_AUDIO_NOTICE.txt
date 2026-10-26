@@ -1,0 +1,23 @@
+Chess piece sounds — Kenney Casino Audio 1.1
+Copyright Kenney Vleugels (Kenney.nl), Creative Commons Zero (CC0).
+Personal and commercial use permitted; attribution is appreciated, not required.
+Source: https://kenney.nl/assets/casino-audio
+License: https://creativecommons.org/publicdomain/zero/1.0/
+Original license text is included in KENNEY_CASINO_LICENSE.txt.
+Publisher and license verified 2026-10-22. Original retained ZIP SHA-256:
+F36250766AC5BC378C13708DDF12A23A8E54A3251F8D482C7536E51B5DBAFA18
+
+Move: Audio/chip-lay-1.ogg, SHA-256
+4B2111252CCB64EED67F171E061053849CFBB29873536C03948646F244A3905C
+Trim 0.015–0.1725s; gain 0.70; fade in 3ms, fade out final 20ms.
+Mono signed 16-bit little-endian PCM, 24000 Hz, 7560 bytes. SHA-256:
+8BC40125AA303D37EDAA71DBF00324DFECB849B73C03A5928477EE8395A2A540
+
+Capture: Audio/chips-collide-1.ogg, SHA-256
+F41B3D106360FC68EBC061A211D4265B4CB5FA1FBE86E4D57D3673510E2C3784
+Trim 0.010–0.25875s; gain 0.70; fade in 3ms, fade out final 30ms.
+Mono signed 16-bit little-endian PCM, 24000 Hz, 11940 bytes. SHA-256:
+82CAF53A5134D7C3DE2D39FD1320EB838CC8FF114CAF6A783FFDEE6C781BE534
+
+Adapted samples and notices are embedded in the plugin at build time.
+No audio downloads occur at runtime. Native SE volume/mute remains in control.

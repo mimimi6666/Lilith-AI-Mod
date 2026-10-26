@@ -1,0 +1,145 @@
+diff --git a/tests/tools/test_lilith_ui_sound.py b/tests/tools/test_lilith_ui_sound.py
+new file mode 100644
+index 0000000..22bec1c
+--- /dev/null
++++ b/tests/tools/test_lilith_ui_sound.py
+@@ -0,0 +1,77 @@
++"""Exercise the preference gate without audio devices, model calls or user files."""
++import ast
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++
++def gate(root, platform="nt"):
++    module = ast.parse((Path(__file__).parents[2] / "tools" / "voice_mode.py").read_text(encoding="utf-8"))
++    function = next(node for node in module.body if isinstance(node, ast.FunctionDef)
++                    and node.name == "_lilith_chat_sound_enabled")
++    scope = {"os": SimpleNamespace(name=platform, environ={"LOCALAPPDATA": str(root)})}
++    exec(compile(ast.Module(body=[function], type_ignores=[]), "preference-test", "exec"), scope)
++    return scope["_lilith_chat_sound_enabled"]
++
++
++def preferences(root, value):
++    path = root / "LilithAiMod" / "Config" / "control-center" / "ui-v1.json"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(value if isinstance(value, str) else json.dumps(value), encoding="utf-8")
++    return path
++
++
++def valid(enabled=True):
++    return {"Schema": 1, "Revision": 2, "Language": "ja-JP", "ChatSendSoundEnabled": enabled}
++
++
++def test_toggle_is_live_and_missing_file_preserves_default(tmp_path):
++    read = gate(tmp_path)
++    assert read() is True
++    preferences(tmp_path, valid(False))
++    assert read() is False
++    preferences(tmp_path, valid(True))
++    assert read() is True
++
++
++@pytest.mark.parametrize("content", ["", "{", "[]", "null", "x" * 4097,
++    {**valid(), "Extra": 0}, {**valid(), "Schema": True}, {**valid(), "Revision": -1},
++    {**valid(), "Revision": 2**63 - 1}, {**valid(), "Language": "fr-FR"},
++    {**valid(), "ChatSendSoundEnabled": "false"},
++    '{"Schema":1,"Revision":2,"Language":"en-US","Language":"ja-JP","ChatSendSoundEnabled":true}'])
++def test_invalid_preference_mutes_without_repairing(tmp_path, content):
++    path = preferences(tmp_path, content)
++    before = path.read_bytes()
++    assert gate(tmp_path)() is False
++    assert path.read_bytes() == before
++
++
++def test_non_windows_does_not_use_desktop_settings(tmp_path):
++    preferences(tmp_path, valid(False))
++    assert gate(tmp_path, "posix")() is True
++
++
++def test_linked_preferences_are_not_read(tmp_path):
++    path = preferences(tmp_path, valid())
++    target = tmp_path / "elsewhere.json"
++    path.replace(target)
++    try:
++        path.symlink_to(target)
++    except OSError:
++        pytest.skip("Symbolic links unavailable to the test process")
++    assert gate(tmp_path)() is False
++
++
++def test_windows_reparse_attribute_is_refused_without_link_privilege(tmp_path, monkeypatch):
++    path = preferences(tmp_path, valid())
++    original = Path.lstat
++    def info(item):
++        actual = original(item)
++        if item == path:
++            return SimpleNamespace(st_mode=actual.st_mode, st_file_attributes=0x400)
++        return actual
++    read = gate(tmp_path)
++    monkeypatch.setattr(Path, "lstat", info)
++    assert read() is False
+diff --git a/tools/voice_mode.py b/tools/voice_mode.py
+index ab96487..0bb9523 100644
+--- a/tools/voice_mode.py
++++ b/tools/voice_mode.py
+@@ -574,8 +574,57 @@ _thinking_lock = threading.Lock()
+ _thinking_stop: Optional[threading.Event] = None
+ 
+ 
++def _lilith_chat_sound_enabled() -> bool:
++    """One non-authoritative UI preference. Never read chat/profile credentials.
++
++    Missing preferences preserve upstream behavior; malformed/linked files mute.
++    Re-read per send so the toggle does not require a gateway restart.
++    """
++    if os.name != "nt":
++        return True
++    try:
++        import json
++        import stat
++        from pathlib import Path
++
++        root = os.environ.get("LOCALAPPDATA", "")
++        if not root or not Path(root).is_absolute():
++            return False
++        path = Path(root) / "LilithAiMod" / "Config" / "control-center" / "ui-v1.json"
++        for item in (path, *path.parents):
++            try:
++                info = item.lstat()
++            except FileNotFoundError:
++                continue
++            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
++                return False
++        try:
++            with path.open("rb") as source:
++                raw = source.read(4097)
++        except FileNotFoundError:
++            return True
++        if not 0 < len(raw) <= 4096:
++            return False
++        pairs = json.loads(raw, object_pairs_hook=list)
++        if not isinstance(pairs, list) or len(pairs) != 4:
++            return False
++        value = dict(pairs)
++        if set(value) != {"Schema", "Revision", "Language", "ChatSendSoundEnabled"}:
++            return False
++        if (type(value["Schema"]) is not int or value["Schema"] != 1
++                or type(value["Revision"]) is not int or not 0 <= value["Revision"] < 2**63 - 1
++                or value["Language"] not in ("zh-TW", "zh-CN", "ja-JP", "en-US")
++                or type(value["ChatSendSoundEnabled"]) is not bool):
++            return False
++        return value["ChatSendSoundEnabled"]
++    except Exception:
++        return False
++
++
+ def thinking_sound_enabled() -> bool:
+     """Config gate: ``voice.thinking_sound`` (default True)."""
++    if not _lilith_chat_sound_enabled():
++        return False
+     try:
+         from hermes_cli.config import load_config
+         from utils import is_truthy_value

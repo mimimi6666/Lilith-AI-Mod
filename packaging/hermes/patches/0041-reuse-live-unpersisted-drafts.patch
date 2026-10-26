@@ -1,0 +1,250 @@
+diff --git a/tests/tui_gateway/test_archived_session_create.py b/tests/tui_gateway/test_archived_session_create.py
+index d50ee0b9..e521f309 100644
+--- a/tests/tui_gateway/test_archived_session_create.py
++++ b/tests/tui_gateway/test_archived_session_create.py
+@@ -1,6 +1,8 @@
+ """Behavior contract for hidden-but-durable TUI gateway sessions."""
+ 
+ import threading
++import types
++from pathlib import Path
+ 
+ import pytest
+ 
+@@ -99,6 +101,126 @@ def test_session_create_default_persists_visible_on_first_prompt(gateway_db):
+     assert stored_id in _listed_ids()
+ 
+ 
++def test_session_resume_reuses_exact_live_unpersisted_empty_draft(gateway_db):
++    db, _ = gateway_db
++    created = server._methods["session.create"]("create-empty", {"cols": 80})
++    assert "error" not in created
++    sid = created["result"]["session_id"]
++    stored_id = created["result"]["stored_session_id"]
++    before = set(server._sessions)
++
++    assert db.get_session(stored_id) is None
++    resumed = server._methods["session.resume"](
++        "resume-empty",
++        {"session_id": stored_id, "cols": 96, "omit_messages": True},
++    )
++
++    assert "error" not in resumed
++    assert resumed["result"]["session_id"] == sid
++    assert resumed["result"]["session_key"] == stored_id
++    assert resumed["result"]["resumed"] == stored_id
++    assert resumed["result"]["message_count"] == 0
++    assert resumed["result"]["messages"] == []
++    assert resumed["result"]["messages_omitted"] is True
++    assert resumed["result"]["status"] == "idle"
++    assert set(server._sessions) == before
++    assert db.get_session(stored_id) is None
++
++    # The ordinary live-draft shortcut must never satisfy the privileged hidden
++    # game resume contract, which still requires an exact durable DB lineage.
++    rejected = server._methods["session.resume"](
++        "resume-empty-durable",
++        {
++            "session_id": stored_id,
++            "require_durable_lineage": True,
++            "expected_source": "lilith-game",
++            "expected_archived": True,
++        },
++    )
++    assert rejected["error"]["code"] == 4094
++
++
++def test_session_resume_does_not_reuse_live_empty_draft_across_profiles(
++    gateway_db, monkeypatch, tmp_path
++):
++    db, _ = gateway_db
++    created = server._methods["session.create"]("create-launch-profile", {})
++    assert "error" not in created
++    stored_id = created["result"]["stored_session_id"]
++    assert db.get_session(stored_id) is None
++
++    other_home = tmp_path / "other-profile"
++    other_home.mkdir()
++    monkeypatch.setattr(
++        server,
++        "_profile_home",
++        lambda profile: Path(other_home) if profile == "other" else None,
++    )
++    resumed = server._methods["session.resume"](
++        "resume-other-profile",
++        {"session_id": stored_id, "profile": "other", "omit_messages": True},
++    )
++
++    assert resumed["error"]["code"] == 4007
++    assert resumed["error"]["message"] == "session not found"
++
++
++def test_session_resume_empty_draft_matches_raw_stored_key_not_agent_identity(
++    gateway_db,
++):
++    first = server._methods["session.create"]("create-first", {})["result"]
++    second = server._methods["session.create"]("create-second", {})["result"]
++    first_session = server._sessions[first["session_id"]]
++    first_session["agent"] = types.SimpleNamespace(
++        session_id=second["stored_session_id"]
++    )
++
++    resumed = server._methods["session.resume"](
++        "resume-second",
++        {"session_id": second["stored_session_id"], "omit_messages": True},
++    )
++
++    assert "error" not in resumed
++    assert resumed["result"]["session_id"] == second["session_id"]
++    assert resumed["result"]["session_key"] == second["stored_session_id"]
++
++
++@pytest.mark.parametrize(
++    "dirty_state",
++    [
++        {"archived": True},
++        {"resume_session_id": "stored-parent"},
++        {"parent_session_id": "stored-parent"},
++        {"active_session_lease": object()},
++        {"history_version": 1},
++        {"history": [{"role": "user", "content": "already started"}]},
++        {"running": True},
++        {"inflight_turn": {"user": "already started"}},
++        {"queued_prompt": {"user": "queued"}},
++        {"queued_prompts": [{"user": "queued"}]},
++    ],
++)
++def test_session_resume_does_not_reuse_dirty_unpersisted_draft(
++    gateway_db, dirty_state
++):
++    db, _ = gateway_db
++    created = server._methods["session.create"]("create-dirty", {})
++    assert "error" not in created
++    sid = created["result"]["session_id"]
++    stored_id = created["result"]["stored_session_id"]
++    assert db.get_session(stored_id) is None
++
++    session = server._sessions[sid]
++    with session["history_lock"]:
++        session.update(dirty_state)
++    resumed = server._methods["session.resume"](
++        "resume-dirty", {"session_id": stored_id, "omit_messages": True}
++    )
++
++    assert resumed["error"]["code"] == 4007
++    assert resumed["error"]["message"] == "session not found"
++
++
+ def test_archived_session_is_hidden_after_first_prompt_but_resumable_with_history(
+     gateway_db,
+ ):
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index f22f6ad2..c0d98d94 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -458,6 +458,27 @@ def _(rid, params: dict) -> dict:
+                 logger.warning("durable resume lineage row was not found")
+                 return _err(rid, 4094, "durable session lineage was rejected")
+         elif not found:
++            # Ordinary create drafts intentionally have no DB row until their
++            # first prompt.  A task switch can nevertheless return the exact
++            # stored key while that untouched draft is still live in this gateway.
++            # Reuse only that same-profile, clean ephemeral record; do not persist
++            # it, accept a title match, or weaken the durable hidden-game path
++            # above.  The resume lock also excludes a concurrent session.close.
++            with _session_resume_lock:
++                live_draft = _find_live_unpersisted_draft_by_key(
++                    target, profile_home=profile_home
++                )
++                if live_draft is not None:
++                    payload = _live_session_payload(
++                        live_draft[0],
++                        live_draft[1],
++                        cols=cols,
++                        touch=True,
++                        transport=current_transport() or _stdio_transport,
++                        omit_messages=omit_messages,
++                    )
++                    payload["resumed"] = target
++                    return _ok(rid, payload)
+             found = db.get_session_by_title(target)
+             if found:
+                 target = found["id"]
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 9ab8faa2..f28f10d4 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -10600,6 +10600,73 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+     return None
+ 
+ 
++def _find_live_unpersisted_draft_by_key(
++    session_key: str, *, profile_home: Path | None
++) -> tuple[str, dict] | None:
++    """Return one exact clean draft that has not reached ``state.db`` yet.
++
++    Ordinary ``session.create`` drafts intentionally stay ephemeral until their
++    first prompt, but a client may switch away and then resume the returned
++    ``stored_session_id`` while that draft is still live.  This predicate is
++    deliberately narrower than the normal live-session fast path: callers may
++    use it only after the exact DB lookup missed, and only for a same-profile,
++    untouched draft.  Durable/archived game sessions therefore continue through
++    the DB-backed lineage-attestation path.
++
++    The caller must hold ``_session_resume_lock`` so ``session.close`` cannot
++    retire the matching record between this check and payload construction.
++    """
++    # Do not use _find_live_session_by_key here: that general resolver prefers
++    # agent.session_id and may therefore match a rotated or synthetic identity.
++    # This recovery contract accepts only the raw stored key returned by the
++    # ordinary create response.
++    live = None
++    for sid, candidate in list(_sessions.items()):
++        if candidate.get("_finalized"):
++            continue
++        if str(candidate.get("session_key") or "") == session_key:
++            live = (sid, candidate)
++            break
++    if live is None:
++        return None
++    _sid, session = live
++
++    expected_home = str(profile_home or "").strip()
++    actual_home = str(session.get("profile_home") or "").strip()
++    if bool(expected_home) != bool(actual_home):
++        return None
++    if expected_home:
++        try:
++            expected_home = os.path.normcase(os.path.abspath(expected_home))
++            actual_home = os.path.normcase(os.path.abspath(actual_home))
++        except Exception:
++            pass
++    if expected_home != actual_home:
++        return None
++
++    history_lock = session.get("history_lock")
++    if history_lock is None:
++        return None
++    with history_lock:
++        if (
++            session.get("archived") is True
++            or session.get("_durable_lineage_root") is not None
++            or session.get("resume_session_id") is not None
++            or session.get("parent_session_id") is not None
++            or session.get("active_session_lease") is not None
++            or session.get("history_version", 0) != 0
++            or bool(session.get("history"))
++            or bool(session.get("display_history_prefix"))
++            or bool(session.get("running"))
++            or session.get("inflight_turn") is not None
++            or session.get("queued_prompt") is not None
++            or bool(session.get("queued_prompts"))
++            or isinstance(session.get(_COMPUTE_HOST_TURN_UNCERTAIN), dict)
++        ):
++            return None
++    return live
++
++
+ def _fallback_session_info(session: dict) -> dict:
+     agent = session.get("agent")
+     if agent is not None:

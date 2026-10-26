@@ -1,0 +1,806 @@
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 4648de7..4def8ee 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -1674,8 +1674,11 @@ def _(rid, params: dict) -> dict:
+ @method("tools.list")
+ def _(rid, params: dict) -> dict:
+     try:
++        from hermes_cli.config import load_config
++        from tui_gateway.native_setup import setup_providers
+         from toolsets import get_all_toolsets, get_toolset_info
+ 
++        config = load_config()
+         session = _sessions.get(params.get("session_id", ""))
+         enabled = (
+             set(getattr(session["agent"], "enabled_toolsets", []) or [])
+@@ -1695,6 +1698,7 @@ def _(rid, params: dict) -> dict:
+                     "tool_count": info["tool_count"],
+                     "enabled": name in enabled if enabled else True,
+                     "tools": info["resolved_tools"],
++                    "setup_providers": setup_providers(name, config),
+                 }
+             )
+         return _ok(rid, {"toolsets": items})
+@@ -1715,17 +1719,15 @@ def _(rid, params: dict) -> dict:
+             _CONFIG_ONLY_TOOLSETS,
+             _get_effective_configurable_toolsets,
+             _get_platform_tools,
+-            _is_provider_active,
+             _toolset_allowed_for_platform,
+             _toolset_has_keys,
+-            _visible_providers,
+             get_nous_subscription_features,
+             gui_toolset_label,
+-            provider_readiness_status,
+         )
+         from toolsets import resolve_toolset
+         from tools.approval import _get_approval_mode
+         from tools.registry import discover_builtin_tools, registry
++        from tui_gateway.native_setup import setup_providers
+ 
+         platform = "cli"
+         config = load_config()
+@@ -1753,7 +1755,7 @@ def _(rid, params: dict) -> dict:
+         # before treating it as the availability authority.
+         discover_builtin_tools()
+ 
+-        def category_readiness(toolset_name: str) -> str:
++        def category_readiness(toolset_name: str, providers: list) -> str:
+             category = TOOL_CATEGORIES.get(toolset_name)
+             if not category:
+                 return (
+@@ -1766,27 +1768,7 @@ def _(rid, params: dict) -> dict:
+                     else "needs_keys"
+                 )
+ 
+-            providers = _visible_providers(
+-                category,
+-                config,
+-                features=features,
+-            )
+-            active_statuses = []
+-            for provider in providers:
+-                try:
+-                    is_active = _is_provider_active(provider, config)
+-                except Exception:
+-                    is_active = False
+-                if not is_active:
+-                    continue
+-                status = provider_readiness_status(
+-                    provider,
+-                    config,
+-                    features=features,
+-                    is_active=True,
+-                )
+-                if status in {"ready", "needs_setup", "needs_auth", "needs_keys"}:
+-                    active_statuses.append(status)
++            active_statuses = [row["readiness"] for row in providers if row["selected"]]
+ 
+             if "ready" in active_statuses:
+                 return "ready"
+@@ -1798,19 +1780,15 @@ def _(rid, params: dict) -> dict:
+             # prerequisite (Spotify authentication, a required key, etc.), but
+             # it can never make the category look ready while inactive.
+             if len(providers) == 1:
+-                status = provider_readiness_status(
+-                    providers[0],
+-                    config,
+-                    features=features,
+-                    is_active=False,
+-                )
++                status = providers[0]["readiness"]
+                 if status in {"needs_setup", "needs_auth", "needs_keys"}:
+                     return status
+             return "needs_setup"
+ 
+         rows = []
+         for name, label, description in catalog:
+-            readiness = category_readiness(name)
++            provider_rows = setup_providers(name, config, features=features)
++            readiness = category_readiness(name, provider_rows)
+             try:
+                 declared_tools = set(resolve_toolset(name))
+                 definitions = registry.get_definitions(
+@@ -1841,6 +1819,7 @@ def _(rid, params: dict) -> dict:
+                     "configured": readiness == "ready",
+                     "readiness": readiness,
+                     "tools": tools,
++                    "setup_providers": provider_rows,
+                 }
+             )
+ 
+@@ -1868,11 +1847,13 @@ def _(rid, params: dict) -> dict:
+         return quarantine_error
+ 
+     required = {"enabled_toolsets", "approval_mode"}
+-    if not isinstance(params, dict) or set(params) != required:
++    if not isinstance(params, dict) or set(params) not in (
++        required, required | {"setup_selection"},
++    ):
+         return _err(
+             rid,
+             -32602,
+-            "tools.set requires exactly enabled_toolsets and approval_mode",
++            "tools.set requires enabled_toolsets and approval_mode, with optional setup_selection",
+         )
+ 
+     requested_raw = params.get("enabled_toolsets")
+@@ -1895,6 +1876,14 @@ def _(rid, params: dict) -> dict:
+             -32602,
+             "approval_mode must be manual, smart, or off",
+         )
++    setup_selection = None
++    if "setup_selection" in params:
++        from tui_gateway.native_setup import validate_selection_shape
++
++        try:
++            setup_selection = validate_selection_shape(params["setup_selection"])
++        except ValueError as exc:
++            return _err(rid, -32602, str(exc))
+     native_mutation_token = None
+     try:
+         from agent.identity_policy import (
+@@ -1983,17 +1972,38 @@ def _(rid, params: dict) -> dict:
+                     config, platform, include_default_mcp_servers=False
+                 ))
+                 approvals = config.get("approvals")
+-                if not isinstance(approvals, dict):
+-                    approvals = {}
+-                    config["approvals"] = approvals
+-                approvals["mode"] = approval_mode
++                if setup_selection is not None:
++                    from tui_gateway.native_setup import apply_selection, verify_selection
++
++                    prior_mode = _normalize_approval_mode(
++                        approvals.get("mode", "manual") if isinstance(approvals, dict)
++                        else "manual"
++                    )
++                    if requested != prior_enabled & valid or approval_mode != prior_mode:
++                        return _err(rid, -32602, "provider selection cannot change toolsets or approval mode")
++                    try:
++                        apply_selection(setup_selection, config)
++                    except ValueError as exc:
++                        return _err(rid, -32602, str(exc))
++                if setup_selection is None:
++                    if not isinstance(approvals, dict):
++                        approvals = {}
++                        config["approvals"] = approvals
++                    approvals["mode"] = approval_mode
+ 
+                 mutation_attempted = True
+                 try:
+                     # The native helper performs the one fail-closed atomic
+                     # config save. Approval mode is already in this same
+                     # mapping, so both authorities commit in one replacement.
+-                    _save_platform_tools(config, platform, requested)
++                    if setup_selection is None:
++                        _save_platform_tools(config, platform, requested)
++                    else:
++                        # Provider selection must not clear no_mcp or rewrite
++                        # platform-toolset/known-toolset enablement bookkeeping.
++                        from hermes_cli.tools_config import save_config
++
++                        save_config(config)
+ 
+                     saved = load_config()
+                     actual_enabled = {
+@@ -2015,6 +2025,12 @@ def _(rid, params: dict) -> dict:
+                         raise RuntimeError(
+                             "native config verification did not reproduce the requested policy"
+                         )
++                    if setup_selection is not None:
++                        if prior_enabled != set(_get_platform_tools(
++                            saved, platform, include_default_mcp_servers=False,
++                        )):
++                            raise RuntimeError("provider selection changed native tool availability policy")
++                        verify_selection(setup_selection, saved)
+ 
+                     config_sha256 = commit_host_config_digest_rotation(
+                         previous_sha256
+@@ -2054,7 +2070,7 @@ def _(rid, params: dict) -> dict:
+             # resume re-proves the complete strict snapshot before adoption.
+             for session in _sessions.values():
+                 pending = session.pop("_native_approval_resume_digest", None)
+-                if previous_sha256 is not None and prior_enabled == set(
++                if setup_selection is None and previous_sha256 is not None and prior_enabled == set(
+                     _get_platform_tools(saved, platform, include_default_mcp_servers=False)
+                 ):
+                     first = previous_sha256
+@@ -2074,6 +2090,7 @@ def _(rid, params: dict) -> dict:
+                     "enabled_toolsets": sorted(actual_enabled),
+                     "config_sha256": config_sha256,
+                     "new_session_required": True,
++                    **({"setup_selection": setup_selection} if setup_selection is not None else {}),
+                 },
+             )
+         finally:
+diff --git a/tui_gateway/native_setup.py b/tui_gateway/native_setup.py
+new file mode 100644
+--- /dev/null
++++ b/tui_gateway/native_setup.py
+@@ -0,0 +1,161 @@
++"""Non-secret native setup projection and provider-selection validation.
++
++No credential, installer, approval, or configuration writer lives here.
++Only tools.set may persist a selection inside its existing idle transaction.
++"""
++from copy import deepcopy
++import re
++import sys
++
++
++# These are the selector markers consumed by native apply_provider_selection,
++# not tool names or permissions. Other setup operations remain separate.
++_SELECTORS = frozenset({
++    "tts_provider", "stt_provider", "browser_provider", "browser_backend",
++    "web_backend", "image_gen_plugin_name", "video_gen_plugin_name",
++    "imagegen_backend", "managed_nous_feature",
++})
++_READINESS = frozenset({"ready", "needs_setup", "needs_auth", "needs_keys"})
++
++
++def validate_selection_shape(selection):
++    if not isinstance(selection, dict) or set(selection) != {"toolset", "provider"}:
++        raise ValueError("setup_selection requires exactly toolset and provider")
++    name, provider = selection["toolset"], selection["provider"]
++    if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,95}", name):
++        raise ValueError("invalid setup toolset")
++    if (not isinstance(provider, str) or not provider or provider != provider.strip()
++            or len(provider) > 256 or any(ord(c) < 32 for c in provider)):
++        raise ValueError("invalid setup provider")
++    return {"toolset": name, "provider": provider}
++
++
++def _providers(toolset, config, features=None):
++    from hermes_cli import tools_config as tc
++
++    if toolset not in {row[0] for row in tc._get_effective_configurable_toolsets()}:
++        return []
++    if not tc._toolset_allowed_for_platform(toolset, "cli"):
++        return []
++    category = tc.TOOL_CATEGORIES.get(toolset)
++    if not category:
++        return []
++    gate = category.get("platform_gate")
++    if gate and sys.platform not in gate:
++        return []
++    return tc._visible_providers(category, config, features=features)
++
++
++def _dependency_status(provider):
++    from hermes_cli import tools_config as tc
++
++    hook = provider.get("post_setup")
++    if hook is not None and not isinstance(hook, str):
++        return "unknown"
++    if not hook or hook in {"spotify", "xai_grok"}:
++        return "not_required"
++    predicate = tc._POST_SETUP_READY.get(hook)
++    if hook == "browser_use_cli":
++        from tools.browser_use_cli import _find_cli
++
++        # A uvx fallback means available on demand, not an installed binary.
++        predicate = lambda: bool((command := _find_cli()) and len(command) == 1)
++    if predicate is None:
++        return "unknown"
++    try:
++        return "ready" if predicate() else "missing"
++    except Exception:
++        return "unknown"
++
++
++def setup_support(provider):
++    if any(provider.get(key) for key in _SELECTORS):
++        return "provider_selection"
++    from tools.native_tool_setup_tool import _support
++
++    return _support(provider)
++
++
++def setup_providers(toolset, config, *, features=None):
++    from hermes_cli import tools_config as tc
++
++    providers = _providers(toolset, config, features)
++    if len(providers) > 64:
++        return []  # An unbounded or ambiguous projection cannot drive a choice.
++    names = [provider.get("name") for provider in providers]
++    if any(not isinstance(name, str) for name in names) or len(set(names)) != len(names):
++        return []
++    rows = []
++    for provider in providers:
++        try:
++            validate_selection_shape({"toolset": toolset, "provider": provider["name"]})
++        except ValueError:
++            continue
++        try:
++            selected = bool(tc._is_provider_active(provider, config))
++        except Exception:
++            selected = False
++        try:
++            readiness = tc.provider_readiness_status(
++                provider, config, features=features, is_active=selected,
++            )
++        except Exception:
++            readiness = "needs_setup"
++        if readiness not in _READINESS:
++            readiness = "needs_setup"
++        dependency = _dependency_status(provider)
++        # Env presence and provider selection never prove installation.
++        if readiness == "ready" and dependency in {"missing", "unknown"}:
++            readiness = "needs_setup"
++        rows.append({
++            "name": provider["name"], "readiness": readiness,
++            "setup_support": setup_support(provider), "selected": selected,
++            "dependency_status": dependency,
++        })
++    return rows
++
++
++def resolve_selection(selection, config):
++    from hermes_cli import tools_config as tc
++    from hermes_cli.nous_subscription import MANAGED_FEATURE_COVERAGE_CATEGORY
++
++    selection = validate_selection_shape(selection)
++    features = tc.get_nous_subscription_features(config)
++    providers = _providers(selection["toolset"], config, features)
++    if len(providers) > 64:
++        raise ValueError("native provider catalog exceeds the management protocol bound")
++    matches = [row for row in providers if row.get("name") == selection["provider"]]
++    if len(matches) != 1 or setup_support(matches[0]) != "provider_selection":
++        raise ValueError("native provider selection is unavailable")
++    provider = matches[0]
++    feature = provider.get("managed_nous_feature")
++    if feature or provider.get("requires_nous_auth"):
++        account = features.account_info
++        category = MANAGED_FEATURE_COVERAGE_CATEGORY.get(feature)
++        entitled = bool(account and account.logged_in and (
++            account.tool_gateway_entitled_for(category) if category
++            else account.tool_gateway_entitled if feature
++            else account.paid_service_access is True
++        ))
++        if not features.nous_auth_present or not entitled:
++            raise ValueError("native provider authentication or entitlement is required")
++    return provider
++
++
++def apply_selection(selection, config):
++    """Mutate only the transaction-owned mapping with the native selector."""
++    from hermes_cli.tools_config import apply_provider_selection
++
++    resolve_selection(selection, config)
++    apply_provider_selection(selection["toolset"], selection["provider"], config)
++
++
++def verify_selection(selection, config):
++    """Require a native selected row and an idempotent exact selector readback."""
++    from hermes_cli.tools_config import _is_provider_active
++
++    provider = resolve_selection(selection, config)
++    expected = deepcopy(config)
++    apply_selection(selection, expected)
++    if expected != config or not _is_provider_active(provider, config):
++        raise RuntimeError("native provider selection readback did not match")
+diff --git a/tools/native_tool_setup_tool.py b/tools/native_tool_setup_tool.py
+index 7189111..1fef710 100644
+--- a/tools/native_tool_setup_tool.py
++++ b/tools/native_tool_setup_tool.py
+@@ -69,8 +69,14 @@ def _snapshot(name, config, providers):
+     rows = []
+     for index, provider in enumerate(providers):
+         readiness = tc.provider_readiness_status(provider, config)
++        from tui_gateway.native_setup import _dependency_status
++
++        dependency = _dependency_status(provider)
++        if readiness == "ready" and dependency in {"missing", "unknown"}:
++            readiness = "needs_setup"
+         rows.append({"index": index, "name": provider["name"],
+                      "readiness": readiness, "setup_support": _support(provider),
++                     "dependency_status": dependency,
+                      "missing_fields": [f["key"] for f in provider.get("env_vars", [])
+                                         if not get_env_value(f["key"])]})
+     return {"toolset": name, "enabled": name in tc._get_platform_tools(config, "cli", include_default_mcp_servers=False),
+@@ -125,7 +131,33 @@ def run_native_setup(name, action, *, prompt, cancelled):
+         provider = providers[index]
+         support = _support(provider)
+         if support == "native_manager_required":
+-            return {"status": support, **snapshot}
++            from tui_gateway.native_setup import setup_support, resolve_selection
++            from hermes_cli.tools_config import _is_provider_active
++
++            handoff = {}
++            if setup_support(provider) == "provider_selection":
++                selection = {"toolset": name, "provider": provider["name"]}
++                try:
++                    selected = resolve_selection(selection, config)
++                    if not _is_provider_active(selected, config):
++                        raise ValueError("native provider has not been selected")
++                except (ValueError, RuntimeError):
++                    handoff["manager_request"] = {
++                        **selection, "operation": "select_provider", "requires_idle": True,
++                    }
++                else:
++                    # A human-selected native backend may still need fields.
++                    # Reuse the existing credential fence; never let selector,
++                    # installer or auth hooks become commands in this worker.
++                    support = _support({key: provider[key] for key in
++                                        ("name", "tag", "env_vars") if key in provider})
++                    if support == "no_setup_fields":
++                        support = "native_manager_required"
++                        handoff["reason"] = "native_setup_hook_required"
++                    elif support == "native_manager_required":
++                        handoff["reason"] = "native_credential_manager_required"
++            if support == "native_manager_required":
++                return {"status": support, **snapshot, **handoff}
+         if support == "no_setup_fields":
+             return {"status": "no_setup_fields", **snapshot}
+         answer = prompt("clarify.request", {
+diff --git a/tests/tui_gateway/test_native_setup_selection.py b/tests/tui_gateway/test_native_setup_selection.py
+new file mode 100644
+--- /dev/null
++++ b/tests/tui_gateway/test_native_setup_selection.py
+@@ -0,0 +1,364 @@
++"""Provider setup uses native metadata and the existing idle config transaction."""
++import hashlib
++import json
++import os
++import threading
++from copy import deepcopy
++
++import pytest
++import yaml
++
++import tui_gateway.server as server
++from tests.tui_gateway.test_tools_policy_rpc import (
++    _attest_strict_host, _clean_gateway_sessions, _home,
++    _logged_out_features, _strict_config, _write_config,
++)
++
++
++@pytest.fixture(autouse=True)
++def native_setup_env(monkeypatch):
++    from hermes_cli import tools_config as tc
++
++    monkeypatch.setattr(tc, "get_nous_subscription_features", lambda *a, **k: _logged_out_features())
++    originals = {}
++    for builder in ("_plugin_browser_providers", "_plugin_web_search_providers",
++                    "_plugin_image_gen_providers", "_plugin_video_gen_providers", "_plugin_tts_providers"):
++        originals[builder] = getattr(tc, builder)
++        monkeypatch.setattr(tc, builder, lambda: [])
++    return originals
++
++
++def _config():
++    return {
++        "platform_toolsets": {"cli": ["browser", "memory", "no_mcp"]},
++        "approvals": {"mode": "manual", "timeout": 123},
++        "browser": {"cloud_provider": "local", "backend": "off"},
++        "mcp_servers": {"preserved": {"command": "example", "enabled": False}},
++    }
++
++
++def _params(provider="Camofox"):
++    from hermes_cli.config import load_config
++    from hermes_cli import tools_config as tc
++
++    valid = {name for name, _, _ in tc._get_effective_configurable_toolsets()
++             if name not in tc._CONFIG_ONLY_TOOLSETS and tc._toolset_allowed_for_platform(name, "cli")}
++    enabled = tc._get_platform_tools(load_config(), "cli", include_default_mcp_servers=False) & valid
++    return {"enabled_toolsets": sorted(enabled), "approval_mode": "manual",
++            "setup_selection": {"toolset": "browser", "provider": provider}}
++
++
++def _set(params=None):
++    return server._methods["tools.set"]("setup", params or _params())
++
++
++def test_provider_selection_saves_once_preserves_policy_and_echoes(monkeypatch):
++    from hermes_cli import tools_config as tc
++
++    config = _config()
++    _write_config(config)
++    saves = []
++    original = tc.save_config
++    monkeypatch.setattr(tc, "save_config", lambda cfg: (saves.append(deepcopy(cfg)), original(cfg))[1])
++    monkeypatch.setattr(tc, "_run_post_setup", lambda *_: pytest.fail("must not install"))
++    params = _params()
++    response = _set(params)
++    assert "error" not in response, response
++    assert len(saves) == 1
++    result = response["result"]
++    assert result["setup_selection"] == _params()["setup_selection"]
++    assert result["approval_mode"] == "manual"
++    assert result["enabled_toolsets"] == params["enabled_toolsets"]
++    raw = (_home() / "config.yaml").read_bytes()
++    assert result["config_sha256"] == hashlib.sha256(raw).hexdigest()
++    saved = yaml.safe_load(raw)
++    assert saved["browser"]["cloud_provider"] == "camofox"
++    assert saved["platform_toolsets"] == config["platform_toolsets"]
++    assert saved["approvals"] == config["approvals"]
++    assert saved["mcp_servers"] == config["mcp_servers"]
++
++
++@pytest.mark.parametrize("change", [
++    {"approval_mode": "off"}, {"enabled_toolsets": ["memory"]},
++    {"setup_selection": None},
++    {"setup_selection": {"toolset": "browser", "provider": "Camofox", "command": "bad"}},
++    {"setup_selection": {"toolset": "browser", "provider": " Camofox"}},
++    {"setup_selection": {"toolset": "browser", "provider": "unknown"}},
++    {"setup_selection": {"toolset": "spotify", "provider": "Spotify Web API"}},
++    {"setup_selection": {"toolset": "mcp_unknown", "provider": "unknown"}},
++])
++def test_invalid_or_mixed_selection_never_writes(change):
++    before = _write_config(_config())
++    assert _set({**_params(), **change})["error"]["code"] == -32602
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_provider_choice_still_rejects_active_turn():
++    before = _write_config(_config())
++    server._sessions["busy"] = {"history_lock": threading.RLock(), "running": True}
++    assert _set()["error"]["code"] == 4090
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_declared_unsupported_platform_cannot_select(monkeypatch):
++    from hermes_cli import tools_config as tc
++
++    before = _write_config(_config())
++    monkeypatch.setitem(tc.TOOL_CATEGORIES["browser"], "platform_gate", ["unsupported-test-host"])
++    assert _set()["error"]["code"] == -32602
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_nous_selection_does_not_bypass_entitlement():
++    before = _write_config(_config())
++    response = _set(_params("Nous Subscription (Browser Use cloud)"))
++    assert response["error"]["code"] == -32602
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_failed_provider_readback_restores_exact_bytes(monkeypatch):
++    import tui_gateway.native_setup as setup
++
++    before = _write_config(_config())
++    monkeypatch.setattr(setup, "verify_selection", lambda *a: (_ for _ in ()).throw(RuntimeError("bad readback")))
++    response = _set()
++    assert "error" in response
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_provider_commit_rotates_strict_digest_but_cannot_resume_old_agent(monkeypatch):
++    import agent.identity_policy as identity
++
++    soul, personality = "Lilith soul.\n", "You are Lilith.\n"
++    config = _strict_config(personality)
++    config.update(_config())
++    before = _write_config(config)
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, before, soul, personality)
++    session = {"history_lock": threading.RLock(), "running": False,
++               "_native_approval_resume_digest": {"previous": "a" * 64, "current": "b" * 64}}
++    server._sessions["idle"] = session
++    result = _set()
++    assert "error" not in result, result
++    digest = result["result"]["config_sha256"]
++    assert os.environ["HERMES_IDENTITY_EXPECTED_CONFIG_SHA256"] == digest
++    assert identity.preflight_aia_agent_identity(request_overrides={}).config_sha256 == digest
++    assert "_native_approval_resume_digest" not in session
++
++
++def test_metadata_never_treats_credentials_as_installed(monkeypatch):
++    from hermes_cli import tools_config as tc
++    from tui_gateway.native_setup import setup_providers
++
++    monkeypatch.setattr(tc, "get_env_value", lambda *_: "must-never-appear-secret")
++    monkeypatch.setitem(tc._POST_SETUP_READY, "camofox", lambda: False)
++    rows = setup_providers("browser", _config(), features=_logged_out_features())
++    row = next(row for row in rows if row["name"] == "Camofox")
++    assert row["readiness"] == "needs_setup"
++    assert row["dependency_status"] == "missing"
++    assert row["setup_support"] == "provider_selection"
++    assert "must-never-appear-secret" not in json.dumps(rows)
++    assert set(row) == {"name", "readiness", "setup_support", "selected", "dependency_status"}
++
++
++def test_browser_use_fallback_is_not_installed(monkeypatch):
++    from tools import browser_use_cli
++    from tui_gateway.native_setup import setup_providers
++
++    monkeypatch.setattr(browser_use_cli, "_find_cli", lambda: ["uvx", "browser-use"])
++    rows = setup_providers("browser", _config(), features=_logged_out_features())
++    row = next(row for row in rows if row["name"] == "Browser Use")
++    assert row["dependency_status"] == "missing"
++    assert row["readiness"] == "needs_setup"
++
++
++def test_catalog_exposes_same_safe_provider_metadata(monkeypatch):
++    from tools.registry import registry
++    from tui_gateway.native_setup import setup_providers
++    from hermes_cli.config import load_config
++
++    _write_config(_config())
++    monkeypatch.setattr(registry, "get_definitions", lambda *a, **k: [])
++    expected = setup_providers("browser", load_config(), features=_logged_out_features())
++    result = server._methods["tools.catalog"]("catalog", {})
++    assert "error" not in result, result
++    row = next(row for row in result["result"]["toolsets"] if row["name"] == "browser")
++    assert row["setup_providers"] == expected
++
++
++def test_chat_manager_handoff_never_applies_selection(monkeypatch):
++    from tools import native_tool_setup_tool as tool
++    from hermes_cli import tools_config as tc
++
++    config = _config()
++    config["browser"]["cloud_provider"] = "camofox"
++    before = _write_config(config)
++    monkeypatch.setattr(tool, "bound_setup_available", lambda: True)
++    monkeypatch.setattr(tool, "_metadata", lambda *_: (config, [tc.TOOL_CATEGORIES["browser"]["providers"][0]]))
++    monkeypatch.setattr(tc, "save_config", lambda *a: pytest.fail("active chat cannot write"))
++    result = tool.run_native_setup("browser", "configure", prompt=lambda *a, **k: pytest.fail("no credential card"), cancelled=lambda: False)
++    assert result["status"] == "native_manager_required"
++    assert result["manager_request"] == {"toolset": "browser", "provider": "Local Browser",
++                                          "operation": "select_provider", "requires_idle": True}
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_managed_save_guard_is_not_bypassed(monkeypatch):
++    from hermes_cli import config as config_module
++
++    before = _write_config(_config())
++    params = _params()
++    for directory in ("cron", "sessions", "logs", "memories"):
++        (_home() / directory).mkdir(exist_ok=True)
++    monkeypatch.setattr(config_module, "is_managed", lambda: True)
++    response = _set(params)
++    assert "error" in response
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_selected_alternate_web_route_does_not_fake_saved_backend(monkeypatch):
++    from hermes_cli import tools_config as tc
++
++    config = _config()
++    config["web"] = {"backend": "ddgs", "search_backend": "firecrawl"}
++    before = _write_config(config)
++    monkeypatch.setattr(tc, "save_config", lambda *_: None)
++    params = _params()
++    params["setup_selection"] = {"toolset": "web", "provider": "Firecrawl Self-Hosted"}
++    response = _set(params)
++    assert "error" in response
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_composed_native_browser_choices_can_both_be_selected():
++    from tui_gateway.native_setup import setup_providers
++
++    config = _config()
++    config["browser"]["backend"] = "browser-use"
++    rows = setup_providers("browser", config, features=_logged_out_features())
++    selected = {row["name"] for row in rows if row["selected"]}
++    assert {"Local Browser", "Browser Use"} <= selected
++
++
++@pytest.mark.parametrize("hook", ["unknown_native_hook", ["malformed-hook"]])
++def test_unknown_dependency_does_not_claim_ready(monkeypatch, hook):
++    from hermes_cli import tools_config as tc
++    from tui_gateway.native_setup import setup_providers
++
++    provider = {"name": "Unverified provider", "browser_provider": "local",
++                "env_vars": [], "post_setup": hook}
++    monkeypatch.setitem(tc.TOOL_CATEGORIES["browser"], "providers", [provider])
++    rows = setup_providers("browser", _config(), features=_logged_out_features())
++    assert rows[0]["dependency_status"] == "unknown"
++    assert rows[0]["readiness"] == "needs_setup"
++    # Only a metadata config selection is supported, never this install hook.
++    assert rows[0]["setup_support"] == "provider_selection"
++
++
++def test_category_readiness_agrees_with_missing_selected_dependency(monkeypatch):
++    from hermes_cli import tools_config as tc
++    from tools.registry import registry
++
++    config = _config()
++    config["browser"]["cloud_provider"] = "camofox"
++    _write_config(config)
++    monkeypatch.setattr(tc, "get_env_value", lambda *_: "configured-test-value")
++    monkeypatch.setitem(tc._POST_SETUP_READY, "camofox", lambda: False)
++    monkeypatch.setattr(registry, "get_definitions", lambda *a, **k: [{"function": {"name": "browser_navigate"}}])
++    result = server._methods["tools.catalog"]("catalog", {})
++    assert "error" not in result, result
++    row = next(row for row in result["result"]["toolsets"] if row["name"] == "browser")
++    assert row["readiness"] == "needs_setup"
++    assert row["configured"] is False
++
++
++def test_selected_provider_secure_fields_complete_once_without_reselection(monkeypatch):
++    from tools import native_tool_setup_tool as tool
++    from hermes_cli import tools_config as tc
++    from hermes_cli.config import load_config, load_env
++
++    _write_config(_config())
++    result = _set()
++    assert "error" not in result, result
++    before = (_home() / "config.yaml").read_bytes()
++    provider = next(row for row in tc.TOOL_CATEGORIES["browser"]["providers"] if row["name"] == "Camofox")
++    monkeypatch.setattr(tool, "bound_setup_available", lambda: True)
++    monkeypatch.setattr(tool, "_metadata", lambda *_: (load_config(), [provider]))
++    monkeypatch.setitem(tc._POST_SETUP_READY, "camofox", lambda: False)
++    monkeypatch.setattr(tc, "_run_post_setup", lambda *a: pytest.fail("chat cannot install"))
++    cards = []
++    def prompt(kind, data, **kwargs):
++        if kind == "clarify.request":
++            return tool._CONFIRM
++        assert kind == "secret.request"
++        cards.append(data["env_var"])
++        assert data["env_var"] == "CAMOFOX_URL"
++        return "http://localhost:9377"
++    for _ in range(2):
++        result = tool.run_native_setup("browser", "configure", prompt=prompt, cancelled=lambda: False)
++        assert result["status"] == "settings_saved", result
++        assert "manager_request" not in result
++        assert result["providers"][0]["readiness"] == "needs_setup"
++        assert result["providers"][0]["dependency_status"] == "missing"
++    assert cards == ["CAMOFOX_URL"]
++    assert load_env()["CAMOFOX_URL"] == "http://localhost:9377"
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++@pytest.mark.parametrize("key", ["PATH", "OPENAI_API_KEY"])
++def test_selected_provider_cannot_write_reserved_or_model_credentials(monkeypatch, key):
++    from tools import native_tool_setup_tool as tool
++    from hermes_cli import tools_config as tc
++    from hermes_cli.config import load_config
++
++    config = _config()
++    config["browser"]["cloud_provider"] = "camofox"
++    before = _write_config(config)
++    provider = {"name": "Selected test provider", "browser_provider": "camofox",
++                "env_vars": [{"key": key}]}
++    monkeypatch.setitem(tc.TOOL_CATEGORIES["browser"], "providers", [provider])
++    monkeypatch.setattr(tool, "bound_setup_available", lambda: True)
++    monkeypatch.setattr(tool, "_metadata", lambda *_: (load_config(), [provider]))
++    result = tool.run_native_setup("browser", "configure", prompt=lambda *a, **k: pytest.fail("no card may request reserved credentials"), cancelled=lambda: False)
++    assert result["status"] == "native_manager_required"
++    assert result["reason"] == "native_credential_manager_required"
++    assert "manager_request" not in result
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_selected_keyless_installer_reports_hook_without_repeat_selection(monkeypatch):
++    from tools import native_tool_setup_tool as tool
++    from hermes_cli import tools_config as tc
++    from hermes_cli.config import load_config
++
++    before = _write_config(_config())
++    provider = tc.TOOL_CATEGORIES["browser"]["providers"][0]
++    monkeypatch.setattr(tool, "bound_setup_available", lambda: True)
++    monkeypatch.setattr(tool, "_metadata", lambda *_: (load_config(), [provider]))
++    result = tool.run_native_setup("browser", "configure", prompt=lambda *a, **k: pytest.fail("no installer card"), cancelled=lambda: False)
++    assert result["status"] == "native_manager_required"
++    assert result["reason"] == "native_setup_hook_required"
++    assert "manager_request" not in result
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_isolated_complete_native_catalog_metadata_smoke(monkeypatch, native_setup_env):
++    from hermes_cli import tools_config as tc
++
++    _write_config(_config())
++    for builder, original in native_setup_env.items():
++        monkeypatch.setattr(tc, builder, original)
++    result = server._methods["tools.catalog"]("real-catalog", {})
++    assert "error" not in result, result
++    rows = result["result"]["toolsets"]
++    assert rows
++    assert any(row["setup_providers"] for row in rows)
++    for row in rows:
++        providers = row["setup_providers"]
++        assert len(providers) <= 64
++        assert len({provider["name"] for provider in providers}) == len(providers)
++        for provider in providers:
++            assert set(provider) == {"name", "readiness", "setup_support", "selected", "dependency_status"}
++            assert provider["readiness"] in {"ready", "needs_keys", "needs_auth", "needs_setup"}
++            assert provider["dependency_status"] in {"not_required", "ready", "missing", "unknown"}
++            assert provider["setup_support"] in {"provider_selection", "secure_fields", "spotify_oauth", "native_manager_required", "no_setup_fields"}

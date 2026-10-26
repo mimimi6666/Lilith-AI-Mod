@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "plugin_id": "lilith_leave_note",
+  "plugin_version": "1.0.0",
+  "files": [
+    {
+      "path": "__init__.py",
+      "sha256": "af4cc1b98ec77251992f64b701a6eef9f07023128306efc5d93f895fe426d0e3"
+    },
+    {
+      "path": "client.py",
+      "sha256": "9aa229e482584544ab9991fba21cf10238251fa130adf91af10111335f4ab961"
+    },
+    {
+      "path": "plugin.yaml",
+      "sha256": "d9a73797012c2a4969d2d41e15259f5e4c13f8aba55bb1e37ea4a99e0533e8c8"
+    }
+  ]
+}

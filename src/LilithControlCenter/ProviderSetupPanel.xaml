@@ -1,0 +1,60 @@
+<UserControl x:Class="LilithControlCenter.ProviderSetupPanel"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:LilithControlCenter">
+    <Border Style="{StaticResource CardStyle}" Padding="22" Background="{DynamicResource PanelBrush}">
+        <StackPanel x:Name="SetupContent">
+            <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <TextBlock Text="{local:UiText provider.setup.title}" FontSize="21" FontWeight="SemiBold"/>
+                <Button Grid.Column="1" Content="{local:UiText common.refresh}" Style="{StaticResource SecondaryButtonStyle}"
+                        IsEnabled="{Binding CanRefresh}" Click="Refresh_Click" AutomationProperties.AutomationId="ProviderSetupRefresh"/>
+            </Grid>
+            <TextBlock Text="{local:UiText provider.setup.help}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" Margin="0,8,0,16"/>
+            <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="230"/><ColumnDefinition Width="22"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                <StackPanel>
+                    <ListBox ItemsSource="{Binding Entries}" SelectedItem="{Binding SelectedEntry, Mode=TwoWay}"
+                             DisplayMemberPath="Label" IsEnabled="{Binding CanEdit}" MinHeight="110" MaxHeight="220"
+                             Background="{DynamicResource InputBrush}" Foreground="{DynamicResource TextBrush}"
+                             BorderBrush="{DynamicResource BorderBrush}" AutomationProperties.AutomationId="ProviderSetupEntries"/>
+                    <Button Content="{local:UiText provider.setup.new}" Style="{StaticResource SecondaryButtonStyle}"
+                            IsEnabled="{Binding CanEdit}" Click="New_Click" Margin="0,10,0,0"/>
+                </StackPanel>
+                <StackPanel Grid.Column="2">
+                    <TextBlock Text="{local:UiText provider.setup.preset}" Foreground="{DynamicResource MutedBrush}"/>
+                    <ComboBox ItemsSource="{Binding Presets}" DisplayMemberPath="Label" SelectedItem="{Binding SelectedPreset, Mode=TwoWay}"
+                              IsEnabled="{Binding CanEdit}" Margin="0,6,0,10" AutomationProperties.AutomationId="ProviderSetupPreset"/>
+                    <TextBlock Text="{local:UiText provider.setup.name}" Foreground="{DynamicResource MutedBrush}"/>
+                    <TextBox Text="{Binding Label, UpdateSourceTrigger=PropertyChanged}" MaxLength="128" IsEnabled="{Binding CanEdit}"
+                             Margin="0,6,0,10" AutomationProperties.AutomationId="ProviderSetupLabel"/>
+                    <TextBlock Text="{local:UiText provider.setup.url}" Foreground="{DynamicResource MutedBrush}"/>
+                    <TextBox Text="{Binding BaseUrl, UpdateSourceTrigger=PropertyChanged}" MaxLength="2048" IsEnabled="{Binding CanEdit}"
+                             Margin="0,6,0,10" AutomationProperties.AutomationId="ProviderSetupBaseUrl"/>
+                    <TextBlock Text="{local:UiText provider.setup.model}" Foreground="{DynamicResource MutedBrush}"/>
+                    <ComboBox ItemsSource="{Binding Models}" IsEditable="True" Text="{Binding ModelId, UpdateSourceTrigger=PropertyChanged}"
+                              IsEnabled="{Binding CanEdit}" Margin="0,6,0,6" AutomationProperties.AutomationId="ProviderSetupModel"/>
+                    <Button Content="{local:UiText provider.setup.models}" Style="{StaticResource SecondaryButtonStyle}"
+                            IsEnabled="{Binding CanReadModels}" Click="Models_Click" HorizontalAlignment="Left" Margin="0,0,0,10"/>
+                    <TextBlock Text="{local:UiText provider.setup.auth}" Foreground="{DynamicResource MutedBrush}"/>
+                    <ComboBox SelectedValuePath="Tag" SelectedValue="{Binding AuthMode, Mode=TwoWay}" IsEnabled="{Binding CanEdit}" Margin="0,6,0,10">
+                        <ComboBoxItem Tag="api_key" Content="{local:UiText provider.setup.authKey}"/>
+                        <ComboBoxItem Tag="none" Content="{local:UiText provider.setup.authNone}" IsEnabled="{Binding CanUseNoAuth}"/>
+                    </ComboBox>
+                    <PasswordBox x:Name="SetupApiKey" PasswordChar="●" MaxLength="16384" PasswordChanged="Key_Changed"
+                                 IsEnabled="{Binding CanEnterKey}" Background="{DynamicResource InputBrush}" Foreground="{DynamicResource TextBrush}"
+                                 BorderBrush="{DynamicResource BorderBrush}" Padding="12,9" AutomationProperties.AutomationId="ProviderSetupApiKey"/>
+                    <TextBlock Text="{Binding KeyHint}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" FontSize="12" Margin="0,6,0,10"/>
+                    <WrapPanel>
+                        <Button Content="{local:UiText provider.setup.save}" Style="{StaticResource PrimaryButtonStyle}"
+                                IsEnabled="{Binding CanSave}" Click="Save_Click" AutomationProperties.AutomationId="ProviderSetupSave"/>
+                        <Button Content="{local:UiText provider.setup.remove}" Style="{StaticResource SecondaryButtonStyle}"
+                                IsEnabled="{Binding CanRemove}" Click="Remove_Click" Margin="10,0,0,0"/>
+                    </WrapPanel>
+                </StackPanel>
+            </Grid>
+            <TextBlock Text="{Binding Status}" Foreground="{DynamicResource AccentStrongBrush}" TextWrapping="Wrap"
+                       AutomationProperties.LiveSetting="Polite" Margin="0,16,0,0"/>
+        </StackPanel>
+    </Border>
+</UserControl>

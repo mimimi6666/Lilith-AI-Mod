@@ -1,0 +1,239 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index a4e57aa358650e636514e9b174926084739cc85c..1d34a473ed64054cc920b294c39c3e3af97a72c4 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -164,6 +164,29 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
+ _TERMINAL_ERROR_TEXT_MAX_CHARS = 2000
+ 
+ 
++def _notify_delegated_assistant_preview(agent: Any, content: str) -> None:
++    """Relay final assistant prose only as a delegated-child progress preview.
++
++    Final assistant content is not reasoning.  Provider-exposed reasoning has
++    its own ``reasoning_callback`` path and the TUI gateway publishes the
++    completed per-turn snapshot from ``result.last_reasoning``.
++    """
++    callback = getattr(agent, "tool_progress_callback", None)
++    if not content or callback is None or getattr(agent, "_delegate_depth", 0) <= 0:
++        return
++
++    preview = re.sub(
++        r"</?(?:REASONING_SCRATCHPAD|think|reasoning)>", "", content
++    ).strip()
++    first_line = preview.split("\n")[0][:80] if preview else ""
++    if not first_line:
++        return
++    try:
++        callback("_thinking", first_line)
++    except Exception:
++        pass
++
++
+ def _force_safe_terminal_error_text(value: Any) -> str:
+     """Force-redact and bound provider-controlled terminal text."""
+     text = _sanitize_surrogates(str(value or "").strip())
+@@ -6765,27 +6788,9 @@ def run_conversation(
+                 else:
+                     agent._vprint(f"{agent.log_prefix}🤖 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}")
+ 
+-            # Notify progress callback of model's thinking (used by subagent
+-            # delegation to relay the child's reasoning to the parent display).
+-            if (assistant_message.content and agent.tool_progress_callback):
+-                _think_text = assistant_message.content.strip()
+-                # Strip reasoning XML tags that shouldn't leak to parent display
+-                _think_text = re.sub(
+-                    r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
+-                ).strip()
+-                # For subagents: relay first line to parent display (existing behaviour).
+-                # For all agents with a structured callback: emit reasoning.available event.
+-                first_line = _think_text.split('\n')[0][:80] if _think_text else ""
+-                if first_line and getattr(agent, '_delegate_depth', 0) > 0:
+-                    try:
+-                        agent.tool_progress_callback("_thinking", first_line)
+-                    except Exception:
+-                        pass
+-                elif _think_text:
+-                    try:
+-                        agent.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
+-                    except Exception:
+-                        pass
++            # Preserve the delegated-child progress preview without relabeling
++            # final assistant prose as provider-exposed reasoning.
++            _notify_delegated_assistant_preview(agent, assistant_message.content)
+             
+             # Check for incomplete <REASONING_SCRATCHPAD> (opened but never closed)
+             # This means the model ran out of output tokens mid-reasoning — retry up to 2 times
+diff --git a/tests/agent/test_reasoning_progress_semantics.py b/tests/agent/test_reasoning_progress_semantics.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7da09a14d3c81fb76bc7ebf3f446ba3111f654e1
+--- /dev/null
++++ b/tests/agent/test_reasoning_progress_semantics.py
+@@ -0,0 +1,32 @@
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++from agent.conversation_loop import _notify_delegated_assistant_preview
++
++
++def test_root_final_content_is_not_relayed_as_reasoning() -> None:
++    observed: list[tuple[object, ...]] = []
++    agent = SimpleNamespace(
++        _delegate_depth=0,
++        tool_progress_callback=lambda *args: observed.append(args),
++    )
++
++    _notify_delegated_assistant_preview(agent, "This is the final answer.")
++
++    assert observed == []
++
++
++def test_delegated_child_keeps_bounded_first_line_progress_preview() -> None:
++    observed: list[tuple[object, ...]] = []
++    agent = SimpleNamespace(
++        _delegate_depth=1,
++        tool_progress_callback=lambda *args: observed.append(args),
++    )
++
++    _notify_delegated_assistant_preview(
++        agent,
++        "<reasoning>delegated result</reasoning>\nignored second line",
++    )
++
++    assert observed == [("_thinking", "delegated result")]
+diff --git a/tests/tui_gateway/test_reasoning_event_semantics.py b/tests/tui_gateway/test_reasoning_event_semantics.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..af44f06da9fc22f1aca33104f48187143195781d
+--- /dev/null
++++ b/tests/tui_gateway/test_reasoning_event_semantics.py
+@@ -0,0 +1,114 @@
++from __future__ import annotations
++
++import threading
++import types
++
++import pytest
++
++from tui_gateway import server
++
++
++class _InlineThread:
++    def __init__(self, target=None, daemon=None, args=(), kwargs=None):
++        self._target = target
++        self._args = args
++        self._kwargs = kwargs or {}
++
++    def start(self):
++        if self._target is not None:
++            self._target(*self._args, **self._kwargs)
++
++    def is_alive(self):
++        return False
++
++    def join(self, timeout=None):
++        return None
++
++
++def _session(agent):
++    return {
++        "agent": agent,
++        "session_key": "session-key",
++        "history": [],
++        "history_lock": threading.Lock(),
++        "history_version": 0,
++        "running": True,
++        "attached_images": [],
++        "image_counter": 0,
++        "cols": 80,
++        "slash_worker": None,
++        "show_reasoning": False,
++        "tool_progress_mode": "all",
++        "inflight_turn": None,
++    }
++
++
++@pytest.fixture()
++def turn_env(monkeypatch, tmp_path):
++    captured: list[tuple[str, str, object]] = []
++    monkeypatch.setattr(
++        server,
++        "_emit",
++        lambda event, sid, payload=None: captured.append((event, sid, payload)),
++    )
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
++    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
++    monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
++    monkeypatch.setattr(server, "_register_session_cwd", lambda session: None)
++    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
++    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    return captured
++
++
++def test_last_reasoning_is_emitted_exactly_before_message_complete(turn_env) -> None:
++    final_answer = "The final answer is separate."
++    actual_reasoning = "First weigh the two constraints, then choose the safer one."
++    agent = types.SimpleNamespace(
++        session_id="session-key",
++        run_conversation=lambda *args, **kwargs: {
++            "final_response": final_answer,
++            "last_reasoning": actual_reasoning,
++        },
++        clear_interrupt=lambda: None,
++    )
++
++    server._run_prompt_submit("rid", "sid", _session(agent), "compare them")
++
++    terminal = [
++        (event, payload)
++        for event, _sid, payload in turn_env
++        if event in {"reasoning.available", "message.complete"}
++    ]
++    assert [event for event, _payload in terminal] == [
++        "reasoning.available",
++        "message.complete",
++    ]
++    assert terminal[0][1] == {"text": actual_reasoning}
++    assert terminal[1][1]["text"] == final_answer
++    assert terminal[1][1]["reasoning"] == actual_reasoning
++    assert terminal[0][1]["text"] != terminal[1][1]["text"]
++
++
++def test_no_last_reasoning_emits_no_reasoning_event(turn_env) -> None:
++    final_answer = "A normal answer without provider-exposed reasoning."
++    agent = types.SimpleNamespace(
++        session_id="session-key",
++        run_conversation=lambda *args, **kwargs: {
++            "final_response": final_answer,
++            "last_reasoning": None,
++        },
++        clear_interrupt=lambda: None,
++    )
++
++    server._run_prompt_submit("rid", "sid", _session(agent), "answer normally")
++
++    assert not [event for event, _sid, _payload in turn_env if event == "reasoning.available"]
++    completes = [
++        payload for event, _sid, payload in turn_env if event == "message.complete"
++    ]
++    assert len(completes) == 1
++    assert completes[0]["text"] == final_answer
++    assert "reasoning" not in completes[0]
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 37a77ed9432026777e80e9c178be1850168ed80d..f017db8e817eebf9dc716a9b280c86a456322de7 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -10730,6 +10730,11 @@ def _run_prompt_submit(
+                 payload["error"] = gateway_error_text
+                 payload["recoverable"] = True
+             _retire_turn_marker(session, marker_key)
++            if last_reasoning:
++                reasoning_payload: dict[str, object] = {"text": last_reasoning}
++                if _session_verbose(sid):
++                    reasoning_payload["verbose"] = True
++                _emit("reasoning.available", sid, reasoning_payload)
+             _emit("message.complete", sid, payload)
+ 
+             # ── /goal continuation (Ralph-style loop) ─────────────────

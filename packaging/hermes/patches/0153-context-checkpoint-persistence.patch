@@ -1,0 +1,82 @@
+diff --git a/agent/history_checkpoint_cache.py b/agent/history_checkpoint_cache.py
+index e5f9827..4485071 100644
+--- a/agent/history_checkpoint_cache.py
++++ b/agent/history_checkpoint_cache.py
+@@ -8,6 +8,7 @@ authority; cached prose remains subordinate model-generated summary data.
+ """
+ import hashlib
+ import json
++import logging
+ import os
+ from pathlib import Path
+ import re
+@@ -20,6 +21,7 @@ MAX_UNITS = 2048
+ SLOTS = 32
+ MAX_AGE = 30 * 86400
+ _HEX = re.compile(r"[a-f0-9]{64}\Z")
++logger = logging.getLogger(__name__)
+ 
+ 
+ def reuse_scope(agent):
+@@ -143,6 +145,23 @@ def _save(root, scope, covered, summary, *, can_commit=lambda: True):
+                 os.fsync(stream.fileno())
+             # Last cancellation/ownership check at the optional publication
+             # boundary. A stop observed before commit cannot publish a cache.
++            if not can_commit():
++                return False
++            # Windows' ordinary replace cannot replace an open destination,
++            # even when our validation handle allowed FILE_SHARE_DELETE.
++            # Ancestors remain pinned for this entire operation. Revalidate the
++            # current leaf after the temp is durable, then release that handle
++            # before atomic rename. Never unlink or copy over the destination.
++            if descriptor is not None:
++                os.close(descriptor)
++                descriptor = None
++            try:
++                descriptor = directory.open(name, allow_delete=True)
++            except FileNotFoundError:
++                pass
++            if descriptor is not None:
++                os.close(descriptor)
++                descriptor = None
+             if not can_commit():
+                 return False
+             if os.name == "nt":
+@@ -161,12 +180,34 @@ def _save(root, scope, covered, summary, *, can_commit=lambda: True):
+                 directory.remove(temporary)
+ 
+ 
++def _save_diagnostic(outcome, reason, error=None):
++    # Closed outcomes/reasons are supplied only by save(). No exception text,
++    # paths, source identities or summary prose may enter routine diagnostics.
++    try:
++        code = 0
++        if isinstance(error, OSError):
++            for value in (getattr(error, "winerror", None), getattr(error, "errno", None)):
++                if type(value) is int and 0 <= value <= 65535:
++                    code = value
++                    break
++        level = logging.WARNING if outcome == "failed" else logging.INFO
++        logger.log(level, "[checkpoint_cache] operation=save outcome=%s reason=%s os_error=%d",
++                   outcome, reason, code)
++    except Exception:
++        pass  # Optional diagnostics cannot turn a cache failure into chat failure.
++
++
+ def save(agent, origin, scope, state):
+     try:
+         root = _root(agent, origin)
+         if root is None:
++            _save_diagnostic("skipped", "not_eligible")
+             return False
+-        return _save(root, scope, state["covered"], state["summary"],
+-                     can_commit=lambda: _root(agent, origin) == root)
+-    except Exception:
++        committed = _save(root, scope, state["covered"], state["summary"],
++                          can_commit=lambda: _root(agent, origin) == root)
++        _save_diagnostic("saved" if committed else "skipped",
++                         "committed" if committed else "not_committed")
++        return committed
++    except Exception as error:
++        _save_diagnostic("failed", "io_error" if isinstance(error, OSError) else "unavailable", error)
+         return False

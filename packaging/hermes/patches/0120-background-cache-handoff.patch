@@ -1,0 +1,427 @@
+diff --git a/agent/background_context.py b/agent/background_context.py
+index 9ec897a..c194daf 100644
+--- a/agent/background_context.py
++++ b/agent/background_context.py
+@@ -2,8 +2,52 @@
+ from dataclasses import dataclass
+ import hashlib
+ import json
++import logging
+ from agent.history_context import summary_scope
+ 
++logger = logging.getLogger(__name__)
++
++
++class BackgroundContextDeferred(RuntimeError):
++    """Optional review lacks a verified bounded projection; never a retry."""
++
++
++def _summary_outcome(stage, code, covered=0):
++    # Closed codes and counts only: no transcript, scope values or credentials.
++    logger.info("[background_checkpoint] stage=%s code=%s covered=%d", stage, code, covered)
++
++
++def ensure_background_projection(agent, history, spec):
++    """Stop optional long-history review if its summary proof was lost.
++
++    Foreground replies and levels 5/6 keep their original behavior. The check
++    is outside prepare_budget_context's original-retention recovery catch.
++    """
++    if not getattr(agent, "_background_context_readonly", False) or spec.history_turns is None:
++        return
++    status = getattr(agent, "_usage_budget_context_status", None)
++    valid = isinstance(status, dict) and status.get("strategy") == "information_v1"
++    if valid:
++        needed = status.get("uncovered_turns_retained", 0) > 0
++        covered = status.get("summarized_turns", 0)
++    else:
++        from agent.history_checkpoint import detail_chars, history_limit
++        units = getattr(history, "units", ())
++        # Only the once-frozen pre-turn history is counted, never this review's
++        # current prompt or later tool results. Unknown projection cannot
++        # silently turn a known long history into an unrestricted replay.
++        needed = (len(units) >= spec.history_turns
++                  or sum(detail_chars([row.message for row in unit]) for unit in units)
++                     > history_limit(spec))
++        covered = 0
++    if needed and not covered:
++        handoff = getattr(agent, "_background_checkpoint_handoff", "snapshot_missing")
++        code = ("coverage_changed" if handoff == "accepted" else handoff) if valid else "projection_unavailable"
++        if code not in ("snapshot_missing", "origin_mismatch", "scope_mismatch", "coverage_changed", "projection_unavailable"):
++            code = "snapshot_missing"
++        _summary_outcome("defer", code)
++        raise BackgroundContextDeferred(code)
++
+ 
+ @dataclass(frozen=True)
+ class HistoryProjectionSnapshot:
+@@ -86,6 +130,7 @@ def freeze_summary(agent):
+     from agent.usage_budget_runtime import capture_origin
+     origin = capture_origin()
+     if origin is None or origin.ledger.snapshot().stopped:
++        _summary_outcome("freeze", "origin_unavailable")
+         return None
+     spec = origin.ledger.policy.information_strategy
+     state = getattr(agent, "_information_summary", None)
+@@ -95,7 +140,9 @@ def freeze_summary(agent):
+             or not isinstance(state.get("summary"), str) or not state["summary"].strip()
+             or not isinstance(state.get("covered"), tuple) or not state["covered"]
+             or not all(isinstance(k, str) and len(k) == 64 for k in state["covered"])):
++        _summary_outcome("freeze", "checkpoint_unavailable")
+         return None
++    _summary_outcome("freeze", "accepted", len(state["covered"]))
+     return SummarySnapshot(state["key"], state["covered"], state["summary"], origin.origin_id)
+ 
+ 
+@@ -103,17 +150,25 @@ def attach_summary(agent, snapshot):
+     # Even without a reusable checkpoint the background fork retains originals;
+     # it must not spend a second auxiliary call rebuilding the historical summary.
+     agent._background_context_readonly = True
++    agent._background_checkpoint_handoff = "snapshot_missing"
+     from agent.usage_budget_runtime import capture_origin
+     origin = capture_origin()
+     if (type(snapshot) is not SummarySnapshot or origin is None
+             or origin.origin_id != snapshot.origin_id or origin.ledger.snapshot().stopped):
++        if type(snapshot) is SummarySnapshot:
++            agent._background_checkpoint_handoff = "origin_mismatch"
++        _summary_outcome("attach", agent._background_checkpoint_handoff)
+         return False
+     spec = origin.ledger.policy.information_strategy
+     if spec.history_turns is None or snapshot.key != summary_scope(agent, origin, spec):
++        agent._background_checkpoint_handoff = "scope_mismatch"
++        _summary_outcome("attach", "scope_mismatch")
+         return False
+     # A new dict, with immutable values only. project_context independently
+     # verifies complete exchange coverage against the CHILD's actual send.
+     agent._information_summary = {"key": snapshot.key, "covered": snapshot.covered,
+         "summary": snapshot.summary, "last": snapshot.origin_id,
+         "attempt_count": len(snapshot.covered)}
++    agent._background_checkpoint_handoff = "accepted"
++    _summary_outcome("attach", "accepted", len(snapshot.covered))
+     return True
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 0e4f70e..4a36f1a 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -25,6 +25,7 @@ import os
+ from typing import Any, Dict, List, Optional
+ 
+ from agent.thread_scoped_output import thread_scoped_silence
++from agent.background_context import BackgroundContextDeferred
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -1152,6 +1153,10 @@ def _run_review_in_thread(
+                 except Exception:
+                     pass
+ 
++    except BackgroundContextDeferred:
++        # Best-effort maintenance may wait for a later valid foreground
++        # checkpoint. No immediate retry, false write receipt or user error.
++        logger.info("Background memory/skill review deferred: checkpoint unavailable")
+     except Exception as e:
+         logger.warning("Background memory/skill review failed: %s", e)
+         agent._emit_auxiliary_failure("background review", e)
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index fb03f5e..f47c0bb 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1926,9 +1926,11 @@ def run_conversation(
+     effective_task_id = _ctx.effective_task_id
+     turn_id = _ctx.turn_id
+     current_turn_user_idx = _ctx.current_turn_user_idx
+-    # Capture eligibility once. Later steers, repairs, redirects or compaction
+-    # must never turn this turn's earlier inputs into disposable history.
+-    _budget_history_selection = capture_budget_history(messages, current_turn_user_idx)
++    # Freeze once after the first owned native repair below. Capturing before
++    # that repair excludes changed old exchanges, so the child sees a different
++    # coverage sequence and discards an otherwise current checkpoint. Later
++    # steers, tools, redirects or compaction must never trigger a recapture.
++    _budget_history_selection = None
+     _unlimited_iterations = unlimited_iterations()
+     _loop_iteration_serial = 0
+     _last_outer_error_iteration = -1
+@@ -2117,57 +2119,6 @@ def run_conversation(
+                 and "skill_manage" in agent.valid_tool_names):
+             agent._iters_since_skill += 1
+         
+-        # ── Pre-API-call /steer drain ──────────────────────────────────
+-        # If a /steer arrived during the previous API call (while the model
+-        # was thinking), drain it now — before we build api_messages — so
+-        # the model sees the steer text on THIS iteration.  Without this,
+-        # steers sent during an API call only land after the NEXT tool batch,
+-        # which may never come if the model returns a final response.
+-        #
+-        # We scan backwards for the last tool-role message in the messages
+-        # list.  If found, the steer is appended there.  If not (first
+-        # iteration, no tools yet), the steer stays pending for the next
+-        # tool batch — injecting into a user message would break role
+-        # alternation, and there's no tool output to piggyback on.
+-        _pre_api_steer = agent._drain_pending_steer()
+-        if _pre_api_steer:
+-            _injected = False
+-            for _si in range(len(messages) - 1, -1, -1):
+-                _sm = messages[_si]
+-                if isinstance(_sm, dict) and _sm.get("role") == "tool":
+-                    from agent.prompt_builder import format_steer_marker
+-                    marker = format_steer_marker(_pre_api_steer)
+-                    existing = _sm.get("content", "")
+-                    if isinstance(existing, str):
+-                        _sm["content"] = existing + marker
+-                    else:
+-                        # Multimodal content blocks — append text block
+-                        try:
+-                            blocks = list(existing) if existing else []
+-                            blocks.append({"type": "text", "text": marker})
+-                            _sm["content"] = blocks
+-                        except Exception:
+-                            pass
+-                    _injected = True
+-                    logger.debug(
+-                        "Pre-API-call steer drain: injected into tool msg at index %d",
+-                        _si,
+-                    )
+-                    break
+-            if not _injected:
+-                # No tool message to inject into — put it back so
+-                # the post-tool-execution drain picks it up later.
+-                _lock = getattr(agent, "_pending_steer_lock", None)
+-                if _lock is not None:
+-                    with _lock:
+-                        if agent._pending_steer:
+-                            agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
+-                        else:
+-                            agent._pending_steer = _pre_api_steer
+-                else:
+-                    existing = getattr(agent, "_pending_steer", None)
+-                    agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+-
+         # Prepare messages for API call
+         # If we have an ephemeral system prompt, prepend it to the messages
+         # Note: Reasoning is embedded in content via <think> tags for trajectory storage.
+@@ -2254,6 +2205,46 @@ def run_conversation(
+                     agent.session_id or "-",
+                 )
+ 
++        if _budget_history_selection is None:
++            _budget_history_selection = capture_budget_history(messages, current_turn_user_idx)
++
++        # Drain only AFTER the one-time normalized-history capture. A steer
++        # can be appended to a much older tool result; its changed digest
++        # must keep that complete exchange out of summary selection.
++        # This still runs before the API copy on every provider pass.
++        _pre_api_steer = agent._drain_pending_steer()
++        if _pre_api_steer:
++            _injected = False
++            for _si in range(len(messages) - 1, -1, -1):
++                _sm = messages[_si]
++                if isinstance(_sm, dict) and _sm.get("role") == "tool":
++                    from agent.prompt_builder import format_steer_marker
++                    marker = format_steer_marker(_pre_api_steer)
++                    existing = _sm.get("content", "")
++                    if isinstance(existing, str):
++                        _sm["content"] = existing + marker
++                    else:
++                        try:
++                            blocks = list(existing) if existing else []
++                            blocks.append({"type": "text", "text": marker})
++                            _sm["content"] = blocks
++                        except Exception:
++                            pass
++                    _injected = True
++                    logger.debug("Pre-API-call steer drain: injected into tool msg at index %d", _si)
++                    break
++            if not _injected:
++                _lock = getattr(agent, "_pending_steer_lock", None)
++                if _lock is not None:
++                    with _lock:
++                        if agent._pending_steer:
++                            agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
++                        else:
++                            agent._pending_steer = _pre_api_steer
++                else:
++                    existing = getattr(agent, "_pending_steer", None)
++                    agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
++
+         api_messages = []
+         for idx, msg in enumerate(messages):
+ 
+diff --git a/agent/usage_budget_context.py b/agent/usage_budget_context.py
+index f4052f8..654f93f 100644
+--- a/agent/usage_budget_context.py
++++ b/agent/usage_budget_context.py
+@@ -368,6 +368,9 @@ def prepare_budget_context(agent, projected, source, history, *, history_offset,
+         from agent.usage_strategy_context import project_context
+         origin = capture_origin()
+         if origin is not None:
++            # Never let an early-return/failed projection reuse last pass's
++            # apparent coverage when deciding whether an optional fork fits.
++            agent._usage_budget_context_status = {"strategy": "projection_unavailable_originals_retained"}
+             try:
+                 units = _strategy_projection_units(agent, history, source, projected, history_offset,
+                                                    normalize_tool_calls=normalize_tool_calls)
+@@ -384,6 +387,8 @@ def prepare_budget_context(agent, projected, source, history, *, history_offset,
+             # the stop instead of dispatching another foreground request.
+             if ledger.snapshot().stopped:
+                 raise BudgetError("turn_stopped")
++            from agent.background_context import ensure_background_projection
++            ensure_background_projection(agent, history, ledger.policy.information_strategy)
+             return result
+     policy = ledger.policy if ledger is not None else None
+     counter = _bound_counter(agent) if policy and policy.enforce_economy_limits else None
+diff --git a/tests/test_background_cache_handoff.py b/tests/test_background_cache_handoff.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_background_cache_handoff.py
+@@ -0,0 +1,151 @@
++"""Synthetic immutable coverage and optional-review admission, no player data."""
++from copy import deepcopy
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++from agent.background_context import (BackgroundContextDeferred, attach_summary,
++    ensure_background_projection, freeze_summary)
++from agent.usage_budget import NormalBudget, VerifiedModelLimits, TurnBudgetLedger, resolve_policy
++from agent.usage_budget_context import (capture_completed_history, _strategy_projection_units,
++    prepare_budget_context)
++from agent.usage_strategy import strategy_for_level
++from agent.usage_strategy_context import project_context
++
++
++class HandoffTests(unittest.TestCase):
++    def setUp(self):
++        self.spec = strategy_for_level(4)
++        self.policy = resolve_policy(4, NormalBudget(max_iterations=90), VerifiedModelLimits(), version=1)
++        self.origin = SimpleNamespace(origin_id="synthetic-origin",
++            ledger=TurnBudgetLedger("synthetic-origin", self.policy))
++        self.capture = patch("agent.usage_budget_runtime.capture_origin", return_value=self.origin)
++        self.capture.start()
++        self.addCleanup(self.capture.stop)
++        self.calls = []
++        self.parent = self.agent()
++        self.rows = [row for i in range(40) for row in
++            ({"role":"user", "content":f"question {i}"},
++             {"role":"assistant", "content":f"answer {i}"})]
++        self.rows.append({"role":"user", "content":"current input"})
++
++    def agent(self):
++        return SimpleNamespace(session_id="synthetic", model="model", provider="provider",
++            api_mode="chat_completions", context_compressor=SimpleNamespace(
++                _generate_summary=lambda rows:(self.calls.append(deepcopy(rows)) or "Synthetic summary")))
++
++    def units(self, rows, selection=None):
++        selection = selection or capture_completed_history(rows,len(rows)-1)
++        return _strategy_projection_units(self.parent,selection,rows,deepcopy(rows),0)
++
++    def project(self, owner, rows, selection=None):
++        return project_context(owner,rows,self.units(rows,selection),self.spec,self.origin)
++
++    def test_old_capture_loses_coverage_after_three_native_owned_history_changes(self):
++        before = capture_completed_history(self.rows,len(self.rows)-1)
++        # The full-host fixture exercises actual adjacent-assistant merging.
++        # Here the already-owned normalization's three changed row identities
++        # isolate the precise immutable-proof/prefix failure without startup.
++        for index in (2,6,10): self.rows[2*index+1]["content"] += "\ncontinuation"
++        self.project(self.parent,self.rows,before)
++        covered = len(self.parent._information_summary["covered"])
++        child = self.agent()
++        self.assertTrue(attach_summary(child,freeze_summary(self.parent)))
++        self.project(child,self.rows)
++        self.assertGreater(covered,0)
++        self.assertEqual(child._information_summary["covered"],())
++        self.assertEqual(len(self.calls),1)
++
++    def test_capture_after_normalization_retains_exact_child_coverage(self):
++        for index in (2,6,10): self.rows[2*index+1]["content"] += "\ncontinuation"
++        frozen = capture_completed_history(self.rows,len(self.rows)-1)
++        self.project(self.parent,self.rows,frozen)
++        snapshot = freeze_summary(self.parent)
++        child = self.agent()
++        self.assertTrue(attach_summary(child,snapshot))
++        self.project(child,self.rows)
++        self.assertEqual(child._information_summary["covered"],snapshot.covered)
++        self.assertEqual(len(self.calls),1)
++
++    def test_later_changes_remain_ineligible_without_recapture(self):
++        frozen = capture_completed_history(self.rows,len(self.rows)-1)
++        prior = len(self.units(self.rows,frozen))
++        self.rows[5]["content"] = "changed after capture"
++        self.rows.extend([{"role":"assistant","content":"current answer"},
++                          {"role":"user","content":"steered input"}])
++        units = self.units(self.rows,frozen)
++        self.assertEqual(len(units),prior-1)
++        self.assertTrue(all(max(unit)<80 for unit in units))
++
++    def test_scope_or_source_mismatch_does_not_borrow_summary(self):
++        self.project(self.parent,self.rows)
++        snapshot = freeze_summary(self.parent)
++        for field in ("model","provider","api_mode","base_url","session_id","fingerprint"):
++            child = self.agent()
++            setattr(child,field,"different")
++            self.assertFalse(attach_summary(child,snapshot),field)
++        child = self.agent()
++        self.assertTrue(attach_summary(child,snapshot))
++        self.rows[0]["content"] = "edited fact"
++        self.project(child,self.rows)
++        self.assertEqual(child._information_summary["covered"],())
++
++    def test_long_optional_history_without_checkpoint_defers(self):
++        child = self.agent()
++        attach_summary(child,None)
++        self.project(child,self.rows)
++        with self.assertRaisesRegex(BackgroundContextDeferred,"snapshot_missing"):
++            ensure_background_projection(child,capture_completed_history(self.rows,len(self.rows)-1),self.spec)
++
++    def test_valid_partial_checkpoint_and_short_history_are_allowed(self):
++        self.project(self.parent,self.rows)
++        child = self.agent()
++        attach_summary(child,freeze_summary(self.parent))
++        self.project(child,self.rows)
++        ensure_background_projection(child,capture_completed_history(self.rows,len(self.rows)-1),self.spec)
++        short = self.rows[-5:]
++        child = self.agent()
++        attach_summary(child,None)
++        self.project(child,short)
++        ensure_background_projection(child,capture_completed_history(short,len(short)-1),self.spec)
++
++    def test_guard_preserves_foreground_and_levels_five_six(self):
++        self.parent._usage_budget_context_status = {"strategy":"projection_unavailable_originals_retained"}
++        history = capture_completed_history(self.rows,len(self.rows)-1)
++        ensure_background_projection(self.parent,history,self.spec)
++        self.parent._background_context_readonly = True
++        for level in (5,6): ensure_background_projection(self.parent,history,strategy_for_level(level))
++
++    def test_projection_exception_not_swallowed_into_long_background_send(self):
++        child = self.agent()
++        attach_summary(child,None)
++        history = capture_completed_history(self.rows,len(self.rows)-1)
++        with patch("agent.usage_budget_context.current_turn_budget",return_value=self.origin.ledger), \
++             patch("agent.usage_strategy_context.project_context",side_effect=ValueError("synthetic")):
++            with self.assertRaisesRegex(BackgroundContextDeferred,"projection_unavailable"):
++                prepare_budget_context(child,self.rows,self.rows,history,history_offset=0)
++            # Ordinary foreground still preserves originals on that failure.
++            self.assertEqual(prepare_budget_context(self.parent,self.rows,self.rows,history,history_offset=0),self.rows)
++
++    def test_stopped_origin_does_not_attach_or_dispatch(self):
++        self.project(self.parent,self.rows)
++        snapshot = freeze_summary(self.parent)
++        self.origin.ledger.stop()
++        self.assertIsNone(freeze_summary(self.parent))
++        self.assertFalse(attach_summary(self.agent(),snapshot))
++
++    def test_diagnostics_contain_only_closed_codes_and_counts(self):
++        self.project(self.parent,self.rows)
++        with self.assertLogs("agent.background_context",level="INFO") as logs:
++            snapshot = freeze_summary(self.parent)
++            child = self.agent()
++            self.assertTrue(attach_summary(child,snapshot))
++        text = "\n".join(logs.output)
++        self.assertIn("stage=freeze code=accepted",text)
++        self.assertNotIn("Synthetic summary",text)
++        self.assertNotIn("synthetic-origin",text)
++        self.assertNotIn("question",text)
++
++
++if __name__ == "__main__":
++    unittest.main()

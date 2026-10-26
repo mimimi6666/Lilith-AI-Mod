@@ -1,0 +1,420 @@
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -2961,6 +2961,7 @@ def compress_context(
+                     engine_name,
+                 )
+ 
++        original_message_refs = list(messages)
+         messages_before_compression = copy.deepcopy(messages)
+         _activity_heartbeat = _CompressionActivityHeartbeat(
+             agent, commit_fence=commit_fence
+@@ -3308,6 +3309,12 @@ def compress_context(
+         _ensure_compressed_has_user_turn(messages, compressed)
+ 
+         cached_system_prompt = agent._cached_system_prompt
++        cached_system_prompt_static = getattr(agent, "_cached_system_prompt_static", None)
++        identity_state_before = {
++            key: copy.deepcopy(getattr(agent, key))
++            for key in ("_identity_legacy_history_v1", "_session_init_model_config")
++            if hasattr(agent, key)
++        }
+         kept_cached_system_prompt = False
+         agent._invalidate_system_prompt()
+ 
+@@ -3615,6 +3622,32 @@ def compress_context(
+                     }
+                 _session_commit_succeeded = True
+             except Exception as e:
++                if in_place and not compacted_in_place:
++                    # archive_and_compact failed before publication. The DB
++                    # still holds the original context, so do not hand a
++                    # shorter, uncommitted transcript to the turn prologue or
++                    # emit a completed boundary. Preserve shared dict identity
++                    # as well as content for the pending input/flush owners.
++                    for original, snapshot in zip(original_message_refs, messages_before_compression):
++                        if isinstance(original, dict) and isinstance(snapshot, dict):
++                            original.clear()
++                            original.update(copy.deepcopy(snapshot))
++                    messages[:] = original_message_refs
++                    agent._cached_system_prompt = cached_system_prompt
++                    agent._cached_system_prompt_static = cached_system_prompt_static
++                    for key, value in identity_state_before.items():
++                        setattr(agent, key, value)
++                    if "_proactive_prune_rearm_tokens" in _compressor_attempt_snapshot:
++                        agent.context_compressor._proactive_prune_rearm_tokens = (
++                            _compressor_attempt_snapshot["_proactive_prune_rearm_tokens"]
++                        )
++                    logger.warning("In-place compression publication failed; original context retained: %s", e)
++                    _emit_compression_attempt_telemetry(
++                        agent, started_at=_attempt_started_at,
++                        commit_status="aborted", split_status="in_place_aborted",
++                        failure_class="session_split_failed",
++                    )
++                    return messages, cached_system_prompt or system_message
+                 if (
+                     not in_place
+                     and locals().get("old_session_id")
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -818,6 +818,23 @@ def build_turn_context(
+     messages.append(user_msg)
+     current_turn_user_idx = len(messages) - 1
+     agent._persist_user_message_idx = current_turn_user_idx
++    # Preflight compaction may persist this row before the ordinary flush.
++    # Give it the same ingress clock and provenance that flush would supply;
++    # neither field is model-authored or inferred from the rewrite time.
++    if (
++        getattr(agent, "_session_db", None) is not None
++        and user_msg.get("timestamp") is None
++        and user_msg.get("_durable_timestamp") is None
++    ):
++        user_msg["timestamp"] = (
++            persist_user_timestamp if persist_user_timestamp is not None else time.time()
++        )
++    from agent.turn_identity import stamp_turn_messages
++    stamp_turn_messages(
++        messages, user_index=current_turn_user_idx,
++        turn_id=canonical_turn_id, user_message_id=canonical_user_message_id,
++        assistant_message_id=canonical_assistant_message_id,
++    )
+ 
+     # Track user turns for memory flush and periodic nudge logic.
+     agent._user_turn_count += 1
+@@ -1306,6 +1323,24 @@ def build_turn_context(
+         agent._persist_user_message_idx = current_turn_user_idx
+ 
+     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
++    if _preflight_compressed:
++        # The compressor copies surviving tail dicts. The durable callback
++        # must inspect the committed copy, not the detached preflight input.
++        if canonical_turn_id and canonical_user_message_id:
++            matches = [
++                (index, message) for index, message in enumerate(messages)
++                if isinstance(message, dict) and message.get("role") == "user"
++                and isinstance(message.get("display_metadata"), dict)
++                and message["display_metadata"].get("hermes_turn_id") == canonical_turn_id
++                and message["display_metadata"].get("hermes_message_id") == canonical_user_message_id
++            ]
++            if len(matches) != 1:
++                raise RuntimeError("compaction did not preserve the exact current user identity")
++            current_turn_user_idx, user_msg = matches[0]
++            agent._persist_user_message_idx = current_turn_user_idx
++        elif 0 <= current_turn_user_idx < len(messages):
++            user_msg = messages[current_turn_user_idx]
++
+     plugin_user_context = ""
+     try:
+         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+diff --git a/hermes_state.py b/hermes_state.py
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -21,6 +21,7 @@ import errno
+ import hashlib
+ import json
+ import logging
++import math
+ import os
+ import queue
+ import random
+@@ -5209,6 +5210,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         one transaction. Readers can therefore observe either the live parent or
+         a complete child, never an ended parent with a missing/empty child.
+         """
++        staged_messages = [dict(message) for message in messages]
++
+         def _do(conn):
+             lock_row = conn.execute(
+                 "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
+@@ -5276,7 +5279,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             total_messages, total_tool_calls = self._insert_message_rows(
+                 conn,
+                 child_session_id,
+-                messages,
++                staged_messages,
+                 require_activity_timestamps=True,
+             )
+             conn.execute(
+@@ -5294,6 +5297,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 )
+ 
+         self._execute_write(_do)
++        for message, staged in zip(messages, staged_messages):
++            for key in ("_row_id", "_durable_timestamp", "_durable_conversation_activity"):
++                message[key] = staged[key]
++            message["_db_persisted"] = True
+ 
+     def end_session(self, session_id: str, end_reason: str) -> None:
+         """Mark a session as ended.
+@@ -9494,9 +9501,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             role = msg.get("role", "unknown")
+             tool_calls = msg.get("tool_calls")
+             message_timestamp = now_ts
+-            if msg.get("timestamp") is not None:
++            timestamp_value = msg.get("timestamp")
++            if timestamp_value is None and require_activity_timestamps:
++                # Live flush receipts carry the original clock under this key;
++                # cold-loaded rows carry timestamp. Compaction must preserve
++                # either representation, never substitute the rewrite clock.
++                timestamp_value = msg.get("_durable_timestamp")
++            if require_activity_timestamps and is_conversation_activity_message(msg):
++                try:
++                    activity_timestamp = float(
++                        timestamp_value.timestamp()
++                        if hasattr(timestamp_value, "timestamp") else timestamp_value
++                    )
++                except (TypeError, ValueError, OverflowError):
++                    activity_timestamp = float("nan")
++                if (
++                    isinstance(timestamp_value, bool)
++                    or not math.isfinite(activity_timestamp)
++                    or activity_timestamp <= 0
++                ):
++                    raise ValueError(
++                        "conversation-bearing rewrite row requires its durable timestamp"
++                    )
++            if timestamp_value is not None:
+                 try:
+-                    ts_value = msg.get("timestamp")
++                    ts_value = timestamp_value
+                     if hasattr(ts_value, "timestamp"):
+                         message_timestamp = float(ts_value.timestamp())
+                     else:
+@@ -9575,12 +9604,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     msg["_durable_conversation_activity"] = bool(
+                         advances_conversation
+                     )
+-                if advances_conversation and require_activity_timestamps and msg.get(
+-                    "timestamp"
+-                ) is None:
+-                    raise ValueError(
+-                        "conversation-bearing rewrite row requires its durable timestamp"
+-                    )
+                 if advances_conversation:
+                     last_conversation_at = max(
+                         float(last_conversation_at or message_timestamp),
+@@ -9739,6 +9762,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         value removes that key. Returns the new active count.
+         """
+ 
++        # SQLite can roll back after individual INSERTs have assigned row ids.
++        # Keep those tentative receipts private until the whole transaction
++        # commits; callers must never observe a durable marker for rolled-back
++        # rows (including on the writer's busy retry path).
++        staged_messages = [dict(message) for message in compacted_messages]
++
+         def _do(conn):
+             patched_model_config = None
+             if model_config_patch is not None:
+@@ -9764,7 +9793,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             inserted, tool_calls_total = self._insert_message_rows(
+                 conn,
+                 session_id,
+-                compacted_messages,
++                staged_messages,
+                 require_activity_timestamps=True,
+             )
+             # message_count / tool_call_count reflect the LIVE (active) set —
+@@ -9783,7 +9812,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             self._recompute_session_conversation_activity(conn, session_id)
+             return inserted
+ 
+-        return self._execute_write(_do)
++        inserted = self._execute_write(_do)
++        for message, staged in zip(compacted_messages, staged_messages):
++            for key in ("_row_id", "_durable_timestamp", "_durable_conversation_activity"):
++                message[key] = staged[key]
++            message["_db_persisted"] = True
++        return inserted
+ 
+     def set_latest_user_api_content(
+         self, session_id: str, content: Any, api_content: str
+diff --git a/tests/agent/test_compaction_durable_receipts.py b/tests/agent/test_compaction_durable_receipts.py
+new file mode 100644
+--- /dev/null
++++ b/tests/agent/test_compaction_durable_receipts.py
+@@ -0,0 +1,183 @@
++"""Real SQLite regressions for compaction timestamps and failed publication."""
++
++import copy
++import os
++import types
++from unittest.mock import patch
++
++import pytest
++
++from hermes_state import SessionDB
++
++
++@pytest.fixture(autouse=True)
++def no_model_or_network(monkeypatch):
++    def forbidden(*args, **kwargs):
++        raise AssertionError("network is forbidden in durability tests")
++    monkeypatch.setattr("socket.socket.connect", forbidden)
++    monkeypatch.setattr("agent.conversation_compression.check_compression_model_feasibility", lambda agent: None)
++
++
++def make_agent(db):
++    from run_agent import AIAgent
++
++    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
++        agent = AIAgent(
++            api_key="test-key", base_url="https://openrouter.ai/api/v1",
++            model="test/model", quiet_mode=True, session_db=db,
++            session_id="chat", skip_context_files=True, skip_memory=True,
++            enabled_toolsets=[],
++        )
++    agent.compression_in_place = True
++    return agent
++
++
++def test_compaction_accepts_durable_live_timestamp_without_refreshing_recency(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        agent = make_agent(db)
++        messages = [{"role": "user", "content": "question"},
++                    {"role": "assistant", "content": "answer"}]
++        agent._flush_messages_to_session_db(messages, [])
++        before = db.get_messages("chat")
++        assert messages[0]["_durable_timestamp"] == before[0]["timestamp"]
++        compacted = copy.deepcopy(messages)
++        for row in compacted:
++            row.pop("_db_persisted", None)
++        db.archive_and_compact("chat", compacted)
++        after = db.get_messages("chat")
++        assert [m["timestamp"] for m in after] == [m["timestamp"] for m in before]
++        assert all(row["_db_persisted"] is True for row in compacted)
++        assert [row["_row_id"] for row in compacted] == [row["id"] for row in after]
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize("timestamp", [None, True, float("nan"), float("inf"), -1.0, 0.0])
++def test_compaction_rejects_missing_or_invalid_authored_clock(tmp_path, timestamp):
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        db.create_session("chat", source="cli")
++        db.append_message("chat", "user", "original", timestamp=10.0)
++        before = db.get_messages("chat", include_inactive=True)
++        with pytest.raises(ValueError, match="durable timestamp"):
++            db.archive_and_compact("chat", [{"role": "user", "content": "tail", "timestamp": timestamp}])
++        assert db.get_messages("chat", include_inactive=True) == before
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize("in_place", [True, False])
++def test_failed_compaction_does_not_publish_rolled_back_row_receipts(tmp_path, in_place):
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        db.create_session("chat", source="cli")
++        db.append_message("chat", "user", "original", timestamp=10.0)
++        before = db.get_messages("chat", include_inactive=True)
++        compacted = [{"role": "user", "content": "valid", "timestamp": 10.0},
++                     {"role": "assistant", "content": "missing timestamp"}]
++        snapshot = copy.deepcopy(compacted)
++        with pytest.raises(ValueError, match="durable timestamp"):
++            if in_place:
++                db.archive_and_compact("chat", compacted)
++            else:
++                db.publish_compression_child(
++                    parent_session_id="chat", child_session_id="child", source="cli",
++                    messages=compacted, require_compression_lease=False,
++                )
++        assert compacted == snapshot
++        assert db.get_messages("chat", include_inactive=True) == before
++        assert db.get_session("chat")["ended_at"] is None
++        assert db.get_session("child") is None
++    finally:
++        db.close()
++
++
++def test_in_place_write_failure_keeps_original_context_and_no_completion_event(tmp_path):
++    from agent.conversation_compression import compress_context
++    from agent.context_compressor import ContextCompressor
++
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        agent = make_agent(db)
++        messages = [{"role": "user" if i % 2 == 0 else "assistant",
++                     "content": f"original {i}"} for i in range(12)]
++        agent._flush_messages_to_session_db(messages, [])
++        snapshot = copy.deepcopy(messages)
++        originals = list(messages)
++        before = db.get_messages("chat", include_inactive=True)
++        compressor = ContextCompressor(model="test/model", quiet_mode=True)
++        agent.context_compressor = compressor
++        events = []
++        agent.event_callback = lambda name, data: events.append(name)
++        agent._cached_system_prompt = "original system"
++        agent._cached_system_prompt_static = "original"
++        agent._identity_legacy_history_v1 = {"cutoff": 12}
++        agent._session_init_model_config["_identity_legacy_history_v1"] = {"cutoff": 12}
++        with patch.object(compressor, "compress", return_value=copy.deepcopy(messages[-2:])), \
++             patch.object(db, "archive_and_compact", side_effect=OSError("injected write failure")):
++            result, prompt = compress_context(agent, messages, "original system", force=True)
++        assert result == snapshot
++        assert all(a is b for a, b in zip(result, originals))
++        assert prompt == "original system"
++        assert agent._cached_system_prompt_static == "original"
++        assert agent._identity_legacy_history_v1 == {"cutoff": 12}
++        assert agent._session_init_model_config["_identity_legacy_history_v1"] == {"cutoff": 12}
++        assert "session:compress" not in events
++        assert not getattr(agent, "_last_compaction_in_place", False)
++        assert agent._last_compression_attempt_in_place is None
++        assert db.get_messages("chat", include_inactive=True) == before
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize("in_place", [True, False])
++def test_preflight_compression_acknowledges_exact_committed_copy(tmp_path, in_place):
++    from agent.context_compressor import ContextCompressor
++    from agent.turn_context import build_turn_context
++
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        agent = make_agent(db)
++        history = [{"role": "user" if i % 2 == 0 else "assistant",
++                    "content": f"old {i}"} for i in range(12)]
++        agent._flush_messages_to_session_db(history, [])
++        agent.compression_enabled = True
++        agent.compression_in_place = in_place
++        compressor = ContextCompressor(model="test/model", quiet_mode=True)
++        agent.context_compressor = compressor
++        agent._relay_pending_turn_id = "11111111111111111111111111111111"
++        agent._relay_pending_user_message_id = "22222222222222222222222222222222"
++        agent._relay_pending_assistant_message_id = "33333333333333333333333333333333"
++        receipts = []
++        agent._relay_turn_durable_callback = receipts.append
++
++        def compact(messages, **kwargs):
++            result = copy.deepcopy(messages[-3:])
++            for row in result:
++                row.pop("_db_persisted", None)
++            return result
++
++        with patch.object(compressor, "should_compress", return_value=True), \
++             patch.object(compressor, "compress", side_effect=compact), \
++             patch("agent.turn_context._should_run_preflight_estimate", return_value=True):
++            ctx = build_turn_context(
++                agent, "new question", "system", history, None, None, None,
++                persist_user_timestamp=123456.0,
++                restore_or_build_system_prompt=lambda *a, **k: "system",
++                install_safe_stdio=lambda: None, sanitize_surrogates=lambda s: s,
++                summarize_user_message_for_log=lambda s: s,
++                set_session_context=lambda sid: None,
++                set_current_write_origin=lambda origin: None,
++                ra=lambda: types.SimpleNamespace(_set_interrupt=lambda *a, **k: None),
++            )
++        assert len(receipts) == 1
++        row = next(m for m in db.get_messages(agent.session_id) if m["content"] == "new question")
++        assert receipts[0]["durable"]["row_id"] == row["id"]
++        assert receipts[0]["durable"]["timestamp"] == 123456.0
++        assert receipts[0]["turn_id"] == "11111111111111111111111111111111"
++        assert receipts[0]["durable"]["turn_origin"] == "user"
++        assert ctx.messages[ctx.current_turn_user_idx]["_row_id"] == row["id"]
++        assert len([m for m in db.get_messages(agent.session_id) if m["content"] == "new question"]) == 1
++    finally:
++        db.close()

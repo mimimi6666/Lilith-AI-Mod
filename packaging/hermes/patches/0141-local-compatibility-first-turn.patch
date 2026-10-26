@@ -1,0 +1,22 @@
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index dd92d5a..fc5b7af 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -587,6 +587,17 @@ def build_turn_context(
+     # after primary restoration has settled the runtime.
+     from agent.local_compatibility import freeze_for_agent
+     agent._local_compatibility_policy = freeze_for_agent(agent)
++    if agent._local_compatibility_policy is not None:
++        # The first turn can project history before native full compression has
++        # ever run. Bind its existing native compressor before either preflight
++        # or the copied history-checkpoint compressor reads the frozen policy.
++        from agent.context_compressor import ContextCompressor
++        from agent.local_compatibility import LocalCompatibilityError
++        compressor = getattr(agent, "context_compressor", None)
++        if (type(compressor) is not ContextCompressor
++                or getattr(compressor, "_strict_identity_agent", agent) is not agent):
++            raise LocalCompatibilityError("local_compatibility_context_unavailable")
++        compressor._strict_identity_agent = agent
+     from agent.auxiliary_client import set_runtime_main
+     set_runtime_main(
+         getattr(agent, "provider", "") or "",

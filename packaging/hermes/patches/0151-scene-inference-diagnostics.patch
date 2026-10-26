@@ -1,0 +1,198 @@
+diff --git a/tools/lilith_scene/errors.py b/tools/lilith_scene/errors.py
+index 0e757c4..bbaa374 100644
+--- a/tools/lilith_scene/errors.py
++++ b/tools/lilith_scene/errors.py
+@@ -3,6 +3,11 @@ CODES = frozenset({
+     "cancelled", "busy", "dependency_unavailable", "worker_start_failed", "worker_failed", "worker_timeout",
+     "worker_output_invalid", "result_validation_failed", "asset_verification_failed", "ocr_initialization_failed",
+     "local_model_start_failed", "local_model_start_timeout", "local_model_exited", "local_inference_failed",
++    "local_image_invalid", "local_sources_invalid", "local_ocr_inference_failed", "local_layout_failed",
++    "local_evidence_failed", "local_projection_failed", "local_visual_request_invalid",
++    "local_visual_timeout", "local_visual_transport_failed", "local_visual_http_rejected",
++    "local_visual_http_unauthorized", "local_visual_http_capacity", "local_visual_http_busy",
++    "local_visual_http_server_error", "local_visual_response_invalid",
+     "capture_unavailable", "capture_timeout", "capture_backend_unavailable", "blank_capture", "ui_unavailable",
+     "sensitive_ui", "sensitive_window", "target_changed", "no_content_window", "own_window_foreground",
+     "target_selection_limit", "target_identity_unavailable", "ambiguous_content_window", "invalid_trigger",
+diff --git a/tools/lilith_scene/worker.py b/tools/lilith_scene/worker.py
+index 722cf9f..ec2fa8b 100644
+--- a/tools/lilith_scene/worker.py
++++ b/tools/lilith_scene/worker.py
+@@ -16,6 +16,7 @@ import socket
+ import subprocess
+ import sys
+ import time
++import urllib.error
+ import urllib.request
+ 
+ try:
+@@ -107,6 +108,60 @@ def ocr_lines(model, image, view, case):
+             "verified": False})
+ 
+ 
++def _scene_step(code, function, *args, **kwargs):
++    """Keep a closed stage, never exception text, pixels or OCR in diagnostics."""
++    try:
++        return function(*args, **kwargs)
++    except SceneError:
++        raise
++    except Exception:
++        raise SceneError(code) from None
++
++
++def _visual_http_failure(status):
++    if status in (401, 403):
++        return "local_visual_http_unauthorized"
++    if status == 413:
++        return "local_visual_http_capacity"
++    if status == 429:
++        return "local_visual_http_busy"
++    if isinstance(status, int) and 500 <= status <= 599:
++        return "local_visual_http_server_error"
++    return "local_visual_http_rejected"
++
++
++def local_visual(http, base, token, image, question, cap):
++    """One request to the existing owned loopback worker; no retry or fallback."""
++    stream = io.BytesIO()
++    _scene_step("local_visual_request_invalid", image.save, stream, format="PNG")
++    body = {"messages": [{"role": "user", "content": [{"type": "text", "text": question},
++        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode("ascii")}}]}],
++        "max_tokens": cap, "temperature": .1, "stream": False}
++    req = urllib.request.Request(base + "/v1/chat/completions", json.dumps(body).encode(),
++        headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
++    try:
++        with http.open(req, timeout=15) as response:
++            raw = response.read(100_000)
++    except urllib.error.HTTPError as error:
++        # Do not read or copy the error body: it may echo private input.
++        raise SceneError(_visual_http_failure(error.code)) from None
++    except (TimeoutError, socket.timeout):
++        raise SceneError("local_visual_timeout") from None
++    except urllib.error.URLError as error:
++        code = "local_visual_timeout" if isinstance(error.reason, (TimeoutError, socket.timeout)) else "local_visual_transport_failed"
++        raise SceneError(code) from None
++    except OSError:
++        raise SceneError("local_visual_transport_failed") from None
++    try:
++        result = json.loads(raw)
++        answer = result["choices"][0]["message"]["content"]
++        if not isinstance(answer, str) or len(answer) > 4000:
++            raise ValueError("invalid_local_visual_response")
++        return answer
++    except Exception:
++        raise SceneError("local_visual_response_invalid") from None
++
++
+ def analyze(image_path, signals, model, visual, trigger):
+     import numpy as np
+     from PIL import Image
+@@ -117,14 +172,20 @@ def analyze(image_path, signals, model, visual, trigger):
+     from brief import build_brief
+     from layout_prompts import content_question, LAYOUT_QUESTION, region_question
+     from ocr_evidence import spatial_owner, fuse_lines
+-    with Image.open(image_path) as opened:
+-        rgb = opened.convert("RGB")
+-    if rgb.width * rgb.height > 25_000_000:
+-        raise ValueError("image_too_large")
+-    frame = {**signals["frame"], "origin": "caller_bound_capture", "capture_time_known": True}
+-    if sha(image_path) != frame["image_sha256"]:
+-        raise ValueError("capture_changed")
+-    sources = validate_sources(signals, frame["image_sha256"], rgb.width, rgb.height, frame["captured_at"])
++    try:
++        with Image.open(image_path) as opened:
++            rgb = opened.convert("RGB")
++        if rgb.width * rgb.height > 25_000_000:
++            raise ValueError("image_too_large")
++    except Exception:
++        raise SceneError("local_image_invalid") from None
++    try:
++        frame = {**signals["frame"], "origin": "caller_bound_capture", "capture_time_known": True}
++        if sha(image_path) != frame["image_sha256"]:
++            raise ValueError("capture_changed")
++        sources = validate_sources(signals, frame["image_sha256"], rgb.width, rgb.height, frame["captured_at"])
++    except Exception:
++        raise SceneError("local_sources_invalid") from None
+     metadata = {}
+     if sources["window"]["status"] == "available":
+         data = sources["window"]["data"]
+@@ -134,21 +195,22 @@ def analyze(image_path, signals, model, visual, trigger):
+     root = {"id": "window", "box_px": [0, 0, rgb.width, rgb.height]}
+     for name, question, cap in (("window-content", content_question(metadata), 100), ("window-layout", LAYOUT_QUESTION, 40)):
+         case["vision"].append({"id": name, "box_px": root["box_px"], "answer": visual(rgb, question, cap)})
+-    ocr_lines(model, rgb, root, case)
+-    manifest = build_plan(np.asarray(rgb), case["vision"][0]["answer"], case["vision"][1]["answer"],
++    _scene_step("local_ocr_inference_failed", ocr_lines, model, rgb, root, case)
++    manifest = _scene_step("local_layout_failed", build_plan, np.asarray(rgb), case["vision"][0]["answer"], case["vision"][1]["answer"],
+                           metadata, case["ocr_lines"], sources, 15)
+     if len(manifest["anchors"]) > 15:
+-        raise ValueError("crop_budget_exceeded")
++        raise SceneError("local_layout_failed")
+     for anchor in manifest["anchors"]:
+         crop = rgb.crop(anchor["box_px"])
+         case["vision"].append({"id": anchor["id"], "box_px": anchor["box_px"],
+                                "answer": visual(crop, region_question(anchor["question_kind"]), 120)})
+-        ocr_lines(model, crop, anchor, case)
++        _scene_step("local_ocr_inference_failed", ocr_lines, model, crop, anchor, case)
+     for line in case["ocr_lines"]:
+-        line["owner_anchor"] = spatial_owner(line["polygon_in_source"], line["source_anchor"], manifest["anchors"])
+-    packet, _ = assemble(case, manifest, fuse_lines(case["ocr_lines"], manifest["anchors"]), sources, frame)
++        line["owner_anchor"] = _scene_step("local_evidence_failed", spatial_owner, line["polygon_in_source"], line["source_anchor"], manifest["anchors"])
++    fused = _scene_step("local_evidence_failed", fuse_lines, case["ocr_lines"], manifest["anchors"])
++    packet, _ = _scene_step("local_evidence_failed", assemble, case, manifest, fused, sources, frame)
+     packet["deployment"] = "native_local_scene_v1"
+-    prepared = prepare_dialogue(Turn(trigger=trigger, enabled=True, now=stamp(), screen_reference=trigger == "player_share",
++    prepared = _scene_step("local_projection_failed", prepare_dialogue, Turn(trigger=trigger, enabled=True, now=stamp(), screen_reference=trigger == "player_share",
+         current_window_key=frame["window_key"], current_image_sha256=frame["image_sha256"]), packet)
+     action = "ready" if prepared["plan"]["action"] == "prepare_text_turn" else ("silent" if trigger == "proactive" else "clarify")
+     guidance = prepared.get("guidance", "")
+@@ -157,7 +219,7 @@ def analyze(image_path, signals, model, visual, trigger):
+     return {"schema": "local_scene_result_v1", "action": action, "window_key": frame["window_key"],
+         "image_sha256": frame["image_sha256"], "captured_unix_ms": int(parsed_time(frame["captured_at"]).timestamp() * 1000),
+         "guidance": guidance, "quoted_evidence": prepared.get("quoted_evidence", ""),
+-        "brief": build_brief(packet),
++        "brief": _scene_step("local_projection_failed", build_brief, packet),
+         "max_crops": 15, "actual_crops": len(manifest["anchors"]), "visual_calls": len(case["vision"]),
+         "ocr_calls": 1 + len(manifest["anchors"]), "automatic_cloud_images": False,
+         "permission": "evidence_only_no_action_or_memory_authority", "continuous_observation": False}
+@@ -240,21 +302,11 @@ def run(request):
+         if signals["frame"]["window_key"] != request["window"]["key"]:
+             raise ValueError("capture_identity_mismatch")
+         def visual(image, question, cap):
+-            stream = io.BytesIO()
+-            image.save(stream, format="PNG")
+-            body = {"messages": [{"role": "user", "content": [{"type": "text", "text": question},
+-                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode("ascii")}}]}],
+-                "max_tokens": cap, "temperature": .1, "stream": False}
+-            req = urllib.request.Request(base + "/v1/chat/completions", json.dumps(body).encode(),
+-                headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
+-            with http.open(req, timeout=15) as response:
+-                result = json.loads(response.read(100_000))
+-            answer = result["choices"][0]["message"]["content"]
+-            if not isinstance(answer, str) or len(answer) > 4000:
+-                raise ValueError("invalid_local_visual_response")
+-            return answer
++            return local_visual(http, base, token, image, question, cap)
+         try:
+             return analyze(capture / "window.png", signals, model, visual, request["trigger"])
++        except SceneError:
++            raise
+         except Exception:
+             raise SceneError("local_inference_failed") from None
+     finally:
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 108acd3..ecde3a4 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -16047,6 +16047,11 @@ def _run_prompt_submit(
+                     if result.get("interrupted")
+                     else "error" if result.get("error") else "complete"
+                 )
++                # A stopped native tool loop can have no authored final text.
++                # Publish a typed empty interruption, not JSON null; preserve
++                # partial prose and leave other malformed results rejectable.
++                if status == "interrupted" and raw is None:
++                    raw = ""
+                 assistant_partial = ""
+                 if status == "error":
+                     with session["history_lock"]:

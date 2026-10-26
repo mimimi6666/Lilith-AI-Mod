@@ -1,0 +1,1006 @@
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 7be94c48e9d24b80210394d1470e2bb4dc895844..200baba5912384e45129cdfdee4485757733f806 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -7479,7 +7479,13 @@ def is_conversation_activity_message(message: Any) -> bool:
+     from :func:`is_user_originated_turn`, whose callers need user-only turn
+     boundaries for retry/undo/compression.
+     """
+-    if not isinstance(message, dict) or message.get("display_kind"):
++    if not isinstance(message, dict):
++        return False
++    # Official Lilith lines are visible assistant conversation even though the
++    # display tags them so native/model speech remain distinguishable.  Every
++    # other display kind retains the historical synthetic-marker exclusion.
++    display_kind = message.get("display_kind")
++    if display_kind and display_kind != "native_assistant_event":
+         return False
+ 
+     role = message.get("role")
+@@ -7498,7 +7504,12 @@ def is_conversation_activity_message(message: Any) -> bool:
+     # for legacy final rows written before the field existed; an explicit
+     # synthetic/internal origin is never guessed back into a user turn.
+     origin = metadata.get("hermes_turn_origin")
+-    if origin not in {None, "", "user"}:
++    native_assistant_origin = (
++        display_kind == "native_assistant_event"
++        and origin == "synthetic"
++        and metadata.get("hermes_turn_origin_kind") == "lilith-native"
++    )
++    if origin not in {None, "", "user"} and not native_assistant_origin:
+         return False
+     kind = metadata.get("hermes_message_kind")
+     if kind not in {None, "", "primary"}:
+diff --git a/hermes_state.py b/hermes_state.py
+index 413137d9b2ae2c668db219e9cb85a22a2956d406..1eb59e187cefd5845b60e0ec2c381840e120e714 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -2297,6 +2297,52 @@ class CompressionSessionBusyError(RuntimeError):
+     """A non-owner tried to write while compression owns the session."""
+ 
+ 
++class NativeAssistantEventConflictError(RuntimeError):
++    """One native event id was already committed with different content."""
++
++
++def build_native_assistant_event_message(
++    *,
++    event_id: str,
++    text: str,
++    occurred_at_unix_ms: int,
++    node_id: str,
++    line_id: str,
++    trigger: str,
++    locale: str,
++    source: str,
++) -> Dict[str, Any]:
++    """Build the one canonical live/durable native-assistant row shape."""
++    native_turn_id = hashlib.sha256(
++        f"lilith-native-turn-v1:{event_id}".encode("ascii")
++    ).hexdigest()[:32]
++    if native_turn_id == event_id:
++        native_turn_id = hashlib.sha256(
++            f"lilith-native-turn-v2:{event_id}".encode("ascii")
++        ).hexdigest()[:32]
++    return {
++        "role": "assistant",
++        "content": text,
++        "message_id": event_id,
++        "timestamp": occurred_at_unix_ms / 1000.0,
++        "display_kind": "native_assistant_event",
++        "display_metadata": {
++            "lilith_native_event_id": event_id,
++            "lilith_native_source": source,
++            "lilith_native_occurred_at_unix_ms": occurred_at_unix_ms,
++            "lilith_native_node_id": node_id,
++            "lilith_native_line_id": line_id,
++            "lilith_native_trigger": trigger,
++            "lilith_native_locale": locale,
++            "hermes_turn_id": native_turn_id,
++            "hermes_message_id": event_id,
++            "hermes_message_kind": "primary",
++            "hermes_turn_origin": "synthetic",
++            "hermes_turn_origin_kind": "lilith-native",
++        },
++    }
++
++
+ class SessionCompressionInProgressError(CompressionSessionBusyError):
+     """A concurrent writer collided with a *live* compression lock.
+ 
+@@ -8406,6 +8452,153 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+         )
+ 
++    def append_native_assistant_event(
++        self,
++        session_id: str,
++        *,
++        lineage_session_ids: List[str],
++        event_id: str,
++        text: str,
++        occurred_at_unix_ms: int,
++        node_id: str,
++        line_id: str,
++        trigger: str,
++        locale: str,
++        source: str,
++    ) -> Dict[str, Any]:
++        """Atomically commit one Lilith-native assistant event.
++
++        ``event_id`` is the durable idempotency key.  The lookup and insert run
++        inside the same ``BEGIN IMMEDIATE`` transaction, so concurrent retries
++        cannot create two transcript rows.  The lookup spans the caller's
++        already-attested compression lineage: a retry after compression still
++        resolves the original row instead of appending the same native line to
++        the new tip.
++
++        This is deliberately a narrow persistence primitive.  The gateway owns
++        admission (hidden ``lilith-game`` surface, durable-lineage proof, and
++        idle-only state); this method owns the atomic transcript receipt.
++        """
++        if (
++            not isinstance(session_id, str)
++            or not session_id
++            or not isinstance(lineage_session_ids, list)
++            or not lineage_session_ids
++            or lineage_session_ids[-1] != session_id
++            or len(lineage_session_ids) != len(set(lineage_session_ids))
++            or any(not isinstance(value, str) or not value for value in lineage_session_ids)
++            or not isinstance(event_id, str)
++            or re.fullmatch(r"[0-9a-f]{32}", event_id) is None
++            or not isinstance(text, str)
++            or not text.strip()
++            or type(occurred_at_unix_ms) is not int
++            or occurred_at_unix_ms <= 0
++            or not all(
++                isinstance(value, str)
++                for value in (node_id, line_id, trigger, locale, source)
++            )
++            or source != "lilith-native"
++        ):
++            raise ValueError("native assistant event persistence input was rejected")
++
++        message = build_native_assistant_event_message(
++            event_id=event_id,
++            text=text,
++            occurred_at_unix_ms=occurred_at_unix_ms,
++            node_id=node_id,
++            line_id=line_id,
++            trigger=trigger,
++            locale=locale,
++            source=source,
++        )
++        message_timestamp = message["timestamp"]
++        display_metadata = message["display_metadata"]
++
++        def _receipt(row, *, already_committed: bool) -> Dict[str, Any]:
++            return {
++                "already_committed": already_committed,
++                "row_id": int(row["id"]),
++                "session_id": str(row["session_id"]),
++                "timestamp": float(row["timestamp"]),
++                "conversation_activity": bool(row["conversation_activity"]),
++                "message": {
++                    **message,
++                    "_row_id": int(row["id"]),
++                    "_durable_timestamp": float(row["timestamp"]),
++                    "_durable_conversation_activity": bool(
++                        row["conversation_activity"]
++                    ),
++                    "_db_persisted": True,
++                },
++            }
++
++        def _do(conn):
++            self._check_transcript_write_guards(conn, session_id, None)
++            placeholders = ",".join("?" for _ in lineage_session_ids)
++            rows = conn.execute(
++                f"""SELECT id, session_id, role, content, timestamp,
++                           display_kind, display_metadata
++                    FROM messages
++                    WHERE session_id IN ({placeholders})
++                      AND platform_message_id = ?
++                    ORDER BY id ASC""",
++                (*lineage_session_ids, event_id),
++            ).fetchall()
++            if rows:
++                for row in rows:
++                    if (
++                        row["role"] != "assistant"
++                        or self._decode_content(row["content"]) != text
++                        or row["display_kind"] != "native_assistant_event"
++                        or self._decode_display_metadata(row["display_metadata"])
++                        != display_metadata
++                        or abs(float(row["timestamp"]) - message_timestamp) > 1e-6
++                    ):
++                        raise NativeAssistantEventConflictError(
++                            "native assistant event id was already committed "
++                            "with different content"
++                        )
++                row = rows[0]
++                from agent.context_compressor import is_conversation_activity_message
++
++                return _receipt(
++                    {
++                        "id": row["id"],
++                        "session_id": row["session_id"],
++                        "timestamp": row["timestamp"],
++                        "conversation_activity": is_conversation_activity_message(
++                            message
++                        ),
++                    },
++                    already_committed=True,
++                )
++
++            self._insert_message_rows(
++                conn,
++                session_id,
++                [message],
++                require_activity_timestamps=True,
++            )
++            conn.execute(
++                "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
++                (session_id,),
++            )
++            return _receipt(
++                {
++                    "id": message["_row_id"],
++                    "session_id": session_id,
++                    "timestamp": message["_durable_timestamp"],
++                    "conversation_activity": message[
++                        "_durable_conversation_activity"
++                    ],
++                },
++                already_committed=False,
++            )
++
++        return self._execute_write(
++            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
++        )
++
+     def append_messages_batch(
+         self,
+         session_id: str,
+diff --git a/tests/tui_gateway/test_native_assistant_event.py b/tests/tui_gateway/test_native_assistant_event.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca37ea5beb5bf3e382dcbe117001f2edbf8362d3
+--- /dev/null
++++ b/tests/tui_gateway/test_native_assistant_event.py
+@@ -0,0 +1,378 @@
++"""Contracts for appending official Lilith lines to the hidden Hermes chat."""
++
++from __future__ import annotations
++
++import threading
++import types
++
++import pytest
++
++from hermes_state import SessionDB
++from tui_gateway import server
++
++
++EVENT_ID = "0123456789abcdef0123456789abcdef"
++METADATA_KEYS = {
++    "lilith_native_event_id",
++    "lilith_native_source",
++    "lilith_native_occurred_at_unix_ms",
++    "lilith_native_node_id",
++    "lilith_native_line_id",
++    "lilith_native_trigger",
++    "lilith_native_locale",
++}
++
++
++def _params(**overrides):
++    params = {
++        "session_id": "game-live",
++        "event_id": EVENT_ID,
++        "text": "莉莉絲整理了一下裙襬。",
++        "occurred_at_unix_ms": 1787932800123,
++        "node_id": "wardrobe-idle",
++        "line_id": "wardrobe-idle-03",
++        "trigger": "wardrobe.changed",
++        "locale": "zh-Hant",
++        "source": "lilith-native",
++        "require_durable_lineage": True,
++    }
++    params.update(overrides)
++    return params
++
++
++@pytest.fixture
++def native_session(tmp_path, monkeypatch):
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("game-root", source="lilith-game", archived=True)
++    agent = types.SimpleNamespace(_session_messages=[])
++    session = {
++        "agent": agent,
++        "archived": True,
++        "history": [],
++        "history_lock": threading.Lock(),
++        "history_version": 0,
++        "inflight_turn": None,
++        "profile_home": None,
++        "queued_prompt": None,
++        "running": False,
++        "session_key": "game-root",
++        "source": "lilith-game",
++        "_durable_lineage_root": "game-root",
++    }
++    emitted = []
++    existing = set(server._sessions)
++    server._sessions["game-live"] = session
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
++    monkeypatch.setattr(
++        server,
++        "_emit",
++        lambda event, sid, payload=None: emitted.append((event, sid, payload)),
++    )
++    try:
++        yield db, session, emitted
++    finally:
++        for sid in set(server._sessions) - existing:
++            server._sessions.pop(sid, None)
++        db.close()
++
++
++def _append(params=None):
++    return server._methods["session.append_assistant_event"](
++        "append-native",
++        params or _params(),
++    )
++
++
++def test_commits_canonical_receipt_and_synchronizes_live_and_durable_history(
++    native_session,
++):
++    db, session, emitted = native_session
++
++    response = _append()
++
++    assert "error" not in response
++    result = response["result"]
++    assert set(result) == {
++        "accepted",
++        "already_committed",
++        "retryable",
++        "code",
++        "session_id",
++        "event_id",
++        "message_id",
++        "content_sha256",
++        "stored_session_id",
++        "durable_lineage",
++        "durable",
++        "message",
++    }
++    assert result["accepted"] is True
++    assert result["already_committed"] is False
++    assert result["retryable"] is False
++    assert result["code"] == "native_assistant_event_committed"
++    assert result["event_id"] == EVENT_ID
++    assert result["message_id"] == EVENT_ID
++    assert len(result["content_sha256"]) == 64
++    assert result["stored_session_id"] == "game-root"
++    assert result["durable"] == {
++        "source": "state.db",
++        "row_id": result["durable"]["row_id"],
++        "session_id": "game-root",
++        "timestamp": 1787932800.123,
++        "conversation_activity": True,
++    }
++    assert result["durable"]["row_id"] > 0
++    assert set(result["message"]["display_metadata"]) == METADATA_KEYS
++    assert result["message"]["display_metadata"] == {
++        "lilith_native_event_id": EVENT_ID,
++        "lilith_native_source": "lilith-native",
++        "lilith_native_occurred_at_unix_ms": 1787932800123,
++        "lilith_native_node_id": "wardrobe-idle",
++        "lilith_native_line_id": "wardrobe-idle-03",
++        "lilith_native_trigger": "wardrobe.changed",
++        "lilith_native_locale": "zh-Hant",
++    }
++
++    assert len(session["history"]) == 1
++    assert session["history"][0]["content"] == _params()["text"]
++    assert session["history"][0]["_db_persisted"] is True
++    assert session["agent"]._session_messages == session["history"]
++    assert db.message_count("game-root") == 1
++    assert db.get_session("game-root")["message_count"] == 1
++
++    history = server._methods["session.history"](
++        "history",
++        {"session_id": "game-live"},
++    )
++    assert [message["text"] for message in history["result"]["messages"]] == [
++        _params()["text"]
++    ]
++    durable_message = history["result"]["messages"][0]
++    assert durable_message["role"] == "assistant"
++    assert durable_message["display_kind"] == "native_assistant_event"
++    assert durable_message["message_id"] == EVENT_ID
++    assert durable_message["message_kind"] == "primary"
++    assert len(durable_message["turn_id"]) == 32
++    assert durable_message["turn_id"] != EVENT_ID
++    for key, value in result["message"]["display_metadata"].items():
++        assert durable_message["display_metadata"][key] == value
++    assert durable_message["display_metadata"] | {
++        "hermes_turn_id": durable_message["turn_id"],
++        "hermes_message_id": EVENT_ID,
++        "hermes_message_kind": "primary",
++        "hermes_turn_origin": "synthetic",
++        "hermes_turn_origin_kind": "lilith-native",
++    } == durable_message["display_metadata"]
++    assert emitted == [("session.assistant_event", "game-live", result)]
++
++
++def test_same_event_retry_is_idempotent_in_db_live_history_and_receipt(native_session):
++    db, session, emitted = native_session
++
++    first = _append()["result"]
++    second = _append()["result"]
++
++    assert first["already_committed"] is False
++    assert second["already_committed"] is True
++    assert second["code"] == "native_assistant_event_duplicate"
++    assert second["durable"] == first["durable"]
++    assert second["message"] == first["message"]
++    assert db.message_count("game-root") == 1
++    assert db.get_session("game-root")["message_count"] == 1
++    assert len(session["history"]) == 1
++    assert len(emitted) == 2
++
++
++def test_same_event_id_with_different_live_or_durable_content_is_terminal(
++    native_session,
++):
++    db, session, _ = native_session
++    session["history"].append(
++        {
++            "role": "assistant",
++            "content": "stale live content",
++            "message_id": EVENT_ID,
++            "timestamp": 1787932800.123,
++            "display_kind": "native_assistant_event",
++            "display_metadata": {"lilith_native_event_id": EVENT_ID},
++        }
++    )
++
++    live_conflict = _append()
++
++    assert live_conflict["error"]["code"] == 4092
++    assert live_conflict["error"]["data"]["code"] == (
++        "native_assistant_event_idempotency_conflict"
++    )
++    assert db.message_count("game-root") == 0
++    session["history"].clear()
++    assert "error" not in _append()
++
++    response = _append(_params(text="這不是同一件事。"))
++
++    assert response["error"]["code"] == 4092
++    assert response["error"]["data"] == {
++        "accepted": False,
++        "already_committed": False,
++        "retryable": False,
++        "code": "native_assistant_event_idempotency_conflict",
++        "session_id": "game-live",
++        "event_id": EVENT_ID,
++    }
++    assert db.message_count("game-root") == 1
++    assert len(session["history"]) == 1
++
++
++@pytest.mark.parametrize(
++    "busy_state",
++    [
++        {"running": True},
++        {"inflight_turn": {"status": "error"}},
++        {"queued_prompt": {"text": "next"}},
++        {"queued_prompts": [{"text": "later"}]},
++        {"_queued_prompt_drain_scheduled": True},
++        {"_turn_cancel_requested": True},
++    ],
++)
++def test_refuses_every_non_idle_turn_state(native_session, busy_state):
++    db, session, _ = native_session
++    session.update(busy_state)
++
++    response = _append()
++
++    assert response["error"]["code"] == 4009
++    assert response["error"]["data"]["retryable"] is True
++    assert response["error"]["data"]["code"] == (
++        "native_assistant_event_session_busy"
++    )
++    assert db.message_count("game-root") == 0
++
++
++@pytest.mark.parametrize(
++    "mutation",
++    [
++        lambda params: params.pop("locale"),
++        lambda params: params.update({"extra": True}),
++        lambda params: params.update({"event_id": EVENT_ID.upper()}),
++        lambda params: params.update({"source": "desktop"}),
++        lambda params: params.update({"require_durable_lineage": False}),
++        lambda params: params.update({"node_id": "x" * 257}),
++        lambda params: params.update({"text": " "}),
++        lambda params: params.update({"occurred_at_unix_ms": True}),
++    ],
++)
++def test_rejects_noncanonical_or_out_of_bounds_input(native_session, mutation):
++    db, _, _ = native_session
++    params = _params()
++    mutation(params)
++
++    response = _append(params)
++
++    assert response["error"]["code"] == 4004
++    assert response["error"]["data"]["retryable"] is False
++    assert response["error"]["data"]["code"] == "native_assistant_event_invalid"
++    assert db.message_count("game-root") == 0
++
++
++@pytest.mark.parametrize(
++    "surface_state",
++    [
++        {"source": "desktop"},
++        {"archived": False},
++        {"_durable_lineage_root": None},
++    ],
++)
++def test_refuses_any_non_hidden_or_non_durable_surface(
++    native_session,
++    surface_state,
++):
++    db, session, _ = native_session
++    session.update(surface_state)
++
++    response = _append()
++
++    assert response["error"]["code"] == 4030
++    assert response["error"]["data"]["retryable"] is False
++    assert response["error"]["data"]["code"] == (
++        "native_assistant_event_scope_rejected"
++    )
++    assert db.message_count("game-root") == 0
++
++
++def test_duplicate_in_compressed_ancestor_is_not_reinserted_into_tip_history(
++    native_session,
++):
++    db, session, _ = native_session
++    first = _append()["result"]
++    assert first["durable"]["session_id"] == "game-root"
++
++    db.end_session("game-root", end_reason="compression")
++    db.create_session(
++        "game-tip",
++        source="lilith-game",
++        parent_session_id="game-root",
++        archived=True,
++    )
++    session["session_key"] = "game-tip"
++    session["history"] = []
++    session["agent"]._session_messages = []
++
++    duplicate = _append()["result"]
++
++    assert duplicate["already_committed"] is True
++    assert duplicate["stored_session_id"] == "game-tip"
++    assert duplicate["durable"]["session_id"] == "game-root"
++    assert duplicate["durable_lineage"]["session_ids"] == [
++        "game-root",
++        "game-tip",
++    ]
++    assert db.message_count() == 1
++    assert session["history"] == []
++    history = server._methods["session.history"](
++        "history-compressed",
++        {"session_id": "game-live"},
++    )
++    assert [message["text"] for message in history["result"]["messages"]] == [
++        _params()["text"]
++    ]
++
++
++def test_model_replay_repairs_adjacent_assistant_rows_without_hiding_native_event(
++    native_session,
++):
++    db, _, _ = native_session
++    db.append_message("game-root", role="user", content="你好")
++    db.append_message("game-root", role="assistant", content="早安。")
++
++    assert "error" not in _append()
++    model_history, display_history = db.get_resume_conversations("game-root")
++
++    assert all(
++        left["role"] != right["role"]
++        for left, right in zip(model_history, model_history[1:])
++    )
++    assert _params()["text"] in model_history[-1]["content"]
++    native_rows = [
++        message
++        for message in display_history
++        if message.get("display_kind") == "native_assistant_event"
++    ]
++    assert len(native_rows) == 1
++    assert native_rows[0]["content"] == _params()["text"]
++
++
++def test_missing_live_session_is_retryable_and_does_not_touch_db(
++    native_session,
++):
++    db, _, _ = native_session
++    server._sessions.pop("game-live")
++
++    response = _append()
++
++    assert response["error"]["code"] == 4001
++    assert response["error"]["data"]["retryable"] is True
++    assert response["error"]["data"]["code"] == (
++        "native_assistant_event_session_not_found"
++    )
++    assert db.message_count("game-root") == 0
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index c054a041aee0257b0aa59e01b89eaedefb23d93b..717c3ee9c7a8477dc10658d311565e3bae2db41e 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -2913,6 +2913,353 @@ def _(rid, params: dict) -> dict:
+     )
+ 
+ 
++@method("session.append_assistant_event")
++def _(rid, params: dict) -> dict:
++    """Commit one official Lilith line as an assistant-authored event.
++
++    This endpoint is intentionally narrower than prompt submission: it never
++    invokes a model, accepts only the hidden durable ``lilith-game`` session,
++    and refuses to race a running or queued turn.  The native event is an
++    appended context fact, so the existing prompt-cache prefix is preserved.
++    """
++    expected_fields = {
++        "session_id",
++        "event_id",
++        "text",
++        "occurred_at_unix_ms",
++        "node_id",
++        "line_id",
++        "trigger",
++        "locale",
++        "source",
++        "require_durable_lineage",
++    }
++
++    raw_event_id = params.get("event_id")
++    event_id = raw_event_id if isinstance(raw_event_id, str) else ""
++    raw_session_id = params.get("session_id")
++    sid = raw_session_id if isinstance(raw_session_id, str) else ""
++
++    def reject(
++        rpc_code: int,
++        message: str,
++        code: str,
++        *,
++        retryable: bool,
++    ) -> dict:
++        return _err(
++            rid,
++            rpc_code,
++            message,
++            {
++                "accepted": False,
++                "already_committed": False,
++                "retryable": retryable,
++                "code": code,
++                "session_id": sid,
++                "event_id": event_id,
++            },
++        )
++
++    if set(params) != expected_fields:
++        return reject(
++            4004,
++            "native assistant event parameters were non-canonical",
++            "native_assistant_event_invalid",
++            retryable=False,
++        )
++
++    from agent.turn_identity import canonical_id
++
++    text = params.get("text")
++    occurred_at_unix_ms = params.get("occurred_at_unix_ms")
++    node_id = params.get("node_id")
++    line_id = params.get("line_id")
++    trigger = params.get("trigger")
++    locale = params.get("locale")
++
++    def bounded_utf8(value, limit: int, *, nonblank: bool = False) -> bool:
++        if not isinstance(value, str) or len(value) > limit:
++            return False
++        if nonblank and not value.strip():
++            return False
++        try:
++            value.encode("utf-8")
++        except UnicodeEncodeError:
++            return False
++        return True
++
++    if (
++        not bounded_utf8(sid, 128, nonblank=True)
++        or canonical_id(event_id) != event_id
++        or not bounded_utf8(text, 8192, nonblank=True)
++        or type(occurred_at_unix_ms) is not int
++        or not 0 < occurred_at_unix_ms <= 253402300799999
++        or not bounded_utf8(node_id, 256)
++        or not bounded_utf8(line_id, 256)
++        or not bounded_utf8(trigger, 256)
++        or not bounded_utf8(locale, 64)
++        or params.get("source") != "lilith-native"
++        or params.get("require_durable_lineage") is not True
++    ):
++        return reject(
++            4004,
++            "native assistant event parameters were rejected",
++            "native_assistant_event_invalid",
++            retryable=False,
++        )
++
++    session = _sessions.get(sid)
++    if session is None:
++        return reject(
++            4001,
++            "session not found",
++            "native_assistant_event_session_not_found",
++            retryable=True,
++        )
++
++    from hermes_state import (
++        CompressionSessionClosedError,
++        NativeAssistantEventConflictError,
++        SessionCompressionInProgressError,
++        build_native_assistant_event_message,
++    )
++
++    try:
++        with _session_resume_lock:
++            if _sessions.get(sid) is not session or session.get("_finalized"):
++                return reject(
++                    4001,
++                    "session not found",
++                    "native_assistant_event_session_not_found",
++                    retryable=True,
++                )
++            with session["history_lock"]:
++                lineage_root = session.get("_durable_lineage_root")
++                session_key = session.get("session_key")
++                if (
++                    session.get("source") != "lilith-game"
++                    or session.get("archived") is not True
++                    or not isinstance(lineage_root, str)
++                    or not lineage_root
++                    or not isinstance(session_key, str)
++                    or not session_key
++                    or _session_uses_compute_host(session)
++                ):
++                    return reject(
++                        4030,
++                        "native assistant events require a local durable hidden game session",
++                        "native_assistant_event_scope_rejected",
++                        retryable=False,
++                    )
++                if (
++                    session.get("running")
++                    or isinstance(session.get("inflight_turn"), dict)
++                    or isinstance(session.get("queued_prompt"), dict)
++                    or bool(session.get("queued_prompts"))
++                    or session.get("_queued_prompt_drain_scheduled") is True
++                    or session.get("_turn_cancel_requested") is True
++                ):
++                    return reject(
++                        4009,
++                        "native assistant events require an idle session",
++                        "native_assistant_event_session_busy",
++                        retryable=True,
++                    )
++
++                expected_live_message = build_native_assistant_event_message(
++                    event_id=event_id,
++                    text=text,
++                    occurred_at_unix_ms=occurred_at_unix_ms,
++                    node_id=node_id,
++                    line_id=line_id,
++                    trigger=trigger,
++                    locale=locale,
++                    source="lilith-native",
++                )
++                matching = []
++                for item in session.setdefault("history", []):
++                    metadata = (
++                        item.get("display_metadata")
++                        if isinstance(item, dict)
++                        else None
++                    )
++                    if (
++                        isinstance(metadata, dict)
++                        and metadata.get("lilith_native_event_id") == event_id
++                    ):
++                        matching.append(item)
++                if len(matching) > 1 or (
++                    matching
++                    and (
++                        matching[0].get("role")
++                        != expected_live_message["role"]
++                        or matching[0].get("content")
++                        != expected_live_message["content"]
++                        or matching[0].get("message_id")
++                        != expected_live_message["message_id"]
++                        or matching[0].get("display_kind")
++                        != expected_live_message["display_kind"]
++                        or matching[0].get("display_metadata")
++                        != expected_live_message["display_metadata"]
++                        or not isinstance(
++                            matching[0].get("timestamp"), (int, float)
++                        )
++                        or isinstance(matching[0].get("timestamp"), bool)
++                        or abs(
++                            float(matching[0]["timestamp"])
++                            - float(expected_live_message["timestamp"])
++                        )
++                        > 1e-6
++                    )
++                ):
++                    raise NativeAssistantEventConflictError(
++                        "live native assistant event identity conflicted"
++                    )
++
++                with _session_db(session) as db:
++                    if db is None:
++                        raise RuntimeError("durable session database is unavailable")
++                    proof = db.attest_resume_session_lineage(
++                        lineage_root,
++                        session_key,
++                        expected_source="lilith-game",
++                        expected_archived=True,
++                    )
++                    _bind_durable_lineage_session(session, proof)
++                    receipt = db.append_native_assistant_event(
++                        session_key,
++                        lineage_session_ids=list(proof["session_ids"]),
++                        event_id=event_id,
++                        text=text,
++                        occurred_at_unix_ms=occurred_at_unix_ms,
++                        node_id=node_id,
++                        line_id=line_id,
++                        trigger=trigger,
++                        locale=locale,
++                        source="lilith-native",
++                    )
++                    post_proof = db.attest_resume_session_lineage(
++                        lineage_root,
++                        session_key,
++                        expected_source="lilith-game",
++                        expected_archived=True,
++                    )
++                    if post_proof != proof:
++                        raise RuntimeError(
++                            "durable lineage changed while appending native event"
++                        )
++                    _bind_durable_lineage_session(session, post_proof)
++
++                durable = {
++                    "source": "state.db",
++                    "row_id": int(receipt["row_id"]),
++                    "session_id": str(receipt["session_id"]),
++                    "timestamp": float(receipt["timestamp"]),
++                    "conversation_activity": bool(
++                        receipt["conversation_activity"]
++                    ),
++                }
++                persisted_metadata = dict(
++                    receipt["message"]["display_metadata"]
++                )
++                public_metadata_keys = (
++                    "lilith_native_event_id",
++                    "lilith_native_source",
++                    "lilith_native_occurred_at_unix_ms",
++                    "lilith_native_node_id",
++                    "lilith_native_line_id",
++                    "lilith_native_trigger",
++                    "lilith_native_locale",
++                )
++                display_metadata = {
++                    key: persisted_metadata[key] for key in public_metadata_keys
++                }
++                public_message = {
++                    "message_id": event_id,
++                    "role": "assistant",
++                    "text": text,
++                    "timestamp": durable["timestamp"],
++                    "display_kind": "native_assistant_event",
++                    "display_metadata": display_metadata,
++                }
++
++                # A retry after compression finds the event in an ancestor.
++                # That row remains visible in the durable display lineage, but
++                # re-appending it to the compressed model history would undo
++                # compression and duplicate context.  Only the current-tip row
++                # belongs in the live model history.
++                if durable["session_id"] == session_key:
++                    if not matching:
++                        session["history"].append(dict(receipt["message"]))
++                        session["history_version"] = int(
++                            session.get("history_version", 0)
++                        ) + 1
++                    agent = session.get("agent")
++                    if agent is not None and isinstance(
++                        getattr(agent, "_session_messages", None), list
++                    ):
++                        agent._session_messages = list(session["history"])
++
++                result = {
++                    "accepted": True,
++                    "already_committed": bool(receipt["already_committed"]),
++                    "retryable": False,
++                    "code": (
++                        "native_assistant_event_duplicate"
++                        if receipt["already_committed"]
++                        else "native_assistant_event_committed"
++                    ),
++                    "session_id": sid,
++                    "event_id": event_id,
++                    "message_id": event_id,
++                    "content_sha256": hashlib.sha256(
++                        text.encode("utf-8")
++                    ).hexdigest(),
++                    "stored_session_id": str(post_proof["resolved_session_id"]),
++                    "durable_lineage": post_proof,
++                    "durable": durable,
++                    "message": public_message,
++                }
++    except NativeAssistantEventConflictError:
++        return reject(
++            4092,
++            "native assistant event id was already committed differently",
++            "native_assistant_event_idempotency_conflict",
++            retryable=False,
++        )
++    except (CompressionSessionClosedError, SessionCompressionInProgressError):
++        return reject(
++            4009,
++            "native assistant event collided with session compression",
++            "native_assistant_event_session_busy",
++            retryable=True,
++        )
++    except ValueError:
++        return reject(
++            4094,
++            "durable session lineage was rejected",
++            "native_assistant_event_lineage_rejected",
++            retryable=False,
++        )
++    except Exception:
++        logger.warning("native assistant event persistence failed", exc_info=True)
++        return reject(
++            5006,
++            "native assistant event persistence is unavailable",
++            "native_assistant_event_persistence_unavailable",
++            retryable=True,
++        )
++
++    try:
++        _emit("session.assistant_event", sid, result)
++    except Exception:
++        # The durable receipt is authoritative.  A disconnected renderer can
++        # rehydrate the exact row from session.history and retry by event id.
++        logger.debug("native assistant event live emit failed", exc_info=True)
++    return _ok(rid, result)
++
++
+ @method("session.undo")
+ def _(rid, params: dict) -> dict:
+     session, err = _sess(params, rid)
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index fb8443897a97ccbdca428a841d8ab643ee1848a2..f9c8d535f64db0ebfe2dcc0f7526c590292eae82 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -259,6 +259,7 @@ _LONG_HANDLERS = frozenset(
+         "tools.catalog",
+         "session.status",
+         "session.history",
++        "session.append_assistant_event",
+         "session.context_breakdown",
+         "model.credential_status",
+         "delegation.status",
+@@ -1890,6 +1891,7 @@ _SESSION_EVENT_TYPES = frozenset(
+         "preview.restart.complete",
+         "preview.restart.start",
+         "rollback.restored",
++        "session.assistant_event",
+         "session.info",
+         "session.title",
+         "sessions.changed",

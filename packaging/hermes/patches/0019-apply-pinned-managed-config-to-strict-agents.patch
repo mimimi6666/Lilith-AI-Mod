@@ -1,0 +1,1885 @@
+diff --git a/agent/identity_policy.py b/agent/identity_policy.py
+index 8a294b6c48a207b1d643956fe77aa1212260cda4..ce8651af74c7f13fccb38be7080e85812b8f82b3 100644
+--- a/agent/identity_policy.py
++++ b/agent/identity_policy.py
+@@ -12,6 +12,7 @@ the lifetime of the session and preserves prefix-cache byte stability.
+ 
+ from __future__ import annotations
+ 
++import copy
+ from dataclasses import dataclass
+ import hashlib
+ import hmac
+@@ -885,9 +886,50 @@ def preflight_aia_agent_identity(
+             "prefill messages are disabled by the identity lock"
+         )
+ 
++    effective_cfg = cfg
++    effective_policy = policy
++    if "HERMES_MANAGED_CONFIG_SHA256" in source:
++        from hermes_cli.managed_scope import (
++            ManagedConfigIntegrityError,
++            apply_managed_overlay,
++        )
++
++        try:
++            effective_cfg = apply_managed_overlay(
++                copy.deepcopy(cfg),
++                environ=source,
++            )
++        except ManagedConfigIntegrityError as exc:
++            raise IdentityPolicyError(
++                "pinned managed config failed strict verification"
++            ) from exc
++
++        # The raw profile bytes remain the receipted identity authority. Managed
++        # configuration may add operational policy, but it cannot replace or
++        # extend the identity/personality that those bytes attested.
++        effective_policy = resolve_identity_policy(effective_cfg, environ=source)
++        if effective_policy != policy:
++            raise IdentityPolicyError(
++                "pinned managed config cannot alter the host-attested identity policy"
++            )
++        effective_personality = _exact_locked_personality_prompt(
++            effective_cfg,
++            effective_policy,
++        )
++        if (
++            effective_personality != personality_prompt
++            or not hmac.compare_digest(
++                _sha256_text(effective_personality),
++                expected_personality,
++            )
++        ):
++            raise IdentityPolicyError(
++                "pinned managed config cannot alter the host-attested personality"
++            )
++
+     return IdentityPreflight(
+-        policy=policy,
+-        config=cfg,
++        policy=effective_policy,
++        config=effective_cfg,
+         soul_content=soul_content,
+         personality_prompt=personality_prompt,
+         config_sha256=config_sha256,
+diff --git a/cli.py b/cli.py
+index 9bc8484484cf5692eff8dbda75c729a79f5ba892..bfbe6f0932de2d6b486e3f8f27f24671972b17f7 100644
+--- a/cli.py
++++ b/cli.py
+@@ -54,6 +54,7 @@ from hermes_cli.fallback_config import get_fallback_chain
+ from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+ from hermes_cli.cli_commands_mixin import CLICommandsMixin
+ from hermes_cli.cli_billing_mixin import CLIBillingMixin
++from hermes_cli.managed_scope import ManagedConfigIntegrityError
+ from agent.interrupt_compat import request_hard_interrupt
+ 
+ # prompt_toolkit for fixed input area TUI
+@@ -786,6 +787,8 @@ CLI_CONFIG = load_cli_config()
+ try:
+     from hermes_logging import setup_logging
+     setup_logging(mode="cli")
++except ManagedConfigIntegrityError:
++    raise
+ except Exception:
+     pass  # Logging setup is best-effort — don't crash the CLI
+ 
+diff --git a/cron/jobs.py b/cron/jobs.py
+index d225fe4ec7c1e0a8673726d4fe9410603fac890f..e53ee39848d801cf9276494024705258cbdbfb4f 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - non-Windows
+ from datetime import datetime, timedelta
+ from pathlib import Path
+ from hermes_constants import get_hermes_home
++from hermes_cli.managed_scope import ManagedConfigIntegrityError
+ from typing import Optional, Dict, List, Any, Set, Tuple, Union, Collection
+ 
+ logger = logging.getLogger(__name__)
+@@ -1450,6 +1451,8 @@ def _resolve_default_model_snapshot() -> Optional[str]:
+         try:
+             from hermes_cli import managed_scope
+             cfg = managed_scope.apply_managed_overlay(cfg)
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:
+             pass
+         cfg = _expand_env_vars(cfg)
+@@ -1468,6 +1471,8 @@ def _resolve_default_model_snapshot() -> Optional[str]:
+             if isinstance(default, str):
+                 return default.strip() or None
+         return None
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         return None
+ 
+@@ -1516,11 +1521,15 @@ def _compute_provider_model_snapshots(
+             snap = resolve_runtime_provider(**runtime_kwargs)
+             snap_provider = str(snap.get("provider") or "").strip().lower()
+             provider_snapshot = snap_provider or None
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:
+             provider_snapshot = None
+     if normalized_model is None:
+         try:
+             model_snapshot = _resolve_default_model_snapshot() or None
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:
+             model_snapshot = None
+     return provider_snapshot, model_snapshot
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 4eae63a36394d9b8dd30c14b0ca83023a86d5ac6..b122a21775add0878d5056ea1277243118809d6e 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -51,6 +51,7 @@ from hermes_cli.config import (
+     resolve_cron_model_drift_defaults,
+ )
+ from hermes_cli.fallback_config import get_fallback_chain
++from hermes_cli.managed_scope import ManagedConfigIntegrityError
+ from hermes_time import now as _hermes_now
+ from agent.interrupt_compat import request_hard_interrupt
+ from agent.delegation_context import (
+@@ -3968,10 +3969,13 @@ def run_job(
+                 # Managed scope: a scheduled job must honor administrator-pinned
+                 # model / reasoning / toolsets / provider_routing too. This loader
+                 # builds its own dict, so overlay managed values via the shared
+-                # helper (fail-open, no-op when no managed scope).
++                # helper (legacy unpinned scope is fail-open; a Runtime digest
++                # pin is fail-closed).
+                 try:
+                     from hermes_cli import managed_scope
+                     _cfg = managed_scope.apply_managed_overlay(_cfg)
++                except ManagedConfigIntegrityError:
++                    raise
+                 except Exception:
+                     pass
+                 _cfg = _expand_env_vars(_cfg)
+@@ -3997,6 +4001,8 @@ def run_job(
+                         _, _global_model = resolve_cron_model_drift_defaults(_cfg)
+                         if _global_model:
+                             model = _global_model
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception as e:
+             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
+ 
+diff --git a/gateway/config.py b/gateway/config.py
+index a00fa0f9a1ca0d8a274a67e62c9b3a8f4f1ed38c..c9de2c815152cfc4f17381a92b391b6fd15a155b 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Any, Callable
+ from enum import Enum
+ 
+ from hermes_cli.config import get_hermes_home
++from hermes_cli.managed_scope import ManagedConfigIntegrityError
+ from agent.secret_scope import current_secret_scope, get_secret as _get_secret
+ from utils import is_truthy_value
+ 
+@@ -1345,7 +1346,8 @@ def load_gateway_config() -> GatewayConfig:
+             # honors them too. This loader builds its own dict instead of going
+             # through hermes_cli.config.load_config, so without this a managed
+             # session_reset / quick_commands / stt / model would be ignored by
+-            # the messaging gateway. Fail-open via the shared helper.
++            # the messaging gateway. Legacy unpinned scope is fail-open; a
++            # Runtime digest pin is fail-closed.
+             from hermes_cli import managed_scope
+             yaml_cfg = managed_scope.apply_managed_overlay(yaml_cfg)
+ 
+@@ -1803,6 +1805,8 @@ def load_gateway_config() -> GatewayConfig:
+             # apply_yaml_config_fn hook (plugins/platforms/feishu/adapter.py).
+             # #41112 / #3823.
+ 
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception as e:
+         logger.warning(
+             "Failed to process config.yaml — falling back to .env / gateway.json values. "
+diff --git a/gateway/run.py b/gateway/run.py
+index 354d4ea915f4f2b5a754c89430163e20542988e9..2449700ba5ae313c898d4f229bb9693e068a4567 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -66,6 +66,7 @@ from agent.turn_context import (
+ )
+ from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
+ from hermes_cli.fallback_config import get_fallback_chain
++from hermes_cli.managed_scope import ManagedConfigIntegrityError
+ 
+ # --- Agent cache tuning ---------------------------------------------------
+ # Bounds the per-session AIAgent cache to prevent unbounded growth in
+@@ -351,6 +352,8 @@ def _gateway_compression_progress_notices_enabled() -> bool:
+                 "yes",
+                 "on",
+             }
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         pass
+     return False
+@@ -1957,12 +1960,17 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
+         # Managed scope: keep administrator-pinned values authoritative on every
+         # turn too. This per-turn reload re-bridges config→env, so without the
+         # overlay a managed agent.max_turns / timezone / redact_secrets would be
+-        # replaced by the user's value after the first turn. Fail-open.
++        # replaced by the user's value after the first turn. Legacy unpinned
++        # scope is fail-open; a Runtime digest pin is fail-closed.
+         try:
+             from hermes_cli import managed_scope
+             cfg = managed_scope.apply_managed_overlay(cfg)
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:
+             pass
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         return
+ 
+@@ -2093,6 +2101,8 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
+     try:
+         with _profile_runtime_scope(Path(home)):
+             return load_gateway_config()
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         logger.debug(
+             "multiplex default-scope config reload failed; using unscoped load",
+@@ -2152,10 +2162,13 @@ if _config_path.exists():
+         # setting wins over the user's value at the env layer too. This bridge
+         # reads config.yaml directly (not via load_config), so without the
+         # overlay every HERMES_*/TERMINAL_* env var below would carry the user's
+-        # value even when an administrator pinned it. Fail-open via the helper.
++        # value even when an administrator pinned it. Legacy unpinned scope is
++        # fail-open; a Runtime digest pin is fail-closed.
+         try:
+             from hermes_cli import managed_scope
+             _cfg = managed_scope.apply_managed_overlay(_cfg)
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:
+             pass
+         # Top-level simple values (fallback only — don't override .env)
+@@ -2381,6 +2394,8 @@ if _config_path.exists():
+                 os.environ["HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT"] = str(
+                     _gateway_cfg["platform_connect_timeout"]
+                 )
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception as _bridge_err:
+         # Previously this was silent (`except Exception: pass`), which
+         # hid partial bridge failures and let .env defaults shadow
+@@ -2779,6 +2794,8 @@ def _try_resolve_fallback_provider() -> dict | None:
+             except Exception as fb_exc:
+                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
+                 continue
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         pass
+     return None
+@@ -3317,10 +3334,13 @@ def _load_gateway_config() -> dict:
+     # Overlay managed scope. read_raw_config() returns the user's raw YAML
+     # WITHOUT the managed merge (that lives in load_config/_load_config_impl),
+     # so the overlay is required on both paths for the gateway to honor pinned
+-    # values. Helper is fail-open and a no-op when no managed scope exists.
++    # values. Legacy unpinned scope is fail-open and a no-op when absent; a
++    # Runtime digest pin is fail-closed.
+     try:
+         from hermes_cli import managed_scope
+         raw = managed_scope.apply_managed_overlay(raw if isinstance(raw, dict) else {})
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         pass
+     if not isinstance(raw, dict):
+@@ -4000,6 +4020,8 @@ class TurnRunner:
+                         ctx.long_tool_hint_fired[0] = True
+                         ctx.progress_queue.put(tool_progress_hint_gateway())
+                         mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
++            except ManagedConfigIntegrityError:
++                raise
+             except Exception as _hint_err:
+                 logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
+             return
+@@ -8115,6 +8137,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             stz = gw.get("scale_to_zero") if isinstance(gw, dict) else None
+             if isinstance(stz, dict):
+                 raw = stz.get("idle_timeout_minutes")
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:  # noqa: BLE001
+             raw = None
+         return parse_idle_timeout_seconds(raw)
+@@ -8148,6 +8172,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     and rlg["max_gap_seconds"] > 0
+                 ):
+                     max_gap_seconds = rlg["max_gap_seconds"]
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:  # noqa: BLE001
+             pass
+         return max_restarts, window_seconds, max_gap_seconds
+@@ -9190,6 +9216,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             # expansion now apply to provider_routing too.
+             cfg = _load_gateway_runtime_config()
+             return cfg.get("provider_routing", {}) or {}
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:
+             pass
+         return {}
+@@ -9209,6 +9237,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             fb = get_fallback_chain(cfg)
+             if fb:
+                 return fb
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:
+             pass
+         return None
+@@ -9241,6 +9271,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             try:
+                 from hermes_cli import managed_scope
+                 cfg = managed_scope.apply_managed_overlay(cfg)
++            except ManagedConfigIntegrityError:
++                raise
+             except Exception:
+                 pass
+             try:
+@@ -9250,6 +9282,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     cfg = expanded
+             except Exception:
+                 pass
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:
+             # Transient failure — keep last known-good chain.
+             logger.debug(
+@@ -9980,6 +10014,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     f"{busy_input_hint_gateway(_hint_mode)}"
+                 )
+                 mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception as _onb_err:
+             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
+ 
+@@ -14480,6 +14516,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     if adapter is not None:
+                         await self._safe_adapter_disconnect(adapter, platform)
+                     raise
++                except ManagedConfigIntegrityError:
++                    if adapter is not None:
++                        await self._safe_adapter_disconnect(adapter, platform)
++                    raise
+                 except Exception:
+                     if adapter is not None:
+                         await self._safe_adapter_disconnect(adapter, platform)
+@@ -17378,6 +17418,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         _msg_custom_providers = get_compatible_custom_providers(_msg_cfg)
+                     except Exception:
+                         _msg_custom_providers = _msg_cfg.get("custom_providers") or []
++                except ManagedConfigIntegrityError:
++                    raise
+                 except Exception:
+                     pass
+                 # Resolve the session's actual model/provider/base_url the
+@@ -17455,6 +17497,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     return None
+                 if _ctx_result.expanded:
+                     message_text = _ctx_result.message
++            except ManagedConfigIntegrityError:
++                raise
+             except Exception as exc:
+                 logger.warning("@ context reference expansion failed: %s", exc)
+                 logger.debug("@ context reference expansion failure detail", exc_info=True)
+@@ -17968,6 +18012,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         try:
+             _pcfg = _load_gateway_config()
+             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:
+             pass
+ 
+@@ -18321,6 +18367,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             _hyg_config_context_length = int(_hyg_custom_ctx)
+                     except (TypeError, ValueError):
+                         pass
++            except ManagedConfigIntegrityError:
++                raise
+             except Exception:
+                 pass
+ 
+@@ -18942,6 +18990,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     mark_seen(_hermes_home / "config.yaml", PROFILE_BUILD_FLAG)
+                 else:
+                     turn_sidecar_notes.append(_intro_note)
++            except ManagedConfigIntegrityError:
++                raise
+             except Exception as _pb_err:
+                 logger.debug(
+                     "Profile-build onboarding directive failed, using plain intro: %s",
+@@ -19071,6 +19121,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     # Toggle off: model sees the clean message; the timestamp
+                     # is still stored as metadata for later opt-in.
+                     message_text = _clean_message_text
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception as _ts_err:
+             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
+ 
+@@ -19281,6 +19333,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     platform=source.platform,
+                     require_platform_override_for={Platform.MATTERMOST},
+                 )
++            except ManagedConfigIntegrityError:
++                raise
+             except Exception:
+                 _show_reasoning_effective = (
+                     False
+@@ -19309,6 +19363,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             "reasoning_style",
+                             "code",
+                         )
++                    except ManagedConfigIntegrityError:
++                        raise
+                     except Exception:
+                         _reasoning_style = "code"
+                     if _reasoning_style == "subtext":
+@@ -19343,6 +19399,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     cwd=os.environ.get("TERMINAL_CWD", ""),
+                     turn_seconds=_turn_seconds,
+                 )
++            except ManagedConfigIntegrityError:
++                raise
+             except Exception as _footer_err:
+                 logger.debug("runtime_footer build failed: %s", _footer_err)
+                 _footer_line = ""
+@@ -19920,6 +19978,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     custom_provs = get_compatible_custom_providers(data)
+                 except Exception:
+                     custom_provs = data.get("custom_providers")
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:
+             pass
+ 
+@@ -25790,6 +25850,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+ 
+             try:
+                 bounds = resolve_agent_cache_bounds(_load_gateway_config())
++            except ManagedConfigIntegrityError:
++                raise
+             except Exception as _e:
+                 logger.debug("Agent cache bounds config read failed: %s", _e)
+                 # Resolve from an empty config rather than bare
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index c257cb10e48cbcef4589020df985da4a8cd052aa..4b82d235430302ec558b8bb5f840b2a1b2d8a780 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -30,7 +30,7 @@ import time
+ import unicodedata
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Dict, Any, Optional, List, Tuple, Set
++from typing import Dict, Any, Mapping, Optional, List, Tuple, Set
+ 
+ from hermes_cli.route_identity import normalize_route_base_url
+ from hermes_cli.secret_prompt import masked_secret_prompt
+@@ -2553,7 +2553,10 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
+     return cfg, stripped
+ 
+ 
+-def _env_expand_match(m: re.Match) -> str:
++def _env_expand_match(
++    m: re.Match,
++    environ: Optional[Mapping[str, str]] = None,
++) -> str:
+     """Expand one ``${...}`` config reference.
+ 
+     Two accepted shapes, matching what MCP server config already resolves
+@@ -2571,13 +2574,14 @@ def _env_expand_match(m: re.Match) -> str:
+     ref only ever needs the env shape.  Unknown prefixes warn once and stay
+     verbatim so callers can detect them.
+     """
++    source = os.environ if environ is None else environ
+     raw = m.group(0)
+     inner = m.group(1).strip()
+     if inner.startswith("env:"):
+         name = inner[len("env:"):].strip()
+         if not name:
+             return raw
+-        val = os.environ.get(name)
++        val = source.get(name)
+         if val is not None:
+             return val
+         logger.warning(
+@@ -2598,7 +2602,7 @@ def _env_expand_match(m: re.Match) -> str:
+         )
+         return raw
+     # Legacy ``${VAR}`` — bare name.
+-    return os.environ.get(inner, raw)
++    return source.get(inner, raw)
+ 
+ 
+ def _env_ref_var_name(ref: str) -> Optional[str]:
+@@ -2613,20 +2617,28 @@ def _env_ref_var_name(ref: str) -> Optional[str]:
+     return ref
+ 
+ 
+-def _expand_env_vars(obj):
++def _expand_env_vars(
++    obj,
++    environ: Optional[Mapping[str, str]] = None,
++):
+     """Recursively expand ``${VAR}`` / ``${env:VAR}`` references in config
+     values.
+ 
+     Only string values are processed; dict keys, numbers, booleans, and
+     None are left untouched.  Unresolved references (variable not in
+-    ``os.environ``) are kept verbatim so callers can detect them.
++    the selected environment mapping) are kept verbatim so callers can detect
++    them. Existing callers default to ``os.environ``.
+     """
+     if isinstance(obj, str):
+-        return re.sub(r"\${([^}]+)}", _env_expand_match, obj)
++        return re.sub(
++            r"\${([^}]+)}",
++            lambda match: _env_expand_match(match, environ=environ),
++            obj,
++        )
+     if isinstance(obj, dict):
+-        return {k: _expand_env_vars(v) for k, v in obj.items()}
++        return {k: _expand_env_vars(v, environ=environ) for k, v in obj.items()}
+     if isinstance(obj, list):
+-        return [_expand_env_vars(item) for item in obj]
++        return [_expand_env_vars(item, environ=environ) for item in obj]
+     return obj
+ 
+ 
+@@ -3537,8 +3549,17 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+             else managed_scope.load_managed_config()
+         )
+         if managed_config:
+-            managed_expanded = _expand_env_vars(managed_config)
+-            expanded = _deep_merge(expanded, managed_expanded)
++            try:
++                managed_expanded = _expand_env_vars(managed_config)
++                expanded = _deep_merge(expanded, managed_expanded)
++            except managed_scope.ManagedConfigIntegrityError:
++                raise
++            except Exception as exc:
++                if managed_pin_active:
++                    raise managed_scope.ManagedConfigIntegrityError(
++                        "pinned managed config.yaml could not be applied"
++                    ) from exc
++                raise
+         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
+         if cache_sig is not None:
+             # Cache stores a separate deepcopy so subsequent ``load_config()``
+diff --git a/hermes_cli/doctor.py b/hermes_cli/doctor.py
+index e16de6060c9ef0a9e7a221eafea9fd547f6fcbea..ff7510e58ce24db82008eddf1117a62f1e89ca6d 100644
+--- a/hermes_cli/doctor.py
++++ b/hermes_cli/doctor.py
+@@ -19,6 +19,7 @@ from hermes_cli.config import (
+     recommended_update_command_for_method,
+ )
+ from hermes_cli.env_loader import load_hermes_dotenv
++from hermes_cli.managed_scope import ManagedConfigIntegrityError
+ from hermes_constants import display_hermes_home
+ from hermes_constants import agent_browser_runnable
+ 
+@@ -877,10 +878,15 @@ def managed_scope_check() -> None:
+     default), that is surfaced too — a redirected scope is the documented
+     foot-gun (see docs/design/managed-scope.md §7) and an operator should see it.
+     """
++    pin_required = "HERMES_MANAGED_CONFIG_SHA256" in os.environ
+     try:
+         from hermes_cli import managed_scope
++        if pin_required:
++            managed_scope.load_managed_config()
+         managed_dir = managed_scope.get_managed_dir()
+-    except Exception:  # noqa: BLE001 — diagnostics must never crash
++    except ManagedConfigIntegrityError:
++        raise
++    except Exception:  # noqa: BLE001 — legacy diagnostics stay best-effort
+         return
+     if managed_dir is None:
+         return
+@@ -2817,20 +2823,26 @@ def run_doctor(args):
+ 
+     _section("Memory Provider")
+     _active_memory_provider = ""
++    _raw_cfg = None
+     try:
+         from hermes_cli.config import read_user_config_raw as _read_raw_mem
+         _mem_cfg_path = HERMES_HOME / "config.yaml"
+         if _mem_cfg_path.exists():
+             # Raw-file diagnostic (+ managed overlay below, unchanged).
+             _raw_cfg = _read_raw_mem(_mem_cfg_path)
+-            try:
+-                from hermes_cli import managed_scope
+-                _raw_cfg = managed_scope.apply_managed_overlay(_raw_cfg)
+-            except Exception:
+-                pass
+-            _active_memory_provider = (_raw_cfg.get("memory") or {}).get("provider", "")
+     except Exception:
+         pass
++    if isinstance(_raw_cfg, dict):
++        try:
++            from hermes_cli import managed_scope
++            _raw_cfg = managed_scope.apply_managed_overlay(_raw_cfg)
++        except ManagedConfigIntegrityError:
++            raise
++        except Exception:
++            pass
++        _memory_cfg = _raw_cfg.get("memory")
++        if isinstance(_memory_cfg, dict):
++            _active_memory_provider = _memory_cfg.get("provider", "")
+ 
+     if not _active_memory_provider:
+         check_ok("Built-in memory active", "(no external provider configured — this is fine)")
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index b58a6c0c18ff4b1d439eab78487c481efa422d70..6007452efaca7a4420ecb2ae269fddceb680f266 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -696,6 +696,7 @@ _apply_profile_override()
+ # User-managed env files should override stale shell exports on restart.
+ from hermes_cli.config import get_hermes_home
+ from hermes_cli.env_loader import load_hermes_dotenv
++from hermes_cli.managed_scope import ManagedConfigIntegrityError
+ 
+ load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+ 
+@@ -716,6 +717,13 @@ try:
+     # 3-4 config.yaml parses per invocation into one.
+     from hermes_cli.config import read_raw_config as _read_raw_early
+ 
++    if "HERMES_MANAGED_CONFIG_SHA256" in os.environ:
++        # Authenticate a Runtime pin even when the user profile config does not
++        # exist yet; pinned managed scope is an explicit startup contract.
++        from hermes_cli import managed_scope as _managed_scope_early
++
++        _managed_scope_early.load_managed_config()
++
+     _cfg_path = get_hermes_home() / "config.yaml"
+     if _cfg_path.exists():
+         _early_cfg_raw = _read_raw_early() or {}
+@@ -723,10 +731,13 @@ try:
+         # security.redact_secrets / network.force_ipv4 wins here too. This early
+         # bridge reads config.yaml directly (before load_config is usable), so
+         # without the overlay a managed redact_secrets toggle would be ignored.
+-        # Fail-open via the shared helper.
++        # Legacy unpinned scope remains fail-open. A Runtime digest pin must not
++        # be discarded by this early bootstrap layer.
+         try:
+             from hermes_cli import managed_scope
+             _early_cfg_raw = managed_scope.apply_managed_overlay(_early_cfg_raw)
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:
+             pass
+         if "HERMES_REDACT_SECRETS" not in os.environ:
+@@ -740,6 +751,8 @@ try:
+             _FORCE_IPV4_EARLY = True
+         del _early_cfg_raw
+     del _cfg_path
++except ManagedConfigIntegrityError:
++    raise
+ except Exception:
+     pass  # best-effort — redaction stays at default (enabled) on config errors
+ 
+@@ -758,6 +771,8 @@ try:
+             else "cli"
+         )
+     )
++except ManagedConfigIntegrityError:
++    raise
+ except Exception:
+     pass  # best-effort — don't crash the CLI if logging setup fails
+ 
+@@ -2368,6 +2383,8 @@ def _launch_tui(
+     try:
+         from hermes_cli.config import apply_terminal_config_to_env
+         apply_terminal_config_to_env(env=env)
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         logger.debug("Failed to apply terminal config bridge for TUI launch", exc_info=True)
+     active_session_fd, active_session_file = tempfile.mkstemp(
+@@ -7283,6 +7300,8 @@ def cmd_gui(args: argparse.Namespace):
+     try:
+         from hermes_logging import setup_logging as _setup_logging_gui
+         _setup_logging_gui(mode="gui")
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         pass
+ 
+@@ -10657,6 +10676,8 @@ def cmd_dashboard(args):
+     try:
+         from hermes_logging import setup_logging as _setup_logging_gui
+         _setup_logging_gui(mode="gui")
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         pass
+ 
+@@ -10693,6 +10714,8 @@ def cmd_dashboard(args):
+         from hermes_cli.config import apply_terminal_config_to_env
+ 
+         apply_terminal_config_to_env()
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         logger.debug("terminal config → env bridge failed for dashboard/serve",
+                      exc_info=True)
+diff --git a/hermes_cli/managed_scope.py b/hermes_cli/managed_scope.py
+index ff8c3c84dedfc4ab4588ba0581054f5097332d36..b1567db204c9edee42f6455b7cd99b110b13c7f5 100644
+--- a/hermes_cli/managed_scope.py
++++ b/hermes_cli/managed_scope.py
+@@ -26,7 +26,7 @@ import re
+ import stat
+ import threading
+ from pathlib import Path
+-from typing import Dict, Optional
++from typing import Dict, Mapping, Optional
+ 
+ import yaml
+ 
+@@ -49,12 +49,15 @@ class ManagedConfigIntegrityError(RuntimeError):
+     """Raised when a Runtime-pinned managed config cannot be authenticated."""
+ 
+ 
+-def managed_config_integrity_required() -> bool:
++def managed_config_integrity_required(
++    environ: Optional[Mapping[str, str]] = None,
++) -> bool:
+     """Whether Runtime closed managed scope to one digest-pinned YAML file."""
+-    return _MANAGED_CONFIG_PIN_ENV in os.environ
++    source = os.environ if environ is None else environ
++    return _MANAGED_CONFIG_PIN_ENV in source
+ 
+ 
+-def _under_pytest() -> bool:
++def _under_pytest(environ: Optional[Mapping[str, str]] = None) -> bool:
+     """True when running inside the test suite.
+ 
+     Used to ignore the system default ``/etc/hermes`` during tests so a real
+@@ -62,10 +65,13 @@ def _under_pytest() -> bool:
+     that exercise managed scope set ``HERMES_MANAGED_DIR`` explicitly, which is
+     still honored (the override path below runs before this guard takes effect).
+     """
+-    return "PYTEST_CURRENT_TEST" in os.environ
++    source = os.environ if environ is None else environ
++    return "PYTEST_CURRENT_TEST" in source
+ 
+ 
+-def get_managed_dir() -> Optional[Path]:
++def get_managed_dir(
++    environ: Optional[Mapping[str, str]] = None,
++) -> Optional[Path]:
+     """Resolve the managed-scope directory, or None when no scope is present.
+ 
+     Resolution (highest priority first):
+@@ -78,11 +84,12 @@ def get_managed_dir() -> Optional[Path]:
+     A non-existent directory at either tier resolves to None (no managed scope),
+     which is the common case and must be cheap + side-effect-free.
+     """
+-    override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
++    source = os.environ if environ is None else environ
++    override = str(source.get("HERMES_MANAGED_DIR") or "").strip()
+     if override:
+         p = Path(override)
+         return p if p.is_dir() else None
+-    if _under_pytest():
++    if _under_pytest(source):
+         return None
+     return _DEFAULT_MANAGED_DIR if _DEFAULT_MANAGED_DIR.is_dir() else None
+ 
+@@ -261,7 +268,9 @@ def _load_pinned_managed_config(managed_dir: Path, raw_pin: str) -> dict:
+     return parsed
+ 
+ 
+-def load_managed_config() -> dict:
++def load_managed_config(
++    environ: Optional[Mapping[str, str]] = None,
++) -> dict:
+     """Load managed config, optionally enforcing a Runtime-supplied digest pin.
+ 
+     With no ``HERMES_MANAGED_CONFIG_SHA256`` in the process environment this
+@@ -269,14 +278,23 @@ def load_managed_config() -> dict:
+     variable is present, every call re-reads and authenticates the bounded file
+     and any validation error is fail-closed.
+     """
+-    raw_pin = os.environ.get(_MANAGED_CONFIG_PIN_ENV)
+-    managed_dir = get_managed_dir()
++    source = os.environ if environ is None else environ
++    raw_pin = source.get(_MANAGED_CONFIG_PIN_ENV)
+     if raw_pin is not None:
+-        if managed_dir is None:
++        try:
++            managed_dir = get_managed_dir(source)
++            if managed_dir is None:
++                raise ManagedConfigIntegrityError(
++                    "pinned managed configuration directory is missing or unreadable"
++                )
++            return _load_pinned_managed_config(managed_dir, raw_pin)
++        except ManagedConfigIntegrityError:
++            raise
++        except Exception as exc:  # noqa: BLE001 — strict API has one failure type
+             raise ManagedConfigIntegrityError(
+-                "pinned managed configuration directory is missing or unreadable"
+-            )
+-        return _load_pinned_managed_config(managed_dir, raw_pin)
++                "pinned managed config.yaml could not be authenticated"
++            ) from exc
++    managed_dir = get_managed_dir(source)
+     if managed_dir is None:
+         return {}
+     parsed = _cached_read(
+@@ -303,7 +321,10 @@ def load_managed_env() -> Dict[str, str]:
+     return parsed if isinstance(parsed, dict) else {}
+ 
+ 
+-def apply_managed_overlay(config: dict) -> dict:
++def apply_managed_overlay(
++    config: dict,
++    environ: Optional[Mapping[str, str]] = None,
++) -> dict:
+     """Overlay administrator-pinned config values on top of an already-built dict.
+ 
+     The single, shared way for any config loader that builds its own dict
+@@ -324,15 +345,18 @@ def apply_managed_overlay(config: dict) -> dict:
+     deliberately re-raised so callers cannot silently discard Runtime policy.
+     Mutates and returns ``config`` (callers pass a dict they own).
+     """
+-    pin_required = managed_config_integrity_required()
++    source = os.environ if environ is None else environ
++    pin_required = managed_config_integrity_required(source)
+     try:
+-        managed = load_managed_config()
++        managed = load_managed_config(source)
+         if not managed:
+             return config
+         # Imported lazily to avoid an import cycle (config imports managed_scope).
+         from hermes_cli.config import _deep_merge, _expand_env_vars, _normalize_root_model_keys
+ 
+-        managed_expanded = _normalize_root_model_keys(_expand_env_vars(managed))
++        managed_expanded = _normalize_root_model_keys(
++            _expand_env_vars(managed, environ=source)
++        )
+         # A bare ``model: x/y`` string in the managed file must merge as
+         # ``model.default`` — otherwise _deep_merge would replace the caller's
+         # ``model`` dict with a string and break every ``cfg["model"]["..."]``
+@@ -343,9 +367,13 @@ def apply_managed_overlay(config: dict) -> dict:
+             managed_expanded = dict(managed_expanded)
+             managed_expanded["model"] = {"default": managed_expanded["model"]}
+         return _deep_merge(config, managed_expanded)
+-    except Exception:  # noqa: BLE001 — unpinned overlay remains fail-open
++    except ManagedConfigIntegrityError:
++        raise
++    except Exception as exc:  # noqa: BLE001 — unpinned overlay remains fail-open
+         if pin_required:
+-            raise
++            raise ManagedConfigIntegrityError(
++                "pinned managed config.yaml could not be applied"
++            ) from exc
+         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
+         return config
+ 
+diff --git a/hermes_cli/send_cmd.py b/hermes_cli/send_cmd.py
+index 6d00e54c6c6984d8b0d520d9f4b19dd08844a2c7..4bc4cf2261800922641d0f1d92facaf81e8b03e8 100644
+--- a/hermes_cli/send_cmd.py
++++ b/hermes_cli/send_cmd.py
+@@ -32,6 +32,8 @@ import sys
+ from pathlib import Path
+ from typing import Optional
+ 
++from hermes_cli.managed_scope import ManagedConfigIntegrityError
++
+ 
+ _USAGE_EXIT = 2
+ _FAILURE_EXIT = 1
+@@ -307,10 +309,13 @@ def _load_hermes_env() -> None:
+         pass
+ 
+     # Managed scope: overlay administrator-pinned values before bridging to env,
+-    # so a managed top-level scalar wins here too. Fail-open via the helper.
++    # so a managed top-level scalar wins here too. Legacy unpinned scope is
++    # fail-open; a Runtime digest pin is fail-closed.
+     try:
+         from hermes_cli import managed_scope
+         raw = managed_scope.apply_managed_overlay(raw if isinstance(raw, dict) else {})
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         pass
+ 
+diff --git a/hermes_logging.py b/hermes_logging.py
+index d371af25aaf051875aaa9eac1240a6e15a378065..159b969d15ca7d00efa2a2514e925b420fda98c5 100644
+--- a/hermes_logging.py
++++ b/hermes_logging.py
+@@ -70,6 +70,7 @@ else:
+ 
+ 
+ from hermes_constants import get_config_path, get_hermes_home
++from hermes_cli.managed_scope import ManagedConfigIntegrityError
+ 
+ # Sentinel to track whether setup_logging() has already run.  The function
+ # is idempotent — calling it twice is safe but the second call is a no-op
+@@ -782,10 +783,13 @@ def _read_logging_config():
+                 cfg = fast_safe_load(f) or {}
+         if cfg:
+             # Managed scope: an administrator can pin logging.* too. Overlay via
+-            # the shared helper (fail-open) since this reads config.yaml directly.
++            # the shared helper. Legacy unpinned scope is fail-open; a Runtime
++            # digest pin is fail-closed.
+             try:
+                 from hermes_cli import managed_scope
+                 cfg = managed_scope.apply_managed_overlay(cfg)
++            except ManagedConfigIntegrityError:
++                raise
+             except Exception:
+                 pass
+             log_cfg = cfg.get("logging", {})
+@@ -795,6 +799,8 @@ def _read_logging_config():
+                     log_cfg.get("max_size_mb"),
+                     log_cfg.get("backup_count"),
+                 )
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         pass
+     return (None, None, None)
+diff --git a/hermes_time.py b/hermes_time.py
+index 08f865333ba3b1a3b5454aa70512dbecf61cd5c5..2965dd5e9fefcae7834d2ac4f53b505f66e81691 100644
+--- a/hermes_time.py
++++ b/hermes_time.py
+@@ -17,6 +17,7 @@ import logging
+ import os
+ from datetime import datetime
+ from hermes_constants import get_config_path
++from hermes_cli.managed_scope import ManagedConfigIntegrityError
+ from typing import Optional
+ 
+ logger = logging.getLogger(__name__)
+@@ -64,15 +65,20 @@ def _resolve_timezone_name() -> str:
+                 cfg = {}
+         if cfg:
+             # Managed scope: an administrator can pin ``timezone`` too. Overlay
+-            # via the shared helper (fail-open) since this reads config.yaml directly.
++            # via the shared helper. Legacy unpinned scope is fail-open; a
++            # Runtime digest pin is fail-closed.
+             try:
+                 from hermes_cli import managed_scope
+                 cfg = managed_scope.apply_managed_overlay(cfg)
++            except ManagedConfigIntegrityError:
++                raise
+             except Exception:
+                 pass
+             tz_cfg = cfg.get("timezone", "")
+             if isinstance(tz_cfg, str) and tz_cfg.strip():
+                 return tz_cfg.strip()
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         pass
+ 
+@@ -131,5 +137,3 @@ def now() -> datetime:
+         return datetime.now(tz)
+     # No timezone configured — use server-local (still tz-aware)
+     return datetime.now().astimezone()
+-
+-
+diff --git a/tests/agent/test_identity_policy.py b/tests/agent/test_identity_policy.py
+index c5c1bf1b26549b1c5dd64c6afb09449943278e9e..e60dc52c6d5addcaed6977247e7e97af529a2d88 100644
+--- a/tests/agent/test_identity_policy.py
++++ b/tests/agent/test_identity_policy.py
+@@ -144,6 +144,22 @@ def _attest(
+     )
+ 
+ 
++def _pin_managed_config(monkeypatch, root: Path, config: dict) -> tuple[Path, str]:
++    managed = root / "managed"
++    managed.mkdir(parents=True, exist_ok=True)
++    payload = yaml.safe_dump(
++        config,
++        allow_unicode=True,
++        sort_keys=False,
++    ).encode("utf-8")
++    config_path = managed / "config.yaml"
++    config_path.write_bytes(payload)
++    digest = hashlib.sha256(payload).hexdigest()
++    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", digest)
++    return config_path, digest
++
++
+ def _strict_agent(*, cached_prompt=None):
+     policy = resolve_identity_policy(_strict_config())
+     agent = SimpleNamespace(
+@@ -398,6 +414,84 @@ def test_runtime_yaml_literal_preserves_final_lf_hash_and_passes_preflight(
+     assert receipt.soul_sha256.upper() == RUNTIME_SOUL_SHA256
+ 
+ 
++def test_strict_preflight_applies_pinned_operational_overlay_without_rewriting_receipt(
++    tmp_path,
++    monkeypatch,
++):
++    cfg = _strict_config()
++    cfg["memory"] = {"provider": ""}
++    _write_profile(tmp_path, cfg=cfg)
++    raw_config = (tmp_path / "config.yaml").read_bytes()
++    raw_digest = hashlib.sha256(raw_config).hexdigest()
++    _attest(monkeypatch, tmp_path, config_sha256=raw_digest)
++    monkeypatch.setenv("D053_EFFECTIVE_OWNER", "owner-from-snapshot")
++    _pin_managed_config(
++        monkeypatch,
++        tmp_path,
++        {
++            "memory": {"provider": "managed_probe"},
++            "plugins": {"managed_probe": {"owner": "${D053_EFFECTIVE_OWNER}"}},
++        },
++    )
++
++    receipt = preflight_aia_agent_identity(api_mode="chat_completions")
++
++    assert receipt.config["memory"]["provider"] == "managed_probe"
++    assert receipt.config["plugins"]["managed_probe"]["owner"] == (
++        "owner-from-snapshot"
++    )
++    assert receipt.config_sha256 == raw_digest
++    assert (tmp_path / "config.yaml").read_bytes() == raw_config
++    assert yaml.safe_load(raw_config)["memory"]["provider"] == ""
++
++
++def test_strict_preflight_reauthenticates_pinned_overlay_on_every_call(
++    tmp_path,
++    monkeypatch,
++):
++    _write_profile(tmp_path)
++    _attest(monkeypatch, tmp_path)
++    managed_path, _ = _pin_managed_config(
++        monkeypatch,
++        tmp_path,
++        {"memory": {"provider": "managed_probe"}},
++    )
++    assert preflight_aia_agent_identity().config["memory"]["provider"] == (
++        "managed_probe"
++    )
++
++    managed_path.write_bytes(managed_path.read_bytes() + b"\n# tampered\n")
++    with pytest.raises(IdentityPolicyError, match="pinned managed config"):
++        preflight_aia_agent_identity()
++
++
++@pytest.mark.parametrize(
++    "overlay",
++    [
++        {"identity": {"fingerprint": "b" * 64}},
++        {
++            "agent": {
++                "personalities": {
++                    "lilith": {"system_prompt": "REPLACED MANAGED VOICE\n"}
++                }
++            }
++        },
++    ],
++    ids=["identity-policy", "personality"],
++)
++def test_strict_preflight_rejects_managed_identity_authority_changes(
++    tmp_path,
++    monkeypatch,
++    overlay,
++):
++    _write_profile(tmp_path)
++    _attest(monkeypatch, tmp_path)
++    _pin_managed_config(monkeypatch, tmp_path, overlay)
++
++    with pytest.raises(IdentityPolicyError, match="pinned managed config cannot alter"):
++        preflight_aia_agent_identity()
++
++
+ def test_missing_strict_profile_fails_before_creating_profile_state(
+     tmp_path,
+     monkeypatch,
+@@ -720,6 +814,66 @@ def test_agent_initialization_snapshots_identity_and_durable_metadata(
+     }
+ 
+ 
++def test_strict_agent_activates_provider_selected_by_pinned_managed_config(
++    tmp_path,
++    monkeypatch,
++):
++    from run_agent import AIAgent
++
++    cfg = _strict_config()
++    cfg["memory"] = {"provider": ""}
++    _write_profile(tmp_path, cfg=cfg)
++    _attest(monkeypatch, tmp_path)
++    _pin_managed_config(
++        monkeypatch,
++        tmp_path,
++        {"memory": {"provider": "managed_probe"}},
++    )
++    provider = MagicMock()
++    provider.name = "managed_probe"
++    provider.is_available.return_value = True
++    provider.get_tool_schemas.return_value = []
++
++    with (
++        patch("run_agent.get_tool_definitions", return_value=[]),
++        patch("run_agent.check_toolset_requirements", return_value={}),
++        patch("run_agent.OpenAI"),
++        patch(
++            "hermes_cli.config.load_config_readonly",
++            return_value=cfg,
++        ) as raw_config_loader,
++        patch(
++            "plugins.memory.load_memory_provider",
++            return_value=provider,
++        ) as loader,
++    ):
++        agent = AIAgent(
++            model="test-model",
++            provider="openrouter",
++            api_mode="chat_completions",
++            base_url="https://example.test/v1",
++            api_key="test-key",
++            enabled_toolsets=[],
++            quiet_mode=True,
++            skip_context_files=True,
++            skip_memory=False,
++        )
++
++    loader.assert_called_once_with("managed_probe")
++    # Other metadata paths still consult the legacy raw loader. Even with those
++    # reads present, provider activation must use the authenticated effective
++    # snapshot produced by strict identity preflight.
++    assert raw_config_loader.call_count >= 1
++    assert agent._memory_manager is not None
++    assert agent._identity_config_snapshot["memory"]["provider"] == (
++        "managed_probe"
++    )
++    assert [item.name for item in agent._memory_manager.providers] == [
++        "managed_probe"
++    ]
++    provider.initialize.assert_called_once()
++
++
+ def test_prompt_build_uses_frozen_config_after_post_preflight_disk_swap(
+     tmp_path,
+     monkeypatch,
+diff --git a/tests/hermes_cli/test_managed_scope.py b/tests/hermes_cli/test_managed_scope.py
+index c73db2643d879a99dacf8c6bcc58345995356524..b9d1557f35fedf5df1ab5211ff700e6e932cde5b 100644
+--- a/tests/hermes_cli/test_managed_scope.py
++++ b/tests/hermes_cli/test_managed_scope.py
+@@ -241,12 +241,106 @@ def test_pinned_overlay_never_swallows_unexpected_error(tmp_path, monkeypatch):
+     managed = _write_managed(tmp_path, monkeypatch, config="{}\n")
+     _pin_managed_config(managed, monkeypatch)
+ 
+-    def fail_load():
++    def fail_load(*_args, **_kwargs):
+         raise OSError("unexpected strict-loader failure")
+ 
+     monkeypatch.setattr(managed_scope, "load_managed_config", fail_load)
+-    with pytest.raises(OSError, match="strict-loader"):
++    with pytest.raises(
++        managed_scope.ManagedConfigIntegrityError,
++        match="could not be applied",
++    ) as exc_info:
+         managed_scope.apply_managed_overlay({})
++    assert isinstance(exc_info.value.__cause__, OSError)
++
++
++def test_pinned_direct_loader_normalizes_unexpected_error(tmp_path, monkeypatch):
++    from hermes_cli import managed_scope
++
++    managed = _write_managed(tmp_path, monkeypatch, config="{}\n")
++    _pin_managed_config(managed, monkeypatch)
++
++    def fail_pinned_load(*_args, **_kwargs):
++        raise OSError("unexpected direct-loader failure")
++
++    monkeypatch.setattr(
++        managed_scope,
++        "_load_pinned_managed_config",
++        fail_pinned_load,
++    )
++    with pytest.raises(
++        managed_scope.ManagedConfigIntegrityError,
++        match="could not be authenticated",
++    ) as exc_info:
++        managed_scope.load_managed_config()
++    assert isinstance(exc_info.value.__cause__, OSError)
++
++
++def test_core_loader_normalizes_pinned_merge_error(tmp_path, monkeypatch):
++    from hermes_cli import config as config_module
++    from hermes_cli import managed_scope
++
++    managed = _write_managed(
++        tmp_path,
++        monkeypatch,
++        config="display:\n  skin: managed\n",
++    )
++    _pin_managed_config(managed, monkeypatch)
++    config_module._LOAD_CONFIG_CACHE.clear()
++
++    def fail_merge(*_args, **_kwargs):
++        raise ValueError("unexpected managed-merge failure")
++
++    monkeypatch.setattr(config_module, "_deep_merge", fail_merge)
++    with pytest.raises(
++        managed_scope.ManagedConfigIntegrityError,
++        match="could not be applied",
++    ) as exc_info:
++        config_module.load_config_readonly()
++    assert isinstance(exc_info.value.__cause__, ValueError)
++
++
++def test_unpinned_overlay_still_swallows_unexpected_error(tmp_path, monkeypatch):
++    from hermes_cli import managed_scope
++
++    _write_managed(tmp_path, monkeypatch, config="{}\n")
++    monkeypatch.delenv("HERMES_MANAGED_CONFIG_SHA256", raising=False)
++    source = {"memory": {"provider": "user"}}
++
++    def fail_load(*_args, **_kwargs):
++        raise OSError("unexpected legacy-loader failure")
++
++    monkeypatch.setattr(managed_scope, "load_managed_config", fail_load)
++    assert managed_scope.apply_managed_overlay(source) is source
++
++
++def test_explicit_environment_snapshot_controls_pin_path_and_expansion(
++    tmp_path,
++    monkeypatch,
++):
++    from hermes_cli import managed_scope
++
++    managed = tmp_path / "managed-explicit"
++    managed.mkdir()
++    config_path = managed / "config.yaml"
++    config_path.write_text(
++        "plugins:\n  probe:\n    owner: ${D053_SNAPSHOT_OWNER}\n",
++        encoding="utf-8",
++    )
++    digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
++    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
++    monkeypatch.delenv("HERMES_MANAGED_CONFIG_SHA256", raising=False)
++    monkeypatch.setenv("D053_SNAPSHOT_OWNER", "process-value-must-not-win")
++    snapshot = {
++        "HERMES_MANAGED_DIR": str(managed),
++        "HERMES_MANAGED_CONFIG_SHA256": digest,
++        "D053_SNAPSHOT_OWNER": "attested-snapshot-value",
++    }
++
++    result = managed_scope.apply_managed_overlay({}, environ=snapshot)
++
++    assert result["plugins"]["probe"]["owner"] == "attested-snapshot-value"
++    assert managed_scope.managed_config_integrity_required(snapshot)
++    assert managed_scope.get_managed_dir(snapshot) == managed
+ 
+ 
+ def test_pinned_config_disables_adjacent_managed_dotenv(tmp_path, monkeypatch):
+diff --git a/tests/hermes_cli/test_managed_scope_loaders.py b/tests/hermes_cli/test_managed_scope_loaders.py
+index 0161102d5e3f5b6a1699a6b639dc8c55a7f4b936..248bb18ff3df79388216e92ceefffd3f9d3ab455 100644
+--- a/tests/hermes_cli/test_managed_scope_loaders.py
++++ b/tests/hermes_cli/test_managed_scope_loaders.py
+@@ -5,6 +5,10 @@ hermes_cli.config.load_config, so the managed overlay has to be wired into each.
+ This is the regression guard for the whole bug class (a managed display.skin was
+ silently ignored by the TUI; the same gap existed in the gateway and cron).
+ """
++import os
++from pathlib import Path
++import subprocess
++import sys
+ import textwrap
+ 
+ import pytest
+@@ -82,3 +86,171 @@ def test_gateway_env_bridge_honors_managed(homes, monkeypatch):
+     raw = yaml.safe_load((home / "config.yaml").read_text())
+     bridged = managed_scope.apply_managed_overlay(raw)
+     assert bridged.get("timezone") == "Asia/Tokyo"
++
++
++def test_tui_runtime_pin_never_falls_back_to_unmanaged_config(monkeypatch):
++    import tui_gateway.server as server
++    from hermes_cli import managed_scope
++
++    def fail_overlay(*_args, **_kwargs):
++        raise managed_scope.ManagedConfigIntegrityError("pinned probe failed")
++
++    monkeypatch.setattr(managed_scope, "apply_managed_overlay", fail_overlay)
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", "0" * 64)
++    with pytest.raises(managed_scope.ManagedConfigIntegrityError, match="pinned probe"):
++        server._apply_managed({"memory": {"provider": "user-fallback"}})
++
++
++def test_tui_unpinned_overlay_keeps_legacy_fail_open_behavior(monkeypatch):
++    import tui_gateway.server as server
++    from hermes_cli import managed_scope
++
++    source = {"memory": {"provider": "user-fallback"}}
++
++    def fail_overlay(*_args, **_kwargs):
++        raise OSError("legacy probe failed")
++
++    monkeypatch.setattr(managed_scope, "apply_managed_overlay", fail_overlay)
++    monkeypatch.delenv("HERMES_MANAGED_CONFIG_SHA256", raising=False)
++    assert server._apply_managed(source) is source
++
++
++def test_tui_real_config_wrappers_never_swallow_runtime_pin_failure(monkeypatch):
++    import tui_gateway.server as server
++    from hermes_cli import managed_scope
++
++    def fail_load():
++        raise managed_scope.ManagedConfigIntegrityError("tui wrapper probe failed")
++
++    monkeypatch.setattr(server, "_load_cfg", fail_load)
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", "0" * 64)
++
++    for caller in (
++        server._load_provider_routing,
++        server._agent_build_wait_cap,
++        server._max_live_sessions,
++    ):
++        with pytest.raises(
++            managed_scope.ManagedConfigIntegrityError,
++            match="tui wrapper probe",
++        ):
++            caller()
++
++
++def test_gateway_runtime_wrappers_never_swallow_runtime_pin_failure(monkeypatch):
++    import gateway.run as gateway_run
++    from hermes_cli import managed_scope
++
++    def fail_load():
++        raise managed_scope.ManagedConfigIntegrityError(
++            "gateway wrapper probe failed"
++        )
++
++    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", fail_load)
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", "0" * 64)
++
++    for caller in (
++        gateway_run._try_resolve_fallback_provider,
++        gateway_run.GatewayRunner._load_provider_routing,
++        gateway_run.GatewayRunner._load_fallback_model,
++    ):
++        with pytest.raises(
++            managed_scope.ManagedConfigIntegrityError,
++            match="gateway wrapper probe",
++        ):
++            caller()
++
++
++def test_gateway_runtime_wrappers_keep_non_integrity_fail_open_with_pin(monkeypatch):
++    import gateway.run as gateway_run
++
++    def fail_load():
++        raise RuntimeError("ordinary gateway config probe failed")
++
++    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", fail_load)
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", "0" * 64)
++
++    assert gateway_run.GatewayRunner._load_provider_routing() == {}
++    assert gateway_run.GatewayRunner._load_fallback_model() is None
++
++
++def test_gateway_config_loader_never_falls_back_after_runtime_pin_failure(
++    homes,
++    monkeypatch,
++):
++    home, managed = homes
++    _seed(home, managed, user="model: user/model\n", mgd="model: managed/model\n")
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", "0" * 64)
++    from gateway.config import load_gateway_config
++    from hermes_cli import managed_scope
++
++    with pytest.raises(
++        managed_scope.ManagedConfigIntegrityError,
++        match="SHA-256 pin",
++    ):
++        load_gateway_config()
++
++
++def test_cli_early_bootstrap_does_not_swallow_runtime_pin_failure(tmp_path):
++    home = tmp_path / "strict-home"
++    home.mkdir()
++    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
++    managed = tmp_path / "managed"
++    managed.mkdir()
++    (managed / "config.yaml").write_text("{}\n", encoding="utf-8")
++    environ = os.environ.copy()
++    environ.update(
++        {
++            "HERMES_HOME": str(home),
++            "HERMES_MANAGED_DIR": str(managed),
++            "HERMES_MANAGED_CONFIG_SHA256": "0" * 64,
++        }
++    )
++    repository = Path(__file__).parents[2]
++
++    result = subprocess.run(
++        [sys.executable, "-c", "import hermes_cli.main"],
++        cwd=repository,
++        env=environ,
++        capture_output=True,
++        text=True,
++        timeout=30,
++        check=False,
++    )
++
++    assert result.returncode != 0
++    assert "pinned managed config.yaml does not match its SHA-256 pin" in (
++        result.stderr
++    )
++
++
++def test_tui_launch_does_not_continue_after_runtime_pin_failure(monkeypatch):
++    from hermes_cli import config, main, managed_scope
++    from tools.environments import local
++
++    def fail_bridge(*_args, **_kwargs):
++        raise managed_scope.ManagedConfigIntegrityError("tui pin probe failed")
++
++    monkeypatch.setattr(local, "build_subprocess_env", lambda **_kwargs: {})
++    monkeypatch.setattr(config, "apply_terminal_config_to_env", fail_bridge)
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", "0" * 64)
++
++    with pytest.raises(managed_scope.ManagedConfigIntegrityError, match="tui pin probe"):
++        main._launch_tui()
++
++
++def test_doctor_validates_runtime_pin_without_profile_or_managed_directory(
++    tmp_path,
++    monkeypatch,
++):
++    from hermes_cli import doctor, managed_scope
++
++    missing = tmp_path / "missing-managed"
++    monkeypatch.setenv("HERMES_MANAGED_DIR", str(missing))
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", "0" * 64)
++
++    with pytest.raises(
++        managed_scope.ManagedConfigIntegrityError,
++        match="directory is missing",
++    ):
++        doctor.managed_scope_check()
+diff --git a/tests/tui_gateway/test_goal_command.py b/tests/tui_gateway/test_goal_command.py
+index e08e906b66e2c70c4134a5a5155126b5602a7af8..bdd7a4883e20387c2169f3e62883a3948f6bff29 100644
+--- a/tests/tui_gateway/test_goal_command.py
++++ b/tests/tui_gateway/test_goal_command.py
+@@ -10,6 +10,7 @@ uses to render a system line and fire the kickoff prompt.
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import importlib
+ import threading
+ import types
+@@ -170,6 +171,34 @@ def _compression_failure():
+     }
+ 
+ 
++def _install_pinned_goal_config(
++    server,
++    monkeypatch,
++    tmp_path,
++    text,
++):
++    """Route the gateway loader through a real digest-pinned managed file."""
++    from hermes_cli import managed_scope
++
++    managed_dir = tmp_path / "managed"
++    managed_dir.mkdir()
++    config_path = managed_dir / "config.yaml"
++    payload = text.encode("utf-8")
++    config_path.write_bytes(payload)
++    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
++    monkeypatch.setenv(
++        "HERMES_MANAGED_CONFIG_SHA256",
++        hashlib.sha256(payload).hexdigest(),
++    )
++    managed_scope.invalidate_managed_cache()
++    monkeypatch.setattr(
++        server,
++        "_load_cfg",
++        lambda: managed_scope.apply_managed_overlay({}),
++    )
++    return managed_scope
++
++
+ # ── command.dispatch /goal ────────────────────────────────────────────
+ 
+ 
+@@ -362,6 +391,181 @@ def test_exhaustion_without_active_goal_keeps_error_only_behavior(server):
+     assert server._GOAL_COMPRESSION_RECOVERY_ATTEMPTS not in session
+ 
+ 
++@pytest.mark.parametrize("branch", ["compression_recovery", "continuation"])
++def test_pinned_managed_integrity_failure_escapes_nested_goal_hooks(
++    server,
++    turn_env,
++    monkeypatch,
++    tmp_path,
++    branch,
++):
++    from hermes_cli.goals import GoalManager
++
++    managed_scope = _install_pinned_goal_config(
++        server,
++        monkeypatch,
++        tmp_path,
++        "goals:\n  max_turns: 20\n",
++    )
++    config_path = tmp_path / "managed" / "config.yaml"
++    session_key = f"goal-pin-integrity-{branch}"
++    GoalManager(session_key).set("finish the current task")
++    seen_prompts = []
++    result = (
++        _compression_failure()
++        if branch == "compression_recovery"
++        else {"final_response": "completed work"}
++    )
++
++    def run_conversation(message, **_kwargs):
++        seen_prompts.append(message)
++        config_path.write_text("goals:\n  max_turns: 21\n", encoding="utf-8")
++        return result
++
++    terminal_errors = []
++
++    def record_terminal_error(_sid, _session, error):
++        terminal_errors.append(error)
++        config_path.write_bytes(b"goals:\n  max_turns: 20\n")
++
++    monkeypatch.setattr(
++        server,
++        "_emit_terminal_turn_error",
++        record_terminal_error,
++    )
++    monkeypatch.setattr(server, "_CRASH_LOG", str(tmp_path / "crash.log"))
++    agent = types.SimpleNamespace(
++        session_id=session_key,
++        run_conversation=run_conversation,
++        clear_interrupt=lambda: None,
++    )
++    session = _turn_session(agent, session_key)
++
++    server._run_prompt_submit("rid", "sid", session, "initial work")
++
++    assert seen_prompts == ["initial work"]
++    assert len(terminal_errors) == 1
++    assert isinstance(
++        terminal_errors[0], managed_scope.ManagedConfigIntegrityError
++    )
++
++
++def test_valid_pin_keeps_invalid_goal_max_turns_fail_open(
++    server,
++    turn_env,
++    monkeypatch,
++    tmp_path,
++):
++    from hermes_cli.goals import GoalManager
++
++    _install_pinned_goal_config(
++        server,
++        monkeypatch,
++        tmp_path,
++        "goals:\n  max_turns: not-an-int\n",
++    )
++    session_key = "goal-valid-pin-invalid-max-turns"
++    manager = GoalManager(session_key)
++    manager.set("finish the current task")
++    continuation = manager.next_continuation_prompt()
++    seen_prompts = []
++    results = iter([_compression_failure(), {"final_response": "recovered work"}])
++
++    def run_conversation(message, **_kwargs):
++        seen_prompts.append(message)
++        return next(results)
++
++    judged = []
++
++    def evaluate(self, response, **_kwargs):
++        judged.append(response)
++        return {"message": "", "should_continue": False}
++
++    monkeypatch.setattr(GoalManager, "evaluate_after_turn", evaluate)
++    terminal_errors = []
++    monkeypatch.setattr(
++        server,
++        "_emit_terminal_turn_error",
++        lambda _sid, _session, error: terminal_errors.append(error),
++    )
++    agent = types.SimpleNamespace(
++        session_id=session_key,
++        run_conversation=run_conversation,
++        clear_interrupt=lambda: None,
++    )
++    session = _turn_session(agent, session_key)
++
++    server._run_prompt_submit("rid", "sid", session, "initial work")
++
++    assert seen_prompts == ["initial work", continuation]
++    assert judged == ["recovered work"]
++    assert terminal_errors == []
++
++
++@pytest.mark.parametrize(
++    ("branch", "expected_log"),
++    [
++        ("compression_recovery", "goal compression recovery failed"),
++        ("continuation", "goal continuation hook failed"),
++    ],
++)
++def test_valid_pin_keeps_non_integrity_goal_hook_errors_fail_open(
++    server,
++    turn_env,
++    monkeypatch,
++    tmp_path,
++    capsys,
++    branch,
++    expected_log,
++):
++    from hermes_cli.goals import GoalManager
++
++    _install_pinned_goal_config(
++        server,
++        monkeypatch,
++        tmp_path,
++        "goals:\n  max_turns: 20\n",
++    )
++    session_key = f"goal-valid-pin-hook-error-{branch}"
++    GoalManager(session_key).set("finish the current task")
++    seen_prompts = []
++    result = (
++        _compression_failure()
++        if branch == "compression_recovery"
++        else {"final_response": "completed work"}
++    )
++
++    def run_conversation(message, **_kwargs):
++        seen_prompts.append(message)
++        return result
++
++    def fail_hook(*_args, **_kwargs):
++        raise RuntimeError("ordinary goal hook failure")
++
++    if branch == "compression_recovery":
++        monkeypatch.setattr(GoalManager, "is_active", fail_hook)
++    else:
++        monkeypatch.setattr(GoalManager, "evaluate_after_turn", fail_hook)
++    terminal_errors = []
++    monkeypatch.setattr(
++        server,
++        "_emit_terminal_turn_error",
++        lambda _sid, _session, error: terminal_errors.append(error),
++    )
++    agent = types.SimpleNamespace(
++        session_id=session_key,
++        run_conversation=run_conversation,
++        clear_interrupt=lambda: None,
++    )
++    session = _turn_session(agent, session_key)
++
++    server._run_prompt_submit("rid", "sid", session, "initial work")
++
++    assert seen_prompts == ["initial work"]
++    assert terminal_errors == []
++    assert expected_log in capsys.readouterr().err
++
++
+ def test_new_goal_does_not_inherit_previous_goal_recovery_attempt(server):
+     from hermes_cli.goals import GoalManager
+ 
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index b543ec2cd3e723c70e9c017c2cf4c35a0bd11b1a..3545472e722d9de3262ff1a81aeece8300b2fa35 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -32,6 +32,7 @@ from hermes_constants import (
+     set_hermes_home_override,
+ )
+ from hermes_cli.env_loader import load_hermes_dotenv
++from hermes_cli.managed_scope import ManagedConfigIntegrityError
+ from utils import is_truthy_value
+ from tools.environments.local import hermes_subprocess_env
+ from agent.replay_cleanup import sanitize_replay_history
+@@ -581,6 +582,8 @@ def _claim_active_session_slot(
+             config=_load_cfg(),
+             metadata={"live_session_id": live_session_id},
+         )
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception as exc:
+         logger.warning("Failed to claim active session slot: %s", exc)
+         return None, None
+@@ -1300,6 +1303,8 @@ def _max_live_sessions() -> int:
+                 raw = gateway_cfg.get("max_live_sessions")
+         coerced = coerce_max_concurrent_sessions(raw, key="max_live_sessions")
+         return int(coerced) if coerced else 0
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         return 0
+ 
+@@ -1585,6 +1590,8 @@ def _profile_configured_cwd(profile_home: Path | None) -> str | None:
+         if isinstance(expanded, dict):
+             data = expanded
+         return _configured_cwd_from_cfg(data)
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         return None
+ 
+@@ -1602,6 +1609,8 @@ def _launch_configured_cwd() -> str | None:
+     """
+     try:
+         return _configured_cwd_from_cfg(_load_cfg())
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         return None
+ 
+@@ -2773,6 +2782,8 @@ def _agent_build_wait_cap() -> float:
+             value = float(raw)
+             if value > 0:
+                 return value
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         pass
+     return 600.0
+@@ -3192,6 +3203,8 @@ def _terminal_task_cwd_with_source(session: dict | None) -> tuple[str, str]:
+                 cfg_backend = str(terminal_cfg.get("backend") or "").strip().lower()
+                 if cfg_backend and cfg_backend != "local":
+                     backend = cfg_backend
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:
+             pass
+ 
+@@ -3207,6 +3220,8 @@ def _terminal_task_cwd_with_source(session: dict | None) -> tuple[str, str]:
+                 terminal_cfg = _load_cfg().get("terminal", {})
+                 if isinstance(terminal_cfg, dict):
+                     raw = str(terminal_cfg.get("cwd") or "").strip()
++            except ManagedConfigIntegrityError:
++                raise
+             except Exception:
+                 raw = ""
+         if raw and raw not in {".", "auto", "cwd"}:
+@@ -3317,6 +3332,8 @@ def _effective_terminal_backend() -> str:
+                 cfg_backend = str(terminal_cfg.get("backend") or "").strip().lower()
+                 if cfg_backend and cfg_backend != "local":
+                     backend = cfg_backend
++        except ManagedConfigIntegrityError:
++            raise
+         except Exception:
+             pass
+     return backend or "local"
+@@ -3883,13 +3900,21 @@ def _apply_managed(cfg: dict) -> dict:
+     The TUI/desktop backend builds config independently of
+     hermes_cli.config.load_config, so without this a managed skin / reasoning_effort
+     / service_tier / provider_routing would be silently ignored here. Read-side
+-    only — the raw user config is what gets cached and saved. Fail-open.
++    only — the raw user config is what gets cached and saved. Legacy unpinned
++    scope stays fail-open; a Runtime digest pin is fail-closed.
+     """
++    pin_required = "HERMES_MANAGED_CONFIG_SHA256" in os.environ
+     try:
+         from hermes_cli import managed_scope
+ 
+         return managed_scope.apply_managed_overlay(cfg if isinstance(cfg, dict) else {})
+-    except Exception:
++    except ManagedConfigIntegrityError:
++        raise
++    except Exception as exc:
++        if pin_required:
++            raise ManagedConfigIntegrityError(
++                "pinned managed config overlay is unavailable"
++            ) from exc
+         return cfg
+ 
+ 
+@@ -4102,6 +4127,8 @@ def resolve_skin() -> dict:
+         }
+     except IdentityPolicyError:
+         raise
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         return {}
+ 
+@@ -4483,6 +4510,8 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
+         if detected:
+             provider, detected_model = detected
+             return detected_model, provider
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         pass
+     return model, None
+@@ -4926,6 +4955,8 @@ def _load_provider_routing() -> dict:
+     """
+     try:
+         return _load_cfg().get("provider_routing", {}) or {}
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         return {}
+ 
+@@ -11564,6 +11595,8 @@ def _plan_goal_compression_recovery(
+     try:
+         goals_cfg = _load_cfg().get("goals") or {}
+         goal_max_turns = int(goals_cfg.get("max_turns", 20) or 20)
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         goal_max_turns = 20
+ 
+@@ -12252,6 +12285,8 @@ def _run_prompt_submit(
+                     )
+                 if recovery_prompt:
+                     goal_followup = recovery_prompt
++            except ManagedConfigIntegrityError:
++                raise
+             except Exception as _goal_recovery_exc:
+                 print(
+                     f"[tui_gateway] goal compression recovery failed: "
+@@ -12272,6 +12307,8 @@ def _run_prompt_submit(
+                         try:
+                             goals_cfg = _load_cfg().get("goals") or {}
+                             goal_max_turns = int(goals_cfg.get("max_turns", 20) or 20)
++                        except ManagedConfigIntegrityError:
++                            raise
+                         except Exception:
+                             goal_max_turns = 20
+                         goal_mgr = GoalManager(
+@@ -12300,6 +12337,8 @@ def _run_prompt_submit(
+                                 cont_prompt = decision.get("continuation_prompt") or ""
+                                 if cont_prompt:
+                                     goal_followup = cont_prompt
++                except ManagedConfigIntegrityError:
++                    raise
+                 except Exception as _goal_exc:
+                     print(
+                         f"[tui_gateway] goal continuation hook failed: "
+@@ -14146,6 +14185,8 @@ def _compute_mcp_rev() -> str:
+             default=str,
+         )
+         return hashlib.sha1(rev_src.encode()).hexdigest()[:12]
++    except ManagedConfigIntegrityError:
++        raise
+     except Exception:
+         return ""
+ 

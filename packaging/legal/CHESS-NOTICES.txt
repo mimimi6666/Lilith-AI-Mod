@@ -1,0 +1,31 @@
+Lilith local chess payload (2026-10-21)
+
+Gera.Chess 1.1.1 (MIT), copyright 2024 Geras1mleo.
+https://www.nuget.org/packages/Gera.Chess/1.1.1
+https://github.com/Geras1mleo/Chess/tree/a59d2ca4128aba565fe6dc9e8b73eefbb9d8bbd3
+Full license: licenses/Gera.Chess-MIT.txt
+
+Ardalis.SmartEnum 2.0.1 (MIT), copyright 2017 Steve Smith.
+https://www.nuget.org/packages/Ardalis.SmartEnum/2.0.1
+https://github.com/ardalis/SmartEnum/tree/aeb2e99c731b581667aa1b4957e16d55ac5467ba
+Full license: licenses/Ardalis.SmartEnum-MIT.txt
+
+Stockfish 16, unmodified official Windows x86-64 engine, GPL version 3.
+https://github.com/official-stockfish/Stockfish/releases/tag/sf_16
+https://github.com/official-stockfish/Stockfish/releases/download/sf_16/stockfish-windows-x86-64.zip
+The engine communicates with the game through UCI in a separate process.
+Full license and authors: licenses/Stockfish-GPL-3.0.txt, licenses/Stockfish-AUTHORS.txt.
+Corresponding source and build scripts: source/stockfish16-official.zip.
+Matching evaluation network: source/nn-5af11540bbfe.nnue, SHA-256
+5AF11540BBFEFCB54E38C5DD000CAB4B469DFA7599A1D55BE5D2722C20A8929B.
+Network source: https://raw.githubusercontent.com/official-stockfish/networks/master/nn-5af11540bbfe.nnue
+For an offline source build, extract the official archive and place this NNUE
+file in stockfish/src. Follow the included Makefile and compiling documentation.
+No Stockfish source modifications were made. The binary contains its network.
+
+The game's adaptive difficulty values are local difficulty settings, not a
+certified player Elo rating. Opponent searches are bounded to one thread, no
+pondering and short thinking budgets. No external service is used for moves.
+
+Artwork is separately supplied owner-approved material. Software licenses above
+do not grant ownership of the game's character or other original game content.

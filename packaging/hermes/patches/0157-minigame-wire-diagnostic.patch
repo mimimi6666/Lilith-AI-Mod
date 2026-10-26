@@ -1,0 +1,298 @@
+diff --git a/agent/minigame_context.py b/agent/minigame_context.py
+index 612e48f..05a1f24 100644
+--- a/agent/minigame_context.py
++++ b/agent/minigame_context.py
+@@ -7,8 +7,11 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ from copy import deepcopy
++from contextlib import contextmanager
++from contextvars import ContextVar
+ import json
+ import re
++import threading
+ import time
+ 
+ SCHEMA = "lilith.minigame.public.v1"
+@@ -320,10 +323,10 @@ class GameContextDiagnosticObserver:
+     """One accepted turn, at most one event per stage; never stored on an agent.
+ 
+     The observer stores only the immutable grant, native turn identity, callback
+-    and a three-item stage set. It never retains a context, prompt or request.
++    and bounded presence metadata. It never retains a context, prompt or request.
+     Optional evidence failures cannot change the ordinary conversation outcome.
+     """
+-    __slots__ = ("_lease", "_turn_id", "_emit", "_seen")
++    __slots__ = ("_lease", "_turn_id", "_emit", "_seen", "_wire_lock", "_wire_closed", "_wire")
+ 
+     def __init__(self, lease, turn_id, emit):
+         if (type(lease) is not GameContextDiagnosticLease or type(turn_id) is not str
+@@ -331,6 +334,82 @@ class GameContextDiagnosticObserver:
+             raise ValueError("invalid mini-game diagnostic observer")
+         self._lease, self._turn_id, self._emit = lease, turn_id, emit
+         self._seen = set()
++        self._wire_lock = threading.Lock()
++        self._wire_closed = False
++        self._wire = dict(route="other", mode="nonstream", unsupportedReason="none",
++                          sdkRequests=0, wireRequests=0, firstSdk="not-observed",
++                          lastSdk="not-observed", firstWire="not-observed", lastWire="not-observed",
++                          anyMissing=False, anyUnknown=False, saturated=False)
++
++    def wire_active(self):
++        with self._wire_lock:
++            return not self._wire_closed and int(time.time() * 1000) < self._lease.expires_at_ms
++
++    def wire_route(self, supported):
++        with self._wire_lock:
++            if self._wire_closed or int(time.time() * 1000) >= self._lease.expires_at_ms:
++                return
++            if supported:
++                self._wire["route"] = "chat"
++            elif self._wire["unsupportedReason"] == "none":
++                self._wire["unsupportedReason"] = "route"
++
++    def wire_unsupported(self, reason):
++        with self._wire_lock:
++            if (self._wire_closed or int(time.time() * 1000) >= self._lease.expires_at_ms
++                    or reason not in {"route", "ownership", "hook", "body"}):
++                return
++            if self._wire["unsupportedReason"] == "none":
++                self._wire["unsupportedReason"] = reason
++
++    def wire_observe(self, boundary, presence):
++        self.wire_inspect(boundary, lambda: (presence, "none"))
++
++    def wire_inspect(self, boundary, inspect):
++        """Reserve bounded inspection under the same close/count lock."""
++        with self._wire_lock:
++            if (self._wire_closed or int(time.time() * 1000) >= self._lease.expires_at_ms
++                    or boundary not in {"Sdk", "Wire"}):
++                return
++            key = boundary.lower() + "Requests"
++            if self._wire[key] >= 32:
++                self._wire["saturated"] = True
++                return
++            try:
++                presence, reason = inspect()
++            except Exception:
++                presence, reason = "unknown", "body" if boundary == "Wire" else "none"
++            if presence not in {"present", "absent", "unknown"}:
++                return
++            if reason in {"route", "ownership", "hook", "body"} and self._wire["unsupportedReason"] == "none":
++                self._wire["unsupportedReason"] = reason
++            if self._wire[key] == 0:
++                self._wire["first" + boundary] = presence
++            self._wire[key] += 1
++            self._wire["last" + boundary] = presence
++            self._wire["anyMissing"] |= presence == "absent"
++            self._wire["anyUnknown"] |= presence == "unknown"
++
++    def finish_wire(self):
++        """Close even on cancellation; copied worker scopes cannot publish late.
++
++        Counts describe at most the first 32 examined items at each boundary.
++        This is local SDK serialization evidence, never remote receipt evidence.
++        """
++        try:
++            with self._wire_lock:
++                if self._wire_closed:
++                    return
++                self._wire_closed = True
++                if int(time.time() * 1000) >= self._lease.expires_at_ms:
++                    return
++                evidence = dict(self._wire)
++            status = ("observed" if evidence["wireRequests"] or evidence["sdkRequests"] else "unsupported"
++                      if evidence["unsupportedReason"] != "none" else "not-observed")
++            self._emit(dict(traceId=self._lease.trace_id, turnId=self._turn_id, stage="wire",
++                            status=status, strictPolicyEnabled=None, **evidence))
++        except Exception:
++            return
+ 
+     def observe(self, stage, status, *, route="not-observed", strict_policy_enabled=None):
+         try:
+@@ -381,6 +460,133 @@ class GameContextDiagnosticObserver:
+             return
+ 
+ 
++_WIRE_BINDING = ContextVar("minigame_wire_diagnostic", default=None)
++_WIRE_BODY_LIMIT = 4 * 1024 * 1024
++
++
++@dataclass(frozen=True, slots=True)
++class _WireBinding:
++    observer: GameContextDiagnosticObserver
++    context: PublicGameContext | None
++    agent: object
++
++
++@contextmanager
++def bind_wire_diagnostic(observer, context, agent, *, supported):
++    """Only the main dispatch binds this scope; native workers copy ContextVars."""
++    token = _WIRE_BINDING.set(None)
++    try:
++        if type(observer) is GameContextDiagnosticObserver and observer.wire_active():
++            observer.wire_route(supported)
++            if supported:
++                _WIRE_BINDING.set(_WireBinding(observer, context, agent))
++    except Exception:
++        pass
++    try:
++        yield
++    finally:
++        if token is not None:
++            _WIRE_BINDING.reset(token)
++
++
++def _wire_presence(request, context):
++    """Inspect authority only, without retaining any request text or body."""
++    try:
++        if type(request) is not dict or type(request.get("messages")) is not list:
++            return "unknown"
++        if type(context) is not PublicGameContext:
++            return "absent"
++        from agent.identity_policy import _provider_authority_text
++        for row in request["messages"]:
++            if type(row) is dict and row.get("role") in {"system", "developer"}:
++                text = _provider_authority_text(row.get("content"))
++                if type(text) is str and context.reference in text:
++                    return "present"
++        return "absent"
++    except Exception:
++        return "unknown"
++
++
++def _owned_wire_http_client(agent, client):
++    """Do not infer exclusive ownership from being different from primary.
++
++    An occupied cache can produce an untracked fresh client; that case remains
++    unsupported. The normal worker releases this exact checked-out cache slot
++    only after our send callback's finally has removed its hook.
++    """
++    from openai import OpenAI
++    import httpx
++    if type(client) is not OpenAI or type(getattr(client, "_client", None)) is not httpx.Client:
++        return None
++    with agent._openai_client_lock():
++        cache = getattr(agent, "_request_client_cache", None)
++        if (type(cache) is dict and cache.get("client") is client
++                and cache.get("in_use") is True and cache.get("poisoned") is False
++                and client is not getattr(agent, "client", None)):
++            return client._client
++    return None
++
++
++def observe_wire_sdk_request(agent, client, request, send):
++    """Called INSIDE the native budget send callback, after all proof checks.
++
++    Append to existing request hooks and remove only this exact hook. Never read
++    a stream, response, URL, credential, or provider error. The original SDK
++    result/exception and any prior hook's exception remain unchanged.
++    """
++    binding = _WIRE_BINDING.get()
++    if type(binding) is not _WireBinding or binding.agent is not agent:
++        return send()
++    observer, context = binding.observer, binding.context
++    http = hook = None
++    active = False
++    try:
++        active = observer.wire_active()
++    except Exception:
++        pass
++    if not active:
++        return send()
++    try:
++        observer.wire_inspect("Sdk", lambda: (_wire_presence(request, context), "none"))
++        http = _owned_wire_http_client(agent, client)
++        if http is None:
++            observer.wire_unsupported("ownership")
++        else:
++            def hook(outgoing):
++                try:
++                    def inspect_body():
++                        body = outgoing.content  # cached bytes only; never .read()
++                        if type(body) is not bytes or len(body) > _WIRE_BODY_LIMIT:
++                            return "unknown", "body"
++                        return _wire_presence(json.loads(body), context), "none"
++                    observer.wire_inspect("Wire", inspect_body)
++                except Exception:
++                    pass
++            hooks = http.event_hooks.get("request")
++            if type(hooks) is not list:
++                observer.wire_unsupported("hook")
++                hook = None
++            else:
++                hooks.append(hook)
++    except Exception:
++        try:
++            observer.wire_unsupported("hook")
++        except Exception:
++            pass
++    try:
++        return send()
++    finally:
++        if http is not None and hook is not None:
++            try:
++                hooks = http.event_hooks.get("request")
++                if type(hooks) is list:
++                    for index in range(len(hooks) - 1, -1, -1):
++                        if hooks[index] is hook:
++                            del hooks[index]
++            except Exception:
++                pass
++
++
+ def diagnostic_request_copy(request, *, _redacted=None):
+     """Remove host facts from an owned diagnostic copy, never the SDK request.
+ 
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 453916a..e7c8963 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -3289,9 +3289,13 @@ def run_conversation(
+ 
+                 def _perform_api_call(next_api_kwargs):
+                     from agent.local_compatibility import bind_policy, for_agent
++                    from agent.minigame_context import bind_wire_diagnostic
+                     # Worker threads already copy the native ContextVars; the
+                     # physical SDK leaf must see this exact frozen turn policy.
+-                    with bind_policy(for_agent(agent)):
++                    with bind_policy(for_agent(agent)), bind_wire_diagnostic(
++                            game_context_diagnostic, game_context, agent,
++                            supported=(agent.api_mode == "chat_completions"
++                                       and agent.provider != "moa" and not _use_streaming)):
+                         return _perform_api_call_bound(next_api_kwargs)
+ 
+                 from hermes_cli.middleware import run_llm_execution_middleware
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index f44f2c2..d2dedd6 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -594,9 +594,11 @@ def _dispatch_nonstreaming_api_request(
+         return native_chat_dispatch_sync(agent.client, api_kwargs,
+             lambda wire: observe_chat_sdk_request(agent, agent.client.chat.completions.create, wire), expected_handle=_budget_handle)
+     request_client = make_client("chat_completion_request")
++    from agent.minigame_context import observe_wire_sdk_request
+     return native_chat_dispatch_sync(
+         request_client, api_kwargs,
+-        lambda request: observe_chat_sdk_request(agent, request_client.chat.completions.create, request),
++        lambda request: observe_wire_sdk_request(agent, request_client, request,
++            lambda: observe_chat_sdk_request(agent, request_client.chat.completions.create, request)),
+         expected_handle=_budget_handle,
+     )
+ 
+diff --git a/run_agent.py b/run_agent.py
+index 41de6fc..f117851 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -8664,6 +8664,11 @@ class AIAgent:
+             raise
+         finally:
+             try:
++                if game_context_diagnostic is not None:
++                    try:
++                        game_context_diagnostic.finish_wire()
++                    except Exception:
++                        pass  # Optional evidence cannot change turn completion.
+                 if relay_turn is not None:
+                     relay_runtime.SESSION_COORDINATOR.end_turn(
+                         relay_turn,

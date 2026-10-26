@@ -1,0 +1,213 @@
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 1e0c3878..8e2e2a99 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -1408,6 +1408,10 @@ def _(rid, params: dict) -> dict:
+                 max_tokens=kwargs.get("max_tokens"),
+                 timeout=kwargs.get("timeout"),
+                 extra_body=kwargs.get("extra_body"),
++                # Formatting-only: request no extra reasoning on this call,
++                # without changing the main agent's reasoning configuration.
++                # Provider adapters retain their supported wire semantics.
++                reasoning_config={"enabled": False},
+                 tools=None,
+                 stream=False,
+                 route_info=route_info,
+diff --git a/tests/tui_gateway/test_speech_projection.py b/tests/tui_gateway/test_speech_projection.py
+index 530da9d0..99984ce4 100644
+--- a/tests/tui_gateway/test_speech_projection.py
++++ b/tests/tui_gateway/test_speech_projection.py
+@@ -109,10 +109,27 @@ def _trust_projection_plugin(monkeypatch):
+     )
+ 
+ 
++@pytest.mark.parametrize(
++    "provider,model,base_url",
++    [
++        ("gemini", "gemini-2.5-flash", "https://generativelanguage.googleapis.com/v1beta/openai"),
++        ("deepseek", "deepseek-v4-pro", "https://api.deepseek.com"),
++        ("future-provider", "future-model", "https://future-provider.invalid/v1"),
++    ],
++)
+ def test_project_speech_is_one_memory_isolated_structured_main_route_call(
+     monkeypatch,
++    provider,
++    model,
++    base_url,
+ ):
+     agent = _agent()
++    agent.provider = agent.requested_provider = provider
++    agent.model = model
++    agent.base_url = base_url
++    agent.reasoning_config = {"enabled": True, "effort": "high"}
++    main_reasoning = agent.reasoning_config
++    original_reasoning = copy.deepcopy(main_reasoning)
+     session, original_history = _install_session(monkeypatch, agent)
+     attestation = _attest_session(monkeypatch, session)
+     _trust_projection_plugin(monkeypatch)
+@@ -127,15 +144,17 @@ def test_project_speech_is_one_memory_isolated_structured_main_route_call(
+         assert_authority,
+     )
+     captured = {}
++    calls = []
+ 
+     def fake_call_llm(**kwargs):
++        calls.append(kwargs)
+         captured.update(kwargs)
+         captured["main_runtime_before_provider"] = kwargs["main_runtime"]["provider"]
+         # The handler passes a private copy, not its retained frozen snapshot.
+         kwargs["main_runtime"]["provider"] = "mutated-by-test-double"
+         kwargs["route_info"].update(
+-            provider="gemini",
+-            model="gemini-2.5-flash",
++            provider=provider,
++            model=model,
+         )
+         return _response({"speech_text": "おはよう。会えてうれしい。"})
+ 
+@@ -170,15 +189,21 @@ def test_project_speech_is_one_memory_isolated_structured_main_route_call(
+     assert captured["temperature"] == 0.0
+     assert captured["max_tokens"] == 4096
+     assert captured["timeout"] == 60.0
+-    assert captured["main_runtime_before_provider"] == "gemini"
++    assert len(calls) == 1
++    assert captured["reasoning_config"] == {"enabled": False}
++    assert captured["reasoning_config"] is not main_reasoning
++    assert agent.reasoning_config is main_reasoning
++    assert agent.reasoning_config == original_reasoning
++    assert agent.provider == provider
++    assert captured["main_runtime_before_provider"] == provider
+     assert {
+         key: value
+         for key, value in captured["main_runtime"].items()
+         if key != "provider"
+     } == {
+-        "requested_provider": "gemini",
+-        "model": "gemini-2.5-flash",
+-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
++        "requested_provider": provider,
++        "model": model,
++        "base_url": base_url,
+         "api_key": "test-route-key",
+         "api_mode": "chat_completions",
+         "auth_mode": "api_key",
+@@ -435,5 +460,119 @@ def test_project_speech_rejects_failed_durable_lineage_reattestation(monkeypatch
+     call_llm.assert_not_called()
+ 
+ 
++@pytest.mark.parametrize("failure", [TimeoutError, ValueError])
++def test_project_speech_provider_failure_preserves_main_reasoning_and_history(
++    monkeypatch,
++    failure,
++):
++    agent = _agent()
++    agent.reasoning_config = {"enabled": True, "effort": "high"}
++    main_reasoning = agent.reasoning_config
++    session, original_history = _install_session(monkeypatch, agent)
++    _attest_session(monkeypatch, session)
++    _trust_projection_plugin(monkeypatch)
++    monkeypatch.setattr(
++        identity_policy, "assert_scoped_identity_prompt", lambda *_args, **_kwargs: None
++    )
++    call_llm = MagicMock(side_effect=failure("synthetic provider failure"))
++    monkeypatch.setattr("agent.auxiliary_client.call_llm", call_llm)
++
++    result = server._methods["prompt.project_speech"](
++        "provider-failure",
++        {
++            "session_id": "sid",
++            "text": "早安",
++            "display_locale": "zh-Hant",
++            "speech_locale": "ja",
++        },
++    )
++
++    assert result["error"] == {"code": 5030, "message": "speech projection failed"}
++    call_llm.assert_called_once()
++    assert call_llm.call_args.kwargs["reasoning_config"] == {"enabled": False}
++    assert agent.reasoning_config is main_reasoning
++    assert agent.reasoning_config == {"enabled": True, "effort": "high"}
++    assert session["history"] == original_history
++    agent.run_conversation.assert_not_called()
++
++
++@pytest.mark.parametrize(
++    "provider,model,base_url,expected_controls",
++    [
++        (
++            "deepseek",
++            "deepseek-v4-flash",
++            "https://api.deepseek.com/v1",
++            {"thinking": {"type": "disabled"}},
++        ),
++        (
++            "gemini",
++            "gemini-2.5-flash",
++            "https://generativelanguage.googleapis.com/v1beta",
++            {"thinking_config": {"includeThoughts": False}},
++        ),
++        (
++            "openrouter",
++            "anthropic/claude-sonnet-4.6",
++            "https://openrouter.ai/api/v1",
++            {},
++        ),
++        (
++            "future-provider",
++            "future-model",
++            "https://future-provider.invalid/v1",
++            {"reasoning": {"enabled": False}},
++        ),
++    ],
++)
++def test_speech_reasoning_request_respects_provider_wire_semantics(
++    monkeypatch,
++    provider,
++    model,
++    base_url,
++    expected_controls,
++):
++    import socket
++
++    def reject_network(*_args, **_kwargs):
++        raise AssertionError("speech wire-shape tests must remain offline")
++
++    monkeypatch.setattr(socket, "create_connection", reject_network)
++    monkeypatch.setattr(socket.socket, "connect", reject_network)
++
++    from agent.auxiliary_client import _build_call_kwargs
++
++    requested_reasoning = {"enabled": False}
++    messages = [{"role": "user", "content": "Synthetic speech text"}]
++    kwargs = _build_call_kwargs(
++        provider,
++        model,
++        messages,
++        temperature=0.0,
++        max_tokens=4096,
++        timeout=60.0,
++        reasoning_config=requested_reasoning,
++        base_url=base_url,
++        task=None,
++    )
++
++    body = kwargs.get("extra_body", {})
++    actual_controls = {
++        key: body[key]
++        for key in ("thinking", "thinking_config", "reasoning")
++        if key in body
++    }
++    # The same request has different supported semantics: Gemini hides thought
++    # output, and mandatory-thinking models omit unsupported disable fields.
++    # Neither is evidence that their internal reasoning is actually disabled.
++    assert actual_controls == expected_controls
++    assert "reasoning_effort" not in kwargs
++    assert "verbosity" not in kwargs
++    assert "_reasoning_config" not in kwargs
++    assert kwargs["model"] == model
++    assert requested_reasoning == {"enabled": False}
++    assert messages == [{"role": "user", "content": "Synthetic speech text"}]
++
++
+ def test_project_speech_is_dispatched_off_the_transport_reader():
+     assert "prompt.project_speech" in server._LONG_HANDLERS

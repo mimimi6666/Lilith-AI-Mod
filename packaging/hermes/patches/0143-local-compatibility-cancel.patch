@@ -1,0 +1,34 @@
+diff --git a/agent/usage_strategy_context.py b/agent/usage_strategy_context.py
+index 256aade..583b808 100644
+--- a/agent/usage_strategy_context.py
++++ b/agent/usage_strategy_context.py
+@@ -106,7 +106,28 @@ def project_context(agent, projected, units, spec, origin, *, source=None, histo
+             summary_attempted = True
+             summary_added_turns = len(old) - len(pending)
+             try:
+-                summary = checkpoint._generate_summary(compact_results(rows, spec.old_tool_chars))
++                from agent.local_compatibility import for_agent
++                if for_agent(agent) is not None:
++                    # Rolling checkpoints bypass archive_and_compact(), whose
++                    # ordinary compression wrapper binds the hard-stop Event.
++                    # Borrow only this exact local turn owner's existing Event;
++                    # never mint a substitute or copy ambient plugin authority.
++                    from threading import Event
++                    from agent.auxiliary_client import aux_interrupt_protection, AuxiliaryExplicitCancellation
++                    cancel = getattr(agent, "_hard_interrupt_requested", None)
++                    if not isinstance(cancel, Event):
++                        raise RuntimeError("local summary cancellation source unavailable")
++                    try:
++                        with aux_interrupt_protection(cancel_event=cancel):
++                            summary = checkpoint._generate_summary(compact_results(rows, spec.old_tool_chars))
++                    except AuxiliaryExplicitCancellation:
++                        # Preserve originals here. The existing host projection
++                        # guard sees this stopped ledger and emits turn_stopped
++                        # before it can send the main request or publish state.
++                        origin.ledger.stop()
++                        summary = None
++                else:
++                    summary = checkpoint._generate_summary(compact_results(rows, spec.old_tool_chars))
+             except Exception:
+                 summary = None
+             if isinstance(summary, str) and summary.strip() and not origin.ledger.snapshot().stopped:

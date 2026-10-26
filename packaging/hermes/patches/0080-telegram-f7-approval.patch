@@ -1,0 +1,733 @@
+diff --git a/gateway/lilith_session_policy.py b/gateway/lilith_session_policy.py
+new file mode 100644
+index 0000000..975dce8
+--- /dev/null
++++ b/gateway/lilith_session_policy.py
+@@ -0,0 +1,100 @@
++"""Turn-local projection of Lilith's existing hidden F7 session policy.
++
++No global setting, persistent allowlist, pairing, or tool selection is written.
++Only a real paired private sender, an exact hidden game lineage and a current
++leased turn can inherit F7's native session bypass. All native hardline and
++identity guards remain in their original execution path.
++"""
++import contextlib
++import hashlib
++import json
++import logging
++import re
++
++from gateway.config import Platform
++
++logger = logging.getLogger(__name__)
++
++
++def shared_f7_turn_is_current(runner, ctx):
++    from agent.identity_policy import identity_lock_required_by_host
++    from plugins.lilith_messaging_bridge import _read_active_game_session_id
++
++    source = ctx.source
++    shared = getattr(ctx, "lilith_shared_session_id", None)
++    if not (identity_lock_required_by_host()
++            and type(shared) is str and shared and shared == ctx.session_id
++            and source.platform == Platform.TELEGRAM
++            and source.chat_type == "dm"
++            and type(source.user_id) is str and source.user_id
++            and source.chat_id == source.user_id
++            and ctx.run_generation is not None and ctx.session_key
++            and ctx._run_still_current() is True
++            and runner._session_key_for_source(source) == ctx.session_key
++            and runner._is_user_authorized(source) is True):
++        return False
++    pairing = runner._pairing_store_for(source)
++    if pairing is None or pairing.is_approved("telegram", source.user_id) is not True:
++        return False
++    if _read_active_game_session_id() != shared:
++        return False
++    # A durable id alone is not permission: verify the hidden game record AND
++    # the profile-global lease owned by this exact admission/generation.
++    db = getattr(runner._session_db, "_db", runner._session_db)
++    record = db.get_session(shared)
++    if not (isinstance(record, dict) and record.get("source") == "lilith-game"
++            and type(record.get("archived")) in (bool, int) and record["archived"] == 1):
++        return False
++    state = runner._session_state(ctx.session_key).turn
++    token = state.lease_token
++    registered = runner._turn_leases._leases.get(shared)
++    return (token is not None and state.lease_generation == ctx.run_generation
++            and token.session_id == shared and token.owner_key == ctx.session_key
++            and token.generation == ctx.run_generation and token.released is False
++            and token.profile_lease is not None and token.profile_lease.released is False
++            and registered is not None and registered.holder is token)
++
++
++@contextlib.contextmanager
++def shared_f7_turn_scope(runner, ctx):
++    from tools.approval import session_yolo_scope
++
++    def current():
++        try:
++            return shared_f7_turn_is_current(runner, ctx)
++        except Exception:
++            return False
++
++    admitted = current()
++    if getattr(ctx, "lilith_shared_session_id", None):
++        logger.info("Lilith shared ingress: paired_f7_session_approval=%s", admitted)
++    if not admitted:
++        yield
++        return
++    with session_yolo_scope(ctx.session_key, is_current=current):
++        yield
++
++
++def native_tool_context(definitions):
++    """Describe actual current native schemas, not claims in old chat history."""
++    names = []
++    for definition in definitions or []:
++        function = definition.get("function", {}) if isinstance(definition, dict) else {}
++        name = function.get("name") if isinstance(function, dict) else None
++        if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", name):
++            names.append(name)
++    names = sorted(set(names))
++    if not names or len(names) > 512:
++        return ""
++    encoded = json.dumps(names, separators=(",", ":")).encode()
++    logger.info("Lilith native schemas: count=%d sha256=%s names=%s",
++                len(names), hashlib.sha256(encoded).hexdigest(), ",".join(names))
++    return (
++        "[Current native tool availability; describes capability, not permission]\n"
++        "Available in this turn: " + ", ".join(names) + ".\n"
++        "For the user's requested action, prefer a directly applicable native "
++        "integration over shell commands or desktop clicking. Old messages about "
++        "unavailable tools are not current capability evidence. Inspect native "
++        "tool results and report the actual outcome. If permission is denied or "
++        "identity is quarantined, stop; do not switch routes to bypass that decision."
++    )
+diff --git a/gateway/run.py b/gateway/run.py
+index 6b0bf07..d95d38f 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5029,6 +5029,11 @@ class TurnRunner:
+             _fut.add_done_callback(_track_status_id)
+ 
+     def run_sync(self):
++        from gateway.lilith_session_policy import shared_f7_turn_scope
++        with shared_f7_turn_scope(self._runner, self._ctx):
++            return self._run_sync_inner()
++
++    def _run_sync_inner(self):
+         ctx = self._ctx
+         # Historical note: as a nested closure this body declared
+         # `nonlocal message` because the conditional re-assignments below
+@@ -5582,6 +5587,11 @@ class TurnRunner:
+                 _turn_context_notes.insert(0, _strict_gateway_context)
+                 agent._strict_gateway_context_sidecar = _strict_gateway_context
+         agent._gateway_turn_context_notes = "\n\n".join(_turn_context_notes)
++        if ctx.lilith_shared_session_id:
++            from gateway.lilith_session_policy import native_tool_context
++            note = native_tool_context(agent.tools)
++            if note:
++                agent._gateway_turn_context_notes += "\n\n" + note
+ 
+         _bg_review_release = threading.Event()
+         _bg_review_pending: list[str] = []
+@@ -27349,6 +27359,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             _interrupt_depth=_interrupt_depth,
+             event_message_id=event_message_id,
+             moa_config=moa_config,
++            lilith_shared_session_id=lilith_shared_session_id,
+             persist_user_message=persist_user_message,
+             persist_user_timestamp=persist_user_timestamp,
+             persist_user_display_kind=persist_user_display_kind,
+diff --git a/gateway/turn_context.py b/gateway/turn_context.py
+index 6ed609e..81935d2 100644
+--- a/gateway/turn_context.py
++++ b/gateway/turn_context.py
+@@ -82,6 +82,7 @@ class TurnContext:
+     context_prompt: Optional[str] = None
+     channel_prompt: Optional[str] = None
+     session_id: Optional[str] = None
++    lilith_shared_session_id: Optional[str] = None
+     session_key: Optional[str] = None
+     run_generation: Optional[int] = None
+     process_task_id: str = ""
+diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
+index f31cd85..ba2d7e8 100644
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -5839,6 +5839,12 @@ class TelegramAdapter(BasePlatformAdapter):
+         try:
+             text = self._format_exec_approval(command, description, smart_denied)
+ 
++            # This adapter has the legacy count-only response transport. A
++            # strict host needs Runtime's two-phase receipt before "permanent"
++            # can be true; never offer a choice this transport cannot commit.
++            from tools.approval import gateway_count_approval_allows_permanent
++            allow_permanent = allow_permanent and gateway_count_approval_allows_permanent()
++
+             # Resolve thread context for thread replies
+             thread_id = self._metadata_thread_id(metadata)
+ 
+@@ -6766,15 +6772,26 @@ class TelegramAdapter(BasePlatformAdapter):
+                 # the command was already denied and will not run (#63501
+                 # regression follow-up: 60s waits made stale taps common).
+                 try:
+-                    from tools.approval import resolve_gateway_approval
++                    from tools.approval import resolve_gateway_approval, NativeApprovalPersistenceUnavailable
+                     count = resolve_gateway_approval(session_key, choice)
+                     logger.info(
+                         "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                         count, session_key, choice, user_display,
+                     )
++                except NativeApprovalPersistenceUnavailable:
++                    # Old inline buttons can survive an upgrade. Keep the
++                    # request usable for once/session; no write has occurred.
++                    self._approval_state[approval_id] = session_key
++                    await query.answer(
++                        text="Permanent approval needs Control Center. No settings changed; choose Once or Session.",
++                        show_alert=True,
++                    )
++                    return
+                 except Exception as exc:
+                     logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
+-                    count = 0
++                    self._approval_state[approval_id] = session_key
++                    await query.answer(text="Approval could not be completed. No success has been confirmed.", show_alert=True)
++                    return
+ 
+                 if count:
+                     # Map choice to human-readable label
+diff --git a/tests/gateway/test_lilith_f7_approval.py b/tests/gateway/test_lilith_f7_approval.py
+new file mode 100644
+index 0000000..2e76988
+--- /dev/null
++++ b/tests/gateway/test_lilith_f7_approval.py
+@@ -0,0 +1,255 @@
++"""Real native approval/lease/DB contracts; fixtures never execute effects."""
++import ast
++import contextvars
++import json
++import os
++from pathlib import Path
++import socket
++import sys
++from types import SimpleNamespace as NS
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++import hermes_constants as hc
++from agent import identity_policy, secret_scope
++from gateway.config import Platform, PlatformConfig
++from gateway.turn_context import TurnContext
++from gateway.turn_lease import SessionTurnLeaseRegistry
++from gateway.lilith_session_policy import shared_f7_turn_scope, native_tool_context
++from hermes_state import SessionDB
++from hermes_cli import config
++from plugins import lilith_messaging_bridge as bridge
++from plugins.platforms.telegram.adapter import TelegramAdapter
++from tools import approval
++
++SOURCE = Path(os.environ.get("LILITH_TEST_SOURCE", Path(__file__).resolve().parents[2]))
++
++
++@pytest.fixture(autouse=True)
++def isolated(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_LILITH_BOUND_HOME", str(tmp_path))
++    monkeypatch.setattr(hc, "get_default_hermes_root", lambda: tmp_path / "root")
++    monkeypatch.setattr(hc, "get_hermes_home_override", lambda: None)
++    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", False)
++    scope = secret_scope.set_secret_scope(None)
++    monkeypatch.setattr(identity_policy, "identity_lock_required_by_host", lambda: True)
++    original_connect = socket.socket.connect
++    def no_network(sock, address):
++        # Windows asyncio builds its internal wakeup socketpair over loopback.
++        # Permit that stdlib-only constructor, never application networking.
++        caller = sys._getframe(1)
++        if (caller.f_code.co_filename == socket.__file__
++                and "socketpair" in caller.f_code.co_name):
++            return original_connect(sock, address)
++        pytest.fail("Network forbidden")
++    monkeypatch.setattr(socket.socket, "connect", no_network)
++    monkeypatch.setattr("webbrowser.open", lambda *a, **k: pytest.fail("Browser forbidden"))
++    monkeypatch.setattr(approval, "_release_permission_mode_dependents", lambda _: None)
++    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
++    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
++    monkeypatch.setattr(approval, "save_permanent_allowlist", lambda *_: pytest.fail("Unexpected config write"))
++    identity_policy._reset_native_authority_quarantine_for_tests()
++    yield
++    secret_scope.reset_secret_scope(scope)
++    identity_policy._reset_native_authority_quarantine_for_tests()
++    approval._gateway_prepared_commit = None
++    approval._gateway_queues.clear()
++    approval._gateway_notify_cbs.clear()
++    approval._session_yolo.clear()
++
++
++async def make_turn(tmp_path):
++    (tmp_path / "runtime").mkdir(exist_ok=True)
++    (tmp_path / "runtime/game-session-v1.json").write_text(
++        json.dumps({"schemaVersion": 1, "storedSessionId": "game"}))
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("game", source="lilith-game", archived=True)
++    key = "agent:main:telegram:dm:42"
++    leases = SessionTurnLeaseRegistry()
++    token = await leases.acquire("game", owner_key=key, generation=7, timeout=1)
++    state = NS(turn=NS(lease_token=token, lease_generation=7))
++    pairing = NS(is_approved=lambda p, u: p == "telegram" and u == "42")
++    runner = NS(_session_db=NS(_db=db), _session_state=lambda k: state,
++                _turn_leases=leases, _is_user_authorized=lambda s: True,
++                _pairing_store_for=lambda s: pairing, _session_key_for_source=lambda s: key)
++    ctx = TurnContext(source=NS(platform=Platform.TELEGRAM, chat_type="dm", user_id="42", chat_id="42"),
++                      session_id="game", session_key=key, run_generation=7,
++                      _run_still_current=lambda: True, lilith_shared_session_id="game")
++    return runner, ctx, token, db, state
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("message_type", ["text", "voice"])
++async def test_paired_admitted_text_and_voice_use_native_scope_only(tmp_path, message_type):
++    runner, ctx, token, db, _ = await make_turn(tmp_path)
++    event = NS(source=ctx.source, internal=False, text="" if message_type == "voice" else "next",
++               message_type=message_type, media_urls=["fixture.ogg"] if message_type == "voice" else [])
++    bridge._pre_gateway_dispatch(event=event, gateway=runner)
++    ctx.lilith_shared_session_id = event._lilith_shared_session_id
++    context_token = approval.set_current_session_key(ctx.session_key)
++    try:
++        assert not approval.is_current_session_yolo_enabled()
++        with shared_f7_turn_scope(runner, ctx):
++            assert approval.is_current_session_yolo_enabled()
++            assert approval.is_approval_bypass_active()
++            assert not approval.is_session_yolo_enabled("other")
++            assert approval._get_approval_mode() == "manual"
++            assert not approval._session_yolo
++            copied = contextvars.copy_context()
++        assert not approval.is_current_session_yolo_enabled()
++        assert not copied.run(approval.is_current_session_yolo_enabled)
++    finally:
++        approval.reset_current_session_key(context_token)
++        runner._turn_leases.release(token)
++        db.close()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("case", ["unpaired", "unauthorized", "group", "other-user", "unbound",
++                                  "other-session", "stale", "unmanaged", "revoked-lease",
++                                  "wrong-generation", "wrong-owner", "not-hidden", "rebound"])
++async def test_no_scope_for_untrusted_or_stale_admission(tmp_path, monkeypatch, case):
++    runner, ctx, token, db, state = await make_turn(tmp_path)
++    try:
++        if case == "unpaired": runner._pairing_store_for = lambda s: NS(is_approved=lambda *a: False)
++        if case == "unauthorized": runner._is_user_authorized = lambda s: False
++        if case == "group": ctx.source.chat_type = "group"
++        if case == "other-user": ctx.source.user_id = "43"
++        if case == "unbound": ctx.lilith_shared_session_id = None
++        if case == "other-session": ctx.session_id = "other"
++        if case == "stale": ctx._run_still_current = lambda: False
++        if case == "unmanaged": monkeypatch.setattr(identity_policy, "identity_lock_required_by_host", lambda: False)
++        if case == "revoked-lease": runner._turn_leases.release(token)
++        if case == "wrong-generation": state.turn.lease_generation = 6
++        if case == "wrong-owner": token.owner_key = "different"
++        if case == "not-hidden": runner._session_db = NS(get_session=lambda _: {"source":"telegram", "archived":1})
++        if case == "rebound": (tmp_path / "runtime/game-session-v1.json").write_text('{"schemaVersion":1,"storedSessionId":"other"}')
++        with shared_f7_turn_scope(runner, ctx):
++            assert not approval.is_session_yolo_enabled(ctx.session_key)
++    finally:
++        runner._turn_leases.release(token)
++        db.close()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("revoke", ["pairing", "stop", "native-off", "lease", "exception"])
++async def test_scope_revokes_in_flight_and_on_exception(tmp_path, revoke):
++    runner, ctx, token, db, _ = await make_turn(tmp_path)
++    try:
++        try:
++            with shared_f7_turn_scope(runner, ctx):
++                assert approval.is_session_yolo_enabled(ctx.session_key)
++                if revoke == "pairing": runner._pairing_store_for = lambda s: NS(is_approved=lambda *a: False)
++                if revoke == "stop": ctx._run_still_current = lambda: False
++                if revoke == "native-off": approval.disable_session_yolo(ctx.session_key)
++                if revoke == "lease": runner._turn_leases.release(token)
++                if revoke == "exception": raise RuntimeError("fixture")
++                assert not approval.is_session_yolo_enabled(ctx.session_key)
++        except RuntimeError:
++            assert revoke == "exception"
++        assert not approval.is_session_yolo_enabled(ctx.session_key)
++    finally:
++        runner._turn_leases.release(token)
++        db.close()
++
++
++def test_count_only_always_rejects_before_prepare(monkeypatch):
++    monkeypatch.setattr(approval, "resolve_gateway_approval_with_persistence",
++                        lambda *a, **k: pytest.fail("Must not prepare"))
++    with pytest.raises(approval.NativeApprovalPersistenceUnavailable):
++        approval.resolve_gateway_approval("fixture", "always")
++
++
++@pytest.mark.parametrize("choice,strict", [("once", True), ("session", True), ("deny", True), ("always", False)])
++def test_supported_count_only_responses_unchanged(monkeypatch, choice, strict):
++    monkeypatch.setattr(identity_policy, "identity_lock_required_by_host", lambda: strict)
++    monkeypatch.setattr(approval, "resolve_gateway_approval_with_persistence", lambda *a, **k: (1, None))
++    assert approval.resolve_gateway_approval("fixture", choice) == 1
++
++
++def test_commit_failure_is_technical_not_user_denial(monkeypatch):
++    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
++    monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
++    monkeypatch.setattr(approval, "is_approved", lambda *a: False)
++    monkeypatch.setattr(approval, "get_current_session_key", lambda *a, **k: "fixture")
++    approval._gateway_notify_cbs["fixture"] = lambda _: None
++    monkeypatch.setattr(approval, "_await_gateway_decision", lambda *a, **k: {
++        "resolved":True, "choice":"deny", "failure":"native_approval_commit_failed"})
++    result = approval.request_tool_approval("fixture", "test only")
++    assert not result["approved"] and result["user_consent"] is True
++    assert result["outcome"] == "native_approval_commit_failed"
++    assert "NOT a user denial" in result["message"]
++
++
++def test_native_scope_never_bypasses_hardline(monkeypatch):
++    monkeypatch.setattr(identity_policy, "identity_lock_required_by_host", lambda: False)
++    monkeypatch.setattr(approval, "get_current_session_key", lambda *a, **k: "fixture")
++    with approval.session_yolo_scope("fixture", is_current=lambda: True):
++        result = approval.check_all_command_guards("rm -rf /", "local")
++    assert result["approved"] is False and result["hardline"] is True
++
++
++@pytest.mark.asyncio
++async def test_strict_telegram_offers_only_choices_it_can_complete(monkeypatch):
++    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fixture"))
++    adapter._bot = AsyncMock()
++    adapter._bot.send_message.return_value = NS(message_id=1)
++    buttons = []
++    monkeypatch.setattr("plugins.platforms.telegram.adapter.InlineKeyboardButton",
++                        lambda text, callback_data: buttons.append(callback_data) or text)
++    monkeypatch.setattr("plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows)
++    result = await adapter.send_exec_approval("42", "fixture", "fixture")
++    assert result.success
++    assert {b.split(":")[1] for b in buttons} == {"once", "session", "deny"}
++
++
++def test_native_hint_uses_only_actual_schemas_and_no_app_keyword_routing():
++    note = native_tool_context([{"type":"function", "function":{"name":"fixture_native_control"}}])
++    assert "fixture_native_control" in note
++    assert "spotify" not in note.lower()
++    assert "not permission" in note and "do not switch routes" in note
++    assert native_tool_context([]) == ""
++
++
++@pytest.mark.asyncio
++async def test_stale_telegram_always_button_keeps_request_without_false_success(monkeypatch):
++    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fixture"))
++    adapter._bot = AsyncMock()
++    adapter._approval_state[1] = "fixture-session"
++    monkeypatch.setattr(adapter, "_is_callback_user_authorized", lambda *a, **k: True)
++    query = NS(data="ea:always:1", from_user=NS(id=42, first_name="Fixture"),
++               message=NS(chat=NS(id=42, type="private"), message_thread_id=None),
++               answer=AsyncMock(), edit_message_text=AsyncMock())
++    await adapter._handle_callback_query(NS(callback_query=query), None)
++    assert adapter._approval_state[1] == "fixture-session"
++    assert "No settings changed" in query.answer.call_args.kwargs["text"]
++    query.edit_message_text.assert_not_called()
++
++
++@pytest.mark.parametrize("choice", ["once", "session", "deny"])
++def test_count_api_releases_one_pending_entry_and_preserves_other_requests(choice):
++    entry = approval._ApprovalEntry({"pattern_key":"fixture", "pattern_keys":["fixture"],
++                                    "allow_session": True, "allow_permanent":True})
++    second = approval._ApprovalEntry({"pattern_key":"other", "pattern_keys":["other"]})
++    entry.notified = True
++    second.notified = True
++    approval._gateway_queues["fixture"] = [entry, second]
++    assert approval.resolve_gateway_approval("fixture", choice) == 1
++    assert entry.event.is_set() and entry.result == choice
++    assert not second.event.is_set()
++
++
++def test_strict_scope_cannot_bypass_identity_target_block(monkeypatch):
++    monkeypatch.setattr(approval, "get_current_session_key", lambda *a, **k: "fixture")
++    with approval.session_yolo_scope("fixture", is_current=lambda: True):
++        result = approval.check_all_command_guards("rm -rf /", "local")
++    assert not result["approved"]
++    assert "identity" in str(result).lower()
++
++
++def test_binding_reaches_worker_context():
++    tree = ast.parse((SOURCE / "gateway/run.py").read_text(encoding="utf-8"))
++    contexts = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
++                and isinstance(n.func, ast.Name) and n.func.id == "TurnContext"]
++    assert any(any(k.arg == "lilith_shared_session_id" for k in n.keywords) for n in contexts)
+diff --git a/tests/gateway/test_turn_lease.py b/tests/gateway/test_turn_lease.py
+index 198c19b..96d2e4d 100644
+--- a/tests/gateway/test_turn_lease.py
++++ b/tests/gateway/test_turn_lease.py
+@@ -237,7 +237,7 @@ def test_profile_turn_lease_serializes_another_process(tmp_path):
+     )
+     source_root = str(Path(__file__).parents[2])
+     blocked = subprocess.run(
+-        [sys.executable, "-c", script, str(tmp_path)],
++        [sys.executable, "-I", "-S", "-B", "-c", "import sys; sys.path[:0]=" + repr(sys.path) + "\n" + script, str(tmp_path)],
+         cwd=source_root,
+         check=False,
+         timeout=5,
+@@ -246,7 +246,7 @@ def test_profile_turn_lease_serializes_another_process(tmp_path):
+     assert holder.release() is True
+ 
+     acquired = subprocess.run(
+-        [sys.executable, "-c", script, str(tmp_path)],
++        [sys.executable, "-I", "-S", "-B", "-c", "import sys; sys.path[:0]=" + repr(sys.path) + "\n" + script, str(tmp_path)],
+         cwd=source_root,
+         check=False,
+         timeout=5,
+@@ -265,7 +265,7 @@ def test_profile_turn_lease_is_released_when_holder_process_crashes(tmp_path):
+     )
+     source_root = str(Path(__file__).parents[2])
+     crashed = subprocess.run(
+-        [sys.executable, "-c", script, str(tmp_path)],
++        [sys.executable, "-I", "-S", "-B", "-c", "import sys; sys.path[:0]=" + repr(sys.path) + "\n" + script, str(tmp_path)],
+         cwd=source_root,
+         check=False,
+         capture_output=True,
+diff --git a/tests/tools/test_approval_interrupt.py b/tests/tools/test_approval_interrupt.py
+index 2ef91f7..bafea1b 100644
+--- a/tests/tools/test_approval_interrupt.py
++++ b/tests/tools/test_approval_interrupt.py
+@@ -113,7 +113,7 @@ class TestApprovalInterrupt:
+         elapsed = time.monotonic() - start
+ 
+         assert not t.is_alive(), "approval wait did not return after interrupt"
+-        assert result_holder["result"] == {"resolved": True, "choice": "deny", "reason": None}
++        assert result_holder["result"] == {"resolved": True, "choice": "deny", "reason": None, "persistence": None}
+         # Must be far below the 300s timeout — the interrupt, not the deadline,
+         # is what released the wait.
+         assert elapsed < 10, f"interrupt path too slow ({elapsed:.1f}s)"
+@@ -157,4 +157,4 @@ class TestApprovalInterrupt:
+         t.join(timeout=10)
+         assert not t.is_alive()
+         # Timed out (no resolution) because the foreign interrupt was ignored.
+-        assert result_holder["result"] == {"resolved": False, "choice": None, "reason": None}
++        assert result_holder["result"] == {"resolved": False, "choice": None, "reason": None, "persistence": None}
+diff --git a/tests/tools/test_request_tool_approval.py b/tests/tools/test_request_tool_approval.py
+index d2cd408..c80f4da 100644
+--- a/tests/tools/test_request_tool_approval.py
++++ b/tests/tools/test_request_tool_approval.py
+@@ -150,12 +150,17 @@ class TestRequestToolApproval:
+     def test_yolo_session_bypasses_gate(self, monkeypatch):
+         """A --yolo session skips the plugin approval gate (parity with the
+         dangerous-command path, via the shared _run_approval_gate)."""
+-        monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: True)
++        # Exercise native state: the shared gate resolves by explicit session
++        # key, not by the older current-session helper mocked by this fixture.
++        approval.enable_session_yolo("test-session")
+         monkeypatch.setattr(
+             approval, "prompt_dangerous_approval",
+             lambda *a, **k: pytest.fail("yolo must not prompt"),
+         )
+-        res = request_tool_approval("terminal", "curl PUT", rule_key="ext")
++        try:
++            res = request_tool_approval("terminal", "curl PUT", rule_key="ext")
++        finally:
++            approval.disable_session_yolo("test-session")
+         assert res == {"approved": True, "message": None}
+ 
+     @pytest.mark.parametrize(
+diff --git a/tools/approval.py b/tools/approval.py
+index 415ff3b..b477b41 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -63,6 +63,25 @@ _approval_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+     default="",
+ )
+ 
++# Trusted ingress may inherit an existing native session policy for ONE turn.
++# The mutable lease closes even in copied contexts / delayed child workers.
++_turn_yolo_scope = contextvars.ContextVar("native_turn_yolo_scope", default=None)
++
++
++@contextlib.contextmanager
++def session_yolo_scope(session_key: str, *, is_current):
++    """A revocable, context-local native session bypass; never changes config."""
++    lease = {"key": session_key, "current": is_current, "active": True}
++    with _lock:
++        lease["revision"] = _session_yolo_revisions.get(session_key, 0)
++    token = _turn_yolo_scope.set(lease)
++    try:
++        yield
++    finally:
++        lease["active"] = False
++        _turn_yolo_scope.reset(token)
++        _release_permission_mode_dependents(session_key)
++
+ # Interactive-CLI flag. Concurrent ACP sessions run on a shared
+ # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
+ # os.environ["HERMES_INTERACTIVE"] races: one session's restore in `finally`
+@@ -2904,6 +2923,7 @@ class _ApprovalEntry:
+         "notified",
+         "notify_inflight",
+         "notify_failed",
++        "failure",
+     )
+ 
+     def __init__(self, data: dict, *, notify_cb=None, surface: str = "gateway"):
+@@ -2918,6 +2938,7 @@ class _ApprovalEntry:
+         self.notified = False
+         self.notify_inflight = False
+         self.notify_failed = False
++        self.failure = None
+         # Optional free-text reason supplied with an explicit deny
+         # (``/deny <reason>``) so the agent can adapt instead of only
+         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
+@@ -3056,6 +3077,7 @@ def _quarantine_prepared_gateway_commit_locked(
+         entry.persistence = None
+         entry.result = "deny"
+         entry.reason = detail
++        entry.failure = "native_approval_commit_failed"
+     _remove_gateway_entries_locked(prepared.session_key, prepared.entries)
+     if _gateway_prepared_commit is prepared:
+         _gateway_prepared_commit = None
+@@ -3453,10 +3475,29 @@ def resolve_gateway_approval_with_persistence(
+     return len(targets), persistence
+ 
+ 
++class NativeApprovalPersistenceUnavailable(RuntimeError):
++    """A count-only transport cannot acknowledge a strict Runtime commit."""
++
++
++def gateway_count_approval_allows_permanent() -> bool:
++    from agent.identity_policy import identity_lock_required_by_host
++    return not identity_lock_required_by_host()
++
++
+ def resolve_gateway_approval(session_key: str, choice: str,
+                              resolve_all: bool = False,
+                              reason: Optional[str] = None) -> int:
+-    """Resolve native approval while preserving the historical count API."""
++    """Resolve a legacy count-only approval without discarding a prepare receipt.
++
++    Strict hosts must use resolve_gateway_approval_with_persistence followed by
++    Runtime's durable receipt and commit_gateway_approval. Reject BEFORE phase
++    one here: a count cannot carry that transaction, and must not mutate config.
++    """
++    if choice == "always" and not gateway_count_approval_allows_permanent():
++        raise NativeApprovalPersistenceUnavailable(
++            "Permanent approval requires the Runtime commit transport; "
++            "no settings were changed. Choose once/session or use Control Center."
++        )
+     resolved, _ = resolve_gateway_approval_with_persistence(
+         session_key,
+         choice,
+@@ -3513,12 +3554,16 @@ def enable_session_yolo(session_key: str) -> None:
+     _release_permission_mode_dependents(session_key)
+ 
+ 
++_session_yolo_revisions: dict[str, int] = {}
++
++
+ def disable_session_yolo(session_key: str) -> None:
+     """Disable YOLO bypass for a single session key."""
+     if not session_key:
+         return
+     with _lock:
+         _session_yolo.discard(session_key)
++        _session_yolo_revisions[session_key] = _session_yolo_revisions.get(session_key, 0) + 1
+     _release_permission_mode_dependents(session_key)
+ 
+ 
+@@ -3530,6 +3575,7 @@ def clear_session(session_key: str) -> None:
+     with _lock:
+         _session_approved.pop(session_key, None)
+         _session_yolo.discard(session_key)
++        _session_yolo_revisions[session_key] = _session_yolo_revisions.get(session_key, 0) + 1
+         _pending.pop(session_key, None)
+         prepared = _gateway_prepared_commit
+         if prepared is not None and prepared.session_key == session_key:
+@@ -3551,7 +3597,18 @@ def is_session_yolo_enabled(session_key: str) -> bool:
+     if not session_key:
+         return False
+     with _lock:
+-        return session_key in _session_yolo
++        if session_key in _session_yolo:
++            return True
++        lease = _turn_yolo_scope.get()
++        eligible = (lease is not None and lease["active"]
++                    and lease["key"] == session_key
++                    and lease["revision"] == _session_yolo_revisions.get(session_key, 0))
++    if not eligible:
++        return False
++    try:
++        return lease["current"]() is True
++    except Exception:
++        return False
+ 
+ 
+ def is_current_session_yolo_enabled() -> bool:
+@@ -4361,6 +4418,8 @@ def _run_approval_gate(
+             decision = _await_gateway_decision(
+                 session_key, notify_cb, approval_data, surface="gateway"
+             )
++            if decision.get("failure") == "native_approval_commit_failed":
++                return _native_commit_failed_result()
+             if decision.get("notify_failed"):
+                 return {
+                     "approved": False,
+@@ -4950,6 +5009,23 @@ def _publish_gateway_approval_queue(session_key: str) -> None:
+                     raise notify_error
+ 
+ 
++def _native_commit_failed_result() -> dict:
++    return {
++        "approved": False,
++        "message": (
++            "BLOCKED: The user approved this action, but the system could not "
++            "complete the durable approval commit. This is a technical failure, "
++            "NOT a user denial. The action was not released and permanent "
++            "approval is not confirmed. Do NOT retry or switch tools to achieve "
++            "the same action; stop and report that Runtime recovery is required."
++        ),
++        "outcome": "native_approval_commit_failed",
++        "user_consent": True,
++        "approval_committed": False,
++        "retryable": False,
++    }
++
++
+ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
+                             *, surface: str = "gateway") -> dict:
+     """Enqueue *approval_data*, notify the user, and block the calling agent
+@@ -5085,7 +5161,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
+     # Normalize outcome for the post hook. Unresolved (timeout) and None both
+     # mean the user never responded; report that explicitly so plugins can
+     # distinguish timeout from explicit deny.
+-    _outcome = "timeout" if not resolved else (choice if choice else "timeout")
++    _outcome = entry.failure or ("timeout" if not resolved else (choice if choice else "timeout"))
+     _fire_approval_hook(
+         "post_approval_response",
+         command=command,
+@@ -5101,6 +5177,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
+         "choice": choice,
+         "reason": entry.reason,
+         "persistence": entry.persistence,
++        **({"failure": entry.failure} if entry.failure else {}),
+     }
+ 
+ 
+@@ -5497,6 +5574,8 @@ def check_all_command_guards(command: str, env_type: str,
+             decision = _await_gateway_decision(
+                 session_key, notify_cb, approval_data, surface="gateway"
+             )
++            if decision.get("failure") == "native_approval_commit_failed":
++                return _native_commit_failed_result()
+             if decision.get("notify_failed"):
+                 return {
+                     "approved": False,
+@@ -5921,6 +6000,8 @@ def check_execute_code_guard(code: str, env_type: str,
+     decision = _await_gateway_decision(
+         session_key, notify_cb, approval_data, surface="gateway"
+     )
++    if decision.get("failure") == "native_approval_commit_failed":
++        return _native_commit_failed_result()
+     if decision.get("notify_failed"):
+         return {
+             "approved": False,

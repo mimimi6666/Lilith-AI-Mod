@@ -1,0 +1,743 @@
+diff --git a/hermes_state.py b/hermes_state.py
+index 95aa465..9393b3c 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -2386,22 +2386,36 @@ def build_native_assistant_extension_message(
+     assistant_message_id: str,
+     text: str,
+     timestamp: float,
++    perception_source: str = "official-native-dialogue",
+ ) -> Dict[str, Any]:
+-    """Build one model-authored continuation without inventing a user row."""
++    """Build one synthetic model reply without inventing a user row."""
++    foreground = perception_source == "foreground-application"
+     return {
+         "role": "assistant",
+         "content": text,
+         "message_id": assistant_message_id,
+         "timestamp": timestamp,
+         "finish_reason": "stop",
+-        "display_kind": "native_assistant_extension",
++        "display_kind": (
++            "foreground_proactive_reply"
++            if foreground
++            else "native_assistant_extension"
++        ),
+         "display_metadata": {
+-            "lilith_native_extension_event_id": event_id,
++            (
++                "lilith_foreground_proactive_operation_id"
++                if foreground
++                else "lilith_native_extension_event_id"
++            ): event_id,
+             "hermes_turn_id": turn_id,
+             "hermes_message_id": assistant_message_id,
+             "hermes_message_kind": "primary",
+             "hermes_turn_origin": "synthetic",
+-            "hermes_turn_origin_kind": "lilith-native-extension",
++            "hermes_turn_origin_kind": (
++                "lilith-foreground-proactive"
++                if foreground
++                else "lilith-native-extension"
++            ),
+         },
+     }
+ 
+@@ -8786,7 +8800,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         death.  A later caller can only observe or terminalize the claim; it
+         can never turn the same event into a second model attempt.
+         """
+-        perception_fields = {
++        native_perception_fields = {
+             "schema_version",
+             "source",
+             "text",
+@@ -8796,6 +8810,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             "trigger",
+             "locale",
+         }
++        foreground_perception_fields = {
++            "schema_version",
++            "source",
++            "application_id",
++            "application_name",
++            "category",
++            "observed_at_unix_ms",
++            "locale",
++        }
++        is_native = (
++            isinstance(perception, dict)
++            and perception.get("source") == "official-native-dialogue"
++        )
++        is_foreground = (
++            isinstance(perception, dict)
++            and perception.get("source") == "foreground-application"
++        )
+         canonical_perception = json.dumps(
+             perception,
+             ensure_ascii=False,
+@@ -8815,16 +8846,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             or any(not isinstance(value, str) or not value for value in lineage_session_ids)
+             or re.fullmatch(r"[0-9a-f]{32}", event_id or "") is None
+             or not isinstance(perception, dict)
+-            or set(perception) != perception_fields
++            or not (
++                (is_native and set(perception) == native_perception_fields)
++                or (
++                    is_foreground
++                    and set(perception) == foreground_perception_fields
++                )
++            )
+             or type(perception.get("schema_version")) is not int
+             or perception.get("schema_version") != 1
+-            or perception.get("source") != "official-native-dialogue"
+-            or not isinstance(perception.get("text"), str)
+-            or not perception["text"].strip()
+-            or type(perception.get("occurred_at_unix_ms")) is not int
+-            or not all(
+-                isinstance(perception.get(key), str)
+-                for key in ("node_id", "line_id", "trigger", "locale")
++            or (
++                is_native
++                and (
++                    not isinstance(perception.get("text"), str)
++                    or not perception["text"].strip()
++                    or type(perception.get("occurred_at_unix_ms")) is not int
++                    or not all(
++                        isinstance(perception.get(key), str)
++                        for key in ("node_id", "line_id", "trigger", "locale")
++                    )
++                )
++            )
++            or (
++                is_foreground
++                and (
++                    type(perception.get("observed_at_unix_ms")) is not int
++                    or not all(
++                        isinstance(perception.get(key), str)
++                        for key in (
++                            "application_id",
++                            "application_name",
++                            "category",
++                            "locale",
++                        )
++                    )
++                    or not perception["application_id"].strip()
++                    or not perception["application_name"].strip()
++                    or not perception["category"].strip()
++                )
+             )
+             or re.fullmatch(r"[0-9a-f]{64}", perception_sha256 or "") is None
+             or hashlib.sha256(canonical_perception.encode("utf-8")).hexdigest()
+@@ -8842,17 +8901,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         ):
+             raise ValueError("native assistant extension claim was rejected")
+ 
+-        expected_metadata = {
+-            "lilith_native_event_id": event_id,
+-            "lilith_native_source": "lilith-native",
+-            "lilith_native_occurred_at_unix_ms": perception[
+-                "occurred_at_unix_ms"
+-            ],
+-            "lilith_native_node_id": perception["node_id"],
+-            "lilith_native_line_id": perception["line_id"],
+-            "lilith_native_trigger": perception["trigger"],
+-            "lilith_native_locale": perception["locale"],
+-        }
++        expected_metadata = (
++            {
++                "lilith_native_event_id": event_id,
++                "lilith_native_source": "lilith-native",
++                "lilith_native_occurred_at_unix_ms": perception[
++                    "occurred_at_unix_ms"
++                ],
++                "lilith_native_node_id": perception["node_id"],
++                "lilith_native_line_id": perception["line_id"],
++                "lilith_native_trigger": perception["trigger"],
++                "lilith_native_locale": perception["locale"],
++            }
++            if is_native
++            else None
++        )
+ 
+         def _do(conn):
+             # Idempotent reconciliation is independent of mutable admission
+@@ -8883,32 +8946,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 )
+ 
+             self._check_transcript_write_guards(conn, session_id, None)
+-            placeholders = ",".join("?" for _ in lineage_session_ids)
+-            native_rows = conn.execute(
+-                f"""SELECT role, content, display_kind, display_metadata
+-                    FROM messages
+-                    WHERE session_id IN ({placeholders})
+-                      AND platform_message_id = ?
+-                    ORDER BY id ASC""",
+-                (*lineage_session_ids, event_id),
+-            ).fetchall()
+-            if len(native_rows) != 1:
+-                raise NativeAssistantExtensionConflictError(
+-                    "native assistant event prerequisite was missing or duplicated"
+-                )
+-            native_row = native_rows[0]
+-            metadata = self._decode_display_metadata(native_row["display_metadata"])
+-            if (
+-                native_row["role"] != "assistant"
+-                or self._decode_content(native_row["content"])
+-                != perception["text"]
+-                or native_row["display_kind"] != "native_assistant_event"
+-                or not isinstance(metadata, dict)
+-                or any(metadata.get(key) != value for key, value in expected_metadata.items())
+-            ):
+-                raise NativeAssistantExtensionConflictError(
+-                    "native assistant event prerequisite conflicted"
++            if is_native:
++                placeholders = ",".join("?" for _ in lineage_session_ids)
++                native_rows = conn.execute(
++                    f"""SELECT role, content, display_kind, display_metadata
++                        FROM messages
++                        WHERE session_id IN ({placeholders})
++                          AND platform_message_id = ?
++                        ORDER BY id ASC""",
++                    (*lineage_session_ids, event_id),
++                ).fetchall()
++                if len(native_rows) != 1:
++                    raise NativeAssistantExtensionConflictError(
++                        "native assistant event prerequisite was missing or duplicated"
++                    )
++                native_row = native_rows[0]
++                metadata = self._decode_display_metadata(
++                    native_row["display_metadata"]
+                 )
++                if (
++                    native_row["role"] != "assistant"
++                    or self._decode_content(native_row["content"])
++                    != perception["text"]
++                    or native_row["display_kind"] != "native_assistant_event"
++                    or not isinstance(metadata, dict)
++                    or any(
++                        metadata.get(key) != value
++                        for key, value in expected_metadata.items()
++                    )
++                ):
++                    raise NativeAssistantExtensionConflictError(
++                        "native assistant event prerequisite conflicted"
++                    )
+ 
+             now = time.time()
+             state = "abandoned" if abandon else "streaming"
+@@ -8965,10 +9034,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         assistant_message_id: str,
+         status: str,
+         text: Optional[str] = None,
++        perception_source: str = "official-native-dialogue",
+     ) -> Dict[str, Any]:
+         """Atomically terminalize a claim and optionally append its reply."""
+         if (
+-            status not in {"completed", "silent", "abandoned"}
++            perception_source
++            not in {"official-native-dialogue", "foreground-application"}
++            or status not in {"completed", "silent", "abandoned"}
+             or (status == "completed" and (not isinstance(text, str) or not text.strip()))
+             or (status != "completed" and text is not None)
+         ):
+@@ -9015,6 +9087,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     assistant_message_id=assistant_message_id,
+                     text=text,
+                     timestamp=time.time(),
++                    perception_source=perception_source,
+                 )
+                 self._insert_message_rows(
+                     conn,
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 5203b71..6be449a 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -7490,6 +7490,7 @@ def is_conversation_activity_message(message: Any) -> bool:
+         "",
+         "native_assistant_event",
+         "native_assistant_extension",
++        "foreground_proactive_reply",
+     }:
+         return False
+ 
+@@ -7519,6 +7520,11 @@ def is_conversation_activity_message(message: Any) -> bool:
+             and metadata.get("hermes_turn_origin_kind")
+             == "lilith-native-extension"
+         )
++        or (
++            display_kind == "foreground_proactive_reply"
++            and metadata.get("hermes_turn_origin_kind")
++            == "lilith-foreground-proactive"
++        )
+     )
+     if origin not in {None, "", "user"} and not native_assistant_origin:
+         return False
+diff --git a/tests/tui_gateway/test_native_assistant_extension.py b/tests/tui_gateway/test_native_assistant_extension.py
+index 3abb5ef..5522853 100644
+--- a/tests/tui_gateway/test_native_assistant_extension.py
++++ b/tests/tui_gateway/test_native_assistant_extension.py
+@@ -16,6 +16,7 @@ from tui_gateway import server
+ 
+ 
+ EVENT_ID = "0123456789abcdef0123456789abcdef"
++FOREGROUND_ID = "fedcba9876543210fedcba9876543210"
+ 
+ 
+ def _append_params(**overrides):
+@@ -58,6 +59,28 @@ def _extend_params(**overrides):
+     return value
+ 
+ 
++def _foreground_params(**overrides):
++    perception = {
++        "schema_version": 1,
++        "source": "foreground-application",
++        "application_id": "code",
++        "application_name": "Visual Studio Code",
++        "category": "development",
++        "observed_at_unix_ms": 1787932801123,
++        "locale": "zh-Hant",
++    }
++    value = {
++        "session_id": "game-live",
++        "event_id": FOREGROUND_ID,
++        "proactive_dialogue_enabled": True,
++        "perception": perception,
++        "source": "lilith-foreground-proactive",
++        "require_durable_lineage": True,
++    }
++    value.update(overrides)
++    return value
++
++
+ class _FakeAgent:
+     def __init__(self, output: str):
+         self._cached_system_prompt = "You are Lilith."
+@@ -181,6 +204,13 @@ def _extend(params=None):
+     )
+ 
+ 
++def _foreground(params=None):
++    return server._methods["session.generate_foreground_proactive"](
++        "foreground-proactive",
++        params or _foreground_params(),
++    )
++
++
+ def _join(session):
+     terminal = session["_test_native_extension_terminal"]
+     assert terminal.wait(timeout=5)
+@@ -1545,3 +1575,70 @@ def test_bedrock_single_attempt_uses_request_local_no_retry_client(monkeypatch):
+         "mode": "standard",
+     }
+     assert "config" not in ordinary.kwargs
++
++
++def test_foreground_proactive_is_one_assistant_reply_without_user_row(
++    extension_session,
++):
++    db, session, agent, emitted = extension_session
++
++    response = _foreground()
++    assert "error" not in response
++    assert response["result"]["status"] == "streaming"
++    assert response["result"]["already_processed"] is False
++
++    _join(session)
++
++    assert agent.calls == 1
++    sent = agent.requests[0]["messages"]
++    canonical = json.dumps(
++        _foreground_params()["perception"],
++        ensure_ascii=False,
++        sort_keys=True,
++        separators=(",", ":"),
++    )
++    assert canonical in sent[0]["content"]
++    assert "not a player or user message" in sent[0]["content"]
++    assert "Never claim to see the screen" in sent[0]["content"]
++    assert "game result" in sent[0]["content"]
++    assert sent[-1]["role"] == "user"
++    assert "foreground observation is not a player message" in sent[-1]["content"]
++
++    rows = db._conn.execute(
++        "SELECT role, display_kind, display_metadata FROM messages ORDER BY id"
++    ).fetchall()
++    assert [row["role"] for row in rows] == ["assistant", "assistant"]
++    assert rows[-1]["display_kind"] == "foreground_proactive_reply"
++    metadata = json.loads(rows[-1]["display_metadata"])
++    assert metadata["lilith_foreground_proactive_operation_id"] == FOREGROUND_ID
++    assert metadata["hermes_turn_origin_kind"] == "lilith-foreground-proactive"
++
++    completed = [
++        payload
++        for event, sid, payload in emitted
++        if event == "message.complete" and sid == "game-live"
++    ]
++    assert len(completed) == 1
++    assert completed[0]["foreground_proactive_status"] == "completed"
++    assert completed[0]["durable"]["conversation_activity"] is True
++    assert "native_assistant_extension_status" not in completed[0]
++
++    replay = _foreground()
++    assert replay["result"]["status"] == "completed"
++    assert replay["result"]["already_processed"] is True
++    assert agent.calls == 1
++
++
++def test_foreground_proactive_rejects_window_content_fields(extension_session):
++    db, _, agent, _ = extension_session
++    value = _foreground_params()
++    value["perception"]["window_title"] = "private-document.txt"
++
++    response = _foreground(value)
++
++    assert response["error"]["code"] == 4004
++    assert response["error"]["data"]["code"] == "foreground_proactive_invalid"
++    assert db._conn.execute(
++        "SELECT COUNT(*) FROM native_assistant_extensions"
++    ).fetchone()[0] == 0
++    assert agent.calls == 0
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 05c1437..7d9d5b2 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -3260,9 +3260,10 @@ def _(rid, params: dict) -> dict:
+     return _ok(rid, result)
+ 
+ 
++@method("session.generate_foreground_proactive")
+ @method("session.extend_native_assistant_event")
+ def _(rid, params: dict) -> dict:
+-    """Claim one optional model continuation of an appended native line."""
++    """Claim one durable synthetic Lilith reply without a fabricated user row."""
+     expected_fields = {
+         "session_id",
+         "event_id",
+@@ -3271,16 +3272,39 @@ def _(rid, params: dict) -> dict:
+         "source",
+         "require_durable_lineage",
+     }
+-    perception_fields = {
+-        "schema_version",
+-        "source",
+-        "text",
+-        "occurred_at_unix_ms",
+-        "node_id",
+-        "line_id",
+-        "trigger",
+-        "locale",
+-    }
++    is_foreground = params.get("source") == "lilith-foreground-proactive"
++    perception_fields = (
++        {
++            "schema_version",
++            "source",
++            "application_id",
++            "application_name",
++            "category",
++            "observed_at_unix_ms",
++            "locale",
++        }
++        if is_foreground
++        else {
++            "schema_version",
++            "source",
++            "text",
++            "occurred_at_unix_ms",
++            "node_id",
++            "line_id",
++            "trigger",
++            "locale",
++        }
++    )
++    route_label = (
++        "foreground proactive"
++        if is_foreground
++        else "native assistant extension"
++    )
++    route_code = (
++        "foreground_proactive"
++        if is_foreground
++        else "native_assistant_extension"
++    )
+     sid = params.get("session_id") if isinstance(params.get("session_id"), str) else ""
+     event_id = params.get("event_id") if isinstance(params.get("event_id"), str) else ""
+ 
+@@ -3300,8 +3324,8 @@ def _(rid, params: dict) -> dict:
+     ):
+         return reject(
+             4004,
+-            "native assistant extension parameters were non-canonical",
+-            "native_assistant_extension_invalid",
++            f"{route_label} parameters were non-canonical",
++            f"{route_code}_invalid",
+         )
+ 
+     from agent.turn_identity import canonical_id, new_message_id
+@@ -3317,27 +3341,44 @@ def _(rid, params: dict) -> dict:
+             return False
+         return True
+ 
++    native_valid = (
++        params.get("source") == "lilith-native"
++        and perception.get("source") == "official-native-dialogue"
++        and bounded_utf8(perception.get("text"), 8192, nonblank=True)
++        and type(perception.get("occurred_at_unix_ms")) is int
++        and 0 < perception["occurred_at_unix_ms"] <= 253402300799999
++        and bounded_utf8(perception.get("node_id"), 256)
++        and bounded_utf8(perception.get("line_id"), 256)
++        and bounded_utf8(perception.get("trigger"), 256)
++        and bounded_utf8(perception.get("locale"), 64)
++    )
++    foreground_valid = (
++        params.get("source") == "lilith-foreground-proactive"
++        and perception.get("source") == "foreground-application"
++        and bounded_utf8(perception.get("application_id"), 128, nonblank=True)
++        and bounded_utf8(
++            perception.get("application_name"),
++            128,
++            nonblank=True,
++        )
++        and bounded_utf8(perception.get("category"), 64, nonblank=True)
++        and type(perception.get("observed_at_unix_ms")) is int
++        and 0 < perception["observed_at_unix_ms"] <= 253402300799999
++        and bounded_utf8(perception.get("locale"), 64)
++    )
+     if (
+         not bounded_utf8(sid, 128, nonblank=True)
+         or canonical_id(event_id) != event_id
+         or params.get("proactive_dialogue_enabled") is not True
+-        or params.get("source") != "lilith-native"
+         or params.get("require_durable_lineage") is not True
+         or type(perception.get("schema_version")) is not int
+         or perception.get("schema_version") != 1
+-        or perception.get("source") != "official-native-dialogue"
+-        or not bounded_utf8(perception.get("text"), 8192, nonblank=True)
+-        or type(perception.get("occurred_at_unix_ms")) is not int
+-        or not 0 < perception["occurred_at_unix_ms"] <= 253402300799999
+-        or not bounded_utf8(perception.get("node_id"), 256)
+-        or not bounded_utf8(perception.get("line_id"), 256)
+-        or not bounded_utf8(perception.get("trigger"), 256)
+-        or not bounded_utf8(perception.get("locale"), 64)
++        or (foreground_valid if is_foreground else native_valid) is not True
+     ):
+         return reject(
+             4004,
+-            "native assistant extension parameters were rejected",
+-            "native_assistant_extension_invalid",
++            f"{route_label} parameters were rejected",
++            f"{route_code}_invalid",
+         )
+ 
+     session = _sessions.get(sid)
+@@ -3345,7 +3386,7 @@ def _(rid, params: dict) -> dict:
+         return reject(
+             4001,
+             "session unavailable",
+-            "native_assistant_extension_session_unavailable",
++            f"{route_code}_session_unavailable",
+         )
+ 
+     canonical_perception = json.dumps(
+@@ -3509,6 +3550,7 @@ def _(rid, params: dict) -> dict:
+                                     "assistant_message_id"
+                                 ],
+                                 status="abandoned",
++                                perception_source=perception["source"],
+                             )
+                         finally:
+                             stale_owner = session.get(
+@@ -3614,6 +3656,7 @@ def _(rid, params: dict) -> dict:
+                                             "assistant_message_id"
+                                         ],
+                                         status="abandoned",
++                                        perception_source=perception["source"],
+                                     )
+                                 )
+                         finally:
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index ed18172..bbca8a4 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -264,6 +264,7 @@ _LONG_HANDLERS = frozenset(
+         "session.history",
+         "session.append_assistant_event",
+         "session.extend_native_assistant_event",
++        "session.generate_foreground_proactive",
+         "session.context_breakdown",
+         "model.credential_status",
+         "delegation.status",
+@@ -14278,7 +14279,7 @@ def _native_assistant_extension_model_messages(
+     history: list[dict],
+     perception: dict,
+ ) -> list[dict]:
+-    """Build request-only context for a native event without a user row."""
++    """Build request-only context for a synthetic perception without a user row."""
+     model_history = copy.deepcopy(history)
+     try:
+         from agent.agent_runtime_helpers import repair_message_sequence
+@@ -14298,27 +14299,47 @@ def _native_assistant_extension_model_messages(
+         sort_keys=True,
+         separators=(",", ":"),
+     )
+-    native_instruction = (
+-        "You are writing Lilith's required natural continuation after an "
+-        "official line she has just spoken to the player. The native perception "
+-        "below is Lilith's own just-perceived and already-spoken event; its "
+-        "text field is the preceding utterance from Lilith to the player, not a "
+-        "player or user message. Keep the speaker and addressee fixed: you are "
+-        "Lilith, and the player is the person you are addressing. The player "
+-        "has not replied. Never treat or answer Lilith's official line as if "
+-        "the player said or asked it. If that line asks the player a question, "
+-        "only the player can answer it: do not answer for the player, switch "
+-        "roles, or invent the player's response, feelings, or state. Continue "
+-        "Lilith's own concern, invitation, or observation instead. A non-empty "
+-        "continuation is required whenever this route is invoked; do not choose "
+-        "silence. Be restrained. Do not repeat or paraphrase the official line. "
+-        "Add only one short, natural follow-up in Lilith's established voice, "
+-        "chosen semantically without mechanical keyword or length rules. Return "
+-        "JSON only, with exactly this field: "
+-        "{\"text\":\"the continuation\"}.\n\n"
+-        "Canonical host-owned native perception JSON:\n"
+-        + canonical_perception
+-    )
++    is_foreground = perception.get("source") == "foreground-application"
++    if is_foreground:
++        native_instruction = (
++            "You are Lilith choosing one brief, natural, caring line to the "
++            "player after the host observed only which foreground application "
++            "category is active. The observation is host-owned context, not a "
++            "player or user message. The player has not spoken in this turn. "
++            "Use only application_id, application_name, category, locale, and "
++            "observation time. Never claim to see the screen, window title, "
++            "document, tab, code, media, game result, score, performance, "
++            "emotion, or intent. Do not imply continuous surveillance. Address "
++            "the player as Lilith in the requested locale. A non-empty reply is "
++            "required whenever this route is invoked; do not choose silence. "
++            "Write exactly one short, warm sentence in Lilith's established "
++            "voice, without a list or explanation. Return JSON only, with "
++            "exactly this field: {\"text\":\"the caring line\"}.\n\n"
++            "Canonical host-owned foreground application observation JSON:\n"
++            + canonical_perception
++        )
++    else:
++        native_instruction = (
++            "You are writing Lilith's required natural continuation after an "
++            "official line she has just spoken to the player. The native perception "
++            "below is Lilith's own just-perceived and already-spoken event; its "
++            "text field is the preceding utterance from Lilith to the player, not a "
++            "player or user message. Keep the speaker and addressee fixed: you are "
++            "Lilith, and the player is the person you are addressing. The player "
++            "has not replied. Never treat or answer Lilith's official line as if "
++            "the player said or asked it. If that line asks the player a question, "
++            "only the player can answer it: do not answer for the player, switch "
++            "roles, or invent the player's response, feelings, or state. Continue "
++            "Lilith's own concern, invitation, or observation instead. A non-empty "
++            "continuation is required whenever this route is invoked; do not choose "
++            "silence. Be restrained. Do not repeat or paraphrase the official line. "
++            "Add only one short, natural follow-up in Lilith's established voice, "
++            "chosen semantically without mechanical keyword or length rules. Return "
++            "JSON only, with exactly this field: "
++            "{\"text\":\"the continuation\"}.\n\n"
++            "Canonical host-owned native perception JSON:\n"
++            + canonical_perception
++        )
+     messages.append(
+         {
+             "role": "system",
+@@ -14374,10 +14395,17 @@ def _native_assistant_extension_model_messages(
+         {
+             "role": "user",
+             "content": (
+-                "Host control: Lilith remains the speaker addressing the player, "
+-                "and the player has not replied. Write the required native "
+-                "continuation now and return exactly one required JSON object "
+-                "with non-empty text."
++                "Host control: the foreground observation is not a player "
++                "message. Lilith is the speaker addressing the player. Write "
++                "one required short caring line now and return exactly one "
++                "JSON object with non-empty text."
++                if is_foreground
++                else (
++                    "Host control: Lilith remains the speaker addressing the player, "
++                    "and the player has not replied. Write the required native "
++                    "continuation now and return exactly one required JSON object "
++                    "with non-empty text."
++                )
+             ),
+         }
+     )
+@@ -14428,6 +14456,18 @@ def _run_native_assistant_extension(
+     start_gate: threading.Event | None = None,
+ ) -> None:
+     """Execute one already-durable native extension claim."""
++    perception_source = str(perception.get("source") or "")
++    is_foreground = perception_source == "foreground-application"
++    status_key = (
++        "foreground_proactive_status"
++        if is_foreground
++        else "native_assistant_extension_status"
++    )
++    turn_origin_kind = (
++        "lilith-foreground-proactive"
++        if is_foreground
++        else "lilith-native-extension"
++    )
+     transport_token = bind_transport(session.get("transport"))
+     runtime_token = _current_runtime_session_record.set(session)
+     session_tokens = []
+@@ -14594,6 +14634,7 @@ def _run_native_assistant_extension(
+                     assistant_message_id=assistant_message_id,
+                     status=terminal_status,
+                     text=reply if terminal_status == "completed" else None,
++                    perception_source=perception_source,
+                 )
+             if terminal.get("status") == "completed" and isinstance(
+                 terminal.get("message"), dict
+@@ -14630,7 +14671,7 @@ def _run_native_assistant_extension(
+                     if terminal_status in {"completed", "silent"}
+                     else "interrupted"
+                 ),
+-                "native_assistant_extension_status": terminal_status,
++                status_key: terminal_status,
+             }
+             if durable_message is not None:
+                 try:
+@@ -14645,7 +14686,7 @@ def _run_native_assistant_extension(
+                                 )
+                             ),
+                             "turn_origin": "synthetic",
+-                            "turn_origin_kind": "lilith-native-extension",
++                            "turn_origin_kind": turn_origin_kind,
+                         }
+                     )
+                 except Exception:
+@@ -14655,7 +14696,7 @@ def _run_native_assistant_extension(
+                     )
+                     payload["text"] = ""
+                     payload["status"] = "interrupted"
+-                    payload["native_assistant_extension_status"] = "silent"
++                    payload[status_key] = "silent"
+             if reply:
+                 rendered = render_message(reply, int(session.get("cols", 80)))
+                 if rendered:
+@@ -14671,7 +14712,7 @@ def _run_native_assistant_extension(
+                 )
+                 payload["text"] = ""
+                 payload["status"] = "interrupted"
+-                payload["native_assistant_extension_status"] = "silent"
++                payload[status_key] = "silent"
+         except BaseException:
+             logger.warning(
+                 "native extension terminal projection failed",
+@@ -14685,7 +14726,7 @@ def _run_native_assistant_extension(
+                     if terminal_status in {"completed", "silent"}
+                     else "interrupted"
+                 ),
+-                "native_assistant_extension_status": terminal_status,
++                status_key: terminal_status,
+             }
+ 
+         with _turn_event_scope(turn_id, assistant_message_id):

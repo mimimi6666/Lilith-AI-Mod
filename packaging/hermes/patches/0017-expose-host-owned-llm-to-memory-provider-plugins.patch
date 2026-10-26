@@ -1,0 +1,117 @@
+diff --git a/plugins/memory/__init__.py b/plugins/memory/__init__.py
+index a24029a0de314d0ea533c1447c010432863f6ae8..488ccb049e50031fd7e8f815b5907017b0a6e0f1 100644
+--- a/plugins/memory/__init__.py
++++ b/plugins/memory/__init__.py
+@@ -546,9 +546,10 @@ class _ProviderCollector:
+     """Plugin context for memory providers.
+ 
+     Captures ``register_memory_provider`` directly — that is the one call the
+-    exclusive activation path owns — and delegates everything else to a real
+-    ``PluginContext`` (see ``__getattr__``), so a memory provider has the same
+-    registration surface as any other plugin.
++    exclusive activation path owns — delegates registration methods to a real
++    ``PluginContext`` (see ``__getattr__``), and explicitly exposes that
++    context's host-owned ``llm`` facade. Other non-registration surfaces stay
++    private to the general plugin context.
+     """
+ 
+     def __init__(self, name: str, *, register_skills: bool = True):
+@@ -560,6 +561,17 @@ class _ProviderCollector:
+     def register_memory_provider(self, provider):
+         self.provider = provider
+ 
++    @property
++    def llm(self):
++        """Return this provider's host-owned, read-only LLM facade.
++
++        The facade comes from the same lazily-created ``PluginContext`` used
++        for delegated registrations. A provider can therefore retain it from
++        ``register(ctx)`` and route only through auxiliary tasks owned by the
++        provider's canonical plugin id.
++        """
++        return self._plugin_context().llm
++
+     def register_skill(self, *args, **kwargs):
+         """Forward plugin-provided skills to the general plugin registry.
+ 
+@@ -615,6 +627,11 @@ class _ProviderCollector:
+             raise AttributeError(attr)
+ 
+         def _forward(*args, **kwargs):
++            # ``register_skills=False`` is the side-effect-free inspection
++            # mode used by provider discovery. Suppress every delegated
++            # registry mutation there, not just register_skill().
++            if not self._register_skills:
++                return None
+             try:
+                 return self._plugin_context().__getattribute__(attr)(*args, **kwargs)
+             except Exception as exc:
+diff --git a/tests/plugins/memory/test_discovery_sources.py b/tests/plugins/memory/test_discovery_sources.py
+index 1384083a6c042cb9c245f526dfdfb8e5a99bb77d..d264d9bed55ecc48fc8051df723ceb9f28417afd 100644
+--- a/tests/plugins/memory/test_discovery_sources.py
++++ b/tests/plugins/memory/test_discovery_sources.py
+@@ -194,6 +194,8 @@ def test_a_secondary_registration_cannot_cost_the_provider(tmp_path, monkeypatch
+             "    ctx.register_memory_provider(Provider())\n",
+             "    instance = Provider()\n"
+             "    instance.marked = True\n"
++            "    instance.llm = ctx.llm\n"
++            "    instance.same_llm = instance.llm is ctx.llm\n"
+             "    ctx.register_memory_provider(instance)\n"
+             "    ctx.register_auxiliary_task(\n"
+             "        'auxmem_filter', display_name='Aux', description='d'\n"
+@@ -203,11 +205,54 @@ def test_a_secondary_registration_cannot_cost_the_provider(tmp_path, monkeypatch
+     )
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+ 
+-    loaded = memory_plugins.load_memory_provider("auxmem")
++    loaded = memory_plugins.load_memory_provider("auxmem", register_skills=True)
+     assert loaded is not None
+     assert loaded.name == "auxmem"
+     # The instance register() handed over, not a replacement.
+     assert getattr(loaded, "marked", False)
++    assert loaded.same_llm
++
++    from hermes_cli.plugins import get_plugin_manager
++
++    task = get_plugin_manager()._aux_tasks["auxmem_filter"]
++    assert loaded.llm._plugin_id == task["plugin"] == "auxmem"
++
++
++def test_inactive_provider_inspection_has_no_registry_side_effects(
++    tmp_path, monkeypatch
++):
++    plugins_root = tmp_path / "plugins"
++    provider = _write_provider_dir(plugins_root, "inspectmem")
++    (provider / "__init__.py").write_text(
++        PROVIDER_SOURCE.format(name="inspectmem").replace(
++            "    ctx.register_memory_provider(Provider())\n",
++            "    instance = Provider()\n"
++            "    instance.llm = ctx.llm\n"
++            "    ctx.register_memory_provider(instance)\n"
++            "    ctx.register_auxiliary_task(\n"
++            "        'inspectmem_filter', display_name='Aux', description='d'\n"
++            "    )\n",
++        ),
++        encoding="utf-8",
++    )
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++
++    from hermes_cli.plugins import get_plugin_manager
++
++    manager = get_plugin_manager()
++    before = dict(manager._aux_tasks)
++
++    discovered = memory_plugins.discover_memory_providers()
++
++    assert any(name == "inspectmem" and available for name, _, available in discovered)
++    assert manager._aux_tasks == before
++
++
++def test_provider_collector_exposes_no_other_context_state():
++    collector = memory_plugins._ProviderCollector("narrowmem")
++
++    with pytest.raises(AttributeError):
++        _ = collector.get_config
+ 
+ 
+ def test_activation_is_not_gated_on_plugins_enabled(tmp_path, monkeypatch):

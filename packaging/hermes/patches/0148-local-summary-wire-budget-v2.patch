@@ -1,0 +1,398 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 51d48b0..4fadb7f 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -10557,6 +10557,99 @@ def _release_sync_semaphore_after_stream(
+             semaphore.release()
+ 
+ 
++_LOCAL_SUMMARY_PREVIEW = contextvars.ContextVar("local_summary_preview", default=None)
++_LOCAL_SUMMARY_PREPARED = contextvars.ContextVar("local_summary_prepared", default=None)
++
++
++class _PreparedLocalSummary:
++    """Host-only, attempt-scoped route and SDK envelope; never serializable."""
++    def __init__(self, policy, client, request, provider, model, base_url, api_mode):
++        from copy import deepcopy
++        from agent.local_compatibility import prepare_request
++        from agent.usage_budget_native_dispatch import local_summary_wire_shaper
++        self.policy, self.client = policy, client
++        self.route = dict(provider=provider, model=model, base_url=base_url, api_mode=api_mode)
++        # Add/validate the exact cap even when the generic auxiliary formatter
++        # omits it for custom providers. This small reference request fits.
++        self.template = prepare_request(policy, deepcopy(request), **self.route)
++        self.shape_wire = local_summary_wire_shaper(client, self.template)
++
++    def __reduce__(self):
++        raise TypeError("local summary preparation is process scoped")
++
++    def request(self, messages, timeout=None):
++        from copy import deepcopy
++        from agent.identity_policy import bind_host_required_auxiliary_messages
++        request = deepcopy(self.template)
++        request["messages"] = bind_host_required_auxiliary_messages(messages)
++        if timeout is not None:
++            request["timeout"] = timeout
++        return request
++
++    def measure(self, messages):
++        from agent.usage_budget_official_routes import estimate_final_input
++        request = self.request(messages)
++        return max(estimate_final_input(request).tokens,
++                   estimate_final_input(self.shape_wire(request)).tokens)
++
++    @contextlib.contextmanager
++    def bind(self):
++        from agent.local_compatibility import current_policy
++        if current_policy() is not self.policy:
++            raise BudgetError("local_compatibility_summary_policy_changed")
++        token = _LOCAL_SUMMARY_PREPARED.set(self)
++        try:
++            yield
++        finally:
++            _LOCAL_SUMMARY_PREPARED.reset(token)
++
++    def dispatch(self, *, task, provider, model, base_url, api_mode, messages,
++                 timeout, max_tokens, tools, stream, extra_body, extra_headers,
++                 reasoning_config, route_info):
++        from agent.local_compatibility import current_policy, matches, prepare_request
++        if (current_policy() is not self.policy or task != "compression" or stream
++                or tools or extra_body or extra_headers or reasoning_config
++                or max_tokens != self.policy.output_reserve
++                or not matches(self.policy, provider=provider, model=model,
++                               base_url=base_url, api_mode=api_mode)):
++            raise BudgetError("local_compatibility_summary_preparation_changed")
++        request = prepare_request(self.policy, self.request(messages, timeout), **self.route)
++        _set_relay_auxiliary_route(self.route["provider"], self.route["model"], self.route["api_mode"])
++        _record_route_info(route_info, _fallback_provider_from_label(self.route["provider"]), self.route["model"])
++        response = _relay_sync_completion(self.client, request, provider=self.route["provider"],
++            api_mode=self.route["api_mode"], create=lambda value: _budget_aux_sync_create(self.client, value))
++        return _validate_llm_response(response, task, provider=self.route["provider"], base_url=self.route["base_url"])
++
++
++def prepare_local_summary_request(policy, **kwargs):
++    """Resolve once without entering the relay/semaphore or dispatching.
++
++    Only an already host-selected exact local route is admissible. The normal
++    local client factory may materialize a transport; no inference, provider
++    fallback, or quota admission occurs. Each binary-search candidate then
++    renders into the same frozen SDK envelope without route/config reads.
++    """
++    from agent.local_compatibility import current_policy, matches
++    if (current_policy() is not policy or kwargs.get("task") != "compression"
++            or kwargs.get("stream") or kwargs.get("tools")
++            or not matches(policy, provider=kwargs.get("provider"), model=kwargs.get("model"),
++                           base_url=kwargs.get("base_url"), api_mode=kwargs.get("api_mode"))):
++        raise BudgetError("local_compatibility_summary_preparation_changed")
++    runtime = kwargs.get("main_runtime")
++    if (not isinstance(runtime, dict) or not matches(policy,
++            provider=runtime.get("provider"), model=runtime.get("model"),
++            base_url=runtime.get("base_url"), api_mode=runtime.get("api_mode"))):
++        raise BudgetError("local_compatibility_summary_preparation_changed")
++    token = _LOCAL_SUMMARY_PREVIEW.set(policy)
++    try:
++        result = _call_llm_impl(**kwargs)
++        if type(result) is not _PreparedLocalSummary:
++            raise BudgetError("local_compatibility_summary_preparation_failed")
++        return result
++    finally:
++        _LOCAL_SUMMARY_PREVIEW.reset(token)
++
++
+ def _call_llm_impl(
+     task: str = None,
+     *,
+@@ -10616,6 +10709,14 @@ def _call_llm_impl(
+     Raises:
+         RuntimeError: If no provider is configured.
+     """
++    prepared = _LOCAL_SUMMARY_PREPARED.get()
++    if prepared is not None:
++        if type(prepared) is not _PreparedLocalSummary:
++            raise BudgetError("local_compatibility_summary_preparation_changed")
++        return prepared.dispatch(task=task, provider=provider, model=model, base_url=base_url,
++            api_mode=api_mode, messages=messages, timeout=timeout, max_tokens=max_tokens,
++            tools=tools, stream=stream, extra_body=extra_body, extra_headers=extra_headers,
++            reasoning_config=reasoning_config, route_info=route_info)
+     # Capture one immutable runtime snapshot for keying, resolution, retries,
+     # and fallbacks. Reading ambient state independently in each phase lets a
+     # concurrent /model switch produce a key for one runtime and a client for
+@@ -10635,6 +10736,13 @@ def _call_llm_impl(
+             main_runtime=main_runtime,
+         )
+     )
++    preview = _LOCAL_SUMMARY_PREVIEW.get()
++    if preview is not None:
++        from agent.local_compatibility import matches
++        if not matches(preview, provider=resolved_provider, model=resolved_model,
++                       base_url=resolved_base_url, api_mode=resolved_api_mode):
++            # Reject drift before any factory, credential fallback or probe.
++            raise BudgetError("local_compatibility_summary_preparation_changed")
+     from agent import speech_recovery
+     if speech_recovery.active():
+         speech_recovery.validate_auxiliary_route(
+@@ -10772,18 +10880,17 @@ def _call_llm_impl(
+ 
+     effective_timeout = _effective_aux_timeout(task, timeout)
+     request_provider = effective_provider or resolved_provider
+-    _set_relay_auxiliary_route(
+-        request_provider,
+-        final_model,
+-        resolved_api_mode,
+-    )
+-    _record_route_info(
+-        route_info, _fallback_provider_from_label(request_provider), final_model
+-    )
++    if _LOCAL_SUMMARY_PREVIEW.get() is None:
++        _set_relay_auxiliary_route(
++            request_provider, final_model, resolved_api_mode,
++        )
++        _record_route_info(
++            route_info, _fallback_provider_from_label(request_provider), final_model
++        )
+ 
+     # Log what we're about to do — makes auxiliary operations visible
+     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
+-    if task:
++    if task and _LOCAL_SUMMARY_PREVIEW.get() is None:
+         _safe_base_info = _safe_auxiliary_base_url_for_log(_base_info)
+         logger.info("Auxiliary %s: using %s (%s)%s",
+                      task, request_provider or "auto", final_model or "default",
+@@ -10818,6 +10925,12 @@ def _call_llm_impl(
+     if current_policy() is not None:
+         if stream:
+             raise BudgetError("local_compatibility_auxiliary_stream_unsupported")
++        preview = _LOCAL_SUMMARY_PREVIEW.get()
++        if preview is not None:
++            if preview is not current_policy() or task != "compression" or speech_recovery.active():
++                raise BudgetError("local_compatibility_summary_preparation_changed")
++            return _PreparedLocalSummary(preview, client, kwargs, request_provider,
++                final_model, _base_info or resolved_base_url, resolved_api_mode)
+         kwargs = prepare_request(current_policy(), kwargs, provider=request_provider, model=final_model,
+             base_url=_base_info or resolved_base_url, api_mode=resolved_api_mode)
+         # One physical call, still through native admission/accounting and the
+diff --git a/agent/local_compatibility_summary.py b/agent/local_compatibility_summary.py
+index 4db55bd..280f7e5 100644
+--- a/agent/local_compatibility_summary.py
++++ b/agent/local_compatibility_summary.py
+@@ -58,24 +58,27 @@ def _validate_checkpoint_text(text):
+     return text
+ 
+ 
+-def plan_chunks(content, render, policy, previous):
+-    """Plan all calls before dispatch; never omit a middle span to make it fit."""
+-    # Reserve a worst-case *estimated* previous checkpoint at every stage. The
+-    # returned checkpoint is separately measured and rejected if over reserve.
+-    from agent.model_metadata import estimate_tokens_rough
++def plan_chunks(content, render, policy, previous, *, measure=None, start_index=1, max_calls=MAX_CALLS):
++    """Plan the entire remaining suffix using the actual prior checkpoint.
++
++    Replan after each validated result: raw text tokens do not bound nested
++    JSON escapes. The largest possible counter in this attempt is included;
++    the actual counter/envelope is measured again immediately before dispatch.
++    """
+     from agent.usage_budget_official_routes import estimate_final_input
+-    placeholder = "x" * (policy.output_reserve * 4)
+-    prior = previous if estimate_tokens_rough(previous) > policy.output_reserve else placeholder
++    if measure is None:
++        measure = lambda messages: estimate_final_input({"messages": messages,
++            "max_tokens": policy.output_reserve}).tokens
++    last_index = start_index + max_calls - 1
+ 
+     def fits(fragment):
+-        request = {"messages": render(prior, fragment, MAX_CALLS, MAX_CALLS)}
+-        return estimate_final_input(request).tokens <= policy.input_budget
++        return measure(render(previous, fragment, last_index, last_index)) <= policy.input_budget
+ 
+     if not fits(""):
+         raise LocalCompatibilityError("local_compatibility_summary_fixed_input_too_large")
+     chunks, remaining = [], content
+     while remaining:
+-        if len(chunks) >= MAX_CALLS:
++        if len(chunks) >= max_calls:
+             raise LocalCompatibilityError("local_compatibility_summary_chunk_limit")
+         low, high = 0, len(remaining)
+         while low < high:
+@@ -91,6 +94,12 @@ def plan_chunks(content, render, policy, previous):
+             boundary = remaining.rfind("\n", max(1, low // 2), low)
+             if boundary > 0:
+                 low = boundary + 1
++        # Rendering is caller-owned; never assume its size is monotonic when
++        # choosing a preferred line boundary after the binary search.
++        while low > 0 and not fits(remaining[:low]):
++            low -= 1
++        if low == 0:
++            raise LocalCompatibilityError("local_compatibility_summary_fixed_input_too_large")
+         chunks.append(remaining[:low])
+         remaining = remaining[low:]
+     return chunks or [""]
+@@ -108,7 +117,7 @@ def generate_summary(compressor, policy, turns, *, focus_topic=None, memory_cont
+     from agent.model_metadata import estimate_tokens_rough
+     from agent.auxiliary_client import (
+         call_llm, aux_interrupt_protection, _aux_interrupt_cancel_requested,
+-        AuxiliaryExplicitCancellation,
++        AuxiliaryExplicitCancellation, prepare_local_summary_request,
+     )
+     from agent import local_compatibility_checkpoint as checkpoints
+ 
+@@ -168,6 +177,21 @@ def generate_summary(compressor, policy, turns, *, focus_topic=None, memory_cont
+     if automatic_focus:
+         focus = "HOST_SOURCE_AUTO_FOCUS_V1"
+     contract = render("", "", MAX_CALLS, MAX_CALLS)
++    call_kwargs = dict(task="compression", messages=contract,
++        max_tokens=policy.output_reserve, timeout=TOTAL_SECONDS,
++        provider=compressor.provider, model=compressor.model,
++        base_url=compressor.base_url, api_key=compressor.api_key,
++        api_mode=compressor.api_mode,
++        main_runtime={"model": compressor.model, "provider": compressor.provider,
++            "base_url": compressor.base_url, "api_key": compressor.api_key,
++            "api_mode": compressor.api_mode})
++    compressor._strict_identity_summary_runtime(call_kwargs)
++    with bind_policy(policy):
++        prepared = prepare_local_summary_request(policy, **call_kwargs)
++    # Include actual task extras, provider defaults and native quota shaping in
++    # the reusable checkpoint contract, excluding transport-only timeout.
++    contract = {key: value for key, value in prepared.shape_wire(prepared.request(contract)).items()
++                if key not in ("timeout", "extra_headers", "extra_query", "stream_options")}
+     focus = current_focus
+     check_cancel()
+     ticket = checkpoints.begin(compressor, policy, turns, serialized, contract, previous, focus)
+@@ -177,7 +201,8 @@ def generate_summary(compressor, policy, turns, *, focus_topic=None, memory_cont
+         focus = ticket.focus
+     summary = ticket.summary if reused else previous
+     chunks = ([] if reused and consumed == len(serialized)
+-              else plan_chunks(serialized[consumed:], render, policy, summary))
++              else plan_chunks(serialized[consumed:], render, policy, summary,
++                  measure=prepared.measure, start_index=reused + 1))
+     total = reused + len(chunks)
+     telemetry = getattr(compressor, "_active_compression_telemetry", None)
+     if isinstance(telemetry, dict):
+@@ -208,27 +233,26 @@ def generate_summary(compressor, policy, turns, *, focus_topic=None, memory_cont
+                 logger.debug("local summary status callback unavailable")
+ 
+     progress(reused, 0)
+-    for call_index, chunk in enumerate(chunks, 1):
++    call_index = 0
++    while chunks:
++        call_index += 1
++        chunk = chunks[0]
+         check_cancel()
+         remaining = deadline - time.monotonic()
+         if remaining <= 0:
+             raise LocalCompatibilityError("local_compatibility_summary_deadline")
+         messages = render(summary, chunk, reused + call_index, total)
+-        request = prepare_request(policy, {"messages": messages, "max_tokens": policy.output_reserve},
+-            provider=compressor.provider, model=compressor.model, base_url=compressor.base_url, api_mode=compressor.api_mode)
++        request = prepare_request(policy, prepared.request(messages, remaining), **prepared.route)
++        if prepared.measure(messages) > policy.input_budget:
++            raise LocalCompatibilityError("local_compatibility_input_too_large")
+         # Local server queueing consumes the same bounded checkpoint deadline.
+         # Do not add a shorter per-call cutoff before the shared 90-second limit.
+-        kwargs = dict(task="compression", messages=request["messages"],
+-                      max_tokens=request["max_tokens"], timeout=remaining,
+-                      main_runtime={"model": compressor.model, "provider": compressor.provider,
+-                          "base_url": compressor.base_url, "api_key": compressor.api_key,
+-                          "api_mode": compressor.api_mode})
+-        compressor._strict_identity_summary_runtime(kwargs)
++        kwargs = dict(call_kwargs, messages=request["messages"], timeout=remaining)
+         if isinstance(telemetry, dict):
+             telemetry["local_summary_calls"] = call_index
+         # Native protection inherits the host Event and polls hard cancellation;
+         # it ignores only soft interrupts. Keep the original origin/ledger.
+-        with bind_policy(policy), aux_interrupt_protection():
++        with bind_policy(policy), prepared.bind(), aux_interrupt_protection():
+             response = call_llm(**kwargs)
+         check_cancel()
+         require_complete_budgeted_summary(response)
+@@ -253,6 +277,17 @@ def generate_summary(compressor, policy, turns, *, focus_topic=None, memory_cont
+         if chunk:
+             ticket = checkpoints.publish(ticket, serialized, consumed, summary, focus, check_cancel)
+         progress(reused + call_index, call_index)
++        if consumed < len(serialized):
++            if call_index >= MAX_CALLS:
++                raise LocalCompatibilityError("local_compatibility_summary_chunk_limit")
++            chunks = plan_chunks(serialized[consumed:], render, policy, summary,
++                measure=prepared.measure, start_index=reused + call_index + 1,
++                max_calls=MAX_CALLS - call_index)
++            total = reused + call_index + len(chunks)
++            if isinstance(telemetry, dict):
++                telemetry.update(chunking=total > 1, chunk_count=total)
++        else:
++            chunks = []
+     if time.monotonic() > deadline:
+         raise LocalCompatibilityError("local_compatibility_summary_deadline")
+     names = _collect_ghosted_skill_names(turns)
+diff --git a/agent/usage_budget_native_dispatch.py b/agent/usage_budget_native_dispatch.py
+index 95c1a68..3da9126 100644
+--- a/agent/usage_budget_native_dispatch.py
++++ b/agent/usage_budget_native_dispatch.py
+@@ -540,6 +540,45 @@ async def native_chat_dispatch_async(client, request, send, *, category="auxilia
+                                        stream=bool(request.get("stream")), category=category)
+ 
+ 
++def _shape_economic_request(client, request, binding, policy):
++    """Pure SDK shaping shared by admission and local summary planning.
++
++    No reservation, counting callback, dispatch permit, or usage event occurs
++    here. The actual leaf still independently validates its final request.
++    """
++    from agent.usage_budget_official_routes import (
++        normalize_official_economy_request, split_final_sdk_body,
++        lower_reviewed_thinking_budget,
++    )
++    request = normalize_official_economy_request(client, request, binding.capability.wire_format)
++    if binding.output_control != "verified" and policy.strict:
++        raise BudgetError("strict_output_cap_unverified")
++    body, restore = split_final_sdk_body(client, request, binding.capability.wire_format)
++    body = lower_reviewed_thinking_budget(client, body, binding.capability.wire_format, policy)
++    if binding.output_control == "unavailable":
++        guarded, cap = prepare_uncontrolled_estimated_request(
++            body, policy.output_tokens, binding.capability, binding.capability.route)
++    else:
++        guarded, cap = prepare_wire_request(body, output_limit=policy.output_tokens,
++            capability=binding.capability, route=binding.capability.route,
++            estimated_output=binding.output_control == "requested")
++    return restore(guarded), cap
++
++
++def local_summary_wire_shaper(client, request):
++    """Freeze a read-only local shaping closure; never acquire admission."""
++    from agent.local_compatibility import current_policy
++    if current_policy() is None:
++        raise BudgetError("local_compatibility_summary_policy_missing")
++    ledger = _active_ledger()
++    if ledger is None:
++        from copy import deepcopy
++        return deepcopy
++    binding = require_native_dispatch_route(client, request, _chat_wire_format(client, request))
++    policy = ledger.policy
++    return lambda candidate: _shape_economic_request(client, candidate, binding, policy)[0]
++
++
+ class _Attempt:
+     def __init__(self, ledger, binding, request, category, *, defer=False, client=None):
+         self.ledger, self.binding = ledger, binding
+@@ -548,22 +587,7 @@ class _Attempt:
+         self.last_usage = UsageCount()
+         self.usage_unreadable = False
+         from copy import deepcopy
+-        from agent.usage_budget_official_routes import normalize_official_economy_request
+-        request = normalize_official_economy_request(client, request, binding.capability.wire_format)
+-        output_limit = ledger.policy.output_tokens
+-        if binding.output_control != "verified" and ledger.policy.strict:
+-            raise BudgetError("strict_output_cap_unverified")
+-        from agent.usage_budget_official_routes import split_final_sdk_body, lower_reviewed_thinking_budget
+-        body, restore = split_final_sdk_body(client, request, binding.capability.wire_format)
+-        body = lower_reviewed_thinking_budget(client, body, binding.capability.wire_format, ledger.policy)
+-        if binding.output_control == "unavailable":
+-            guarded, cap = prepare_uncontrolled_estimated_request(
+-                body, output_limit, binding.capability, binding.capability.route)
+-        else:
+-            guarded, cap = prepare_wire_request(body, output_limit=output_limit,
+-                capability=binding.capability, route=binding.capability.route,
+-                estimated_output=binding.output_control == "requested")
+-        self.request = restore(guarded)
++        self.request, cap = _shape_economic_request(client, request, binding, ledger.policy)
+         from agent.local_compatibility import prepare_final_sdk_request
+         self.request = prepare_final_sdk_request(client, self.request, binding.capability.wire_format)
+         if cap is None:

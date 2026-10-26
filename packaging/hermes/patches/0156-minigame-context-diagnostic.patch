@@ -1,0 +1,317 @@
+diff --git a/agent/minigame_context.py b/agent/minigame_context.py
+index 4b5d28f..612e48f 100644
+--- a/agent/minigame_context.py
++++ b/agent/minigame_context.py
+@@ -280,6 +280,107 @@ def reference_suffix(value, *, provider=None):
+     return value.reference if type(value) is PublicGameContext else ""
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class GameContextDiagnosticLease:
++    """Content-free opt-in grant, carried only by the authenticated test turn."""
++    trace_id: str
++    expires_at_ms: int
++
++
++def parse_diagnostic_request(value, now_ms=None):
++    """Validate the exact bounded grant; expiry quietly disables diagnostics."""
++    if value is None:
++        return None
++    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
++    if type(value) is GameContextDiagnosticLease:
++        trace_id, expiry = value.trace_id, value.expires_at_ms
++    else:
++        if type(value) is not dict or set(value) != {"traceId", "expiresAtUnixMs"}:
++            raise ValueError("invalid mini-game diagnostic grant")
++        trace_id, expiry = value["traceId"], value["expiresAtUnixMs"]
++    if (type(trace_id) is not str or not _GUID.fullmatch(trace_id) or trace_id == "0" * 32
++            or type(expiry) is not int or expiry < 1 or expiry > 253402300799999
++            or type(now_ms) is not int or now_ms < 1 or expiry > now_ms + 1800000):
++        raise ValueError("invalid mini-game diagnostic grant")
++    return GameContextDiagnosticLease(trace_id, expiry) if expiry > now_ms else None
++
++
++def diagnostic_grant_wire(value):
++    lease = parse_diagnostic_request(value)
++    return ({"traceId": lease.trace_id, "expiresAtUnixMs": lease.expires_at_ms}
++            if lease is not None else None)
++
++
++def diagnostic_context_status(before, after):
++    """No payload inspection: callers supply the result of their normal parse."""
++    return "absent" if before is None else "fresh" if after is not None else "stale"
++
++
++class GameContextDiagnosticObserver:
++    """One accepted turn, at most one event per stage; never stored on an agent.
++
++    The observer stores only the immutable grant, native turn identity, callback
++    and a three-item stage set. It never retains a context, prompt or request.
++    Optional evidence failures cannot change the ordinary conversation outcome.
++    """
++    __slots__ = ("_lease", "_turn_id", "_emit", "_seen")
++
++    def __init__(self, lease, turn_id, emit):
++        if (type(lease) is not GameContextDiagnosticLease or type(turn_id) is not str
++                or not _GUID.fullmatch(turn_id) or turn_id == "0" * 32 or not callable(emit)):
++            raise ValueError("invalid mini-game diagnostic observer")
++        self._lease, self._turn_id, self._emit = lease, turn_id, emit
++        self._seen = set()
++
++    def observe(self, stage, status, *, route="not-observed", strict_policy_enabled=None):
++        try:
++            if stage not in {"ingress", "agent", "dispatch"} or stage in self._seen:
++                return
++            if int(time.time() * 1000) >= self._lease.expires_at_ms:
++                return
++            statuses = {"present", "absent", "omitted-moa"} if stage == "dispatch" else {"fresh", "stale", "absent"}
++            if status not in statuses or route not in {"not-observed", "chat", "responses", "anthropic", "bedrock", "other"}:
++                return
++            if stage != "dispatch" and (route != "not-observed" or strict_policy_enabled is not None):
++                return
++            if strict_policy_enabled is not None and type(strict_policy_enabled) is not bool:
++                return
++            self._seen.add(stage)
++            self._emit({"traceId": self._lease.trace_id, "turnId": self._turn_id,
++                        "stage": stage, "status": status, "route": route,
++                        "strictPolicyEnabled": strict_policy_enabled})
++        except Exception:
++            # No message, exception text, payload or fallback log is retained.
++            return
++
++    def dispatch(self, request, context, *, provider, api_mode, strict_policy_enabled):
++        """Observe the final prepared main-loop authority, not network receipt.
++
++        Called after middleware, local compatibility and Responses preflight;
++        lower SDK/relay/budget adapters have not yet dispatched the request.
++        """
++        if "dispatch" in self._seen or int(time.time() * 1000) >= self._lease.expires_at_ms:
++            return
++        try:
++            from agent.identity_policy import _provider_authority_text
++            authority = []
++            if type(request) is dict:
++                rows = request.get("messages")
++                if type(rows) is list:
++                    authority.extend(_provider_authority_text(row.get("content")) for row in rows
++                                     if type(row) is dict and row.get("role") in {"system", "developer"})
++                authority.extend(_provider_authority_text(request[key])
++                                 for key in ("instructions", "system") if key in request)
++            present = (type(context) is PublicGameContext
++                       and any(type(text) is str and context.reference in text for text in authority))
++            status = "present" if present else "omitted-moa" if provider == "moa" and context is not None else "absent"
++            route = {"chat_completions": "chat", "codex_responses": "responses",
++                     "anthropic_messages": "anthropic", "bedrock_converse": "bedrock"}.get(api_mode, "other")
++            self.observe("dispatch", status, route=route, strict_policy_enabled=strict_policy_enabled)
++        except Exception:
++            return
++
++
+ def diagnostic_request_copy(request, *, _redacted=None):
+     """Remove host facts from an owned diagnostic copy, never the SDK request.
+ 
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index f09ce6c..453916a 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1803,6 +1803,7 @@ def run_conversation(
+     moa_config: Optional[dict[str, Any]] = None,
+     *,
+     game_context=None,
++    game_context_diagnostic=None,
+ ) -> Dict[str, Any]:
+     """
+     Run a complete conversation with tool calling until completion.
+@@ -3251,6 +3252,14 @@ def run_conversation(
+                         expected_system_prompt=effective_system,
+                         label="provider dispatch",
+                     )
++                    if game_context_diagnostic is not None:
++                        try:
++                            game_context_diagnostic.dispatch(
++                                next_api_kwargs, game_context, provider=agent.provider,
++                                api_mode=agent.api_mode,
++                                strict_policy_enabled=_request_identity_policy(agent).enabled)
++                        except Exception:
++                            pass  # Optional evidence cannot affect dispatch.
+                     if _use_streaming:
+                         return agent._interruptible_streaming_api_call(
+                             next_api_kwargs, on_first_delta=_stop_spinner
+diff --git a/run_agent.py b/run_agent.py
+index cc60a43..41de6fc 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -8497,6 +8497,7 @@ class AIAgent:
+         moa_config: Optional[dict[str, Any]] = None,
+         *,
+         game_context=None,
++        game_context_diagnostic=None,
+     ) -> Dict[str, Any]:
+         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+         if getattr(self, "_isolated_request", False):
+@@ -8627,6 +8628,7 @@ class AIAgent:
+                     persist_user_human_origin=persist_user_human_origin,
+                     persist_user_human_subject_id=persist_user_human_subject_id,
+                     game_context=game_context,
++                    game_context_diagnostic=game_context_diagnostic,
+                     moa_config=moa_config,
+                 )
+             terminal = result if isinstance(result, dict) else {}
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 4173a0b..0198a8e 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -342,13 +342,26 @@ def _(rid, params: dict) -> dict:
+         and isinstance(session.get("_durable_lineage_root"), str)
+         and bool(session.get("_durable_lineage_root"))
+     )
++    game_context_diagnostic = None
++    if "game_context_diagnostic" in params:
++        if not runtime_ingress_attested or not game_lineage_attested:
++            return _err(rid, 4030, "game diagnostic requires attested game input")
++        from agent.minigame_context import parse_diagnostic_request
++        try:
++            game_context_diagnostic = parse_diagnostic_request(params["game_context_diagnostic"])
++        except (ValueError, TypeError):
++            # Optional evidence must not reject an otherwise valid game turn.
++            game_context_diagnostic = None
+     game_context = None
++    game_context_ingress_status = "absent"
+     if "game_context" in params:
+         if not runtime_ingress_attested or not game_lineage_attested:
+             return _err(rid, 4030, "game_context requires attested game input")
+         from agent.minigame_context import parse_public_context, fresh_public_context
+         try:
+-            game_context = fresh_public_context(parse_public_context(params["game_context"]))
++            parsed_game_context = parse_public_context(params["game_context"])
++            game_context = fresh_public_context(parsed_game_context)
++            game_context_ingress_status = "fresh" if game_context is not None else "stale"
+         except (ValueError, TypeError):
+             return _err(rid, 4004, "invalid mini-game public context")
+     human_input_origin = ""
+@@ -784,6 +797,16 @@ def _(rid, params: dict) -> dict:
+             _clear_inflight_turn(session)
+             return _err(rid, 4091, "economic origin admission unavailable")
+ 
++    if game_context_diagnostic is not None:
++        try:
++            from agent.minigame_context import GameContextDiagnosticObserver
++            with _turn_event_scope(accepted_turn_id):
++                GameContextDiagnosticObserver(game_context_diagnostic, accepted_turn_id,
++                    lambda payload: _emit("game.context_diagnostic", sid, payload)).observe(
++                        "ingress", game_context_ingress_status)
++        except Exception:
++            pass  # Content-free diagnostics never alter the accepted turn.
++
+     if turn_isolation:
+         isolated_response = _submit_prompt_to_compute_host(
+             rid,
+@@ -794,6 +817,7 @@ def _(rid, params: dict) -> dict:
+             human_input_origin=human_input_origin,
+             human_input_subject_id=human_input_subject_id,
+             game_context=game_context,
++            game_context_diagnostic=game_context_diagnostic,
+         )
+         if not isolated_response.get("error"):
+             if survivor_user_row_ids is not None:
+@@ -904,6 +928,7 @@ def _(rid, params: dict) -> dict:
+             human_input_origin=human_input_origin,
+             human_input_subject_id=human_input_subject_id,
+             game_context=game_context,
++            game_context_diagnostic=game_context_diagnostic,
+         )
+ 
+     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 4cd8368..f41fc91 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -1865,6 +1865,7 @@ _TURN_REQUIRED_EVENT_TYPES = frozenset(
+         "approval.request",
+         "clarify.expire",
+         "clarify.request",
++        "game.context_diagnostic",
+         "mcp.setup.expire",
+         "mcp.setup.request",
+         "lilith.host.request",
+@@ -2192,6 +2193,7 @@ def _compute_host_turn_frame(
+     human_input_origin: str | None = None,
+     human_input_subject_id: str | None = None,
+     game_context=None,
++    game_context_diagnostic=None,
+ ) -> dict:
+     with session["history_lock"]:
+         history = list(session.get("history", []))
+@@ -2249,6 +2251,14 @@ def _compute_host_turn_frame(
+     public_context = fresh_public_context(game_context)
+     if public_context is not None:
+         frame["game_context"] = json.loads(public_context.wire)
++    if game_context_diagnostic is not None:
++        try:
++            from agent.minigame_context import diagnostic_grant_wire
++            grant_wire = diagnostic_grant_wire(game_context_diagnostic)
++            if grant_wire is not None:
++                frame["game_context_diagnostic"] = grant_wire
++        except Exception:
++            pass  # Optional test evidence cannot block the normal IPC frame.
+     return frame
+ 
+ 
+@@ -2694,6 +2704,7 @@ def _submit_prompt_to_compute_host(
+     human_input_origin: str | None = None,
+     human_input_subject_id: str | None = None,
+     game_context=None,
++    game_context_diagnostic=None,
+ ) -> dict:
+     from tui_gateway.host_supervisor import ComputeHostTurnCommitError
+ 
+@@ -2709,6 +2720,7 @@ def _submit_prompt_to_compute_host(
+         human_input_origin=human_input_origin,
+         human_input_subject_id=human_input_subject_id,
+         game_context=game_context,
++        game_context_diagnostic=game_context_diagnostic,
+     )
+     # Freeze the accepted identity before handing work to another process. A
+     # very fast host can complete and clear the parent inflight snapshot before
+@@ -15391,6 +15403,7 @@ def _run_prompt_submit(
+     human_input_origin: str | None = None,
+     human_input_subject_id: str | None = None,
+     game_context=None,
++    game_context_diagnostic=None,
+ ) -> None:
+     quarantine_error = _native_authority_quarantine_rpc_error(rid)
+     if quarantine_error is not None:
+@@ -15905,6 +15918,21 @@ def _run_prompt_submit(
+             public_context = fresh_public_context(game_context)
+             if public_context is not None:
+                 run_kwargs["game_context"] = public_context
++            if game_context_diagnostic is not None:
++                try:
++                    from agent.minigame_context import (
++                        parse_diagnostic_request, GameContextDiagnosticObserver,
++                        diagnostic_context_status,
++                    )
++                    diagnostic_lease = parse_diagnostic_request(game_context_diagnostic)
++                    if diagnostic_lease is not None:
++                        diagnostic_observer = GameContextDiagnosticObserver(
++                            diagnostic_lease, turn_id,
++                            lambda payload: _emit("game.context_diagnostic", sid, payload))
++                        diagnostic_observer.observe("agent", diagnostic_context_status(game_context, public_context))
++                        run_kwargs["game_context_diagnostic"] = diagnostic_observer
++                except Exception:
++                    pass  # No diagnostic failure may alter a normal request.
+             with scene_request_context(agent, scene_note):
+                 result = agent.run_conversation(run_message, **run_kwargs)
+             if display_kind and isinstance(text, str):
+diff --git a/tui_gateway/compute_host.py b/tui_gateway/compute_host.py
+index fae33e0..96b55e6 100644
+--- a/tui_gateway/compute_host.py
++++ b/tui_gateway/compute_host.py
+@@ -768,6 +768,7 @@ class ComputeHost:
+                     else None
+                 ),
+                 game_context=frame.get("game_context"),
++                game_context_diagnostic=frame.get("game_context_diagnostic"),
+             )
+             run_thread = session.get("_run_thread")
+             if run_thread is not None and hasattr(run_thread, "join"):

@@ -1,0 +1,4220 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 51e7bdb7e0d63dc65587a3b7e120fece2b7f1acf..e4dd9b9b076e17ca7a41e2d8bc9a9e2ea5166a2c 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -7837,7 +7837,7 @@ def run_conversation(
+                             _frag.pop("_length_continuation_nudge", None)
+                 
+                 final_response = agent._strip_think_blocks(final_response).strip()
+-                 
++
+                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+ 
+                 # Reached finalization. Clear the consecutive-stall budget so
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index 8799be8afefc0e24cfa6bb0e2733c778fa39ac34..8e741bb21bf0cd46f48f28694c7f207267e9ab25 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -9110,7 +9110,7 @@ def test_input_detect_drop_path_with_spaces_and_remainder(tmp_path):
+     assert server._sessions["sid"]["attached_images"][0] == str(img)
+ 
+ 
+-def test_rollback_restore_resolves_number_and_file_path():
++def test_rollback_restore_resolves_number_and_file_path(monkeypatch, tmp_path):
+     calls = {}
+ 
+     class _Mgr:
+@@ -9123,14 +9123,25 @@ def test_rollback_restore_resolves_number_and_file_path():
+             calls["args"] = (cwd, target, file_path)
+             return {"success": True, "message": "done"}
+ 
++    cwd = tmp_path / "workspace"
++    cwd.mkdir()
+     server._sessions["sid"] = _session(
+-        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()), history=[]
++        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()),
++        history=[],
++        cwd=str(cwd),
+     )
++    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+     resp = server.handle_request(
+         {
+             "id": "1",
+             "method": "rollback.restore",
+-            "params": {"session_id": "sid", "hash": "2", "file_path": "src/app.tsx"},
++            "params": {
++                "session_id": "sid",
++                "hash": "2",
++                "file_path": "src/app.tsx",
++                "confirm": True,
++                "operation_id": "restore-file-1",
++            },
+         }
+     )
+ 
+@@ -9139,7 +9150,9 @@ def test_rollback_restore_resolves_number_and_file_path():
+     assert calls["args"][2] == "src/app.tsx"
+ 
+ 
+-def test_rollback_restore_truncates_from_real_user_turn_not_marker(monkeypatch):
++def test_rollback_restore_truncates_from_real_user_turn_not_marker(
++    monkeypatch, tmp_path,
++):
+     """rollback.restore must truncate from the last *real* user turn,
+     not a display_kind timeline marker (same bug class as /undo).
+     """
+@@ -9165,16 +9178,30 @@ def test_rollback_restore_truncates_from_real_user_turn_not_marker(monkeypatch):
+             "display_kind": "async_delegation_complete",
+         },
+     ]
++    cwd = tmp_path / "workspace"
++    cwd.mkdir()
+     server._sessions["sid"] = _session(
+         agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()),
+         history=list(history),
++        cwd=str(cwd),
+     )
++    class _Db:
++        def replace_messages(self, *_args, **_kwargs):
++            return None
++
++    monkeypatch.setattr(server, "_get_db", lambda: _Db())
++    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+     try:
+         resp = server.handle_request(
+             {
+                 "id": "1",
+                 "method": "rollback.restore",
+-                "params": {"session_id": "sid", "hash": "abc123"},
++                "params": {
++                    "session_id": "sid",
++                    "hash": "abc123",
++                    "confirm": True,
++                    "operation_id": "restore-history-1",
++                },
+             }
+         )
+ 
+@@ -9187,7 +9214,7 @@ def test_rollback_restore_truncates_from_real_user_turn_not_marker(monkeypatch):
+         server._sessions.pop("sid", None)
+ 
+ 
+-def test_rollback_restore_skips_legacy_compaction_handoff(monkeypatch):
++def test_rollback_restore_skips_legacy_compaction_handoff(monkeypatch, tmp_path):
+     """rollback.restore must not truncate from a legacy standalone compaction
+     handoff — a durable role=user row persisted pre-#80622 with NO
+     display_kind. Same bug class as the display_kind marker above, caught
+@@ -9225,16 +9252,30 @@ def test_rollback_restore_skips_legacy_compaction_handoff(monkeypatch):
+         {"role": "assistant", "content": "second answer"},
+         handoff,
+     ]
++    cwd = tmp_path / "workspace"
++    cwd.mkdir()
+     server._sessions["sid"] = _session(
+         agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()),
+         history=list(history),
++        cwd=str(cwd),
+     )
++    class _Db:
++        def replace_messages(self, *_args, **_kwargs):
++            return None
++
++    monkeypatch.setattr(server, "_get_db", lambda: _Db())
++    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+     try:
+         resp = server.handle_request(
+             {
+                 "id": "1",
+                 "method": "rollback.restore",
+-                "params": {"session_id": "sid", "hash": "abc123"},
++                "params": {
++                    "session_id": "sid",
++                    "hash": "abc123",
++                    "confirm": True,
++                    "operation_id": "restore-history-2",
++                },
+             }
+         )
+ 
+@@ -9247,6 +9288,536 @@ def test_rollback_restore_skips_legacy_compaction_handoff(monkeypatch):
+         server._sessions.pop("sid", None)
+ 
+ 
++def test_rollback_list_maps_reason_and_guards_expected_cwd(tmp_path):
++    calls = []
++
++    class _Mgr:
++        enabled = True
++
++        def list_checkpoints(self, cwd):
++            calls.append(cwd)
++            return [
++                {
++                    "hash": "abc123",
++                    "timestamp": "2026-08-15T12:34:56+08:00",
++                    "reason": "before patch",
++                }
++            ]
++
++    cwd = tmp_path / "workspace"
++    cwd.mkdir()
++    server._sessions["rollback-list"] = _session(
++        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()), cwd=str(cwd)
++    )
++    try:
++        response = server.handle_request(
++            {
++                "id": "list-ok",
++                "method": "rollback.list",
++                "params": {
++                    "session_id": "rollback-list",
++                    "expected_cwd": str(cwd / "."),
++                },
++            }
++        )
++        assert response["result"] == {
++            "enabled": True,
++            "checkpoints": [
++                {
++                    "hash": "abc123",
++                    "timestamp": "2026-08-15T12:34:56+08:00",
++                    "message": "before patch",
++                }
++            ],
++        }
++        assert calls == [str(cwd)]
++
++        mismatch = server.handle_request(
++            {
++                "id": "list-bad",
++                "method": "rollback.list",
++                "params": {
++                    "session_id": "rollback-list",
++                    "expected_cwd": str(tmp_path / "other"),
++                },
++            }
++        )
++        assert mismatch["error"]["code"] == 4004
++        assert calls == [str(cwd)]
++    finally:
++        server._sessions.pop("rollback-list", None)
++
++
++def test_rollback_diff_preserves_domain_failure_and_truncation(tmp_path):
++    class _Mgr:
++        enabled = True
++
++        def list_checkpoints(self, _cwd):
++            return []
++
++        def diff(self, _cwd, target):
++            if target == "bad1":
++                return {"success": False, "error": "not owned"}
++            return {"success": True, "stat": "1 file", "diff": "x" * 5000}
++
++    cwd = tmp_path / "workspace"
++    cwd.mkdir()
++    server._sessions["rollback-diff"] = _session(
++        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()), cwd=str(cwd)
++    )
++    try:
++        failed = server.handle_request(
++            {
++                "id": "diff-fail",
++                "method": "rollback.diff",
++                "params": {
++                    "session_id": "rollback-diff",
++                    "hash": "bad1",
++                    "expected_cwd": str(cwd),
++                },
++            }
++        )
++        assert failed["result"] == {
++            "success": False,
++            "error": "not owned",
++            "stat": "",
++            "diff": "",
++            "truncated": False,
++        }
++
++        succeeded = server.handle_request(
++            {
++                "id": "diff-ok",
++                "method": "rollback.diff",
++                "params": {
++                    "session_id": "rollback-diff",
++                    "hash": "good1",
++                    "expected_cwd": str(cwd),
++                },
++            }
++        )
++        assert succeeded["result"]["success"] is True
++        assert len(succeeded["result"]["diff"]) == 4000
++        assert succeeded["result"]["truncated"] is True
++
++        mismatch = server.handle_request(
++            {
++                "id": "diff-cwd",
++                "method": "rollback.diff",
++                "params": {
++                    "session_id": "rollback-diff",
++                    "hash": "good1",
++                    "expected_cwd": str(tmp_path / "other"),
++                },
++            }
++        )
++        assert mismatch["error"]["code"] == 4004
++    finally:
++        server._sessions.pop("rollback-diff", None)
++
++
++def test_rollback_restore_is_durable_idempotent_and_emits_lossless_event(
++    monkeypatch, tmp_path,
++):
++    manager_calls = []
++    db_calls = []
++    memory_calls = []
++    invalidations = []
++    events = []
++
++    class _Mgr:
++        enabled = True
++
++        def list_checkpoints(self, _cwd):
++            return []
++
++        def restore(self, cwd, target, file_path=None):
++            manager_calls.append((cwd, target, file_path))
++            return {
++                "success": True,
++                "restored_to": target[:8],
++                "reason": "before edit",
++                "directory": cwd,
++                "pre_snapshot": "f" * 40,
++            }
++
++    class _Db:
++        def replace_messages(self, key, messages, **kwargs):
++            db_calls.append((key, list(messages), kwargs))
++
++    class _Memory:
++        def on_session_switch(self, *args, **kwargs):
++            memory_calls.append((args, kwargs))
++
++    cwd = tmp_path / "workspace"
++    cwd.mkdir()
++    agent = types.SimpleNamespace(
++        _checkpoint_mgr=_Mgr(),
++        _last_flushed_db_idx=99,
++        _memory_manager=_Memory(),
++        _invalidate_system_prompt=lambda: invalidations.append(True),
++    )
++    history = [
++        {"role": "user", "content": "first"},
++        {"role": "assistant", "content": "first reply"},
++        {"role": "user", "content": "second"},
++        {"role": "assistant", "content": "second reply"},
++    ]
++    server._sessions["rollback-idempotent"] = _session(
++        agent=agent, cwd=str(cwd), history=list(history)
++    )
++    monkeypatch.setattr(server, "_get_db", lambda: _Db())
++    monkeypatch.setattr(
++        server, "_emit", lambda event, sid, payload: events.append((event, sid, payload))
++    )
++    params = {
++        "session_id": "rollback-idempotent",
++        "hash": "abc12345",
++        "expected_cwd": str(cwd),
++        "confirm": True,
++        "operation_id": "restore-op-1",
++    }
++    try:
++        first = server.handle_request(
++            {"id": "restore-1", "method": "rollback.restore", "params": params}
++        )
++        assert set(first["result"]) == {
++            "success",
++            "restored_to",
++            "pre_snapshot",
++            "reason",
++            "error",
++            "operation_id",
++            "replayed",
++            "workspace_restored",
++            "history_rewound",
++            "history_removed",
++            "partial",
++        }
++        assert first["result"]["success"] is True
++        assert first["result"]["workspace_restored"] is True
++        assert first["result"]["history_rewound"] is True
++        assert first["result"]["history_removed"] == 2
++        assert first["result"]["partial"] is False
++        assert first["result"]["error"] == ""
++        assert server._sessions["rollback-idempotent"]["history"] == history[:2]
++        assert db_calls == [
++            (
++                "session-key",
++                history[:2],
++                {"active_only": True, "archive_dropped": True},
++            )
++        ]
++        assert agent._last_flushed_db_idx == 2
++        assert len(memory_calls) == 1
++        assert invalidations == [True]
++        assert len(events) == 1
++        assert events[0][0:2] == ("rollback.restored", "rollback-idempotent")
++        assert events[0][2]["pre_snapshot"] == "f" * 40
++        assert "directory" not in events[0][2]
++
++        replay = server.handle_request(
++            {"id": "restore-2", "method": "rollback.restore", "params": dict(params)}
++        )
++        assert replay["result"]["replayed"] is True
++        assert len(manager_calls) == 1
++        assert len(db_calls) == 1
++        assert len(events) == 1
++
++        conflict_params = dict(params, hash="def67890")
++        conflict = server.handle_request(
++            {
++                "id": "restore-conflict",
++                "method": "rollback.restore",
++                "params": conflict_params,
++            }
++        )
++        assert conflict["error"]["code"] == 4004
++        assert len(manager_calls) == 1
++    finally:
++        server._sessions.pop("rollback-idempotent", None)
++
++
++def test_rollback_restore_partial_receipt_is_truthful_and_replay_safe(
++    monkeypatch, tmp_path,
++):
++    manager_calls = []
++    events = []
++
++    class _Mgr:
++        enabled = True
++
++        def list_checkpoints(self, _cwd):
++            return []
++
++        def restore(self, cwd, target, file_path=None):
++            manager_calls.append((cwd, target, file_path))
++            return {
++                "success": True,
++                "restored_to": target[:8],
++                "reason": "target",
++                "directory": cwd,
++                "pre_snapshot": "e" * 40,
++            }
++
++    class _FailDb:
++        def replace_messages(self, *_args, **_kwargs):
++            raise OSError("disk full")
++
++    cwd = tmp_path / "workspace"
++    cwd.mkdir()
++    history = [
++        {"role": "user", "content": "question"},
++        {"role": "assistant", "content": "answer"},
++    ]
++    server._sessions["rollback-partial"] = _session(
++        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()),
++        cwd=str(cwd),
++        history=list(history),
++    )
++    monkeypatch.setattr(server, "_get_db", lambda: _FailDb())
++    monkeypatch.setattr(
++        server, "_emit", lambda event, sid, payload: events.append((event, sid, payload))
++    )
++    params = {
++        "session_id": "rollback-partial",
++        "hash": "abc12345",
++        "expected_cwd": str(cwd),
++        "confirm": True,
++        "operation_id": "partial-op-1",
++    }
++    try:
++        first = server.handle_request(
++            {"id": "partial-1", "method": "rollback.restore", "params": params}
++        )
++        receipt = first["result"]
++        assert set(receipt) == {
++            "success",
++            "restored_to",
++            "pre_snapshot",
++            "reason",
++            "error",
++            "operation_id",
++            "replayed",
++            "workspace_restored",
++            "history_rewound",
++            "history_removed",
++            "partial",
++        }
++        assert receipt["success"] is False
++        assert receipt["partial"] is True
++        assert receipt["workspace_restored"] is True
++        assert receipt["history_rewound"] is False
++        assert receipt["history_removed"] == 0
++        assert receipt["pre_snapshot"] == "e" * 40
++        assert "disk full" in receipt["error"]
++        assert server._sessions["rollback-partial"]["history"] == history
++        assert events[0][2]["partial"] is True
++        assert events[0][2]["restored_to"] == "abc12345"
++        assert events[0][2]["pre_snapshot"] == "e" * 40
++
++        replay = server.handle_request(
++            {"id": "partial-2", "method": "rollback.restore", "params": dict(params)}
++        )
++        assert replay["result"]["replayed"] is True
++        assert replay["result"]["partial"] is True
++        assert len(manager_calls) == 1
++        assert len(events) == 1
++    finally:
++        server._sessions.pop("rollback-partial", None)
++
++
++def test_rollback_restore_known_not_mutated_projects_exact_safe_receipt(
++    monkeypatch, tmp_path,
++):
++    events = []
++
++    class _Mgr:
++        enabled = True
++
++        def list_checkpoints(self, _cwd):
++            return []
++
++        def restore(self, cwd, target, file_path=None):
++            return {
++                "success": False,
++                "error": "restore collision; workspace recovered",
++                "pre_snapshot": "d" * 40,
++                "mutation_uncertain": False,
++                "recovered_to_pre_snapshot": True,
++                "directory": cwd,
++                "file": file_path,
++                "debug": "must not cross wire",
++            }
++
++    cwd = tmp_path / "workspace"
++    cwd.mkdir()
++    session_id = "rollback-not-mutated"
++    server._sessions[session_id] = _session(
++        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()),
++        cwd=str(cwd),
++    )
++    monkeypatch.setattr(server, "_emit", lambda *args: events.append(args))
++    params = {
++        "session_id": session_id,
++        "hash": "abc12345",
++        "expected_cwd": str(cwd),
++        "confirm": True,
++        "operation_id": "known-safe-op-1",
++    }
++    try:
++        response = server.handle_request(
++            {"id": "safe-1", "method": "rollback.restore", "params": params}
++        )
++        receipt = response["result"]
++        assert set(receipt) == {
++            "success",
++            "restored_to",
++            "pre_snapshot",
++            "reason",
++            "error",
++            "operation_id",
++            "replayed",
++            "workspace_restored",
++            "history_rewound",
++            "history_removed",
++            "partial",
++        }
++        assert receipt == {
++            "success": False,
++            "restored_to": "",
++            "pre_snapshot": "d" * 40,
++            "reason": "",
++            "error": "restore collision; workspace recovered",
++            "operation_id": "known-safe-op-1",
++            "replayed": False,
++            "workspace_restored": False,
++            "history_rewound": False,
++            "history_removed": 0,
++            "partial": False,
++        }
++        assert events == []
++    finally:
++        server._sessions.pop(session_id, None)
++
++
++def test_rollback_restore_mutation_uncertain_is_rpc_error_and_never_cached_or_emitted(
++    monkeypatch, tmp_path,
++):
++    manager_calls = []
++    events = []
++
++    class _Mgr:
++        enabled = True
++
++        def list_checkpoints(self, _cwd):
++            return []
++
++        def restore(self, cwd, target, file_path=None):
++            manager_calls.append((cwd, target, file_path))
++            return {
++                "success": False,
++                "error": "workspace mutation is uncertain",
++                "mutation_uncertain": True,
++                "pre_snapshot": "f" * 40,
++            }
++
++    cwd = tmp_path / "workspace"
++    cwd.mkdir()
++    session_id = "rollback-uncertain"
++    server._sessions[session_id] = _session(
++        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()),
++        cwd=str(cwd),
++        history=[{"role": "user", "content": "keep"}],
++    )
++    monkeypatch.setattr(
++        server, "_emit", lambda *args: events.append(args)
++    )
++    params = {
++        "session_id": session_id,
++        "hash": "abc12345",
++        "expected_cwd": str(cwd),
++        "confirm": True,
++        "operation_id": "uncertain-op-1",
++    }
++    try:
++        first = server.handle_request(
++            {"id": "uncertain-1", "method": "rollback.restore", "params": params}
++        )
++        second = server.handle_request(
++            {"id": "uncertain-2", "method": "rollback.restore", "params": params}
++        )
++
++        assert first["error"]["code"] == 5021
++        assert second["error"]["code"] == 5021
++        assert len(manager_calls) == 2
++        assert events == []
++        assert server._sessions[session_id]["history"] == [
++            {"role": "user", "content": "keep"}
++        ]
++        assert server._sessions[session_id]["_rollback_restore_receipts"] == {}
++    finally:
++        server._sessions.pop(session_id, None)
++
++
++def test_rollback_restore_requires_confirmation_operation_id_and_expected_cwd(
++    tmp_path,
++):
++    calls = []
++
++    class _Mgr:
++        enabled = True
++
++        def list_checkpoints(self, _cwd):
++            return []
++
++        def restore(self, *args, **kwargs):
++            calls.append((args, kwargs))
++            return {"success": True}
++
++    cwd = tmp_path / "workspace"
++    cwd.mkdir()
++    server._sessions["rollback-guards"] = _session(
++        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()), cwd=str(cwd)
++    )
++    base = {"session_id": "rollback-guards", "hash": "abc12345"}
++    try:
++        missing_confirm = server.handle_request(
++            {
++                "id": "guard-confirm",
++                "method": "rollback.restore",
++                "params": dict(base, operation_id="guard-op"),
++            }
++        )
++        assert missing_confirm["error"]["code"] == 4004
++
++        missing_id = server.handle_request(
++            {
++                "id": "guard-id",
++                "method": "rollback.restore",
++                "params": dict(base, confirm=True),
++            }
++        )
++        assert missing_id["error"]["code"] == 4004
++
++        wrong_cwd = server.handle_request(
++            {
++                "id": "guard-cwd",
++                "method": "rollback.restore",
++                "params": dict(
++                    base,
++                    confirm=True,
++                    operation_id="guard-op",
++                    expected_cwd=str(tmp_path / "other"),
++                ),
++            }
++        )
++        assert wrong_cwd["error"]["code"] == 4004
++        assert calls == []
++    finally:
++        server._sessions.pop("rollback-guards", None)
++
++
+ # ── session.steer ────────────────────────────────────────────────────
+ 
+ 
+@@ -9558,19 +10129,24 @@ def test_session_compress_rejects_while_running(monkeypatch):
+         server._sessions.pop("sid", None)
+ 
+ 
+-def test_rollback_restore_rejects_full_history_while_running(monkeypatch):
+-    """Full-history rollback must reject; file-scoped rollback still allowed."""
++def test_rollback_restore_rejects_all_workspace_mutation_while_running(monkeypatch):
++    """Both full and file-scoped rollback must reject during an active turn."""
+     server._sessions["sid"] = _session(running=True)
+     try:
+-        resp = server.handle_request(
+-            {
+-                "id": "1",
+-                "method": "rollback.restore",
+-                "params": {"session_id": "sid", "hash": "abc"},
++        for operation_id, file_path in (("busy-full", None), ("busy-file", "main.py")):
++            params = {
++                "session_id": "sid",
++                "hash": "abc1",
++                "confirm": True,
++                "operation_id": operation_id,
+             }
+-        )
+-        assert resp.get("error"), "full-history rollback should reject while running"
+-        assert resp["error"]["code"] == 4009
++            if file_path is not None:
++                params["file_path"] = file_path
++            resp = server.handle_request(
++                {"id": operation_id, "method": "rollback.restore", "params": params}
++            )
++            assert resp.get("error"), "rollback should reject while running"
++            assert resp["error"]["code"] == 4009
+     finally:
+         server._sessions.pop("sid", None)
+ 
+diff --git a/tests/tools/test_checkpoint_manager.py b/tests/tools/test_checkpoint_manager.py
+index db96b0eafaf48afd134134fc087ceb6c49c5f2e2..f72bfb770446adaa2f168774ae53d8631c931c7c 100644
+--- a/tests/tools/test_checkpoint_manager.py
++++ b/tests/tools/test_checkpoint_manager.py
+@@ -1,16 +1,21 @@
+ """Tests for tools/checkpoint_manager.py — CheckpointManager (v2 single-store)."""
+ 
+ import argparse
++import contextlib
+ import json
+ import logging
+ import os
+ import shutil
+ import subprocess
++import sys
++import threading
+ import time
+ import pytest
+ from pathlib import Path
+ from unittest.mock import patch
+ 
++from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++
+ from tools.checkpoint_manager import (
+     CheckpointManager,
+     _shadow_repo_path,
+@@ -30,6 +35,29 @@ from tools.checkpoint_manager import (
+ )
+ 
+ 
++def _make_directory_link(link: Path, target: Path) -> None:
++    """Create a real directory link, including a Windows junction."""
++    if os.name == "nt":
++        result = subprocess.run(
++            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
++            capture_output=True,
++            text=True,
++        )
++        if result.returncode != 0:
++            pytest.skip(f"junction creation unavailable: {result.stderr}")
++    else:
++        link.symlink_to(target, target_is_directory=True)
++
++
++def _remove_directory_link(link: Path) -> None:
++    if not os.path.lexists(link):
++        return
++    if os.name == "nt":
++        link.rmdir()
++    else:
++        link.unlink()
++
++
+ # =========================================================================
+ # Fixtures
+ # =========================================================================
+@@ -147,6 +175,26 @@ class TestDisabledManager:
+         disabled_mgr.new_turn()
+         assert disabled_mgr.ensure_checkpoint(str(work_dir)) is False
+ 
++    def test_disabled_manager_cannot_observe_or_restore_existing_store(
++        self, work_dir, checkpoint_base,
++    ):
++        enabled = CheckpointManager(enabled=True, checkpoint_base=checkpoint_base)
++        assert enabled.ensure_checkpoint(str(work_dir), "initial") is True
++        target = enabled.list_checkpoints(str(work_dir))[0]["hash"]
++        (work_dir / "main.py").write_text("changed\n")
++
++        disabled = CheckpointManager(enabled=False, checkpoint_base=checkpoint_base)
++        assert disabled.list_checkpoints(str(work_dir)) == []
++        assert disabled.diff(str(work_dir), target) == {
++            "success": False,
++            "error": "Checkpoints are disabled",
++        }
++        assert disabled.restore(str(work_dir), target) == {
++            "success": False,
++            "error": "Checkpoints are disabled",
++        }
++        assert (work_dir / "main.py").read_text() == "changed\n"
++
+ 
+ # =========================================================================
+ # CheckpointManager — taking checkpoints
+@@ -169,6 +217,67 @@ class TestTakeCheckpoint:
+         (work_dir / "main.py").write_text("print('modified')\n")
+         assert mgr.ensure_checkpoint(str(work_dir), "turn 2") is True
+ 
++    def test_parallel_same_turn_ensure_waits_for_snapshot_barrier(
++        self, work_dir, checkpoint_base,
++    ):
++        manager = CheckpointManager(enabled=True, checkpoint_base=checkpoint_base)
++        original_take = manager._take
++        entered = threading.Event()
++        release = threading.Event()
++        results = []
++
++        def slow_take(*args, **kwargs):
++            entered.set()
++            assert release.wait(timeout=5)
++            return original_take(*args, **kwargs)
++
++        manager._take = slow_take
++        first = threading.Thread(
++            target=lambda: results.append(
++                manager.ensure_checkpoint(str(work_dir), "first")
++            )
++        )
++        second = threading.Thread(
++            target=lambda: results.append(
++                manager.ensure_checkpoint(str(work_dir), "second")
++            )
++        )
++        first.start()
++        assert entered.wait(timeout=5)
++        second.start()
++        time.sleep(0.1)
++        assert second.is_alive(), "second mutator crossed the snapshot barrier"
++        release.set()
++        first.join(timeout=10)
++        second.join(timeout=10)
++        assert sorted(results) == [False, True]
++
++    def test_manager_captures_context_local_profile_at_construction(
++        self, tmp_path, monkeypatch,
++    ):
++        import tools.checkpoint_manager as checkpoint_module
++
++        monkeypatch.setattr(
++            checkpoint_module,
++            "CHECKPOINT_BASE",
++            checkpoint_module._IMPORTED_CHECKPOINT_BASE,
++        )
++        home_a = tmp_path / "profile-a"
++        home_b = tmp_path / "profile-b"
++        token = set_hermes_home_override(home_a)
++        try:
++            manager_a = CheckpointManager(enabled=True)
++        finally:
++            reset_hermes_home_override(token)
++        token = set_hermes_home_override(home_b)
++        try:
++            manager_b = CheckpointManager(enabled=True)
++        finally:
++            reset_hermes_home_override(token)
++
++        assert manager_a.checkpoint_base == home_a / "checkpoints"
++        assert manager_b.checkpoint_base == home_b / "checkpoints"
++
+ 
+ # =========================================================================
+ # CheckpointManager — listing
+@@ -306,6 +415,338 @@ class TestRestore:
+         assert restore_result["success"] is True
+         assert file_path.read_text() == "original\n"
+ 
++    def test_restore_target_survives_pre_restore_prune(
++        self, work_dir, checkpoint_base,
++    ):
++        manager = CheckpointManager(
++            enabled=True,
++            max_snapshots=2,
++            checkpoint_base=checkpoint_base,
++        )
++        (work_dir / "main.py").write_text("v1\n")
++        assert manager.ensure_checkpoint(str(work_dir), "v1") is True
++        target = manager.list_checkpoints(str(work_dir))[0]["hash"]
++
++        manager.new_turn()
++        (work_dir / "main.py").write_text("v2\n")
++        assert manager.ensure_checkpoint(str(work_dir), "v2") is True
++        manager.new_turn()
++        (work_dir / "main.py").write_text("v3-unsnapshotted\n")
++
++        result = manager.restore(str(work_dir), target)
++        assert result["success"] is True
++        assert result["pre_snapshot"]
++        assert (work_dir / "main.py").read_text() == "v1\n"
++
++    def test_full_restore_removes_later_tracked_files_but_preserves_excludes(
++        self, mgr, work_dir, checkpoint_base,
++    ):
++        (work_dir / "main.py").write_text("target\n")
++        assert mgr.ensure_checkpoint(str(work_dir), "target") is True
++        target = mgr.list_checkpoints(str(work_dir))[0]["hash"]
++
++        (work_dir / "main.py").write_text("later\n")
++        later_tracked = work_dir / "later-tracked.txt"
++        later_tracked.write_text("captured before restore\n")
++        excluded_secret = work_dir / ".env"
++        excluded_secret.write_text("preserve-policy-file\n")
++        excluded_dependency = work_dir / "node_modules" / "keep.txt"
++        excluded_dependency.parent.mkdir()
++        excluded_dependency.write_text("preserve-excluded-file\n")
++
++        result = mgr.restore(str(work_dir), target)
++
++        assert result["success"] is True
++        assert (work_dir / "main.py").read_text() == "target\n"
++        assert not later_tracked.exists()
++        assert excluded_secret.read_text() == "preserve-policy-file\n"
++        assert excluded_dependency.read_text() == "preserve-excluded-file\n"
++
++        ok, names, _ = _run_git(
++            ["ls-tree", "-r", "--name-only", result["pre_snapshot"]],
++            _store_path(checkpoint_base),
++            str(work_dir),
++        )
++        assert ok
++        pre_restore_names = set(names.splitlines())
++        assert "later-tracked.txt" in pre_restore_names
++        assert ".env" not in pre_restore_names
++        assert "node_modules/keep.txt" not in pre_restore_names
++
++    def test_restore_fails_closed_when_recovery_snapshot_is_incomplete(
++        self, mgr, work_dir, monkeypatch,
++    ):
++        assert mgr.ensure_checkpoint(str(work_dir), "initial") is True
++        target = mgr.list_checkpoints(str(work_dir))[0]["hash"]
++        (work_dir / "main.py").write_text("must survive\n")
++        monkeypatch.setattr(mgr, "_take", lambda *_args, **_kwargs: False)
++
++        result = mgr.restore(str(work_dir), target)
++        assert result["success"] is False
++        assert "capture" in result["error"].lower()
++        assert (work_dir / "main.py").read_text() == "must survive\n"
++
++    def test_restore_rejects_ignored_untracked_target_collision_without_mutation(
++        self, mgr, work_dir,
++    ):
++        secret = work_dir / "secret.txt"
++        secret.write_bytes(b"checkpoint target bytes\n")
++        assert mgr.ensure_checkpoint(str(work_dir), "target tracks secret") is True
++        target = mgr.list_checkpoints(str(work_dir))[0]["hash"]
++
++        secret.unlink()
++        (work_dir / ".gitignore").write_text("secret.txt\n")
++        mgr.new_turn()
++        assert mgr.ensure_checkpoint(str(work_dir), "secret ignored") is True
++        secret.write_bytes(b"unique ignored user bytes\x00\xff")
++        before_ignore = (work_dir / ".gitignore").read_bytes()
++
++        result = mgr.restore(str(work_dir), target)
++
++        assert result["success"] is False
++        assert result["mutation_uncertain"] is False
++        assert "excluded from the recovery checkpoint" in result["error"]
++        assert secret.read_bytes() == b"unique ignored user bytes\x00\xff"
++        assert (work_dir / ".gitignore").read_bytes() == before_ignore
++
++    def test_restore_rejects_file_over_empty_uncaptured_subdirectory(
++        self, mgr, work_dir,
++    ):
++        shape = work_dir / "shape"
++        shape.write_text("target file\n")
++        assert mgr.ensure_checkpoint(str(work_dir), "target file") is True
++        target = mgr.list_checkpoints(str(work_dir))[0]["hash"]
++
++        shape.unlink()
++        shape.mkdir()
++        (shape / "captured.txt").write_text("captured\n")
++        empty = shape / "empty-user-directory"
++        empty.mkdir()
++        mgr.new_turn()
++        assert mgr.ensure_checkpoint(str(work_dir), "directory state") is True
++
++        result = mgr.restore(str(work_dir), target)
++
++        assert result["success"] is False
++        assert result["mutation_uncertain"] is False
++        assert "cannot represent" in result["error"]
++        assert (shape / "captured.txt").read_text() == "captured\n"
++        assert empty.is_dir()
++
++    def test_failed_checkout_recovers_and_verifies_pre_restore_workspace(
++        self, mgr, work_dir, monkeypatch,
++    ):
++        import tools.checkpoint_manager as checkpoint_module
++
++        assert mgr.ensure_checkpoint(str(work_dir), "target") is True
++        target = mgr.list_checkpoints(str(work_dir))[0]["hash"]
++        (work_dir / "main.py").write_text("pre-restore user state\n")
++        original_run_git = checkpoint_module._run_git
++        checkout_calls = 0
++
++        def fail_first_checkout(args, *call_args, **call_kwargs):
++            nonlocal checkout_calls
++            if args[:2] == ["checkout", "--no-overlay"]:
++                checkout_calls += 1
++                if checkout_calls == 1:
++                    (work_dir / "main.py").write_text("partially restored\n")
++                    return False, "", "injected mid-checkout failure"
++            return original_run_git(args, *call_args, **call_kwargs)
++
++        monkeypatch.setattr(checkpoint_module, "_run_git", fail_first_checkout)
++        result = mgr.restore(str(work_dir), target)
++
++        assert result["success"] is False
++        assert result["recovered_to_pre_snapshot"] is True
++        assert result["mutation_uncertain"] is False
++        assert checkout_calls == 2
++        assert (work_dir / "main.py").read_text() == "pre-restore user state\n"
++
++    def test_unverifiable_target_and_recovery_reports_mutation_uncertain(
++        self, mgr, work_dir, monkeypatch,
++    ):
++        assert mgr.ensure_checkpoint(str(work_dir), "target") is True
++        target = mgr.list_checkpoints(str(work_dir))[0]["hash"]
++        (work_dir / "main.py").write_text("pre-restore user state\n")
++        comparisons = iter([True, False, False])
++        monkeypatch.setattr(
++            mgr,
++            "_working_tree_matches_commit",
++            lambda *_args, **_kwargs: next(comparisons),
++        )
++
++        result = mgr.restore(str(work_dir), target)
++
++        assert result["success"] is False
++        assert result["recovered_to_pre_snapshot"] is False
++        assert result["mutation_uncertain"] is True
++        assert "mutation is uncertain" in result["error"]
++
++    def test_unexpected_exception_after_checkout_runs_verified_recovery(
++        self, mgr, work_dir, monkeypatch,
++    ):
++        assert mgr.ensure_checkpoint(str(work_dir), "target") is True
++        target = mgr.list_checkpoints(str(work_dir))[0]["hash"]
++        (work_dir / "main.py").write_text("pre-restore user state\n")
++        original_matches = mgr._working_tree_matches_commit
++        comparison_calls = 0
++
++        def unexpected_once(*args, **kwargs):
++            nonlocal comparison_calls
++            comparison_calls += 1
++            if comparison_calls == 2:
++                raise RuntimeError("injected post-checkout verification exception")
++            return original_matches(*args, **kwargs)
++
++        monkeypatch.setattr(mgr, "_working_tree_matches_commit", unexpected_once)
++        result = mgr.restore(str(work_dir), target)
++
++        assert result["success"] is False
++        assert result["recovered_to_pre_snapshot"] is True
++        assert result["mutation_uncertain"] is False
++        assert (work_dir / "main.py").read_text() == "pre-restore user state\n"
++
++    @pytest.mark.parametrize("unsafe_mode", ["120000", "160000"])
++    def test_restore_and_diff_reject_legacy_special_tree_entries_without_mutation(
++        self, mgr, work_dir, checkpoint_base, unsafe_mode,
++    ):
++        assert mgr.ensure_checkpoint(str(work_dir), "safe parent") is True
++        parent = mgr.list_checkpoints(str(work_dir))[0]["hash"]
++        store = _store_path(checkpoint_base)
++        index = store / "indexes" / _project_hash(str(work_dir))
++        object_hash = parent
++        if unsafe_mode == "120000":
++            ok, object_hash, _ = _run_git(
++                ["rev-parse", f"{parent}:main.py"], store, str(work_dir)
++            )
++            assert ok
++        ok, _, error = _run_git(
++            [
++                "update-index",
++                "--add",
++                "--cacheinfo",
++                f"{unsafe_mode},{object_hash},legacy-special",
++            ],
++            store,
++            str(work_dir),
++            index_file=index,
++        )
++        assert ok, error
++        ok, tree_hash, error = _run_git(
++            ["write-tree"], store, str(work_dir), index_file=index
++        )
++        assert ok, error
++        ok, unsafe_commit, error = _run_git(
++            [
++                "commit-tree",
++                tree_hash,
++                "-p",
++                parent,
++                "-m",
++                "legacy unsafe tree",
++                "--no-gpg-sign",
++            ],
++            store,
++            str(work_dir),
++            index_file=index,
++        )
++        assert ok, error
++        ok, _, error = _run_git(
++            ["update-ref", _ref_name(_project_hash(str(work_dir))), unsafe_commit],
++            store,
++            str(work_dir),
++        )
++        assert ok, error
++        (work_dir / "main.py").write_text("must remain unchanged\n")
++
++        diff_result = mgr.diff(str(work_dir), unsafe_commit)
++        restore_result = mgr.restore(str(work_dir), unsafe_commit)
++
++        assert diff_result["success"] is False
++        assert restore_result["success"] is False
++        assert "unsafe" in restore_result["error"].lower()
++        assert (work_dir / "main.py").read_text() == "must remain unchanged\n"
++        assert not (work_dir / "legacy-special").exists()
++
++
++class TestProjectOwnershipAndDiffIsolation:
++    def test_other_project_commit_is_rejected_for_diff_and_restore(
++        self, tmp_path, checkpoint_base,
++    ):
++        project_a = tmp_path / "project-a"
++        project_b = tmp_path / "project-b"
++        project_a.mkdir()
++        project_b.mkdir()
++        (project_a / "file.txt").write_text("a\n")
++        (project_b / "file.txt").write_text("b\n")
++        manager = CheckpointManager(enabled=True, checkpoint_base=checkpoint_base)
++        assert manager.ensure_checkpoint(str(project_a), "a") is True
++        assert manager.ensure_checkpoint(str(project_b), "b") is True
++        foreign = manager.list_checkpoints(str(project_a))[0]["hash"]
++        (project_b / "file.txt").write_text("b changed\n")
++
++        diff_result = manager.diff(str(project_b), foreign)
++        restore_result = manager.restore(str(project_b), foreign)
++        assert diff_result["success"] is False
++        assert restore_result["success"] is False
++        assert "does not belong" in diff_result["error"]
++        assert "does not belong" in restore_result["error"]
++        assert (project_b / "file.txt").read_text() == "b changed\n"
++
++    def test_diff_does_not_mutate_persistent_index_or_object_store(
++        self, mgr, work_dir, checkpoint_base,
++    ):
++        assert mgr.ensure_checkpoint(str(work_dir), "initial") is True
++        target = mgr.list_checkpoints(str(work_dir))[0]["hash"]
++        store = _store_path(checkpoint_base)
++        index = store / "indexes" / _project_hash(str(work_dir))
++        before_index = index.read_bytes()
++        before_objects = {
++            path.relative_to(store / "objects").as_posix(): path.read_bytes()
++            for path in (store / "objects").rglob("*")
++            if path.is_file()
++        }
++        (work_dir / "main.py").write_text("changed\n")
++
++        result = mgr.diff(str(work_dir), target)
++        assert result["success"] is True
++        assert "main.py" in result["diff"]
++        assert index.read_bytes() == before_index
++        after_objects = {
++            path.relative_to(store / "objects").as_posix(): path.read_bytes()
++            for path in (store / "objects").rglob("*")
++            if path.is_file()
++        }
++        assert after_objects == before_objects
++
++    def test_tree_object_is_not_accepted_as_checkpoint(
++        self, mgr, work_dir, checkpoint_base,
++    ):
++        assert mgr.ensure_checkpoint(str(work_dir), "initial") is True
++        target = mgr.list_checkpoints(str(work_dir))[0]["hash"]
++        ok, tree_hash, _ = _run_git(
++            ["rev-parse", f"{target}^{{tree}}"],
++            _store_path(checkpoint_base),
++            str(work_dir),
++        )
++        assert ok and tree_hash
++        result = mgr.restore(str(work_dir), tree_hash)
++        assert result["success"] is False
++
++    def test_restore_treats_git_pathspec_magic_as_literal(
++        self, mgr, work_dir,
++    ):
++        (work_dir / "other.txt").write_text("original other\n")
++        assert mgr.ensure_checkpoint(str(work_dir), "initial") is True
++        target = mgr.list_checkpoints(str(work_dir))[0]["hash"]
++        (work_dir / "main.py").write_text("changed main\n")
++        (work_dir / "other.txt").write_text("changed other\n")
++
++        result = mgr.restore(str(work_dir), target, file_path=":(glob)**/*.txt")
++        assert result["success"] is False
++        assert (work_dir / "main.py").read_text() == "changed main\n"
++        assert (work_dir / "other.txt").read_text() == "changed other\n"
++
+ 
+ # =========================================================================
+ # CheckpointManager — working dir resolution
+@@ -470,6 +911,291 @@ class TestTouchProjectMalformedMeta:
+ # =========================================================================
+ 
+ class TestSecurity:
++    def test_lock_open_race_does_not_follow_dangling_file_link(
++        self, tmp_path,
++    ):
++        from tools.checkpoint_manager import _CheckpointFileLock
++
++        lock_path = tmp_path / "checkpoints" / ".locks" / "store.lock"
++        outside_target = tmp_path / "outside" / "created-through-link.lock"
++
++        def swap_final_component(path):
++            outside_target.parent.mkdir()
++            try:
++                os.symlink(outside_target, path, target_is_directory=False)
++            except OSError as exc:
++                pytest.skip(f"file symlink creation unavailable: {exc}")
++
++        try:
++            with pytest.raises((OSError, RuntimeError)):
++                with _CheckpointFileLock(
++                    lock_path,
++                    before_open=swap_final_component,
++                ):
++                    pass
++            assert not outside_target.exists()
++        finally:
++            if os.path.lexists(lock_path):
++                lock_path.unlink()
++
++    def test_lock_open_race_does_not_follow_swapped_locks_directory(
++        self, tmp_path,
++    ):
++        from tools.checkpoint_manager import _CheckpointFileLock
++
++        locks_dir = tmp_path / "checkpoints" / ".locks"
++        lock_path = locks_dir / "store.lock"
++        original_locks = tmp_path / "original-locks"
++        outside = tmp_path / "outside-locks"
++        outside.mkdir()
++
++        def swap_parent(_path):
++            locks_dir.rename(original_locks)
++            _make_directory_link(locks_dir, outside)
++
++        try:
++            with pytest.raises((OSError, RuntimeError)):
++                with _CheckpointFileLock(lock_path, before_open=swap_parent):
++                    pass
++            assert not (outside / "store.lock").exists()
++        finally:
++            _remove_directory_link(locks_dir)
++            if original_locks.exists():
++                original_locks.rename(locks_dir)
++
++    def test_lock_parent_provision_does_not_follow_swapped_checkpoint_base(
++        self, tmp_path,
++    ):
++        from tools.checkpoint_manager import _CheckpointFileLock
++
++        checkpoint_base = tmp_path / "checkpoints"
++        checkpoint_base.mkdir()
++        original_base = tmp_path / "original-checkpoints"
++        outside = tmp_path / "outside-profile"
++        outside.mkdir()
++        lock_path = checkpoint_base / ".locks" / "store.lock"
++
++        def swap_base(_safe_parent):
++            checkpoint_base.rename(original_base)
++            _make_directory_link(checkpoint_base, outside)
++
++        try:
++            with pytest.raises((OSError, RuntimeError)):
++                with _CheckpointFileLock(
++                    lock_path,
++                    before_parent_provision=swap_base,
++                ):
++                    pass
++            assert not (outside / ".locks").exists()
++            assert not (outside / ".locks" / "store.lock").exists()
++        finally:
++            _remove_directory_link(checkpoint_base)
++            if original_base.exists():
++                original_base.rename(checkpoint_base)
++
++    def test_lock_open_does_not_follow_swapped_checkpoint_base_ancestor(
++        self, tmp_path,
++    ):
++        from tools.checkpoint_manager import _CheckpointFileLock
++
++        checkpoint_base = tmp_path / "checkpoints"
++        locks_dir = checkpoint_base / ".locks"
++        locks_dir.mkdir(parents=True)
++        original_base = tmp_path / "original-checkpoints-open"
++        outside = tmp_path / "outside-profile-open"
++        (outside / ".locks").mkdir(parents=True)
++        lock_path = locks_dir / "store.lock"
++
++        def swap_base(_path):
++            checkpoint_base.rename(original_base)
++            _make_directory_link(checkpoint_base, outside)
++
++        try:
++            with pytest.raises((OSError, RuntimeError)):
++                with _CheckpointFileLock(lock_path, before_open=swap_base):
++                    pass
++            assert not (outside / ".locks" / "store.lock").exists()
++        finally:
++            _remove_directory_link(checkpoint_base)
++            if original_base.exists():
++                original_base.rename(checkpoint_base)
++
++    def test_lock_rejects_hardlink_without_mutating_external_target(
++        self, tmp_path,
++    ):
++        from tools.checkpoint_manager import _CheckpointFileLock
++
++        locks_dir = tmp_path / "checkpoints" / ".locks"
++        locks_dir.mkdir(parents=True)
++        lock_path = locks_dir / "store.lock"
++        outside_target = tmp_path / "outside-empty.lock"
++        outside_target.write_bytes(b"")
++        try:
++            os.link(outside_target, lock_path)
++        except OSError as exc:
++            pytest.skip(f"hard-link creation unavailable: {exc}")
++
++        before = outside_target.read_bytes()
++        before_size = outside_target.stat().st_size
++        with pytest.raises(RuntimeError, match="single-link"):
++            with _CheckpointFileLock(lock_path):
++                pass
++
++        assert outside_target.read_bytes() == before
++        assert outside_target.stat().st_size == before_size == 0
++
++    def test_empty_lock_file_remains_empty_after_locking(self, tmp_path):
++        from tools.checkpoint_manager import _CheckpointFileLock
++
++        lock_path = tmp_path / "checkpoints" / ".locks" / "store.lock"
++        with _CheckpointFileLock(lock_path):
++            assert lock_path.stat().st_size == 0
++        assert lock_path.stat().st_size == 0
++
++    @pytest.mark.skipif(os.name != "nt", reason="exercises Windows LockFileEx")
++    def test_windows_empty_lock_blocks_another_process_until_release(
++        self, tmp_path,
++    ):
++        from tools.checkpoint_manager import _CheckpointFileLock
++
++        lock_path = tmp_path / "checkpoints" / ".locks" / "store.lock"
++        repo_root = Path(__file__).resolve().parents[2]
++        child_code = (
++            "import sys\n"
++            "from pathlib import Path\n"
++            "from tools.checkpoint_manager import _CheckpointFileLock\n"
++            "print('attempting', flush=True)\n"
++            "with _CheckpointFileLock(Path(sys.argv[1])):\n"
++            "    print('acquired', flush=True)\n"
++        )
++        child = None
++        try:
++            with _CheckpointFileLock(lock_path):
++                child = subprocess.Popen(
++                    [sys.executable, "-c", child_code, str(lock_path)],
++                    cwd=str(repo_root),
++                    stdout=subprocess.PIPE,
++                    stderr=subprocess.PIPE,
++                    text=True,
++                )
++                assert child.stdout is not None
++                assert child.stdout.readline().strip() == "attempting"
++                with pytest.raises(subprocess.TimeoutExpired):
++                    child.wait(timeout=0.5)
++                assert lock_path.stat().st_size == 0
++
++            stdout, stderr = child.communicate(timeout=10)
++            assert child.returncode == 0, stderr
++            assert stdout.strip() == "acquired"
++            assert lock_path.stat().st_size == 0
++        finally:
++            if child is not None and child.poll() is None:
++                child.kill()
++                child.communicate(timeout=10)
++
++    def test_workspace_root_junction_is_rejected_before_store_mutation(
++        self, tmp_path, checkpoint_base,
++    ):
++        real_workspace = tmp_path / "real-workspace"
++        real_workspace.mkdir()
++        (real_workspace / "main.py").write_text("outside bytes\n")
++        linked_workspace = tmp_path / "linked-workspace"
++        _make_directory_link(linked_workspace, real_workspace)
++        try:
++            manager = CheckpointManager(
++                enabled=True,
++                checkpoint_base=checkpoint_base,
++            )
++            assert manager.ensure_checkpoint(str(linked_workspace), "unsafe") is False
++            assert not checkpoint_base.exists()
++            assert (real_workspace / "main.py").read_text() == "outside bytes\n"
++        finally:
++            _remove_directory_link(linked_workspace)
++
++    def test_nested_workspace_junction_is_rejected_before_restore_mutation(
++        self, mgr, work_dir, tmp_path,
++    ):
++        assert mgr.ensure_checkpoint(str(work_dir), "target") is True
++        target = mgr.list_checkpoints(str(work_dir))[0]["hash"]
++        (work_dir / "main.py").write_text("must remain\n")
++        external = tmp_path / "external"
++        external.mkdir()
++        (external / "outside.txt").write_text("outside\n")
++        nested = work_dir / "nested-link"
++        _make_directory_link(nested, external)
++        try:
++            result = mgr.restore(str(work_dir), target)
++            assert result["success"] is False
++            assert "symbolic link or reparse point" in result["error"]
++            assert (work_dir / "main.py").read_text() == "must remain\n"
++            assert (external / "outside.txt").read_text() == "outside\n"
++        finally:
++            _remove_directory_link(nested)
++
++    def test_checkpoint_base_junction_is_rejected_without_redirected_store_write(
++        self, work_dir, tmp_path,
++    ):
++        external = tmp_path / "external-profile-store"
++        external.mkdir()
++        linked_base = tmp_path / "linked-checkpoints"
++        _make_directory_link(linked_base, external)
++        try:
++            manager = CheckpointManager(
++                enabled=True,
++                checkpoint_base=linked_base,
++            )
++            assert manager.ensure_checkpoint(str(work_dir), "unsafe store") is False
++            assert list(external.iterdir()) == []
++        finally:
++            _remove_directory_link(linked_base)
++
++    def test_internal_checkpoint_store_junction_is_rejected_before_git(
++        self, mgr, work_dir, checkpoint_base, tmp_path,
++    ):
++        assert mgr.ensure_checkpoint(str(work_dir), "initial") is True
++        objects = checkpoint_base / "store" / "objects"
++        saved_objects = tmp_path / "saved-objects"
++        objects.rename(saved_objects)
++        external = tmp_path / "external-objects"
++        external.mkdir()
++        _make_directory_link(objects, external)
++        try:
++            assert mgr.list_checkpoints(str(work_dir)) == []
++            assert list(external.iterdir()) == []
++        finally:
++            _remove_directory_link(objects)
++            saved_objects.rename(objects)
++
++    def test_workspace_is_revalidated_inside_operation_lock(self, mgr, work_dir, tmp_path, monkeypatch):
++        import tools.checkpoint_manager as checkpoint_module
++
++        assert mgr.ensure_checkpoint(str(work_dir), "target") is True
++        target = mgr.list_checkpoints(str(work_dir))[0]["hash"]
++        (work_dir / "main.py").write_text("must remain\n")
++        external = tmp_path / "race-external"
++        external.mkdir()
++        raced_link = work_dir / "raced-link"
++
++        @contextlib.contextmanager
++        def raced_operation_locks(*_args, **_kwargs):
++            _make_directory_link(raced_link, external)
++            try:
++                yield
++            finally:
++                _remove_directory_link(raced_link)
++
++        monkeypatch.setattr(
++            checkpoint_module,
++            "_checkpoint_operation_locks",
++            raced_operation_locks,
++        )
++        result = mgr.restore(str(work_dir), target)
++
++        assert result["success"] is False
++        assert "symbolic link or reparse point" in result["error"]
++        assert (work_dir / "main.py").read_text() == "must remain\n"
++        assert list(external.iterdir()) == []
++
+     def test_restore_rejects_argument_injection(self, mgr, work_dir):
+         mgr.ensure_checkpoint(str(work_dir), "initial")
+         result = mgr.restore(str(work_dir), "--patch")
+@@ -691,6 +1417,78 @@ class TestPruneCheckpointsV2:
+         assert not meta_path.exists()
+         assert not old_legacy.exists()
+ 
++    def test_prune_waits_for_profile_store_lock(
++        self, work_dir, checkpoint_base,
++    ):
++        from tools.checkpoint_manager import _checkpoint_file_lock
++
++        manager = CheckpointManager(
++            enabled=True,
++            checkpoint_base=checkpoint_base,
++        )
++        assert manager.ensure_checkpoint(str(work_dir), "initial") is True
++        lock_path = checkpoint_base / ".locks" / "store.lock"
++        results = []
++        with _checkpoint_file_lock(lock_path):
++            worker = threading.Thread(
++                target=lambda: results.append(
++                    prune_checkpoints(
++                        retention_days=0,
++                        checkpoint_base=checkpoint_base,
++                    )
++                )
++            )
++            worker.start()
++            time.sleep(0.1)
++            assert worker.is_alive(), "maintenance crossed the store lock"
++        worker.join(timeout=10)
++        assert not worker.is_alive()
++        assert len(results) == 1
++        assert results[0]["errors"] == 0
++
++    def test_prune_rejects_checkpoint_base_junction_without_mutation(
++        self, tmp_path,
++    ):
++        external = tmp_path / "external-checkpoints"
++        external.mkdir()
++        linked = tmp_path / "linked-checkpoints"
++        _make_directory_link(linked, external)
++        try:
++            result = prune_checkpoints(checkpoint_base=linked)
++            assert result["errors"] == 1
++            assert list(external.iterdir()) == []
++        finally:
++            _remove_directory_link(linked)
++
++    def test_prune_sweeps_stale_restore_pins(self, work_dir, checkpoint_base):
++        manager = CheckpointManager(
++            enabled=True,
++            checkpoint_base=checkpoint_base,
++        )
++        assert manager.ensure_checkpoint(str(work_dir), "initial") is True
++        target = manager.list_checkpoints(str(work_dir))[0]["hash"]
++        store = _store_path(checkpoint_base)
++        stale_pin = "refs/hermes-restore-pins/stale-test-pin"
++        ok, _, error = _run_git(
++            ["update-ref", stale_pin, target], store, str(work_dir)
++        )
++        assert ok, error
++
++        result = prune_checkpoints(
++            retention_days=0,
++            delete_orphans=False,
++            checkpoint_base=checkpoint_base,
++        )
++
++        assert result["errors"] == 0
++        exists, _, _ = _run_git(
++            ["rev-parse", "--verify", stale_pin],
++            store,
++            str(work_dir),
++            allowed_returncodes={128},
++        )
++        assert exists is False
++
+ 
+ class TestPruneCheckpointsOrphanAllowlist:
+     """P1 fix on PR #69141: the confirmation preview must bind to exactly
+diff --git a/tools/checkpoint_manager.py b/tools/checkpoint_manager.py
+index df3666f134b39a7f25713e10f3e47927d81326f3..7828bc0757a460877ab5334bc317278f05e5533c 100644
+--- a/tools/checkpoint_manager.py
++++ b/tools/checkpoint_manager.py
+@@ -48,14 +48,19 @@ reclaim object storage.  A size-cap pass drops the oldest checkpoints per
+ project until total store size is under ``max_total_size_mb``.
+ """
+ 
++import contextlib
+ import hashlib
+ import json
+ import logging
+ import os
+ import re
+ import shutil
++import stat
+ import subprocess
++import tempfile
++import threading
+ import time
++import uuid
+ from pathlib import Path
+ from hermes_constants import get_hermes_home
+ from hermes_cli._subprocess_compat import windows_hide_flags
+@@ -65,18 +70,30 @@ from utils import env_int
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++def _rmtree_make_writable(func, path, _exc_info) -> None:
++    """Allow explicit checkpoint cleanup to remove read-only git objects."""
++    try:
++        os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
++        func(path)
++    except OSError:
++        raise
++
+ # ---------------------------------------------------------------------------
+ # Constants
+ # ---------------------------------------------------------------------------
+ 
+ CHECKPOINT_BASE = get_hermes_home() / "checkpoints"
++_IMPORTED_CHECKPOINT_BASE = CHECKPOINT_BASE
+ 
+ # Single shared store directory under CHECKPOINT_BASE.
+ _STORE_DIRNAME = "store"
+ _REFS_PREFIX = "refs/hermes"
++_RESTORE_PINS_PREFIX = "refs/hermes-restore-pins"
+ _INDEXES_DIRNAME = "indexes"
+ _PROJECTS_DIRNAME = "projects"
+ _LEGACY_PREFIX = "legacy-"
++_LOCKS_DIRNAME = ".locks"
+ 
+ DEFAULT_EXCLUDES = [
+     # Dependency / build output
+@@ -147,9 +164,23 @@ _GIT_TIMEOUT: int = max(10, min(60, env_int("HERMES_CHECKPOINT_TIMEOUT", 30)))
+ # Max files to snapshot — skip huge directories to avoid slowdowns.
+ _MAX_FILES = 50_000
+ 
++# Safety scans are bounded independently from the byte cap so a damaged tree
++# containing huge numbers of tiny entries fails closed instead of walking
++# indefinitely.
++_MAX_CHECKPOINT_SCAN_ENTRIES = 250_000
++
++_FILE_ATTRIBUTE_REPARSE_POINT = getattr(
++    stat,
++    "FILE_ATTRIBUTE_REPARSE_POINT",
++    0x400,
++)
++
+ # Valid git commit hash pattern: 4–40 hex chars (short or full SHA-1/SHA-256).
+ _COMMIT_HASH_RE = re.compile(r'^[0-9a-fA-F]{4,64}$')
+ 
++_PROCESS_LOCKS: Dict[str, threading.RLock] = {}
++_PROCESS_LOCKS_GUARD = threading.Lock()
++
+ 
+ # ---------------------------------------------------------------------------
+ # Input validation helpers
+@@ -189,6 +220,848 @@ def _validate_file_path(file_path: str, working_dir: str) -> Optional[str]:
+     return None
+ 
+ 
++def _is_symlink_or_reparse(file_stat: os.stat_result) -> bool:
++    """Recognise POSIX links and Windows junction/reparse-point entries."""
++    attributes = getattr(file_stat, "st_file_attributes", 0)
++    return stat.S_ISLNK(file_stat.st_mode) or bool(
++        attributes & _FILE_ATTRIBUTE_REPARSE_POINT
++    )
++
++
++def _validate_existing_path_components(
++    path_value,
++    label: str,
++) -> Tuple[Optional[Path], Optional[str]]:
++    """Return a lexical absolute path after rejecting reparse ancestors.
++
++    ``Path.resolve()`` cannot be used for this admission check because it
++    erases the evidence that a workspace or profile path crossed a symlink or
++    Windows junction. Missing tail components are allowed so a new profile
++    checkpoint directory can be created after proving its existing ancestors.
++    """
++    try:
++        raw_path = os.fspath(path_value)
++        absolute = Path(os.path.abspath(os.path.expanduser(raw_path)))
++    except (OSError, RuntimeError, TypeError, ValueError) as exc:
++        return None, f"{label} path is invalid: {exc}"
++
++    parts = absolute.parts
++    if not parts:
++        return None, f"{label} path is invalid"
++    current = Path(parts[0])
++    candidates = [current]
++    for part in parts[1:]:
++        current = current / part
++        candidates.append(current)
++
++    for candidate in candidates:
++        try:
++            file_stat = os.lstat(candidate)
++        except FileNotFoundError:
++            break
++        except OSError:
++            return None, f"{label} path could not be inspected safely"
++        if _is_symlink_or_reparse(file_stat):
++            return None, f"{label} path crosses a symbolic link or reparse point"
++    return absolute, None
++
++
++def _scan_tree_no_follow(
++    root: Path,
++    label: str,
++    max_entries: int,
++) -> Optional[str]:
++    """Reject links/reparse points without descending through them."""
++    pending = [root]
++    seen = 0
++    while pending:
++        directory = pending.pop()
++        try:
++            directory_stat = os.lstat(directory)
++        except OSError:
++            return f"{label} could not be inspected safely"
++        if _is_symlink_or_reparse(directory_stat):
++            return f"{label} contains a symbolic link or reparse point"
++        if not stat.S_ISDIR(directory_stat.st_mode):
++            return f"{label} contains a non-directory traversal component"
++
++        try:
++            with os.scandir(directory) as entries:
++                for entry in entries:
++                    seen += 1
++                    if seen > max_entries:
++                        return f"{label} exceeds the safe path-scan limit"
++                    try:
++                        entry_stat = entry.stat(follow_symlinks=False)
++                    except OSError:
++                        return f"{label} could not be inspected safely"
++                    relative = os.path.relpath(entry.path, root)
++                    if _is_symlink_or_reparse(entry_stat):
++                        return (
++                            f"{label} contains a symbolic link or reparse point: "
++                            f"{relative}"
++                        )
++                    if stat.S_ISDIR(entry_stat.st_mode):
++                        pending.append(Path(entry.path))
++        except OSError:
++            return f"{label} could not be inspected safely"
++    return None
++
++
++def _validate_checkpoint_base(
++    checkpoint_base: Path,
++) -> Tuple[Optional[Path], Optional[str]]:
++    """Validate profile storage ancestors and its complete owned tree."""
++    absolute, path_error = _validate_existing_path_components(
++        checkpoint_base,
++        "Checkpoint storage",
++    )
++    if path_error or absolute is None:
++        return None, path_error or "Checkpoint storage path is invalid"
++    try:
++        base_stat = os.lstat(absolute)
++    except FileNotFoundError:
++        return absolute, None
++    except OSError:
++        return None, "Checkpoint storage could not be inspected safely"
++    if _is_symlink_or_reparse(base_stat):
++        return None, "Checkpoint storage is a symbolic link or reparse point"
++    if not stat.S_ISDIR(base_stat.st_mode):
++        return None, "Checkpoint storage path is not a directory"
++    tree_error = _scan_tree_no_follow(
++        absolute,
++        "Checkpoint storage",
++        _MAX_CHECKPOINT_SCAN_ENTRIES,
++    )
++    if tree_error:
++        return None, tree_error
++    return absolute, None
++
++
++def _validate_working_dir(working_dir: str) -> Tuple[Optional[Path], Optional[str]]:
++    """Resolve and reject missing, non-directory, root, or home workspaces."""
++    unresolved, component_error = _validate_existing_path_components(
++        working_dir,
++        "Working directory",
++    )
++    if component_error or unresolved is None:
++        return None, component_error or "Invalid working directory"
++    try:
++        resolved = unresolved.resolve(strict=True)
++    except FileNotFoundError:
++        return None, f"Working directory not found: {unresolved}"
++    except (OSError, RuntimeError, ValueError) as exc:
++        return None, f"Invalid working directory: {exc}"
++    if not resolved.is_dir():
++        return None, f"Working directory is not a directory: {resolved}"
++
++    normalized = os.path.normcase(str(resolved))
++    try:
++        normalized_home = os.path.normcase(str(Path.home().resolve()))
++    except (OSError, RuntimeError):
++        normalized_home = os.path.normcase(str(Path.home()))
++    if resolved.parent == resolved or normalized == normalized_home:
++        return None, f"Working directory is too broad for checkpoints: {resolved}"
++    tree_error = _scan_tree_no_follow(
++        resolved,
++        "Working directory",
++        _MAX_FILES,
++    )
++    if tree_error:
++        return None, tree_error
++    return resolved, None
++
++
++def _directory_identity(path: Path) -> Optional[Tuple[int, int]]:
++    """Best available stable identity for an already admitted directory."""
++    try:
++        file_stat = os.stat(path, follow_symlinks=False)
++    except OSError:
++        return None
++    if not file_stat.st_dev or not file_stat.st_ino:
++        return None
++    return file_stat.st_dev, file_stat.st_ino
++
++
++def _revalidate_working_dir(
++    original_path: str,
++    expected_path: Path,
++    expected_identity: Optional[Tuple[int, int]],
++) -> Optional[str]:
++    """Repeat no-follow admission and detect a path swap before mutation."""
++    current, error = _validate_working_dir(original_path)
++    if error or current is None:
++        return error or "Working directory is no longer safe"
++    if os.path.normcase(str(current)) != os.path.normcase(str(expected_path)):
++        return "Working directory changed during checkpoint operation"
++    current_identity = _directory_identity(current)
++    if expected_identity is not None and current_identity != expected_identity:
++        return "Working directory identity changed during checkpoint operation"
++    return None
++
++
++def _ensure_directory_tree_no_follow(path: Path) -> None:
++    """Create a directory tree component-by-component under held handles."""
++    absolute = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
++    parts = absolute.parts
++    if not parts:
++        raise RuntimeError("checkpoint directory path is invalid")
++
++    if os.name != "nt":
++        current_fd = os.open(
++            parts[0],
++            os.O_RDONLY
++            | getattr(os, "O_DIRECTORY", 0)
++            | getattr(os, "O_NOFOLLOW", 0),
++        )
++        try:
++            for component in parts[1:]:
++                try:
++                    child_fd = os.open(
++                        component,
++                        os.O_RDONLY
++                        | getattr(os, "O_DIRECTORY", 0)
++                        | getattr(os, "O_NOFOLLOW", 0),
++                        dir_fd=current_fd,
++                    )
++                except FileNotFoundError:
++                    try:
++                        os.mkdir(component, mode=0o700, dir_fd=current_fd)
++                    except FileExistsError:
++                        # Another process may be provisioning the same profile.
++                        # The no-follow open below still proves what won the race.
++                        pass
++                    child_fd = os.open(
++                        component,
++                        os.O_RDONLY
++                        | getattr(os, "O_DIRECTORY", 0)
++                        | getattr(os, "O_NOFOLLOW", 0),
++                        dir_fd=current_fd,
++                    )
++                child_stat = os.fstat(child_fd)
++                if not stat.S_ISDIR(child_stat.st_mode):
++                    os.close(child_fd)
++                    raise RuntimeError("checkpoint directory component is unsafe")
++                os.close(current_fd)
++                current_fd = child_fd
++        finally:
++            os.close(current_fd)
++        return
++
++    import ctypes
++
++    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++    create_file = kernel32.CreateFileW
++    create_file.argtypes = [
++        ctypes.c_wchar_p,
++        ctypes.c_uint32,
++        ctypes.c_uint32,
++        ctypes.c_void_p,
++        ctypes.c_uint32,
++        ctypes.c_uint32,
++        ctypes.c_void_p,
++    ]
++    create_file.restype = ctypes.c_void_p
++    close_handle = kernel32.CloseHandle
++    close_handle.argtypes = [ctypes.c_void_p]
++    close_handle.restype = ctypes.c_int
++    invalid_handle = ctypes.c_void_p(-1).value
++    current_handle = create_file(
++        parts[0],
++        0x80000000,  # GENERIC_READ
++        0x00000001 | 0x00000002,
++        None,
++        3,  # OPEN_EXISTING
++        0x02000000 | 0x00200000,
++        None,
++    )
++    if current_handle in (None, invalid_handle):
++        raise ctypes.WinError(ctypes.get_last_error())
++
++    class _FileAttributeTagInfo(ctypes.Structure):
++        _fields_ = [
++            ("file_attributes", ctypes.c_uint32),
++            ("reparse_tag", ctypes.c_uint32),
++        ]
++
++    get_info = kernel32.GetFileInformationByHandleEx
++    get_info.argtypes = [
++        ctypes.c_void_p,
++        ctypes.c_int,
++        ctypes.c_void_p,
++        ctypes.c_uint32,
++    ]
++    get_info.restype = ctypes.c_int
++    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
++
++    class _UnicodeString(ctypes.Structure):
++        _fields_ = [
++            ("length", ctypes.c_ushort),
++            ("maximum_length", ctypes.c_ushort),
++            ("buffer", ctypes.c_wchar_p),
++        ]
++
++    class _ObjectAttributes(ctypes.Structure):
++        _fields_ = [
++            ("length", ctypes.c_uint32),
++            ("root_directory", ctypes.c_void_p),
++            ("object_name", ctypes.POINTER(_UnicodeString)),
++            ("attributes", ctypes.c_uint32),
++            ("security_descriptor", ctypes.c_void_p),
++            ("security_quality_of_service", ctypes.c_void_p),
++        ]
++
++    class _IoStatusBlock(ctypes.Structure):
++        _fields_ = [
++            ("status", ctypes.c_void_p),
++            ("information", ctypes.c_size_t),
++        ]
++
++    nt_create_file = ntdll.NtCreateFile
++    nt_create_file.argtypes = [
++        ctypes.POINTER(ctypes.c_void_p),
++        ctypes.c_uint32,
++        ctypes.POINTER(_ObjectAttributes),
++        ctypes.POINTER(_IoStatusBlock),
++        ctypes.c_void_p,
++        ctypes.c_uint32,
++        ctypes.c_uint32,
++        ctypes.c_uint32,
++        ctypes.c_uint32,
++        ctypes.c_void_p,
++        ctypes.c_uint32,
++    ]
++    nt_create_file.restype = ctypes.c_long
++    rtl_error = ntdll.RtlNtStatusToDosError
++    rtl_error.argtypes = [ctypes.c_long]
++    rtl_error.restype = ctypes.c_uint32
++
++    try:
++        root_info = _FileAttributeTagInfo()
++        if not get_info(
++            current_handle,
++            9,
++            ctypes.byref(root_info),
++            ctypes.sizeof(root_info),
++        ):
++            raise ctypes.WinError(ctypes.get_last_error())
++        if (
++            root_info.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
++            or not root_info.file_attributes & 0x00000010
++        ):
++            raise RuntimeError("checkpoint directory root is unsafe")
++
++        for component in parts[1:]:
++            name_buffer = ctypes.create_unicode_buffer(component)
++            name_bytes = len(component) * ctypes.sizeof(ctypes.c_wchar)
++            name = _UnicodeString(
++                name_bytes,
++                name_bytes + ctypes.sizeof(ctypes.c_wchar),
++                ctypes.cast(name_buffer, ctypes.c_wchar_p),
++            )
++            attributes = _ObjectAttributes(
++                ctypes.sizeof(_ObjectAttributes),
++                current_handle,
++                ctypes.pointer(name),
++                0x00000040,
++                None,
++                None,
++            )
++            io_status = _IoStatusBlock()
++            child_handle = ctypes.c_void_p()
++            status_code = nt_create_file(
++                ctypes.byref(child_handle),
++                0x80000000 | 0x00100000,
++                ctypes.byref(attributes),
++                ctypes.byref(io_status),
++                None,
++                0x00000010,  # FILE_ATTRIBUTE_DIRECTORY
++                0x00000001 | 0x00000002,
++                3,  # FILE_OPEN_IF
++                0x00000001 | 0x00200000 | 0x00000020,
++                None,
++                0,
++            )
++            if status_code < 0 or not child_handle.value:
++                raise ctypes.WinError(rtl_error(status_code))
++            child_info = _FileAttributeTagInfo()
++            try:
++                if not get_info(
++                    child_handle.value,
++                    9,
++                    ctypes.byref(child_info),
++                    ctypes.sizeof(child_info),
++                ):
++                    raise ctypes.WinError(ctypes.get_last_error())
++                if (
++                    child_info.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
++                    or not child_info.file_attributes & 0x00000010
++                ):
++                    raise RuntimeError(
++                        "checkpoint directory component is unsafe"
++                    )
++            except Exception:
++                close_handle(child_handle.value)
++                raise
++            close_handle(current_handle)
++            current_handle = child_handle.value
++    finally:
++        close_handle(current_handle)
++
++
++def _open_checkpoint_lock_no_follow(path: Path) -> int:
++    """Open/create a lock relative to a verified, held parent directory."""
++    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
++    if os.name != "nt":
++        parts = path.parent.parts
++        if not parts:
++            raise RuntimeError("checkpoint lock parent is unsafe")
++        parent_fd = os.open(
++            parts[0],
++            os.O_RDONLY
++            | getattr(os, "O_DIRECTORY", 0)
++            | getattr(os, "O_NOFOLLOW", 0),
++        )
++        try:
++            # Walk from the filesystem root while retaining each directory
++            # handle.  Reopening the full parent path would let an ancestor be
++            # swapped to a symlink after admission even with O_NOFOLLOW on the
++            # final component.
++            for component in parts[1:]:
++                child_fd = os.open(
++                    component,
++                    os.O_RDONLY
++                    | getattr(os, "O_DIRECTORY", 0)
++                    | getattr(os, "O_NOFOLLOW", 0),
++                    dir_fd=parent_fd,
++                )
++                child_stat = os.fstat(child_fd)
++                if not stat.S_ISDIR(child_stat.st_mode):
++                    os.close(child_fd)
++                    raise RuntimeError("checkpoint lock parent is unsafe")
++                os.close(parent_fd)
++                parent_fd = child_fd
++            return os.open(
++                path.name,
++                flags | getattr(os, "O_NOFOLLOW", 0),
++                0o600,
++                dir_fd=parent_fd,
++            )
++        finally:
++            os.close(parent_fd)
++
++    # Python's Windows os.open has no O_NOFOLLOW or dir_fd.  Open the parent
++    # reparse point itself, prove that its handle resolves to the expected
++    # lexical directory, hold it without FILE_SHARE_DELETE, then use
++    # NtCreateFile with RootDirectory so the final file is opened atomically
++    # relative to that exact handle.  Neither a dangling final symlink nor an
++    # ancestor junction swap can create a file outside checkpoint storage.
++    import ctypes
++    import msvcrt
++
++    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++    create_file = kernel32.CreateFileW
++    create_file.argtypes = [
++        ctypes.c_wchar_p,
++        ctypes.c_uint32,
++        ctypes.c_uint32,
++        ctypes.c_void_p,
++        ctypes.c_uint32,
++        ctypes.c_uint32,
++        ctypes.c_void_p,
++    ]
++    create_file.restype = ctypes.c_void_p
++    close_handle = kernel32.CloseHandle
++    close_handle.argtypes = [ctypes.c_void_p]
++    close_handle.restype = ctypes.c_int
++    invalid_handle = ctypes.c_void_p(-1).value
++
++    parent_handle = create_file(
++        str(path.parent),
++        0x80000000,  # GENERIC_READ
++        0x00000001 | 0x00000002,  # FILE_SHARE_READ | FILE_SHARE_WRITE
++        None,
++        3,  # OPEN_EXISTING
++        0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
++        None,
++    )
++    if parent_handle in (None, invalid_handle):
++        raise ctypes.WinError(ctypes.get_last_error())
++
++    class _FileAttributeTagInfo(ctypes.Structure):
++        _fields_ = [
++            ("file_attributes", ctypes.c_uint32),
++            ("reparse_tag", ctypes.c_uint32),
++        ]
++
++    get_info = kernel32.GetFileInformationByHandleEx
++    get_info.argtypes = [
++        ctypes.c_void_p,
++        ctypes.c_int,
++        ctypes.c_void_p,
++        ctypes.c_uint32,
++    ]
++    get_info.restype = ctypes.c_int
++    get_final_path = kernel32.GetFinalPathNameByHandleW
++    get_final_path.argtypes = [
++        ctypes.c_void_p,
++        ctypes.c_wchar_p,
++        ctypes.c_uint32,
++        ctypes.c_uint32,
++    ]
++    get_final_path.restype = ctypes.c_uint32
++
++    def _handle_path(handle) -> str:
++        buffer = ctypes.create_unicode_buffer(32768)
++        length = get_final_path(handle, buffer, len(buffer), 0)
++        if length == 0 or length >= len(buffer):
++            raise ctypes.WinError(ctypes.get_last_error())
++        value = buffer.value
++        if value.startswith("\\\\?\\UNC\\"):
++            value = "\\\\" + value[8:]
++        elif value.startswith("\\\\?\\"):
++            value = value[4:]
++        return os.path.normcase(os.path.normpath(value))
++
++    def _expected_path(value: Path) -> str:
++        return os.path.normcase(os.path.normpath(os.path.abspath(value)))
++
++    file_handle = ctypes.c_void_p()
++    try:
++        parent_info = _FileAttributeTagInfo()
++        if not get_info(
++            parent_handle,
++            9,  # FileAttributeTagInfo
++            ctypes.byref(parent_info),
++            ctypes.sizeof(parent_info),
++        ):
++            raise ctypes.WinError(ctypes.get_last_error())
++        if (
++            parent_info.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
++            or not parent_info.file_attributes & 0x00000010  # DIRECTORY
++            or _handle_path(parent_handle) != _expected_path(path.parent)
++        ):
++            raise RuntimeError("checkpoint lock parent changed or is unsafe")
++
++        class _UnicodeString(ctypes.Structure):
++            _fields_ = [
++                ("length", ctypes.c_ushort),
++                ("maximum_length", ctypes.c_ushort),
++                ("buffer", ctypes.c_wchar_p),
++            ]
++
++        class _ObjectAttributes(ctypes.Structure):
++            _fields_ = [
++                ("length", ctypes.c_uint32),
++                ("root_directory", ctypes.c_void_p),
++                ("object_name", ctypes.POINTER(_UnicodeString)),
++                ("attributes", ctypes.c_uint32),
++                ("security_descriptor", ctypes.c_void_p),
++                ("security_quality_of_service", ctypes.c_void_p),
++            ]
++
++        class _IoStatusBlock(ctypes.Structure):
++            _fields_ = [
++                ("status", ctypes.c_void_p),
++                ("information", ctypes.c_size_t),
++            ]
++
++        name_buffer = ctypes.create_unicode_buffer(path.name)
++        name_bytes = len(path.name) * ctypes.sizeof(ctypes.c_wchar)
++        name = _UnicodeString(
++            name_bytes,
++            name_bytes + ctypes.sizeof(ctypes.c_wchar),
++            ctypes.cast(name_buffer, ctypes.c_wchar_p),
++        )
++        object_attributes = _ObjectAttributes(
++            ctypes.sizeof(_ObjectAttributes),
++            parent_handle,
++            ctypes.pointer(name),
++            0x00000040,  # OBJ_CASE_INSENSITIVE
++            None,
++            None,
++        )
++        io_status = _IoStatusBlock()
++        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
++        nt_create_file = ntdll.NtCreateFile
++        nt_create_file.argtypes = [
++            ctypes.POINTER(ctypes.c_void_p),
++            ctypes.c_uint32,
++            ctypes.POINTER(_ObjectAttributes),
++            ctypes.POINTER(_IoStatusBlock),
++            ctypes.c_void_p,
++            ctypes.c_uint32,
++            ctypes.c_uint32,
++            ctypes.c_uint32,
++            ctypes.c_uint32,
++            ctypes.c_void_p,
++            ctypes.c_uint32,
++        ]
++        nt_create_file.restype = ctypes.c_long
++        status_code = nt_create_file(
++            ctypes.byref(file_handle),
++            0x80000000 | 0x40000000 | 0x00100000,
++            ctypes.byref(object_attributes),
++            ctypes.byref(io_status),
++            None,
++            0x00000080,  # FILE_ATTRIBUTE_NORMAL
++            0x00000001 | 0x00000002,
++            3,  # FILE_OPEN_IF
++            0x00000040 | 0x00200000 | 0x00000020,
++            None,
++            0,
++        )
++        if status_code < 0 or not file_handle.value:
++            rtl_error = ntdll.RtlNtStatusToDosError
++            rtl_error.argtypes = [ctypes.c_long]
++            rtl_error.restype = ctypes.c_uint32
++            raise ctypes.WinError(rtl_error(status_code))
++        if _handle_path(file_handle.value) != _expected_path(path):
++            raise RuntimeError("checkpoint lock handle escaped its parent")
++        fd = msvcrt.open_osfhandle(
++            file_handle.value,
++            os.O_RDWR | getattr(os, "O_BINARY", 0),
++        )
++        file_handle.value = None  # CRT owns the handle now.
++        return fd
++    finally:
++        if file_handle.value:
++            close_handle(file_handle.value)
++        close_handle(parent_handle)
++
++
++def _checkpoint_lock_link_count(fd: int) -> int:
++    """Return the open lock file's link count from handle-backed metadata."""
++    if os.name != "nt":
++        return int(os.fstat(fd).st_nlink)
++
++    import ctypes
++    import msvcrt
++
++    class _FileStandardInfo(ctypes.Structure):
++        _fields_ = [
++            ("allocation_size", ctypes.c_longlong),
++            ("end_of_file", ctypes.c_longlong),
++            ("number_of_links", ctypes.c_uint32),
++            ("delete_pending", ctypes.c_ubyte),
++            ("directory", ctypes.c_ubyte),
++        ]
++
++    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++    get_info = kernel32.GetFileInformationByHandleEx
++    get_info.argtypes = [
++        ctypes.c_void_p,
++        ctypes.c_int,
++        ctypes.c_void_p,
++        ctypes.c_uint32,
++    ]
++    get_info.restype = ctypes.c_int
++    info = _FileStandardInfo()
++    handle = msvcrt.get_osfhandle(fd)
++    if not get_info(
++        handle,
++        1,  # FileStandardInfo
++        ctypes.byref(info),
++        ctypes.sizeof(info),
++    ):
++        raise ctypes.WinError(ctypes.get_last_error())
++    return int(info.number_of_links)
++
++
++def _lock_checkpoint_file_windows(fd: int):
++    """Take a blocking one-byte lock without extending an empty file."""
++    import ctypes
++    import msvcrt
++
++    class _Overlapped(ctypes.Structure):
++        _fields_ = [
++            ("internal", ctypes.c_size_t),
++            ("internal_high", ctypes.c_size_t),
++            ("offset", ctypes.c_uint32),
++            ("offset_high", ctypes.c_uint32),
++            ("event", ctypes.c_void_p),
++        ]
++
++    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++    lock_file = kernel32.LockFileEx
++    lock_file.argtypes = [
++        ctypes.c_void_p,
++        ctypes.c_uint32,
++        ctypes.c_uint32,
++        ctypes.c_uint32,
++        ctypes.c_uint32,
++        ctypes.c_void_p,
++    ]
++    lock_file.restype = ctypes.c_int
++    overlapped = _Overlapped()
++    if not lock_file(
++        msvcrt.get_osfhandle(fd),
++        0x00000002,  # LOCKFILE_EXCLUSIVE_LOCK; waits without FAIL_IMMEDIATELY
++        0,
++        1,
++        0,
++        ctypes.byref(overlapped),
++    ):
++        raise ctypes.WinError(ctypes.get_last_error())
++    return overlapped
++
++
++def _unlock_checkpoint_file_windows(fd: int, overlapped) -> None:
++    import ctypes
++    import msvcrt
++
++    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++    unlock_file = kernel32.UnlockFileEx
++    unlock_file.argtypes = [
++        ctypes.c_void_p,
++        ctypes.c_uint32,
++        ctypes.c_uint32,
++        ctypes.c_uint32,
++        ctypes.c_void_p,
++    ]
++    unlock_file.restype = ctypes.c_int
++    if not unlock_file(
++        msvcrt.get_osfhandle(fd),
++        0,
++        1,
++        0,
++        ctypes.byref(overlapped),
++    ):
++        raise ctypes.WinError(ctypes.get_last_error())
++
++
++class _CheckpointFileLock:
++    """Small blocking cross-process lock used for checkpoint store mutations."""
++
++    def __init__(self, path: Path, before_open=None, before_parent_provision=None):
++        self.path = path
++        self._fh = None
++        self._before_open = before_open
++        self._before_parent_provision = before_parent_provision
++        self._windows_overlapped = None
++
++    def __enter__(self):
++        safe_parent, parent_error = _validate_existing_path_components(
++            self.path.parent,
++            "Checkpoint lock parent",
++        )
++        if parent_error or safe_parent is None:
++            raise RuntimeError(parent_error or "checkpoint lock parent is unsafe")
++        if self._before_parent_provision is not None:
++            self._before_parent_provision(safe_parent)
++        _ensure_directory_tree_no_follow(safe_parent)
++        safe_parent, parent_error = _validate_existing_path_components(
++            safe_parent,
++            "Checkpoint lock parent",
++        )
++        if parent_error or safe_parent is None:
++            raise RuntimeError(parent_error or "checkpoint lock parent is unsafe")
++        safe_path, path_error = _validate_existing_path_components(
++            safe_parent / self.path.name,
++            "Checkpoint lock",
++        )
++        if path_error or safe_path is None:
++            raise RuntimeError(path_error or "checkpoint lock path is unsafe")
++        self.path = safe_path
++        if self._before_open is not None:
++            self._before_open(self.path)
++
++        fd = _open_checkpoint_lock_no_follow(self.path)
++        try:
++            path_stat = os.lstat(self.path)
++            handle_stat = os.fstat(fd)
++            same_identity = (
++                not path_stat.st_dev
++                or not path_stat.st_ino
++                or (path_stat.st_dev, path_stat.st_ino)
++                == (handle_stat.st_dev, handle_stat.st_ino)
++            )
++            if (
++                _is_symlink_or_reparse(path_stat)
++                or not stat.S_ISREG(handle_stat.st_mode)
++                or not same_identity
++                or getattr(path_stat, "st_nlink", 1) != 1
++                or _checkpoint_lock_link_count(fd) != 1
++            ):
++                raise RuntimeError(
++                    "checkpoint lock path changed or is not a single-link regular file"
++                )
++            self._fh = os.fdopen(fd, "r+b")
++            fd = -1
++        finally:
++            if fd >= 0:
++                os.close(fd)
++        try:
++            if os.name == "nt":
++                # LockFileEx permits a range beyond EOF, so an empty lock file
++                # never needs a sentinel write that could mutate a hard-link.
++                self._windows_overlapped = _lock_checkpoint_file_windows(
++                    self._fh.fileno()
++                )
++            else:
++                import fcntl
++
++                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
++        except Exception as exc:
++            self._fh.close()
++            self._fh = None
++            raise RuntimeError(f"checkpoint lock unavailable: {self.path.name}") from exc
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        if self._fh is None:
++            return
++        try:
++            if os.name == "nt":
++                if self._windows_overlapped is not None:
++                    _unlock_checkpoint_file_windows(
++                        self._fh.fileno(), self._windows_overlapped
++                    )
++            else:
++                import fcntl
++
++                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
++        except Exception:
++            pass
++        finally:
++            self._fh.close()
++            self._fh = None
++            self._windows_overlapped = None
++
++
++@contextlib.contextmanager
++def _checkpoint_file_lock(path: Path):
++    safe_path, path_error = _validate_existing_path_components(
++        path,
++        "Checkpoint lock",
++    )
++    if path_error or safe_path is None:
++        raise RuntimeError(path_error or "checkpoint lock path is unsafe")
++    key = os.path.normcase(str(safe_path))
++    with _PROCESS_LOCKS_GUARD:
++        process_lock = _PROCESS_LOCKS.setdefault(key, threading.RLock())
++    with process_lock:
++        with _CheckpointFileLock(safe_path):
++            yield
++
++
++@contextlib.contextmanager
++def _checkpoint_operation_locks(checkpoint_base: Path, working_dir: str):
++    """Take locks in a canonical order: profile store, then workspace."""
++    safe_base, base_error = _validate_checkpoint_base(checkpoint_base)
++    if base_error or safe_base is None:
++        raise RuntimeError(base_error or "Checkpoint storage is unsafe")
++    locks_dir = safe_base / _LOCKS_DIRNAME
++    with _checkpoint_file_lock(locks_dir / "store.lock"):
++        with _checkpoint_file_lock(
++            locks_dir / f"workspace-{_project_hash(working_dir)}.lock"
++        ):
++            _, base_error = _validate_checkpoint_base(safe_base)
++            if base_error:
++                raise RuntimeError(base_error)
++            yield
++
++
+ # ---------------------------------------------------------------------------
+ # Path / hash helpers
+ # ---------------------------------------------------------------------------
+@@ -240,6 +1113,8 @@ def _git_env(
+     store: Path,
+     working_dir: str,
+     index_file: Optional[Path] = None,
++    object_dir: Optional[Path] = None,
++    alternate_object_dirs: Optional[List[Path]] = None,
+ ) -> dict:
+     """Build env dict that redirects git to the shared store.
+ 
+@@ -266,10 +1141,20 @@ def _git_env(
+     env["GIT_WORK_TREE"] = str(normalized_working_dir)
+     env.pop("GIT_NAMESPACE", None)
+     env.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
++    env.pop("GIT_OBJECT_DIRECTORY", None)
+     if index_file is not None:
+-        env["GIT_INDEX_FILE"] = str(index_file)
++        env["GIT_INDEX_FILE"] = index_file.as_posix()
+     else:
+         env.pop("GIT_INDEX_FILE", None)
++    if object_dir is not None:
++        env["GIT_OBJECT_DIRECTORY"] = str(object_dir)
++    if alternate_object_dirs:
++        env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = os.pathsep.join(
++            str(path) for path in alternate_object_dirs
++        )
++    # All paths supplied by this module are literal.  In particular, a caller
++    # must not be able to turn restore(file_path=...) into git pathspec magic.
++    env["GIT_LITERAL_PATHSPECS"] = "1"
+     env["GIT_CONFIG_GLOBAL"] = os.devnull
+     env["GIT_CONFIG_SYSTEM"] = os.devnull
+     env["GIT_CONFIG_NOSYSTEM"] = "1"
+@@ -305,6 +1190,9 @@ def _run_git(
+     timeout: int = _GIT_TIMEOUT,
+     allowed_returncodes: Optional[Set[int]] = None,
+     index_file: Optional[Path] = None,
++    object_dir: Optional[Path] = None,
++    alternate_object_dirs: Optional[List[Path]] = None,
++    strip_output: bool = True,
+ ) -> Tuple[bool, str, str]:
+     """Run a git command against the shared store.  Returns (ok, stdout, stderr).
+ 
+@@ -322,7 +1210,13 @@ def _run_git(
+         logger.error("Git command skipped: %s (%s)", " ".join(["git"] + list(args)), msg)
+         return False, "", msg
+ 
+-    env = _git_env(store, str(normalized_working_dir), index_file=index_file)
++    env = _git_env(
++        store,
++        str(normalized_working_dir),
++        index_file=index_file,
++        object_dir=object_dir,
++        alternate_object_dirs=alternate_object_dirs,
++    )
+     cmd = ["git"] + list(args)
+     allowed_returncodes = allowed_returncodes or set()
+ 
+@@ -341,7 +1235,7 @@ def _run_git(
+             creationflags=windows_hide_flags(),
+         )
+         ok = result.returncode == 0
+-        stdout = result.stdout.strip()
++        stdout = result.stdout.strip() if strip_output else result.stdout
+         stderr = result.stderr.strip()
+         if not ok and result.returncode not in allowed_returncodes:
+             logger.error(
+@@ -387,7 +1281,7 @@ def _migrate_legacy_store(base: Path) -> Optional[Path]:
+     store = _store_path(base)
+     legacy_root: Optional[Path] = None
+     # Reserved top-level entries managed by v2.
+-    reserved = {_STORE_DIRNAME, _PRUNE_MARKER_NAME}
++    reserved = {_STORE_DIRNAME, _PRUNE_MARKER_NAME, _LOCKS_DIRNAME}
+     for child in list(base.iterdir()):
+         name = child.name
+         if name in reserved or name.startswith(_LEGACY_PREFIX):
+@@ -726,13 +1620,28 @@ class CheckpointManager:
+         max_snapshots: int = 20,
+         max_total_size_mb: int = 500,
+         max_file_size_mb: int = 10,
++        checkpoint_base: Optional[Path] = None,
+     ):
+         self.enabled = enabled
+         self.max_snapshots = max(1, int(max_snapshots))
+         self.max_total_size_mb = max(0, int(max_total_size_mb))
+         self.max_file_size_mb = max(0, int(max_file_size_mb))
++        if checkpoint_base is not None:
++            self.checkpoint_base = Path(checkpoint_base)
++        elif CHECKPOINT_BASE != _IMPORTED_CHECKPOINT_BASE:
++            # Preserve the long-standing test/embedding seam that monkeypatches
++            # this module constant before constructing a manager.
++            self.checkpoint_base = Path(CHECKPOINT_BASE)
++        else:
++            # Capture the active profile at construction time.  A module-level
++            # path would leak checkpoint storage across profile contexts.
++            self.checkpoint_base = Path(get_hermes_home()) / "checkpoints"
++        self.checkpoint_base = Path(
++            os.path.abspath(os.path.expanduser(os.fspath(self.checkpoint_base)))
++        )
+         self._checkpointed_dirs: Set[str] = set()
+         self._git_available: Optional[bool] = None  # lazy probe
++        self._turn_lock = threading.RLock()
+ 
+     # ------------------------------------------------------------------
+     # Turn lifecycle
+@@ -740,7 +1649,8 @@ class CheckpointManager:
+ 
+     def new_turn(self) -> None:
+         """Reset per-turn dedup.  Call at the start of each agent iteration."""
+-        self._checkpointed_dirs.clear()
++        with self._turn_lock:
++            self._checkpointed_dirs.clear()
+ 
+     # ------------------------------------------------------------------
+     # Public API
+@@ -762,64 +1672,100 @@ class CheckpointManager:
+         if not self._git_available:
+             return False
+ 
+-        abs_dir = str(_normalize_path(working_dir))
+-
+-        # Skip root, home, and other overly broad directories
+-        if abs_dir in {"/", str(Path.home())}:
+-            logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
++        resolved_dir, dir_err = _validate_working_dir(working_dir)
++        if dir_err or resolved_dir is None:
++            logger.debug("Checkpoint skipped: %s", dir_err)
+             return False
+-
+-        if abs_dir in self._checkpointed_dirs:
++        abs_dir = str(resolved_dir)
++        workspace_identity = _directory_identity(resolved_dir)
++        _, base_err = _validate_checkpoint_base(self.checkpoint_base)
++        if base_err:
++            logger.debug("Checkpoint skipped: %s", base_err)
+             return False
+ 
+-        self._checkpointed_dirs.add(abs_dir)
+-
+-        try:
+-            return self._take(abs_dir, reason)
+-        except Exception as e:
+-            logger.debug("Checkpoint failed (non-fatal): %s", e)
+-            return False
++        # Hold this lock through the snapshot: a second parallel mutator in the
++        # same turn must wait for the first snapshot barrier before proceeding.
++        with self._turn_lock:
++            if abs_dir in self._checkpointed_dirs:
++                return False
++            self._checkpointed_dirs.add(abs_dir)
++            try:
++                with _checkpoint_operation_locks(self.checkpoint_base, abs_dir):
++                    tree_err = _revalidate_working_dir(
++                        working_dir,
++                        resolved_dir,
++                        workspace_identity,
++                    )
++                    if tree_err:
++                        logger.debug("Checkpoint skipped: %s", tree_err)
++                        return False
++                    return self._take(abs_dir, reason)
++            except Exception as e:
++                logger.debug("Checkpoint failed (non-fatal): %s", e)
++                return False
+ 
+     def list_checkpoints(self, working_dir: str) -> List[Dict]:
+         """List available checkpoints for a directory (most recent first)."""
+-        abs_dir = str(_normalize_path(working_dir))
+-        store = _store_path(CHECKPOINT_BASE)
++        if not self.enabled:
++            return []
++        resolved_dir, dir_err = _validate_working_dir(working_dir)
++        if dir_err or resolved_dir is None:
++            logger.debug("Checkpoint list skipped: %s", dir_err)
++            return []
++        abs_dir = str(resolved_dir)
++        workspace_identity = _directory_identity(resolved_dir)
++        _, base_err = _validate_checkpoint_base(self.checkpoint_base)
++        if base_err:
++            logger.debug("Checkpoint list skipped: %s", base_err)
++            return []
++        store = _store_path(self.checkpoint_base)
+ 
+         if not (store / "HEAD").exists():
+             return []
+ 
+-        ref = _ref_name(_project_hash(abs_dir))
+-        ok, stdout, _ = _run_git(
+-            ["log", ref, "--format=%H|%h|%aI|%s", "-n", str(self.max_snapshots)],
+-            store, abs_dir,
+-            allowed_returncodes={128, 129},
+-        )
+-
+-        if not ok or not stdout:
+-            return []
++        with _checkpoint_operation_locks(self.checkpoint_base, abs_dir):
++            tree_err = _revalidate_working_dir(
++                working_dir,
++                resolved_dir,
++                workspace_identity,
++            )
++            if tree_err:
++                logger.debug("Checkpoint list skipped: %s", tree_err)
++                return []
++            if not (store / "HEAD").exists():
++                return []
++            ref = _ref_name(_project_hash(abs_dir))
++            ok, stdout, _ = _run_git(
++                ["log", ref, "--format=%H|%h|%aI|%s", "-n", str(self.max_snapshots)],
++                store, abs_dir,
++                allowed_returncodes={128, 129},
++            )
+ 
+-        results: List[Dict] = []
+-        for line in stdout.splitlines():
+-            parts = line.split("|", 3)
+-            if len(parts) == 4:
+-                entry = {
+-                    "hash": parts[0],
+-                    "short_hash": parts[1],
+-                    "timestamp": parts[2],
+-                    "reason": parts[3],
+-                    "files_changed": 0,
+-                    "insertions": 0,
+-                    "deletions": 0,
+-                }
+-                stat_ok, stat_out, _ = _run_git(
+-                    ["diff", "--shortstat", f"{parts[0]}~1", parts[0]],
+-                    store, abs_dir,
+-                    allowed_returncodes={128, 129},
+-                )
+-                if stat_ok and stat_out:
+-                    self._parse_shortstat(stat_out, entry)
+-                results.append(entry)
+-        return results
++            if not ok or not stdout:
++                return []
++
++            results: List[Dict] = []
++            for line in stdout.splitlines():
++                parts = line.split("|", 3)
++                if len(parts) == 4:
++                    entry = {
++                        "hash": parts[0],
++                        "short_hash": parts[1],
++                        "timestamp": parts[2],
++                        "reason": parts[3],
++                        "files_changed": 0,
++                        "insertions": 0,
++                        "deletions": 0,
++                    }
++                    stat_ok, stat_out, _ = _run_git(
++                        ["diff", "--shortstat", f"{parts[0]}~1", parts[0]],
++                        store, abs_dir,
++                        allowed_returncodes={128, 129},
++                    )
++                    if stat_ok and stat_out:
++                        self._parse_shortstat(stat_out, entry)
++                    results.append(entry)
++            return results
+ 
+     @staticmethod
+     def _parse_shortstat(stat_line: str, entry: Dict) -> None:
+@@ -834,55 +1780,445 @@ class CheckpointManager:
+         if m:
+             entry["deletions"] = int(m.group(1))
+ 
+-    def diff(self, working_dir: str, commit_hash: str) -> Dict:
+-        """Show diff between a checkpoint and the current working tree."""
+-        hash_err = _validate_commit_hash(commit_hash)
+-        if hash_err:
+-            return {"success": False, "error": hash_err}
++    def _resolve_owned_commit(
++        self, store: Path, working_dir: str, commit_hash: str,
++    ) -> Tuple[Optional[str], Optional[str]]:
++        """Resolve a commit only when it belongs to this project's ref."""
++        ref = _ref_name(_project_hash(working_dir))
++        ok_ref, tip, _ = _run_git(
++            ["rev-parse", "--verify", ref + "^{commit}"],
++            store,
++            working_dir,
++            allowed_returncodes={128},
++        )
++        if not ok_ref or not tip:
++            return None, "No checkpoints exist for this directory"
+ 
+-        abs_dir = str(_normalize_path(working_dir))
+-        store = _store_path(CHECKPOINT_BASE)
++        ok_commit, resolved, _ = _run_git(
++            ["rev-parse", "--verify", commit_hash + "^{commit}"],
++            store,
++            working_dir,
++            allowed_returncodes={128},
++        )
++        if not ok_commit or not resolved:
++            return None, f"Checkpoint '{commit_hash}' not found"
++
++        owned, _, _ = _run_git(
++            ["merge-base", "--is-ancestor", resolved, tip],
++            store,
++            working_dir,
++            allowed_returncodes={1, 128},
++        )
++        if not owned:
++            return None, f"Checkpoint '{commit_hash}' does not belong to this directory"
++        return resolved, None
+ 
+-        if not (store / "HEAD").exists():
+-            return {"success": False, "error": "No checkpoints exist for this directory"}
++    @staticmethod
++    def _temporary_git_paths(temp_root: Path) -> Tuple[Path, Path]:
++        index_file = temp_root / "index"
++        object_dir = temp_root / "objects"
++        (object_dir / "info").mkdir(parents=True)
++        (object_dir / "pack").mkdir(parents=True)
++        return index_file, object_dir
++
++    def _stage_current_in_temporary_index(
++        self,
++        store: Path,
++        working_dir: str,
++        index_file: Path,
++        object_dir: Path,
++    ) -> Tuple[bool, str]:
++        ref = _ref_name(_project_hash(working_dir))
++        git_kwargs = {
++            "index_file": index_file,
++            "object_dir": object_dir,
++            "alternate_object_dirs": [store / "objects"],
++        }
++        ok_read, _, err = _run_git(
++            ["read-tree", ref], store, working_dir, **git_kwargs,
++        )
++        if not ok_read:
++            return False, err or "Could not seed temporary checkpoint index"
++        ok_add, _, err = _run_git(
++            ["add", "-A"],
++            store,
++            working_dir,
++            timeout=_GIT_TIMEOUT * 2,
++            **git_kwargs,
++        )
++        if not ok_add:
++            return False, err or "Could not stage current workspace"
++        return True, ""
++
++    def _diff_unlocked(
++        self, store: Path, working_dir: str, resolved_commit: str,
++    ) -> Dict:
++        """Generate a diff without writing the persistent index or object DB."""
++        with tempfile.TemporaryDirectory(prefix="hermes-checkpoint-diff-") as raw_tmp:
++            index_file, object_dir = self._temporary_git_paths(Path(raw_tmp))
++            staged, stage_error = self._stage_current_in_temporary_index(
++                store, working_dir, index_file, object_dir,
++            )
++            if not staged:
++                return {"success": False, "error": stage_error}
++            git_kwargs = {
++                "index_file": index_file,
++                "object_dir": object_dir,
++                "alternate_object_dirs": [store / "objects"],
++            }
++            ok_stat, stat_out, _ = _run_git(
++                ["diff", "--stat", resolved_commit, "--cached"],
++                store,
++                working_dir,
++                **git_kwargs,
++            )
++            ok_diff, diff_out, _ = _run_git(
++                ["diff", resolved_commit, "--cached", "--no-color"],
++                store,
++                working_dir,
++                **git_kwargs,
++            )
++            if not ok_stat and not ok_diff:
++                return {"success": False, "error": "Could not generate diff"}
++            return {
++                "success": True,
++                "stat": stat_out if ok_stat else "",
++                "diff": diff_out if ok_diff else "",
++            }
+ 
+-        ok, _, err = _run_git(
+-            ["cat-file", "-t", commit_hash], store, abs_dir,
++    def _working_tree_matches_commit(
++        self,
++        store: Path,
++        working_dir: str,
++        commit_hash: str,
++        file_path: Optional[str] = None,
++    ) -> Optional[bool]:
++        """Return True/False for equality, or None if comparison failed."""
++        with tempfile.TemporaryDirectory(prefix="hermes-checkpoint-verify-") as raw_tmp:
++            index_file, object_dir = self._temporary_git_paths(Path(raw_tmp))
++            staged, _ = self._stage_current_in_temporary_index(
++                store, working_dir, index_file, object_dir,
++            )
++            if not staged:
++                return None
++            args = ["diff-index", "--cached", "--quiet", commit_hash]
++            if file_path is not None:
++                args.extend(["--", file_path])
++            ok, _, err = _run_git(
++                args,
++                store,
++                working_dir,
++                allowed_returncodes={1},
++                index_file=index_file,
++                object_dir=object_dir,
++                alternate_object_dirs=[store / "objects"],
++            )
++            if ok:
++                return True
++            if not err:
++                return False
++            return None
++
++    @staticmethod
++    def _validate_commit_tree(
++        store: Path,
++        working_dir: str,
++        commit_hash: str,
++        file_path: Optional[str] = None,
++    ) -> Optional[str]:
++        """Reject legacy checkpoint trees that could create link-like entries."""
++        args = ["ls-tree", "-r", "-z", commit_hash]
++        if file_path is not None:
++            args.extend(["--", file_path])
++        ok, output, error = _run_git(
++            args,
++            store,
++            working_dir,
++            strip_output=False,
+         )
+         if not ok:
+-            return {"success": False, "error": f"Checkpoint '{commit_hash}' not found"}
++            return error or "Could not inspect checkpoint tree safely"
++        if "\ufffd" in output:
++            return "Checkpoint tree contains a path that cannot be inspected safely"
++        for record in output.split("\x00"):
++            if not record:
++                continue
++            try:
++                metadata, relative = record.split("\t", 1)
++                mode = metadata.split(" ", 1)[0]
++            except ValueError:
++                return "Checkpoint tree returned an invalid entry"
++            if mode not in {"100644", "100755"}:
++                return (
++                    "Checkpoint tree contains an unsafe symbolic-link, gitlink, "
++                    f"or special entry: {relative}"
++                )
++        return None
+ 
+-        dir_hash = _project_hash(abs_dir)
+-        index_file = _index_path(store, dir_hash)
++    @staticmethod
++    def _tree_file_names(
++        store: Path,
++        working_dir: str,
++        commit_hash: str,
++    ) -> Tuple[Optional[Set[str]], Optional[str]]:
++        ok, output, error = _run_git(
++            ["ls-tree", "-r", "--name-only", "-z", commit_hash],
++            store,
++            working_dir,
++            strip_output=False,
++        )
++        if not ok or "\ufffd" in output:
++            return None, error or "Could not inspect recovery checkpoint paths"
++        return {name for name in output.split("\x00") if name}, None
+ 
+-        # Stage current state into the per-project index to compare.
+-        _run_git(["add", "-A"], store, abs_dir,
+-                 timeout=_GIT_TIMEOUT * 2, index_file=index_file)
++    @staticmethod
++    def _restore_changed_paths(
++        store: Path,
++        working_dir: str,
++        pre_snapshot: str,
++        target: str,
++        file_path: Optional[str],
++    ) -> Tuple[Optional[List[str]], Optional[str]]:
++        args = [
++            "diff",
++            "--name-only",
++            "--no-renames",
++            "-z",
++            pre_snapshot,
++            target,
++        ]
++        if file_path is not None:
++            args.extend(["--", file_path])
++        ok, output, error = _run_git(
++            args,
++            store,
++            working_dir,
++            strip_output=False,
++        )
++        if not ok or "\ufffd" in output:
++            return None, error or "Could not inspect restore paths safely"
++        return [name for name in output.split("\x00") if name], None
+ 
+-        ok_stat, stat_out, _ = _run_git(
+-            ["diff", "--stat", commit_hash, "--cached"],
+-            store, abs_dir, index_file=index_file,
++    def _restore_collision_error(
++        self,
++        store: Path,
++        working_dir: str,
++        pre_snapshot: str,
++        target: str,
++        file_path: Optional[str],
++    ) -> Optional[str]:
++        """Protect real entries omitted from the recovery checkpoint.
++
++        Ignore rules and size limits intentionally omit some workspace files.
++        A target checkout must not overwrite one of those uncaptured entries,
++        because the pre-restore checkpoint could not put its bytes back.
++        """
++        captured, captured_error = self._tree_file_names(
++            store, working_dir, pre_snapshot,
+         )
+-        ok_diff, diff_out, _ = _run_git(
+-            ["diff", commit_hash, "--cached", "--no-color"],
+-            store, abs_dir, index_file=index_file,
++        if captured_error or captured is None:
++            return captured_error or "Could not inspect recovery checkpoint paths"
++        captured_directories: Set[str] = set()
++        for captured_name in captured:
++            captured_parts = Path(captured_name).parts
++            for index in range(1, len(captured_parts)):
++                captured_directories.add(
++                    Path(*captured_parts[:index]).as_posix()
++                )
++        changed, changed_error = self._restore_changed_paths(
++            store,
++            working_dir,
++            pre_snapshot,
++            target,
++            file_path,
+         )
++        if changed_error or changed is None:
++            return changed_error or "Could not inspect restore paths safely"
+ 
+-        # Reset staged tree back to the project's last checkpoint so the
+-        # index doesn't drift out of sync with the ref.
+-        ref = _ref_name(dir_hash)
+-        _run_git(["read-tree", ref], store, abs_dir,
+-                 index_file=index_file,
+-                 allowed_returncodes={128})
++        root = Path(working_dir)
++        for relative in changed:
++            relative_path = Path(relative)
++            if (
++                relative_path.is_absolute()
++                or not relative_path.parts
++                or any(part in {"", ".", ".."} for part in relative_path.parts)
++            ):
++                return "Checkpoint tree contains an invalid workspace path"
+ 
+-        if not ok_stat and not ok_diff:
+-            return {"success": False, "error": "Could not generate diff"}
++            # A target such as dir/file may need to replace a real, uncaptured
++            # file at dir before it can create the child.
++            current = root
++            for part in relative_path.parts[:-1]:
++                current = current / part
++                try:
++                    current_stat = os.lstat(current)
++                except FileNotFoundError:
++                    break
++                except OSError:
++                    return "Workspace restore paths could not be inspected safely"
++                ancestor_rel = current.relative_to(root).as_posix()
++                if not stat.S_ISDIR(current_stat.st_mode):
++                    if ancestor_rel not in captured:
++                        return (
++                            "Restore would overwrite or remove a workspace path "
++                            f"excluded from the recovery checkpoint: {ancestor_rel}"
++                        )
++                    break
+ 
+-        return {
+-            "success": True,
+-            "stat": stat_out if ok_stat else "",
+-            "diff": diff_out if ok_diff else "",
+-        }
++            actual = root.joinpath(*relative_path.parts)
++            try:
++                actual_stat = os.lstat(actual)
++            except FileNotFoundError:
++                continue
++            except OSError:
++                return "Workspace restore paths could not be inspected safely"
++            if stat.S_ISDIR(actual_stat.st_mode):
++                # Git snapshots files, not directory objects.  An existing
++                # directory is recoverable only when every directory has at
++                # least one represented descendant and every real file below
++                # it is represented in the pre-snapshot.  This also rejects an
++                # uncaptured empty subdirectory beside captured files.
++                pending = [actual]
++                while pending:
++                    directory = pending.pop()
++                    directory_rel = directory.relative_to(root).as_posix()
++                    if directory_rel not in captured_directories:
++                        return (
++                            "Restore would overwrite or remove an empty or "
++                            "excluded directory that the recovery checkpoint "
++                            f"cannot represent: {directory_rel}"
++                        )
++                    try:
++                        with os.scandir(directory) as entries:
++                            for entry in entries:
++                                entry_stat = entry.stat(follow_symlinks=False)
++                                entry_path = Path(entry.path)
++                                entry_rel = entry_path.relative_to(root).as_posix()
++                                if _is_symlink_or_reparse(entry_stat):
++                                    return (
++                                        "Workspace restore path contains a symbolic "
++                                        f"link or reparse point: {entry_rel}"
++                                    )
++                                if stat.S_ISDIR(entry_stat.st_mode):
++                                    pending.append(entry_path)
++                                else:
++                                    if entry_rel not in captured:
++                                        return (
++                                            "Restore would overwrite or remove a "
++                                            "workspace path excluded from the recovery "
++                                            f"checkpoint: {entry_rel}"
++                                        )
++                    except OSError:
++                        return "Workspace restore paths could not be inspected safely"
++            elif relative not in captured:
++                return (
++                    "Restore would overwrite or remove a workspace path excluded "
++                    f"from the recovery checkpoint: {relative}"
++                )
++        return None
++
++    def _checkout_and_verify(
++        self,
++        store: Path,
++        original_working_dir: str,
++        resolved_working_dir: Path,
++        workspace_identity: Optional[Tuple[int, int]],
++        commit_hash: str,
++        index_file: Path,
++        restore_target: str,
++        verify_file_path: Optional[str],
++    ) -> Tuple[bool, str]:
++        """Perform one exact checkout and prove its resulting workspace tree."""
++        try:
++            tree_error = _revalidate_working_dir(
++                original_working_dir,
++                resolved_working_dir,
++                workspace_identity,
++            )
++            if tree_error:
++                return False, tree_error
++            _, base_error = _validate_checkpoint_base(self.checkpoint_base)
++            if base_error:
++                return False, base_error
++
++            ok, _, checkout_error = _run_git(
++                ["checkout", "--no-overlay", commit_hash, "--", restore_target],
++                store,
++                str(resolved_working_dir),
++                timeout=_GIT_TIMEOUT * 2,
++                index_file=index_file,
++            )
++            if not ok:
++                return False, checkout_error or "git checkout failed"
++
++            tree_error = _revalidate_working_dir(
++                original_working_dir,
++                resolved_working_dir,
++                workspace_identity,
++            )
++            if tree_error:
++                return False, tree_error
++            _, base_error = _validate_checkpoint_base(self.checkpoint_base)
++            if base_error:
++                return False, base_error
++            matches = self._working_tree_matches_commit(
++                store,
++                str(resolved_working_dir),
++                commit_hash,
++                file_path=verify_file_path,
++            )
++            if matches is True:
++                return True, ""
++            if matches is False:
++                return False, "workspace did not match the requested checkpoint"
++            return False, "workspace verification could not be completed"
++        except Exception as exc:
++            return False, f"unexpected checkout or verification failure: {exc}"
++
++    def diff(self, working_dir: str, commit_hash: str) -> Dict:
++        """Show diff between a checkpoint and the current working tree."""
++        if not self.enabled:
++            return {"success": False, "error": "Checkpoints are disabled"}
++        hash_err = _validate_commit_hash(commit_hash)
++        if hash_err:
++            return {"success": False, "error": hash_err}
++
++        resolved_dir, dir_err = _validate_working_dir(working_dir)
++        if dir_err or resolved_dir is None:
++            return {"success": False, "error": dir_err or "Invalid working directory"}
++        abs_dir = str(resolved_dir)
++        workspace_identity = _directory_identity(resolved_dir)
++        _, base_err = _validate_checkpoint_base(self.checkpoint_base)
++        if base_err:
++            return {"success": False, "error": base_err}
++        store = _store_path(self.checkpoint_base)
++
++        if not (store / "HEAD").exists():
++            return {"success": False, "error": "No checkpoints exist for this directory"}
++
++        try:
++            with _checkpoint_operation_locks(self.checkpoint_base, abs_dir):
++                tree_err = _revalidate_working_dir(
++                    working_dir,
++                    resolved_dir,
++                    workspace_identity,
++                )
++                if tree_err:
++                    return {"success": False, "error": tree_err}
++                if not (store / "HEAD").exists():
++                    return {"success": False, "error": "No checkpoints exist for this directory"}
++                resolved, owned_error = self._resolve_owned_commit(
++                    store, abs_dir, commit_hash,
++                )
++                if owned_error or resolved is None:
++                    return {"success": False, "error": owned_error or "Checkpoint not found"}
++                tree_error = self._validate_commit_tree(store, abs_dir, resolved)
++                if tree_error:
++                    return {"success": False, "error": tree_error}
++                return self._diff_unlocked(store, abs_dir, resolved)
++        except Exception as exc:
++            logger.debug("Checkpoint diff failed: %s", exc)
++            return {"success": False, "error": "Could not generate diff"}
+ 
+     def session_diff(self, working_dir: str) -> Dict:
+         """Show the cumulative diff of everything changed in this directory.
+@@ -918,60 +2254,218 @@ class CheckpointManager:
+ 
+     def restore(self, working_dir: str, commit_hash: str, file_path: str = None) -> Dict:
+         """Restore files to a checkpoint state."""
++        if not self.enabled:
++            return {"success": False, "error": "Checkpoints are disabled"}
+         hash_err = _validate_commit_hash(commit_hash)
+         if hash_err:
+             return {"success": False, "error": hash_err}
+ 
+-        abs_dir = str(_normalize_path(working_dir))
++        resolved_dir, dir_err = _validate_working_dir(working_dir)
++        if dir_err or resolved_dir is None:
++            return {"success": False, "error": dir_err or "Invalid working directory"}
++        abs_dir = str(resolved_dir)
++        workspace_identity = _directory_identity(resolved_dir)
++        _, base_err = _validate_checkpoint_base(self.checkpoint_base)
++        if base_err:
++            return {"success": False, "error": base_err}
+ 
+-        if file_path:
++        if file_path is not None:
+             path_err = _validate_file_path(file_path, abs_dir)
+             if path_err:
+                 return {"success": False, "error": path_err}
+ 
+-        store = _store_path(CHECKPOINT_BASE)
++        store = _store_path(self.checkpoint_base)
+ 
+         if not (store / "HEAD").exists():
+             return {"success": False, "error": "No checkpoints exist for this directory"}
+ 
+-        ok, _, err = _run_git(
+-            ["cat-file", "-t", commit_hash], store, abs_dir,
+-        )
+-        if not ok:
+-            return {"success": False, "error": f"Checkpoint '{commit_hash}' not found",
+-                    "debug": err or None}
+-
+-        # Take a pre-rollback snapshot so you can undo the undo.
+-        self._take(abs_dir, f"pre-rollback snapshot (restoring to {commit_hash[:8]})")
+-
+-        dir_hash = _project_hash(abs_dir)
+-        index_file = _index_path(store, dir_hash)
+-
+-        restore_target = file_path if file_path else "."
+-        ok, stdout, err = _run_git(
+-            ["checkout", commit_hash, "--", restore_target],
+-            store, abs_dir, timeout=_GIT_TIMEOUT * 2,
+-            index_file=index_file,
+-        )
+-
+-        if not ok:
+-            return {"success": False, "error": f"Restore failed: {err}",
+-                    "debug": err or None}
+-
+-        ok2, reason_out, _ = _run_git(
+-            ["log", "--format=%s", "-1", commit_hash], store, abs_dir,
+-        )
+-        reason = reason_out if ok2 else "unknown"
++        pin_ref: Optional[str] = None
++        mutation_started = False
++        pre_snapshot_for_error = ""
++        try:
++            with _checkpoint_operation_locks(self.checkpoint_base, abs_dir):
++                tree_err = _revalidate_working_dir(
++                    working_dir,
++                    resolved_dir,
++                    workspace_identity,
++                )
++                if tree_err:
++                    return {"success": False, "error": tree_err}
++                if not (store / "HEAD").exists():
++                    return {"success": False, "error": "No checkpoints exist for this directory"}
++                resolved, owned_error = self._resolve_owned_commit(
++                    store, abs_dir, commit_hash,
++                )
++                if owned_error or resolved is None:
++                    return {"success": False, "error": owned_error or "Checkpoint not found"}
++                target_tree_error = self._validate_commit_tree(
++                    store,
++                    abs_dir,
++                    resolved,
++                    file_path=file_path,
++                )
++                if target_tree_error:
++                    return {"success": False, "error": target_tree_error}
++
++                # A restore-triggered snapshot may prune and garbage-collect the
++                # very target being restored.  Pin it under a ref outside the
++                # managed refs/hermes namespace until checkout completes.
++                pin_ref = f"{_RESTORE_PINS_PREFIX}/{uuid.uuid4().hex}"
++                pinned, _, pin_err = _run_git(
++                    ["update-ref", pin_ref, resolved], store, abs_dir,
++                )
++                if not pinned:
++                    return {
++                        "success": False,
++                        "error": f"Could not pin restore target: {pin_err}",
++                    }
+ 
+-        result = {
+-            "success": True,
+-            "restored_to": commit_hash[:8],
+-            "reason": reason,
+-            "directory": abs_dir,
+-        }
+-        if file_path:
+-            result["file"] = file_path
+-        return result
++                try:
++                    self._take(
++                        abs_dir,
++                        f"pre-rollback snapshot (restoring to {resolved[:8]})",
++                    )
++                    ref = _ref_name(_project_hash(abs_dir))
++                    ok_pre, pre_snapshot, pre_err = _run_git(
++                        ["rev-parse", "--verify", ref + "^{commit}"],
++                        store,
++                        abs_dir,
++                        allowed_returncodes={128},
++                    )
++                    if not ok_pre or not pre_snapshot:
++                        return {
++                            "success": False,
++                            "error": "Could not establish a recovery checkpoint before restore",
++                            "debug": pre_err or None,
++                        }
++                    pre_snapshot_for_error = pre_snapshot
++                    captured = self._working_tree_matches_commit(
++                        store, abs_dir, pre_snapshot,
++                    )
++                    if captured is not True:
++                        return {
++                            "success": False,
++                            "error": "Could not capture the current workspace before restore",
++                        }
++
++                    recovery_tree_error = self._validate_commit_tree(
++                        store,
++                        abs_dir,
++                        pre_snapshot,
++                    )
++                    if recovery_tree_error:
++                        return {
++                            "success": False,
++                            "error": (
++                                "Recovery checkpoint is unsafe: "
++                                f"{recovery_tree_error}"
++                            ),
++                        }
++
++                    collision_error = self._restore_collision_error(
++                        store,
++                        abs_dir,
++                        pre_snapshot,
++                        resolved,
++                        file_path,
++                    )
++                    if collision_error:
++                        return {
++                            "success": False,
++                            "error": collision_error,
++                            "pre_snapshot": pre_snapshot,
++                            "mutation_uncertain": False,
++                        }
++
++                    dir_hash = _project_hash(abs_dir)
++                    index_file = _index_path(store, dir_hash)
++                    restore_target = file_path if file_path is not None else "."
++                    mutation_started = True
++                    restored, restore_error = self._checkout_and_verify(
++                        store,
++                        working_dir,
++                        resolved_dir,
++                        workspace_identity,
++                        resolved,
++                        index_file,
++                        restore_target,
++                        file_path,
++                    )
++                    if not restored:
++                        recovered, recovery_error = self._checkout_and_verify(
++                            store,
++                            working_dir,
++                            resolved_dir,
++                            workspace_identity,
++                            pre_snapshot,
++                            index_file,
++                            ".",
++                            None,
++                        )
++                        if recovered:
++                            return {
++                                "success": False,
++                                "error": (
++                                    "Restore failed; workspace recovered to the "
++                                    "pre-restore checkpoint: "
++                                    f"{restore_error}"
++                                ),
++                                "pre_snapshot": pre_snapshot,
++                                "recovered_to_pre_snapshot": True,
++                                "mutation_uncertain": False,
++                            }
++                        return {
++                            "success": False,
++                            "error": (
++                                "Restore failed and workspace recovery could not "
++                                "be verified; workspace mutation is uncertain: "
++                                f"{restore_error}; recovery: {recovery_error}"
++                            ),
++                            "pre_snapshot": pre_snapshot,
++                            "recovered_to_pre_snapshot": False,
++                            "mutation_uncertain": True,
++                        }
++
++                    ok_reason, reason_out, _ = _run_git(
++                        ["log", "--format=%s", "-1", resolved], store, abs_dir,
++                    )
++                    result = {
++                        "success": True,
++                        "restored_to": resolved[:8],
++                        "reason": reason_out if ok_reason else "unknown",
++                        "directory": abs_dir,
++                        "pre_snapshot": pre_snapshot,
++                    }
++                    if file_path is not None:
++                        result["file"] = file_path
++                    return result
++                finally:
++                    unpinned, _, unpin_error = _run_git(
++                        ["update-ref", "-d", pin_ref],
++                        store,
++                        abs_dir,
++                        allowed_returncodes={128},
++                    )
++                    if not unpinned:
++                        logger.warning(
++                            "Could not remove temporary restore pin %s: %s",
++                            pin_ref,
++                            unpin_error or "unknown error",
++                        )
++        except Exception as exc:
++            logger.debug("Checkpoint restore failed: %s", exc)
++            if mutation_started:
++                return {
++                    "success": False,
++                    "error": (
++                        "Restore raised after workspace mutation began and exact "
++                        f"recovery was not verified: {exc}"
++                    ),
++                    "pre_snapshot": pre_snapshot_for_error,
++                    "recovered_to_pre_snapshot": False,
++                    "mutation_uncertain": True,
++                }
++            return {"success": False, "error": f"Restore failed safely: {exc}"}
+ 
+     def get_working_dir_for_path(self, file_path: str) -> str:
+         """Resolve a file path to its working directory for checkpointing."""
+@@ -997,13 +2491,30 @@ class CheckpointManager:
+ 
+     def _take(self, working_dir: str, reason: str) -> bool:
+         """Take a snapshot.  Returns True on success."""
+-        store = _store_path(CHECKPOINT_BASE)
++        _, base_error = _validate_checkpoint_base(self.checkpoint_base)
++        if base_error:
++            logger.debug("Checkpoint skipped: %s", base_error)
++            return False
++        _, working_error = _validate_working_dir(working_dir)
++        if working_error:
++            logger.debug("Checkpoint skipped: %s", working_error)
++            return False
++        store = _store_path(self.checkpoint_base)
+ 
+         err = _init_store(store, working_dir)
+         if err:
+             logger.debug("Checkpoint store init failed: %s", err)
+             return False
+ 
++        _, base_error = _validate_checkpoint_base(self.checkpoint_base)
++        if base_error:
++            logger.debug("Checkpoint skipped: %s", base_error)
++            return False
++        _, working_error = _validate_working_dir(working_dir)
++        if working_error:
++            logger.debug("Checkpoint skipped: %s", working_error)
++            return False
++
+         _touch_project(store, working_dir)
+ 
+         # Quick size guard — don't try to snapshot enormous directories
+@@ -1259,7 +2770,7 @@ class CheckpointManager:
+ 
+         # Collect (commit_time, ref, sha) across all per-project refs.
+         ok, stdout, _ = _run_git(
+-            ["for-each-ref", "--format=%(refname)", _REFS_PREFIX],
++            ["for-each-ref", "--format=%(refname)", _REFS_PREFIX + "/"],
+             store, str(store.parent),
+             allowed_returncodes={128},
+         )
+@@ -1480,7 +2991,7 @@ def _dir_has_any_entry(directory: Path) -> bool:
+     return False
+ 
+ 
+-def prune_checkpoints(
++def _prune_checkpoints_unlocked(
+     retention_days: int = 7,
+     delete_orphans: bool = True,
+     checkpoint_base: Optional[Path] = None,
+@@ -1615,6 +3126,36 @@ def prune_checkpoints(
+     # --- v2 shared store: per-project ref pruning via metadata ---
+     store = _store_path(base)
+     if (store / "HEAD").exists():
++        # No restore can be active while this function holds store.lock, so
++        # every leftover pin is stale (normally only possible after a failed
++        # update-ref -d or abrupt process termination).  Sweep them before GC
++        # so temporary target retention cannot accumulate without bound.
++        ok_pins, pins_out, _ = _run_git(
++            [
++                "for-each-ref",
++                "--format=%(refname)",
++                _RESTORE_PINS_PREFIX + "/",
++            ],
++            store,
++            str(base),
++            allowed_returncodes={128},
++        )
++        if ok_pins:
++            for pin_ref in pins_out.splitlines():
++                if not pin_ref.startswith(_RESTORE_PINS_PREFIX + "/"):
++                    result["errors"] += 1
++                    continue
++                removed, _, _ = _run_git(
++                    ["update-ref", "-d", pin_ref],
++                    store,
++                    str(base),
++                    allowed_returncodes={128},
++                )
++                if not removed:
++                    result["errors"] += 1
++        else:
++            result["errors"] += 1
++
+         for meta in _list_projects(store):
+             dir_hash = meta.get("_hash") or ""
+             workdir = meta.get("workdir") or ""
+@@ -1686,7 +3227,7 @@ def prune_checkpoints(
+                 if size <= cap_bytes:
+                     break
+                 ok, stdout, _ = _run_git(
+-                    ["for-each-ref", "--format=%(refname)", _REFS_PREFIX],
++                    ["for-each-ref", "--format=%(refname)", _REFS_PREFIX + "/"],
+                     store, str(base),
+                     allowed_returncodes={128},
+                 )
+@@ -1757,6 +3298,56 @@ def prune_checkpoints(
+     return result
+ 
+ 
++def prune_checkpoints(
++    retention_days: int = 7,
++    delete_orphans: bool = True,
++    checkpoint_base: Optional[Path] = None,
++    max_total_size_mb: int = 0,
++    orphan_allowlist: Optional[set] = None,
++) -> Dict[str, int]:
++    """Run checkpoint maintenance under the profile-wide store lock.
++
++    Restore, snapshot, diff, and list all take this lock before touching the
++    shared object database and refs.  Maintenance must participate in the
++    same ordering so garbage collection cannot race a restore pin or a
++    temporary recovery checkpoint.
++    """
++    empty = {
++        "scanned": 0,
++        "deleted_orphan": 0,
++        "deleted_stale": 0,
++        "errors": 0,
++        "bytes_freed": 0,
++    }
++    base = Path(checkpoint_base or CHECKPOINT_BASE)
++    safe_base, base_error = _validate_checkpoint_base(base)
++    if base_error or safe_base is None:
++        logger.warning(
++            "checkpoint maintenance refused unsafe storage: %s",
++            base_error or "invalid checkpoint storage",
++        )
++        empty["errors"] = 1
++        return empty
++    if not safe_base.exists():
++        return empty
++    try:
++        with _checkpoint_file_lock(safe_base / _LOCKS_DIRNAME / "store.lock"):
++            _, base_error = _validate_checkpoint_base(safe_base)
++            if base_error:
++                raise RuntimeError(base_error)
++            return _prune_checkpoints_unlocked(
++                retention_days=retention_days,
++                delete_orphans=delete_orphans,
++                checkpoint_base=safe_base,
++                max_total_size_mb=max_total_size_mb,
++                orphan_allowlist=orphan_allowlist,
++            )
++    except Exception as exc:
++        logger.warning("checkpoint maintenance failed safely: %s", exc)
++        empty["errors"] = 1
++        return empty
++
++
+ def maybe_auto_prune_checkpoints(
+     retention_days: int = 7,
+     min_interval_hours: int = 24,
+@@ -1923,7 +3514,7 @@ def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
+         return out
+     size = _dir_size_bytes(base)
+     try:
+-        shutil.rmtree(base)
++        shutil.rmtree(base, onerror=_rmtree_make_writable)
+         out["bytes_freed"] = size
+         out["deleted"] = True
+     except OSError as exc:
+@@ -1945,7 +3536,7 @@ def clear_legacy(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
+             continue
+         try:
+             size = _dir_size_bytes(child)
+-            shutil.rmtree(child)
++            shutil.rmtree(child, onerror=_rmtree_make_writable)
+             out["bytes_freed"] += size
+             out["deleted"] += 1
+         except OSError as exc:
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 22d3d3f1de74a890188d63e3e40a1632463ece38..5b55fe971a51c257728a5e7f04b036b56e8eb629 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -1244,27 +1244,47 @@ def _(rid, params: dict) -> dict:
+     session, err = _sess(params, rid)
+     if err:
+         return err
+-    try:
+-
+-        def go(mgr, cwd):
+-            if not mgr.enabled:
+-                return _ok(rid, {"enabled": False, "checkpoints": []})
+-            return _ok(
+-                rid,
+-                {
+-                    "enabled": True,
+-                    "checkpoints": [
+-                        {
+-                            "hash": c.get("hash", ""),
+-                            "timestamp": c.get("timestamp", ""),
+-                            "message": c.get("message", ""),
+-                        }
+-                        for c in mgr.list_checkpoints(cwd)
+-                    ],
+-                },
+-            )
++    cwd = _session_cwd(session)
++    from tools.checkpoint_manager import _validate_working_dir
+ 
+-        return _with_checkpoints(session, go)
++    actual_cwd, actual_cwd_error = _validate_working_dir(cwd)
++    if actual_cwd_error or actual_cwd is None:
++        return _err(
++            rid,
++            4004,
++            actual_cwd_error or "session cwd is unsafe for checkpoint access",
++        )
++    if "expected_cwd" in params:
++        expected_cwd = params.get("expected_cwd")
++        if not isinstance(expected_cwd, str) or not expected_cwd.strip():
++            return _err(rid, 4004, "expected_cwd must be a non-empty path")
++        expected_path, expected_error = _validate_working_dir(expected_cwd)
++        if expected_error or expected_path is None:
++            return _err(rid, 4004, expected_error or "expected_cwd is invalid")
++        expected_normalized = os.path.normcase(str(expected_path))
++        actual_normalized = os.path.normcase(str(actual_cwd))
++        if expected_normalized != actual_normalized:
++            return _err(rid, 4004, "expected_cwd does not match session cwd")
++    try:
++        mgr = session["agent"]._checkpoint_mgr
++        if not mgr.enabled:
++            return _ok(rid, {"enabled": False, "checkpoints": []})
++        return _ok(
++            rid,
++            {
++                "enabled": True,
++                "checkpoints": [
++                    {
++                        "hash": str(c.get("hash", "") or ""),
++                        "timestamp": str(c.get("timestamp", "") or ""),
++                        "message": str(
++                            c.get("reason", c.get("message", "")) or ""
++                        ),
++                    }
++                    for c in mgr.list_checkpoints(cwd)
++                ],
++            },
++        )
+     except Exception as e:
+         return _err(rid, 5020, str(e))
+ 
+@@ -1275,53 +1295,232 @@ def _(rid, params: dict) -> dict:
+     if err:
+         return err
+     target = params.get("hash", "")
+-    file_path = params.get("file_path", "")
+     if not target:
+         return _err(rid, 4014, "hash required")
+-    # Full-history rollback mutates session history.  Rejecting during
+-    # an in-flight turn prevents prompt.submit from silently dropping
+-    # the agent's output (version mismatch path) or clobbering the
+-    # rollback (version-matches path).  A file-scoped rollback only
+-    # touches disk, so we allow it.
+-    if not file_path and session.get("running"):
++    if params.get("confirm") is not True:
++        return _err(rid, 4004, "rollback.restore requires confirm=true")
++    operation_id = params.get("operation_id")
++    allowed_operation_chars = (
++        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
++    )
++    if (
++        not isinstance(operation_id, str)
++        or not 1 <= len(operation_id) <= 128
++        or operation_id[0] not in allowed_operation_chars[:62]
++        or any(ch not in allowed_operation_chars for ch in operation_id)
++    ):
++        return _err(rid, 4004, "invalid operation_id")
++
++    # Preserve the cheap/bounded busy response even when a workspace has
++    # become unsafe.  The authoritative check is repeated under the same
++    # lock immediately before restore below, closing a concurrent turn race.
++    with session["history_lock"]:
++        if session.get("running"):
++            return _err(
++                rid,
++                4009,
++                "session busy — /interrupt the current turn before rollback.restore",
++            )
++
++    cwd = _session_cwd(session)
++    from tools.checkpoint_manager import _validate_working_dir
++
++    actual_cwd, actual_cwd_error = _validate_working_dir(cwd)
++    if actual_cwd_error or actual_cwd is None:
+         return _err(
+             rid,
+-            4009,
+-            "session busy — /interrupt the current turn before full rollback.restore",
++            4004,
++            actual_cwd_error or "session cwd is unsafe for checkpoint access",
+         )
++    expected_normalized = ""
++    if "expected_cwd" in params:
++        expected_cwd = params.get("expected_cwd")
++        if not isinstance(expected_cwd, str) or not expected_cwd.strip():
++            return _err(rid, 4004, "expected_cwd must be a non-empty path")
++        expected_path, expected_error = _validate_working_dir(expected_cwd)
++        if expected_error or expected_path is None:
++            return _err(rid, 4004, expected_error or "expected_cwd is invalid")
++        expected_normalized = os.path.normcase(str(expected_path))
++        actual_normalized = os.path.normcase(str(actual_cwd))
++        if expected_normalized != actual_normalized:
++            return _err(rid, 4004, "expected_cwd does not match session cwd")
++
++    file_path_value = params.get("file_path")
++    if file_path_value is not None and not isinstance(file_path_value, str):
++        return _err(rid, 4004, "file_path must be a string")
++    file_path = file_path_value if file_path_value is not None else ""
++    fingerprint = (str(target), file_path, expected_normalized)
++
++    with _sessions_lock:
++        restore_lock = session.get("_rollback_restore_lock")
++        if restore_lock is None:
++            restore_lock = threading.RLock()
++            session["_rollback_restore_lock"] = restore_lock
++        receipts = session.get("_rollback_restore_receipts")
++        if not isinstance(receipts, dict):
++            receipts = {}
++            session["_rollback_restore_receipts"] = receipts
++
+     try:
++        with restore_lock:
++            cached = receipts.get(operation_id)
++            if cached is not None:
++                if cached.get("fingerprint") != fingerprint:
++                    return _err(
++                        rid,
++                        4004,
++                        "operation_id was already used for different restore parameters",
++                    )
++                replay = copy.deepcopy(cached.get("result") or {})
++                replay["replayed"] = True
++                return _ok(rid, replay)
+ 
+-        def go(mgr, cwd):
+-            resolved = _resolve_checkpoint_hash(mgr, cwd, target)
+-            result = mgr.restore(cwd, resolved, file_path=file_path or None)
+-            if result.get("success") and not file_path:
+-                removed = 0
+-                with session["history_lock"]:
+-                    history = session.get("history", [])
+-                    # Truncate from the last *real* user turn. Same predicate
+-                    # as list_recent_user_messages / /undo / /retry —
+-                    # is_user_originated_turn also excludes compaction
+-                    # handoffs (durable role=user, sometimes without
+-                    # display_kind on legacy sessions; #80622).
++            with session["history_lock"]:
++                # Both file-scoped and full restores mutate the workspace.  The
++                # history lock is also prompt.submit's turn-claim lock, closing
++                # the check/use race without pretending a restore is an agent run.
++                if session.get("running"):
++                    return _err(
++                        rid,
++                        4009,
++                        "session busy — /interrupt the current turn before rollback.restore",
++                    )
++
++                mgr = session["agent"]._checkpoint_mgr
++                try:
++                    resolved = _resolve_checkpoint_hash(mgr, cwd, str(target))
++                except ValueError as exc:
++                    return _err(rid, 4004, str(exc))
++                manager_result = mgr.restore(
++                    cwd,
++                    resolved,
++                    file_path=file_path if file_path_value is not None else None,
++                )
++                if not isinstance(manager_result, dict):
++                    manager_result = {
++                        "success": False,
++                        "error": "Checkpoint restore returned an invalid result",
++                    }
++                if manager_result.get("mutation_uncertain") is True:
++                    return _err(
++                        rid,
++                        5021,
++                        str(
++                            manager_result.get("error")
++                            or "Workspace mutation could not be verified"
++                        ),
++                    )
++
++                workspace_restored = bool(manager_result.get("success"))
++                receipt = {
++                    "success": workspace_restored,
++                    "restored_to": str(manager_result.get("restored_to") or ""),
++                    "pre_snapshot": str(manager_result.get("pre_snapshot") or ""),
++                    "reason": str(manager_result.get("reason") or ""),
++                    "error": str(manager_result.get("error") or ""),
++                    "operation_id": operation_id,
++                    "replayed": False,
++                    "workspace_restored": workspace_restored,
++                    "history_rewound": False,
++                    "history_removed": 0,
++                    "partial": False,
++                }
++
++                if workspace_restored and file_path_value is None:
+                     from agent.context_compressor import is_user_originated_turn
+ 
++                    history = list(session.get("history", []))
+                     last_user_idx = None
+                     for i in range(len(history) - 1, -1, -1):
+-                        msg = history[i]
+-                        if is_user_originated_turn(msg):
++                        if is_user_originated_turn(history[i]):
+                             last_user_idx = i
+                             break
+-                    if last_user_idx is not None:
++                    if last_user_idx is None:
++                        receipt["history_rewound"] = True
++                    else:
++                        truncated = history[:last_user_idx]
+                         removed = len(history) - last_user_idx
+-                        del history[last_user_idx:]
+-                    if removed:
+-                        session["history_version"] = (
+-                            int(session.get("history_version", 0)) + 1
+-                        )
+-                result["history_removed"] = removed
+-            return result
+-
+-        return _ok(rid, _with_checkpoints(session, go))
++                        session_key = str(session.get("session_key") or "")
++                        try:
++                            if not session_key:
++                                raise RuntimeError("session has no durable key")
++                            with _session_db(session) as db:
++                                if db is None:
++                                    raise RuntimeError("session database is unavailable")
++                                db.replace_messages(
++                                    session_key,
++                                    copy.deepcopy(truncated),
++                                    active_only=True,
++                                    archive_dropped=True,
++                                )
++                        except Exception as history_exc:
++                            receipt.update(
++                                {
++                                    "success": False,
++                                    "partial": True,
++                                    "history_rewound": False,
++                                    "history_removed": 0,
++                                    "error": (
++                                        "Workspace restored, but conversation history "
++                                        f"could not be rewound: {history_exc}"
++                                    ),
++                                }
++                            )
++                        else:
++                            session["history"] = truncated
++                            session["history_version"] = (
++                                int(session.get("history_version", 0)) + 1
++                            )
++                            receipt["history_rewound"] = True
++                            receipt["history_removed"] = removed
++                            agent = session.get("agent")
++                            if agent is not None:
++                                if hasattr(agent, "_last_flushed_db_idx"):
++                                    try:
++                                        agent._last_flushed_db_idx = len(truncated)
++                                    except Exception:
++                                        pass
++                                memory_manager = getattr(agent, "_memory_manager", None)
++                                if memory_manager is not None:
++                                    try:
++                                        memory_manager.on_session_switch(
++                                            session_key,
++                                            parent_session_id="",
++                                            reset=False,
++                                            rewound=True,
++                                        )
++                                    except Exception:
++                                        pass
++                                if hasattr(agent, "_invalidate_system_prompt"):
++                                    try:
++                                        agent._invalidate_system_prompt()
++                                    except Exception:
++                                        pass
++
++            receipts[operation_id] = {
++                "fingerprint": fingerprint,
++                "result": copy.deepcopy(receipt),
++            }
++            while len(receipts) > 64:
++                receipts.pop(next(iter(receipts)))
++
++            if receipt.get("workspace_restored"):
++                event_payload = {
++                    key: copy.deepcopy(value)
++                    for key, value in receipt.items()
++                    if key != "replayed"
++                }
++                try:
++                    _emit(
++                        "rollback.restored",
++                        str(params.get("session_id") or ""),
++                        event_payload,
++                    )
++                except Exception:
++                    logger.debug(
++                        "rollback.restored event delivery failed", exc_info=True
++                    )
++            return _ok(rid, receipt)
+     except Exception as e:
+         return _err(rid, 5021, str(e))
+ 
+@@ -1334,17 +1533,60 @@ def _(rid, params: dict) -> dict:
+     target = params.get("hash", "")
+     if not target:
+         return _err(rid, 4014, "hash required")
+-    try:
+-        r = _with_checkpoints(
+-            session,
+-            lambda mgr, cwd: mgr.diff(cwd, _resolve_checkpoint_hash(mgr, cwd, target)),
++    cwd = _session_cwd(session)
++    from tools.checkpoint_manager import _validate_working_dir
++
++    actual_cwd, actual_cwd_error = _validate_working_dir(cwd)
++    if actual_cwd_error or actual_cwd is None:
++        return _err(
++            rid,
++            4004,
++            actual_cwd_error or "session cwd is unsafe for checkpoint access",
+         )
+-        raw = r.get("diff", "")[:4000]
+-        payload = {"stat": r.get("stat", ""), "diff": raw}
++    if "expected_cwd" in params:
++        expected_cwd = params.get("expected_cwd")
++        if not isinstance(expected_cwd, str) or not expected_cwd.strip():
++            return _err(rid, 4004, "expected_cwd must be a non-empty path")
++        expected_path, expected_error = _validate_working_dir(expected_cwd)
++        if expected_error or expected_path is None:
++            return _err(rid, 4004, expected_error or "expected_cwd is invalid")
++        expected_normalized = os.path.normcase(str(expected_path))
++        actual_normalized = os.path.normcase(str(actual_cwd))
++        if expected_normalized != actual_normalized:
++            return _err(rid, 4004, "expected_cwd does not match session cwd")
++    try:
++        mgr = session["agent"]._checkpoint_mgr
++        resolved = _resolve_checkpoint_hash(mgr, cwd, str(target))
++        r = mgr.diff(cwd, resolved)
++        if not isinstance(r, dict) or not r.get("success"):
++            return _ok(
++                rid,
++                {
++                    "success": False,
++                    "error": (
++                        r.get("error", "Could not generate diff")
++                        if isinstance(r, dict)
++                        else "Could not generate diff"
++                    ),
++                    "stat": "",
++                    "diff": "",
++                    "truncated": False,
++                },
++            )
++        full_diff = str(r.get("diff", "") or "")
++        raw = full_diff[:4000]
++        payload = {
++            "success": True,
++            "stat": str(r.get("stat", "") or ""),
++            "diff": raw,
++            "truncated": len(full_diff) > len(raw),
++        }
+         rendered = render_diff(raw, session.get("cols", 80))
+         if rendered:
+             payload["rendered"] = rendered
+         return _ok(rid, payload)
++    except ValueError as e:
++        return _err(rid, 4004, str(e))
+     except Exception as e:
+         return _err(rid, 5022, str(e))
+ 
+diff --git a/ui-tui/src/__tests__/createSlashHandler.test.ts b/ui-tui/src/__tests__/createSlashHandler.test.ts
+index 4fa7ff2dca88da8ef8eaaf4cf016158485cb6f05..48960cb03c2b562d24c625c1c41f6b2b711f5d2d 100644
+--- a/ui-tui/src/__tests__/createSlashHandler.test.ts
++++ b/ui-tui/src/__tests__/createSlashHandler.test.ts
+@@ -719,6 +719,44 @@ describe('createSlashHandler', () => {
+     expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
+   })
+ 
++  it('confirms /rollback restore with a one-shot operation id', () => {
++    patchUiState({ sid: 'sid-abc' })
++    const rpc = vi.fn((_method: string, _params: Record<string, unknown>) =>
++      Promise.resolve({ success: true })
++    )
++    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
++
++    expect(createSlashHandler(ctx)('/rollback abc123')).toBe(true)
++    expect(rpc).toHaveBeenCalledTimes(1)
++    expect(rpc).toHaveBeenCalledWith('rollback.restore', {
++      confirm: true,
++      hash: 'abc123',
++      operation_id: expect.any(String),
++      session_id: 'sid-abc'
++    })
++    const operationId = rpc.mock.calls[0]?.[1]?.operation_id as string
++    expect(operationId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)
++  })
++
++  it('surfaces rollback diff domain failures', async () => {
++    patchUiState({ sid: 'sid-abc' })
++    const rpc = vi.fn(() =>
++      Promise.resolve({
++        diff: '',
++        error: 'checkpoint not owned',
++        stat: '',
++        success: false,
++        truncated: false
++      })
++    )
++    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
++
++    expect(createSlashHandler(ctx)('/rollback diff abc123')).toBe(true)
++    await vi.waitFor(() =>
++      expect(ctx.transcript.sys).toHaveBeenCalledWith('rollback diff failed: checkpoint not owned')
++    )
++  })
++
+   it('hot-swaps the live indicator when /indicator <style> succeeds', async () => {
+     const rpc = vi.fn(() => Promise.resolve({ value: 'emoji' }))
+     const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+diff --git a/ui-tui/src/app/slash/commands/ops.ts b/ui-tui/src/app/slash/commands/ops.ts
+index f6f1d5ed5be10bea7f95f234373c8a8bca4f9068..b51b050b6ace4eb29c2a63959f1541324b459ed3 100644
+--- a/ui-tui/src/app/slash/commands/ops.ts
++++ b/ui-tui/src/app/slash/commands/ops.ts
+@@ -1,3 +1,4 @@
++import { randomUUID } from 'node:crypto'
+ import type {
+   BrowserManageResponse,
+   CommandsCatalogResponse,
+@@ -248,6 +249,9 @@ export const opsCommands: SlashCommand[] = [
+           .rpc<RollbackDiffResponse>('rollback.diff', { hash, session_id: ctx.sid })
+           .then(
+             ctx.guarded<RollbackDiffResponse>(r => {
++              if (!r.success) {
++                return ctx.transcript.sys(`rollback diff failed: ${r.error || 'unknown error'}`)
++              }
+               const body = (r.rendered || r.diff || '').trim()
+ 
+               if (!body && !r.stat) {
+@@ -267,12 +271,19 @@ export const opsCommands: SlashCommand[] = [
+       return ctx.gateway
+         .rpc<RollbackRestoreResponse>('rollback.restore', {
+           ...(filePath ? { file_path: filePath } : {}),
++          confirm: true,
+           hash,
++          operation_id: randomUUID(),
+           session_id: ctx.sid
+         })
+         .then(
+           ctx.guarded<RollbackRestoreResponse>(r => {
+             if (!r.success) {
++              if (r.partial && r.workspace_restored) {
++                return ctx.transcript.sys(
++                  `rollback partially applied: ${r.error || 'workspace restored, but history rewind failed'}`
++                )
++              }
+               return ctx.transcript.sys(`rollback failed: ${r.error || r.message || 'unknown error'}`)
+             }
+ 
+diff --git a/ui-tui/src/gatewayTypes.ts b/ui-tui/src/gatewayTypes.ts
+index ba8e85c42afb0ce8bebbf21b35a6eab2ec03c2f1..d15ee9275e1b8584ef81b25131142a1b9d855550 100644
+--- a/ui-tui/src/gatewayTypes.ts
++++ b/ui-tui/src/gatewayTypes.ts
+@@ -498,28 +498,39 @@ export interface BrowserManageResponse {
+ 
+ export interface RollbackCheckpoint {
+   hash: string
+-  message?: string
+-  timestamp?: string
++  message: string
++  timestamp: string
+ }
+ 
+ export interface RollbackListResponse {
+-  checkpoints?: RollbackCheckpoint[]
+-  enabled?: boolean
++  checkpoints: RollbackCheckpoint[]
++  enabled: boolean
+ }
+ 
+ export interface RollbackDiffResponse {
+-  diff?: string
++  diff: string
++  error?: string
+   rendered?: string
+-  stat?: string
++  stat: string
++  success: boolean
++  truncated: boolean
+ }
+ 
+ export interface RollbackRestoreResponse {
+-  error?: string
+-  history_removed?: number
++  directory?: string
++  error: string
++  file?: string
++  history_removed: number
++  history_rewound: boolean
+   message?: string
+-  reason?: string
+-  restored_to?: string
+-  success?: boolean
++  operation_id: string
++  partial: boolean
++  pre_snapshot?: string
++  reason: string
++  replayed: boolean
++  restored_to: string
++  success: boolean
++  workspace_restored: boolean
+ }
+ 
+ // ── Subagent events ──────────────────────────────────────────────────

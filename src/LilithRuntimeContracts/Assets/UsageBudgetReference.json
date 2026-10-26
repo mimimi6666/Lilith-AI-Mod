@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "scope": "reference_preview",
+  "reference_version": "lilith-economy-20260926-v2",
+  "input_count_mode": "estimated",
+  "memory_policy": "unchanged_no_per_level_count",
+  "levels": [
+    {
+      "level": 1,
+      "request_input_tokens": 45056,
+      "request_output_tokens": 2048,
+      "request_thinking_tokens": null,
+      "logical_iterations": null,
+      "turn_token_allowance": 262144,
+      "turn_actual_call_allowance": 8
+    },
+    {
+      "level": 2,
+      "request_input_tokens": 57344,
+      "request_output_tokens": 4096,
+      "request_thinking_tokens": null,
+      "logical_iterations": null,
+      "turn_token_allowance": 524288,
+      "turn_actual_call_allowance": 16
+    },
+    {
+      "level": 3,
+      "request_input_tokens": 81920,
+      "request_output_tokens": 8192,
+      "request_thinking_tokens": null,
+      "logical_iterations": null,
+      "turn_token_allowance": 1048576,
+      "turn_actual_call_allowance": 32
+    },
+    {
+      "level": 4,
+      "request_input_tokens": 106496,
+      "request_output_tokens": 12288,
+      "request_thinking_tokens": null,
+      "logical_iterations": null,
+      "turn_token_allowance": 1572864,
+      "turn_actual_call_allowance": 48
+    },
+    {
+      "level": 5,
+      "request_input_tokens": null,
+      "request_output_tokens": null,
+      "request_thinking_tokens": null,
+      "logical_iterations": null,
+      "turn_token_allowance": null,
+      "turn_actual_call_allowance": null
+    },
+    {
+      "level": 6,
+      "request_input_tokens": null,
+      "request_output_tokens": null,
+      "request_thinking_tokens": null,
+      "logical_iterations": null,
+      "turn_token_allowance": null,
+      "turn_actual_call_allowance": null
+    }
+  ]
+}

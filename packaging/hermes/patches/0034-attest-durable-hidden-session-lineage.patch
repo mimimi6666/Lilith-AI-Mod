@@ -1,0 +1,1092 @@
+diff --git a/hermes_state.py b/hermes_state.py
+index 823eb9a..53fedcd 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -9115,6 +9115,120 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+ 
+             return best if best is not None else session_id
+ 
++    def attest_resume_session_lineage(
++        self,
++        requested_session_id: str,
++        resolved_session_id: Optional[str] = None,
++        *,
++        expected_source: str,
++        expected_archived: bool,
++    ) -> Dict[str, Any]:
++        """Resolve and prove one durable compression lineage atomically.
++
++        One recursive SQLite statement walks *forward* from the exact requested
++        row to the current compression tip.  Every edge must be a real
++        compression continuation, never a branch, delegate, reset, or tool
++        child, and every row must keep the caller's expected source and archive
++        policy.  Resolving the tip inside this same read snapshot avoids granting
++        scoped authority from a proof assembled across two compression states.
++
++        ``resolved_session_id`` is an optional assertion for callers that already
++        carry a candidate tip; omitting it makes the returned proof authoritative.
++        """
++        if not isinstance(requested_session_id, str) or not requested_session_id:
++            raise ValueError("durable session identity is required")
++        if resolved_session_id is not None and (
++            not isinstance(resolved_session_id, str) or not resolved_session_id
++        ):
++            raise ValueError("resolved durable session identity was rejected")
++        if not isinstance(expected_source, str) or not expected_source.strip():
++            raise ValueError("expected source is required")
++        if type(expected_archived) is not bool:
++            raise ValueError("expected archived must be a boolean")
++
++        source = expected_source.strip()
++        with self._read_ctx() as conn:
++            rows = conn.execute(
++                f"""
++                WITH RECURSIVE lineage(
++                    id, parent_session_id, source, archived, end_reason,
++                    model_config, depth
++                ) AS (
++                    SELECT id, parent_session_id, source, archived, end_reason,
++                           model_config, 0
++                    FROM sessions
++                    WHERE id = ?
++                    UNION ALL
++                    SELECT child.id, child.parent_session_id, child.source,
++                           child.archived, child.end_reason,
++                           child.model_config, parent.depth + 1
++                    FROM lineage AS parent
++                    JOIN sessions AS child
++                      ON child.id = (
++                          SELECT candidate.id
++                          FROM sessions AS candidate
++                          WHERE candidate.parent_session_id = parent.id
++                            AND json_extract(
++                                  COALESCE(candidate.model_config, '{{}}'),
++                                  '$._branched_from'
++                                ) IS NULL
++                            AND json_extract(
++                                  COALESCE(candidate.model_config, '{{}}'),
++                                  '$._delegate_from'
++                                ) IS NULL
++                            AND json_extract(
++                                  COALESCE(candidate.model_config, '{{}}'),
++                                  '$._reset_from'
++                                ) IS NULL
++                            AND COALESCE(candidate.source, '') != 'tool'
++                          ORDER BY
++                            CASE
++                              WHEN candidate.end_reason = 'compression' THEN 0
++                              WHEN candidate.ended_at IS NULL THEN 1
++                              ELSE 2
++                            END,
++                            {_sql_session_last_active("candidate")} DESC,
++                            candidate.started_at DESC,
++                            candidate.id DESC
++                          LIMIT 1
++                      )
++                    WHERE parent.depth < 100
++                      AND parent.end_reason = 'compression'
++                )
++                SELECT id, source, archived, depth
++                FROM lineage
++                ORDER BY depth ASC
++                """,
++                (requested_session_id,),
++            ).fetchall()
++
++        if not rows:
++            raise ValueError("durable session lineage was not found")
++        ids = [str(row["id"] or "") for row in rows]
++        if not all(ids) or len(ids) != len(set(ids)):
++            raise ValueError("durable session lineage was cyclic")
++        if len(rows) >= 101:
++            raise ValueError("durable session lineage exceeded its safe depth")
++        if ids[0] != requested_session_id:
++            raise ValueError("durable session lineage root did not match")
++        resolved = ids[-1]
++        if resolved_session_id is not None and resolved != resolved_session_id:
++            raise ValueError("resolved session is not a compression continuation")
++
++        for row in rows:
++            if str(row["source"] or "") != source:
++                raise ValueError("durable session source did not match")
++            if bool(int(row["archived"] or 0)) is not expected_archived:
++                raise ValueError("durable session archive policy did not match")
++
++        return {
++            "requested_session_id": requested_session_id,
++            "resolved_session_id": resolved,
++            "session_ids": ids,
++            "source": source,
++            "archived": expected_archived,
++        }
++
+     def get_messages_as_conversation(
+         self,
+         session_id: str,
+diff --git a/tests/test_durable_session_lineage.py b/tests/test_durable_session_lineage.py
+new file mode 100644
+index 0000000..ae3a575
+--- /dev/null
++++ b/tests/test_durable_session_lineage.py
+@@ -0,0 +1,162 @@
++"""Durable hidden-session lineage proofs used before scoped authority grants."""
++
++import pytest
++
++from hermes_state import SessionDB
++
++
++@pytest.fixture
++def db(tmp_path):
++    handle = SessionDB(tmp_path / "state.db")
++    try:
++        yield handle
++    finally:
++        handle.close()
++
++
++def _compression_child(db, parent, child, *, source="lilith-game", **kwargs):
++    db.end_session(parent, "compression")
++    db.create_session(
++        child,
++        source=source,
++        parent_session_id=parent,
++        archived=True,
++        **kwargs,
++    )
++
++
++def test_attests_one_exact_durable_archived_row(db):
++    db.create_session("game", source="lilith-game", archived=True)
++
++    assert db.attest_resume_session_lineage(
++        "game",
++        "game",
++        expected_source="lilith-game",
++        expected_archived=True,
++    ) == {
++        "requested_session_id": "game",
++        "resolved_session_id": "game",
++        "session_ids": ["game"],
++        "source": "lilith-game",
++        "archived": True,
++    }
++
++
++def test_attests_only_an_ordered_compression_continuation(db):
++    db.create_session("root", source="lilith-game", archived=True)
++    _compression_child(db, "root", "middle")
++    _compression_child(db, "middle", "tip")
++
++    proof = db.attest_resume_session_lineage(
++        "root",
++        "tip",
++        expected_source="lilith-game",
++        expected_archived=True,
++    )
++
++    assert proof["session_ids"] == ["root", "middle", "tip"]
++    assert proof["requested_session_id"] == "root"
++    assert proof["resolved_session_id"] == "tip"
++
++
++def test_atomic_compression_publication_preserves_hidden_policy_and_attestation(db):
++    db.create_session("root", source="lilith-game", archived=True)
++
++    db.publish_compression_child(
++        parent_session_id="root",
++        child_session_id="tip",
++        source="lilith-game",
++        messages=[{"role": "user", "content": "compressed context"}],
++        require_compression_lease=False,
++    )
++
++    assert db.get_session("root")["end_reason"] == "compression"
++    assert db.get_session("tip")["archived"] == 1
++    assert db.attest_resume_session_lineage(
++        "root",
++        expected_source="lilith-game",
++        expected_archived=True,
++    )["session_ids"] == ["root", "tip"]
++
++
++@pytest.mark.parametrize(
++    "model_config",
++    [
++        {"_branched_from": "root"},
++        {"_delegate_from": "root"},
++        {"_reset_from": "root"},
++    ],
++)
++def test_rejects_non_compression_child_markers(db, model_config):
++    db.create_session("root", source="lilith-game", archived=True)
++    _compression_child(db, "root", "tip", model_config=model_config)
++
++    with pytest.raises(ValueError, match="compression continuation"):
++        db.attest_resume_session_lineage(
++            "root",
++            "tip",
++            expected_source="lilith-game",
++            expected_archived=True,
++        )
++
++
++@pytest.mark.parametrize(
++    ("source", "archived"),
++    [("desktop", True), ("lilith-game", False)],
++)
++def test_rejects_any_row_with_the_wrong_policy(db, source, archived):
++    db.create_session("row", source=source, archived=archived)
++
++    with pytest.raises(ValueError, match="did not match"):
++        db.attest_resume_session_lineage(
++            "row",
++            "row",
++            expected_source="lilith-game",
++            expected_archived=True,
++        )
++
++
++def test_rejects_unrelated_requested_and_resolved_rows(db):
++    db.create_session("requested", source="lilith-game", archived=True)
++    db.create_session("resolved", source="lilith-game", archived=True)
++
++    with pytest.raises(ValueError, match="compression continuation"):
++        db.attest_resume_session_lineage(
++            "requested",
++            "resolved",
++            expected_source="lilith-game",
++            expected_archived=True,
++        )
++
++
++def test_rejects_tool_children_even_when_the_parent_was_compressed(db):
++    db.create_session("root", source="lilith-game", archived=True)
++    _compression_child(db, "root", "tool-tip", source="tool")
++
++    with pytest.raises(ValueError, match="compression continuation"):
++        db.attest_resume_session_lineage(
++            "root",
++            "tool-tip",
++            expected_source="lilith-game",
++            expected_archived=True,
++        )
++
++
++def test_rejects_cyclic_lineage(db):
++    db.create_session("root", source="lilith-game", archived=True)
++    _compression_child(db, "root", "tip")
++    db.end_session("tip", "compression")
++    db._execute_write(
++        lambda conn: conn.execute(
++            "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
++            ("tip", "root"),
++        )
++    )
++
++    with pytest.raises(ValueError, match="cyclic"):
++        db.attest_resume_session_lineage(
++            "root",
++            "tip",
++            expected_source="lilith-game",
++            expected_archived=True,
++        )
+diff --git a/tests/tui_gateway/test_archived_session_create.py b/tests/tui_gateway/test_archived_session_create.py
+index 293f5d2..d50ee0b 100644
+--- a/tests/tui_gateway/test_archived_session_create.py
++++ b/tests/tui_gateway/test_archived_session_create.py
+@@ -137,6 +137,226 @@ def test_archived_session_is_hidden_after_first_prompt_but_resumable_with_histor
+     assert stored_id not in _listed_ids()
+ 
+ 
++def test_durable_archived_session_is_persisted_and_attested_before_first_prompt(
++    gateway_db,
++):
++    db, _ = gateway_db
++
++    created = server._methods["session.create"](
++        "create-durable",
++        {
++            "archived": True,
++            "durable": True,
++            "source": "lilith-game",
++        },
++    )
++
++    assert "error" not in created
++    result = created["result"]
++    stored_id = result["stored_session_id"]
++    row = db.get_session(stored_id)
++    assert row is not None
++    assert row["source"] == "lilith-game"
++    assert row["archived"] == 1
++    assert stored_id not in _listed_ids()
++    assert result["durable_lineage"] == {
++        "requested_session_id": stored_id,
++        "resolved_session_id": stored_id,
++        "session_ids": [stored_id],
++        "source": "lilith-game",
++        "archived": True,
++    }
++    session = server._sessions[result["session_id"]]
++    assert session["_durable_lineage_root"] == stored_id
++    assert server._attest_durable_lineage_postcondition(session) == {
++        "stored_session_id": stored_id,
++        "durable_lineage": result["durable_lineage"],
++    }
++
++
++def test_durable_resume_attests_the_exact_compression_lineage(gateway_db):
++    db, _ = gateway_db
++    db.create_session("game-root", source="lilith-game", archived=True)
++    db.append_message("game-root", role="user", content="before compression")
++    db.append_message("game-root", role="assistant", content="root reply")
++    db.end_session("game-root", end_reason="compression")
++    db.create_session(
++        "game-tip",
++        source="lilith-game",
++        parent_session_id="game-root",
++        archived=True,
++    )
++    db.append_message("game-tip", role="user", content="after compression")
++    db.append_message("game-tip", role="assistant", content="tip reply")
++
++    resumed = server._methods["session.resume"](
++        "resume-durable",
++        {
++            "session_id": "game-root",
++            "source": "lilith-game",
++            "require_durable_lineage": True,
++            "expected_source": "lilith-game",
++            "expected_archived": True,
++        },
++    )
++
++    assert "error" not in resumed
++    assert resumed["result"]["resumed"] == "game-tip"
++    assert resumed["result"]["durable_lineage"] == {
++        "requested_session_id": "game-root",
++        "resolved_session_id": "game-tip",
++        "session_ids": ["game-root", "game-tip"],
++        "source": "lilith-game",
++        "archived": True,
++    }
++    live_session = server._sessions[resumed["result"]["session_id"]]
++    assert live_session["_durable_lineage_root"] == "game-root"
++    assert server._attest_durable_lineage_postcondition(live_session) == {
++        "stored_session_id": "game-tip",
++        "durable_lineage": resumed["result"]["durable_lineage"],
++    }
++    history = server._methods["session.history"](
++        "history", {"session_id": resumed["result"]["session_id"]}
++    )
++    assert [message["text"] for message in history["result"]["messages"]] == [
++        "before compression",
++        "root reply",
++        "after compression",
++        "tip reply",
++    ]
++
++
++def test_durable_turn_postcondition_rotates_to_exact_compression_tip(gateway_db):
++    db, _ = gateway_db
++    created = server._methods["session.create"](
++        "create-durable-compress",
++        {
++            "archived": True,
++            "durable": True,
++            "source": "lilith-game",
++        },
++    )["result"]
++    root = created["stored_session_id"]
++    session = server._sessions[created["session_id"]]
++
++    db.end_session(root, end_reason="compression")
++    db.create_session(
++        "compressed-tip",
++        source="lilith-game",
++        parent_session_id=root,
++        archived=True,
++    )
++    session["session_key"] = "compressed-tip"
++
++    assert server._attest_durable_lineage_postcondition(session) == {
++        "stored_session_id": "compressed-tip",
++        "durable_lineage": {
++            "requested_session_id": root,
++            "resolved_session_id": "compressed-tip",
++            "session_ids": [root, "compressed-tip"],
++            "source": "lilith-game",
++            "archived": True,
++        },
++    }
++
++
++def test_durable_turn_postcondition_rejects_non_compression_substitution(gateway_db):
++    db, _ = gateway_db
++    created = server._methods["session.create"](
++        "create-durable-branch",
++        {
++            "archived": True,
++            "durable": True,
++            "source": "lilith-game",
++        },
++    )["result"]
++    session = server._sessions[created["session_id"]]
++    db.create_session(
++        "unrelated-game",
++        source="lilith-game",
++        archived=True,
++    )
++    session["session_key"] = "unrelated-game"
++
++    with pytest.raises(ValueError, match="compression continuation"):
++        server._attest_durable_lineage_postcondition(session)
++
++
++@pytest.mark.parametrize(
++    ("source", "archived", "expected_source", "expected_archived"),
++    [
++        ("desktop", True, "lilith-game", True),
++        ("lilith-game", False, "lilith-game", True),
++    ],
++)
++def test_durable_resume_rejects_policy_mismatch_before_allocating_live_session(
++    gateway_db,
++    source,
++    archived,
++    expected_source,
++    expected_archived,
++):
++    db, _ = gateway_db
++    db.create_session("wrong-policy", source=source, archived=archived)
++    before = set(server._sessions)
++
++    resumed = server._methods["session.resume"](
++        "resume-rejected",
++        {
++            "session_id": "wrong-policy",
++            "require_durable_lineage": True,
++            "expected_source": expected_source,
++            "expected_archived": expected_archived,
++        },
++    )
++
++    assert resumed["error"] == {
++        "code": 4094,
++        "message": "durable session lineage was rejected",
++    }
++    assert set(server._sessions) == before
++
++
++def test_durable_resume_maps_a_missing_stored_row_to_lineage_rejection(gateway_db):
++    before = set(server._sessions)
++
++    resumed = server._methods["session.resume"](
++        "resume-missing",
++        {
++            "session_id": "missing-game-handle",
++            "require_durable_lineage": True,
++            "expected_source": "lilith-game",
++            "expected_archived": True,
++        },
++    )
++
++    assert resumed["error"] == {
++        "code": 4094,
++        "message": "durable session lineage was rejected",
++    }
++    assert set(server._sessions) == before
++
++
++def test_durable_resume_never_reinterprets_a_handle_as_a_session_title(gateway_db):
++    db, _ = gateway_db
++    db.create_session("real-id", source="lilith-game", archived=True)
++    assert db.set_session_title("real-id", "spoofed-handle") is True
++    before = set(server._sessions)
++
++    resumed = server._methods["session.resume"](
++        "resume-title-collision",
++        {
++            "session_id": "spoofed-handle",
++            "require_durable_lineage": True,
++            "expected_source": "lilith-game",
++            "expected_archived": True,
++        },
++    )
++
++    assert resumed["error"]["code"] == 4094
++    assert set(server._sessions) == before
++
++
+ @pytest.mark.parametrize(
+     "malicious_value",
+     [None, 0, 1, "false", "true", [], {}],
+@@ -154,3 +374,29 @@ def test_session_create_rejects_non_boolean_archived_without_allocating_session(
+     assert response["error"]["message"] == "archived must be a boolean"
+     assert set(server._sessions) == before
+ 
++
++@pytest.mark.parametrize("malicious_value", [None, 0, 1, "false", "true", [], {}])
++def test_session_create_rejects_non_boolean_durable_without_allocating_session(
++    malicious_value,
++):
++    before = set(server._sessions)
++
++    response = server._methods["session.create"](
++        "invalid-durable", {"archived": True, "durable": malicious_value}
++    )
++
++    assert response["error"]["code"] == 4004
++    assert response["error"]["message"] == "durable must be a boolean"
++    assert set(server._sessions) == before
++
++
++def test_session_create_rejects_visible_durable_draft_without_allocating_session():
++    before = set(server._sessions)
++
++    response = server._methods["session.create"](
++        "visible-durable", {"archived": False, "durable": True}
++    )
++
++    assert response["error"]["code"] == 4004
++    assert response["error"]["message"] == "durable draft sessions must be archived"
++    assert set(server._sessions) == before
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 12c38fc..e753f59 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -16,6 +16,11 @@ def _(rid, params: dict) -> dict:
+     archived = params.get("archived", False)
+     if type(archived) is not bool:
+         return _err(rid, 4004, "archived must be a boolean")
++    durable = params.get("durable", False)
++    if type(durable) is not bool:
++        return _err(rid, 4004, "durable must be a boolean")
++    if durable and not archived:
++        return _err(rid, 4004, "durable draft sessions must be archived")
+     sid = uuid.uuid4().hex[:8]
+     key = _new_session_key()
+     cols = int(params.get("cols", 80))
+@@ -145,12 +150,38 @@ def _(rid, params: dict) -> dict:
+         }
+         _register_session_cwd(_sessions[sid])
+ 
+-    # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
+-    # launch (and every "New agent" / draft) opens a session here just to paint
+-    # the composer, so eagerly creating a row left an "Untitled" empty session
+-    # behind for every launch the user never typed into. The row is now created
+-    # lazily on the first prompt (see _ensure_session_db_row + prompt.submit),
+-    # and the AIAgent's own INSERT-OR-IGNORE persists it on the first turn too.
++    durable_lineage = None
++    if durable:
++        try:
++            _ensure_session_db_row(_sessions[sid], strict=True)
++            with _session_db(_sessions[sid]) as db:
++                if db is None:
++                    raise RuntimeError("durable session database is unavailable")
++                durable_lineage = db.attest_resume_session_lineage(
++                    key,
++                    key,
++                    expected_source=source,
++                    expected_archived=True,
++                )
++                _bind_durable_lineage_session(
++                    _sessions[sid], durable_lineage
++                )
++        except Exception:
++            with _sessions_lock:
++                _sessions.pop(sid, None)
++            try:
++                from tools.terminal_tool import clear_task_env_overrides
++
++                clear_task_env_overrides(key)
++            except Exception:
++                pass
++            logger.warning("durable archived session creation failed")
++            return _err(rid, 5006, "durable session creation failed")
++
++    # Ordinary drafts intentionally remain ephemeral until their first prompt.
++    # A caller that explicitly requested a durable archived draft was persisted
++    # and attested above; because it is archived, it cannot create a visible
++    # abandoned "Untitled" row in normal session pickers.
+ 
+     # Return the lightweight session immediately so Ink can paint the composer
+     # + skeleton panel, then build the real AIAgent just after this response is
+@@ -159,39 +190,39 @@ def _(rid, params: dict) -> dict:
+     _schedule_agent_build(sid)
+     _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
+ 
+-    return _ok(
+-        rid,
+-        {
+-            "session_id": sid,
+-            "stored_session_id": key,
+-            "message_count": len(history),
+-            "messages": _history_to_messages(history),
+-            "info": {
+-                # Reflect the per-session model override (desktop composer pick)
+-                # in the immediate response so the client doesn't briefly clobber
+-                # its sticky pick with the global default before the deferred
+-                # build's session.info lands.
+-                "model": (
+-                    session_model_override.get("model")
+-                    if session_model_override
+-                    else _resolve_model()
+-                ),
+-                **(
+-                    {"provider": session_model_override["provider"]}
+-                    if session_model_override and session_model_override.get("provider")
+-                    else {}
+-                ),
+-                "tools": {},
+-                "skills": {},
+-                "cwd": _sessions[sid]["cwd"],
+-                "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
+-                "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
+-                "lazy": True,
+-                "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+-                "profile_name": _response_profile_name(profile),
+-            },
++    result = {
++        "session_id": sid,
++        "stored_session_id": key,
++        "message_count": len(history),
++        "messages": _history_to_messages(history),
++        "info": {
++            # Reflect the per-session model override (desktop composer pick)
++            # in the immediate response so the client doesn't briefly clobber
++            # its sticky pick with the global default before the deferred
++            # build's session.info lands.
++            "model": (
++                session_model_override.get("model")
++                if session_model_override
++                else _resolve_model()
++            ),
++            **(
++                {"provider": session_model_override["provider"]}
++                if session_model_override and session_model_override.get("provider")
++                else {}
++            ),
++            "tools": {},
++            "skills": {},
++            "cwd": _sessions[sid]["cwd"],
++            "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
++            "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
++            "lazy": True,
++            "desktop_contract": DESKTOP_BACKEND_CONTRACT,
++            "profile_name": _response_profile_name(profile),
+         },
+-    )
++    }
++    if durable_lineage is not None:
++        result["durable_lineage"] = durable_lineage
++    return _ok(rid, result)
+ 
+ 
+ @method("session.list")
+@@ -352,6 +383,33 @@ def _(rid, params: dict) -> dict:
+     target = params.get("session_id", "")
+     if not target:
+         return _err(rid, 4006, "session_id required")
++    requested_target = target
++    require_durable_lineage = params.get("require_durable_lineage", False)
++    if type(require_durable_lineage) is not bool:
++        return _err(rid, 4004, "require_durable_lineage must be a boolean")
++    has_expected_source = "expected_source" in params
++    has_expected_archived = "expected_archived" in params
++    if (
++        require_durable_lineage
++        and not (has_expected_source and has_expected_archived)
++    ) or (
++        not require_durable_lineage
++        and (has_expected_source or has_expected_archived)
++    ):
++        return _err(rid, 4004, "durable lineage expectations are incomplete")
++    expected_source = params.get("expected_source")
++    expected_archived = params.get("expected_archived")
++    if require_durable_lineage:
++        if (
++            type(expected_source) is not str
++            or not expected_source.strip()
++            or len(expected_source) > 128
++            or any(ord(character) < 32 for character in expected_source)
++        ):
++            return _err(rid, 4004, "expected_source was rejected")
++        expected_source = expected_source.strip()
++        if type(expected_archived) is not bool:
++            return _err(rid, 4004, "expected_archived must be a boolean")
+     try:
+         cols = int(params.get("cols", 80))
+     except (TypeError, ValueError):
+@@ -382,7 +440,15 @@ def _(rid, params: dict) -> dict:
+             return _db_unavailable_error(rid, code=5000)
+ 
+         found = db.get_session(target)
+-        if not found:
++        if require_durable_lineage:
++            # A privileged hidden-session resume targets one exact durable id.
++            # Never reinterpret an absent handle as a human title: a title
++            # collision must not turn an untrusted string into an authority-bearing
++            # game session.
++            if not found:
++                logger.warning("durable resume lineage row was not found")
++                return _err(rid, 4094, "durable session lineage was rejected")
++        elif not found:
+             found = db.get_session_by_title(target)
+             if found:
+                 target = found["id"]
+@@ -402,18 +468,28 @@ def _(rid, params: dict) -> dict:
+             else:
+                 return _err(rid, 4007, "session not found")
+ 
+-        # Follow the compression-continuation chain to the live tip so a resume on
+-        # a rotated-out parent id binds to the descendant that actually holds the
+-        # post-compression turns. Auto-compression ends the session and forks a
+-        # continuation child; without this, resuming the original id (the desktop's
+-        # routed id when the chat was opened before it rotated) reloads the parent
+-        # transcript and the response generated after compression is missing — the
+-        # "I came back and the reply isn't there" bug on large sessions. Resolving
+-        # here also re-anchors the fast path below so a still-live rotated session
+-        # is reused (by its new key) instead of rebuilding a duplicate agent on the
+-        # stale parent. Skipped for lazy watch windows, which intentionally attach
+-        # to the exact child branch they were opened on.
+-        if found and not is_truthy_value(params.get("lazy", False)):
++        durable_lineage = None
++        if require_durable_lineage:
++            try:
++                # Resolve the current compression tip and prove every row in one
++                # SQLite read snapshot.  Splitting these operations allows a
++                # compression rotation between them and produces a stale proof.
++                durable_lineage = db.attest_resume_session_lineage(
++                    requested_target,
++                    expected_source=expected_source,
++                    expected_archived=expected_archived,
++                )
++                target = durable_lineage["resolved_session_id"]
++                found = db.get_session(target)
++                if not found:
++                    raise ValueError("attested durable session tip disappeared")
++            except Exception:
++                logger.warning("durable resume lineage attestation failed")
++                return _err(rid, 4094, "durable session lineage was rejected")
++        # Ordinary resumes retain the historical convenience resolver. Follow the
++        # compression-continuation chain to the live tip so a resume on a rotated
++        # parent binds to the descendant holding the post-compression turns.
++        elif found and not is_truthy_value(params.get("lazy", False)):
+             try:
+                 tip = db.resolve_resume_session_id(target)
+             except Exception:
+@@ -457,6 +533,21 @@ def _(rid, params: dict) -> dict:
+             profile_home
+         )
+ 
++        def _attest_payload(payload: dict) -> dict:
++            if durable_lineage is not None:
++                live_sid = str(payload.get("session_id") or "")
++                with _sessions_lock:
++                    live_session = _sessions.get(live_sid)
++                    if live_session is None:
++                        raise RuntimeError(
++                            "attested durable session is no longer live"
++                        )
++                    _bind_durable_lineage_session(
++                        live_session, durable_lineage
++                    )
++                payload["durable_lineage"] = durable_lineage
++            return payload
++
+         def _reuse_live_payload(sid: str, session: dict) -> dict:
+             payload = _live_session_payload(
+                 sid,
+@@ -556,7 +647,7 @@ def _(rid, params: dict) -> dict:
+                 with _session_resume_lock:
+                     current = _find_live_session_by_key(target)
+                     if current is not None:
+-                        return _ok(rid, _reuse_live_payload(*current))
++                        return _ok(rid, _attest_payload(_reuse_live_payload(*current)))
+ 
+         # Lazy/watch resume: register the live session WITHOUT building an agent.
+         # Used by the desktop's subagent windows — the child runs inside the
+@@ -597,7 +688,7 @@ def _(rid, params: dict) -> dict:
+                 lazy=True,
+             )
+             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
+-                return _ok(rid, _reuse_live_payload(*live))
++                return _ok(rid, _attest_payload(_reuse_live_payload(*live)))
+             # A delegated child mid-run emits no session events of its own — report
+             # its liveness from the relay registry so the window shows a busy turn.
+             child_running = _child_run_active(target)
+@@ -617,7 +708,7 @@ def _(rid, params: dict) -> dict:
+             messages = [] if omit_messages else _history_to_messages(display_history)
+             return _ok(
+                 rid,
+-                {
++                _attest_payload({
+                     "session_id": sid,
+                     "resumed": target,
+                     "message_count": len(display_history) if omit_messages else len(messages),
+@@ -629,7 +720,7 @@ def _(rid, params: dict) -> dict:
+                     "session_key": target,
+                     "started_at": record["created_at"],
+                     "status": "streaming" if child_running else "idle",
+-                },
++                }),
+             )
+ 
+         # Cold resume default: register the live session and read its stored
+@@ -695,7 +786,7 @@ def _(rid, params: dict) -> dict:
+                 resume_runtime_overrides=overrides or None,
+             )
+             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
+-                return _ok(rid, _reuse_live_payload(*live))
++                return _ok(rid, _attest_payload(_reuse_live_payload(*live)))
+ 
+             _schedule_agent_build(sid)
+             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
+@@ -722,7 +813,7 @@ def _(rid, params: dict) -> dict:
+             }
+             if auto_continue is not None:
+                 payload["auto_continue"] = auto_continue
+-            return _ok(rid, payload)
++            return _ok(rid, _attest_payload(payload))
+ 
+         # Build the agent OUTSIDE the lock — _make_agent can block for seconds
+         # (MCP discovery, prompt/skill build, AIAgent construction). Holding
+@@ -815,7 +906,7 @@ def _(rid, params: dict) -> dict:
+                     omit_messages=omit_messages,
+                 )
+                 payload["resumed"] = target
+-                return _ok(rid, payload)
++                return _ok(rid, _attest_payload(payload))
+             try:
+                 init_home_token = (
+                     set_hermes_home_override(str(profile_home))
+@@ -927,7 +1018,7 @@ def _(rid, params: dict) -> dict:
+     }
+     if auto_continue is not None:
+         payload["auto_continue"] = auto_continue
+-    return _ok(rid, payload)
++    return _ok(rid, _attest_payload(payload))
+ 
+ 
+ @method("session.cwd.set")
+@@ -2795,6 +2886,7 @@ def _(rid, params: dict) -> dict:
+             )
+             agent = session["agent"]
+             _sync_session_key_after_compress(sid, session)
++            durable_postcondition = _attest_durable_lineage_postcondition(session)
+             summary = summarize_manual_compression(
+                 before_messages,
+                 messages,
+@@ -2808,9 +2900,7 @@ def _(rid, params: dict) -> dict:
+                 agent,
+                 committed=True,
+             )
+-            return _ok(
+-                rid,
+-                {
++            payload = {
+                     "status": "aborted" if summary["aborted"] else "compressed",
+                     "removed": removed,
+                     "before_messages": before_count,
+@@ -2825,8 +2915,10 @@ def _(rid, params: dict) -> dict:
+                     # that belong in persisted history, not the transcript
+                     # replacement response.
+                     "messages": _history_to_messages(messages),
+-                },
+-            )
++                }
++            if durable_postcondition is not None:
++                payload.update(durable_postcondition)
++            return _ok(rid, payload)
+         finally:
+             # Always clear the pinned compressing status so the bar
+             # reverts to neutral whether compaction succeeded, was a
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 5f2637c..155d965 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -3503,7 +3503,7 @@ def _register_session_cwd(session: dict | None) -> None:
+         pass
+ 
+ 
+-def _ensure_session_db_row(session: dict) -> None:
++def _ensure_session_db_row(session: dict, *, strict: bool = False) -> bool:
+     """Idempotently persist the session's DB row on first real activity.
+ 
+     Called from prompt.submit so a row only exists once the user actually sends
+@@ -3527,7 +3527,9 @@ def _ensure_session_db_row(session: dict) -> None:
+     """
+     key = session.get("session_key")
+     if not key:
+-        return
++        if strict:
++            raise RuntimeError("durable session key is unavailable")
++        return False
+     # Persist into the session's own profile db (global remote mode), not the
+     # launch profile's — otherwise the row lands in the wrong state.db, the
+     # unified list mis-tags it, and resume 404s ("session not found").
+@@ -3538,14 +3540,18 @@ def _ensure_session_db_row(session: dict) -> None:
+         try:
+             db = SessionDB(db_path=Path(profile_home) / "state.db")
+         except Exception:
++            if strict:
++                raise
+             logger.debug("failed to open profile db for session row", exc_info=True)
+-            return
++            return False
+         close_db = True
+     else:
+         db = _get_db()
+         close_db = False
+     if db is None:
+-        return
++        if strict:
++            raise RuntimeError("durable session database is unavailable")
++        return False
+     # The session's own model/effort/fast pick — the composer override shipped on
+     # session.create, or a restored /model switch — must own the row's model +
+     # model_config. The agent isn't built yet at first prompt.submit, so derive
+@@ -3622,15 +3628,29 @@ def _ensure_session_db_row(session: dict) -> None:
+             # itself, so an archived row is never briefly listable.
+             **({"archived": True} if session.get("archived") is True else {}),
+         )
++        if strict:
++            row = db.get_session(key)
++            expected_source = _session_source(session)
++            expected_archived = session.get("archived") is True
++            if (
++                not isinstance(row, dict)
++                or str(row.get("source") or "") != expected_source
++                or bool(int(row.get("archived") or 0)) is not expected_archived
++            ):
++                raise RuntimeError(
++                    "durable session row did not match its creation policy"
++                )
++        return True
+     except Exception as exc:
+         # Disk-full is not a soft failure: if we swallow it here, prompt.submit
+         # returns {"status":"streaming"} and the user's message vanishes with
+         # no toast. Re-raise so the submit handler can return a real RPC error.
+         from hermes_state import is_disk_full_error
+ 
+-        if is_disk_full_error(exc):
++        if strict or is_disk_full_error(exc):
+             raise
+         logger.debug("failed to persist desktop session row", exc_info=True)
++        return False
+     finally:
+         if close_db:
+             try:
+@@ -5909,6 +5929,90 @@ def _sync_session_key_after_compress(
+             pass
+ 
+ 
++def _bind_durable_lineage_session(session: dict, proof: dict) -> None:
++    """Bind one privileged durable root to its live gateway session.
++
++    The binding is host-created by ``session.create``/``session.resume`` after
++    SessionDB has attested the exact archived ``lilith-game`` lineage.  It is
++    deliberately stored outside the client-visible session payload so an
++    ordinary prompt cannot manufacture a post-compression authority receipt.
++    """
++    if not isinstance(session, dict) or not isinstance(proof, dict):
++        raise ValueError("durable session lineage binding was malformed")
++    if set(proof) != {
++        "requested_session_id",
++        "resolved_session_id",
++        "session_ids",
++        "source",
++        "archived",
++    }:
++        raise ValueError("durable session lineage binding was non-canonical")
++    root = proof.get("requested_session_id")
++    resolved = proof.get("resolved_session_id")
++    session_ids = proof.get("session_ids")
++    if (
++        not isinstance(root, str)
++        or not root
++        or not isinstance(resolved, str)
++        or not resolved
++        or not isinstance(session_ids, list)
++        or not session_ids
++        or session_ids[0] != root
++        or session_ids[-1] != resolved
++        or len(session_ids) != len(set(session_ids))
++        or any(not isinstance(value, str) or not value for value in session_ids)
++        or proof.get("source") != "lilith-game"
++        or proof.get("archived") is not True
++        or session.get("source") != "lilith-game"
++        or session.get("session_key") != resolved
++    ):
++        raise ValueError("durable session lineage binding was rejected")
++    # Resume records historically omitted the visibility bit because ordinary
++    # sessions did not need it after the picker response.  The DB proof above,
++    # not a client parameter, is the authority for restoring it here.
++    session["archived"] = True
++    session["_durable_lineage_root"] = root
++
++
++def _attest_durable_lineage_postcondition(session: dict) -> dict | None:
++    """Return the exact durable tip proof for a bound hidden game session.
++
++    This is called only after the agent has finished the turn and
++    ``_sync_session_key_after_compress`` has re-anchored ``session_key``.  The
++    SessionDB method resolves and validates the whole root-to-tip chain in one
++    SQLite read snapshot.  Omitting the optional assertion would permit a
++    second compression rotation between the gateway state and the proof, so
++    the current stored key is asserted explicitly.
++    """
++    root = session.get("_durable_lineage_root")
++    if root is None:
++        return None
++    current = session.get("session_key")
++    if (
++        not isinstance(root, str)
++        or not root
++        or not isinstance(current, str)
++        or not current
++        or session.get("source") != "lilith-game"
++        or session.get("archived") is not True
++    ):
++        raise ValueError("durable session postcondition binding was rejected")
++    with _session_db(session) as db:
++        if db is None:
++            raise RuntimeError("durable session database is unavailable")
++        proof = db.attest_resume_session_lineage(
++            root,
++            current,
++            expected_source="lilith-game",
++            expected_archived=True,
++        )
++    _bind_durable_lineage_session(session, proof)
++    return {
++        "stored_session_id": current,
++        "durable_lineage": proof,
++    }
++
++
+ def _get_usage(agent) -> dict:
+     g = lambda k, fb=None: getattr(agent, k, 0) or (getattr(agent, fb, 0) if fb else 0)
+     usage = {
+@@ -9695,6 +9799,9 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
+         rendered = ""
+     if rendered:
+         payload["rendered"] = rendered
++    durable_postcondition = _attest_durable_lineage_postcondition(session)
++    if durable_postcondition is not None:
++        payload.update(durable_postcondition)
+     _retire_turn_marker(session)
+     from agent.turn_identity import canonical_id
+ 
+@@ -12450,6 +12557,9 @@ def _run_prompt_submit(
+                 payload["recoverable"] = True
+                 if assistant_partial:
+                     payload["partial"] = True
++            durable_postcondition = _attest_durable_lineage_postcondition(session)
++            if durable_postcondition is not None:
++                payload.update(durable_postcondition)
+             _retire_turn_marker(session, marker_key)
+             if last_reasoning:
+                 reasoning_payload: dict[str, object] = {"text": last_reasoning}

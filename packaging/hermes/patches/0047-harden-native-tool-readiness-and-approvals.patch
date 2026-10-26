@@ -1,0 +1,803 @@
+diff --git a/model_tools.py b/model_tools.py
+index 8fe4ffd34c13e25721affa9308ba7d86dfd2f17f..638ee6c5f041dc43a85590972c18cf32b8be11da 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -345,6 +345,19 @@ def get_tool_definitions(
+             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
+         except (FileNotFoundError, OSError, ImportError):
+             cfg_fp = None
++        try:
++            # Vision/video schema gates resolve against the active turn's main
++            # runtime ContextVar. Include its non-secret identity so a cached
++            # Gemini tool list cannot be reused by a concurrent/sessionless
++            # DeepSeek model (or vice versa).
++            from agent.auxiliary_client import _runtime_main_value
++
++            runtime_model_fp = (
++                str(_runtime_main_value("provider") or ""),
++                str(_runtime_main_value("model") or ""),
++            )
++        except Exception:
++            runtime_model_fp = ("", "")
+         profile_scope = check_fn_cache_scope()
+         if profile_scope != CHECK_FN_CACHE_BYPASS:
+             cache_key = (
+@@ -353,6 +366,7 @@ def get_tool_definitions(
+                 frozenset(disabled_toolsets) if disabled_toolsets else None,
+                 registry._generation,
+                 cfg_fp,
++                runtime_model_fp,
+                 bool(os.environ.get("HERMES_KANBAN_TASK")),
+                 bool(skip_tool_search_assembly),
+                 _is_delegated_child_context(),
+diff --git a/tests/tools/test_execute_code_approval_cluster.py b/tests/tools/test_execute_code_approval_cluster.py
+index 7722198ff2e5823b1ed7ab943b86f2fa6158c57f..c1a377ac1e4d0e681ccedc51a70e63626a7303b2 100644
+--- a/tests/tools/test_execute_code_approval_cluster.py
++++ b/tests/tools/test_execute_code_approval_cluster.py
+@@ -233,6 +233,22 @@ def test_guard_gateway_user_approves_is_one_shot(gw_session):
+     assert A.is_approved(gw_session, "execute_code") is False
+ 
+ 
++def test_guard_description_explains_script_and_persistence_scope(gw_session):
++    shown = _register_capturing_resolver(gw_session, "once")
++
++    result = A.check_execute_code_guard("print('review me')", "local")
++
++    assert result["approved"] is True
++    payload = shown["approval_data"]
++    description = payload["description"].lower()
++    assert "complete displayed script" in description
++    assert "once authorizes only that script" in description
++    assert "session or permanent" in description
++    assert "coarse execute_code capability" in description
++    assert "one-shot for this run" not in description
++    assert "print('review me')" in payload["command"]
++
++
+ def test_guard_session_approval_short_circuits_prompt(gw_session):
+     """Once session-approved, execute_code skips the approval prompt (#39275)."""
+     # Manually set session approval.
+diff --git a/tests/tools/test_tts_opus_routing.py b/tests/tools/test_tts_opus_routing.py
+index fee2fc93a7392754350ad9e2bfca310049f25c4a..118f0cf99da7469cad6c6adf8c5d324edf78901d 100644
+--- a/tests/tools/test_tts_opus_routing.py
++++ b/tests/tools/test_tts_opus_routing.py
+@@ -44,6 +44,28 @@ def test_edge_cli_preserves_native_mp3(tmp_path, monkeypatch):
+     convert.assert_not_called()
+ 
+ 
++def test_unconfigured_tts_defaults_to_keyless_edge(monkeypatch):
++    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {})
++    monkeypatch.setattr(tts_tool, "_import_edge_tts", lambda: object())
++
++    assert tts_tool._get_provider({}) == "edge"
++    assert tts_tool.check_tts_requirements() is True
++
++
++def test_unconfigured_tts_is_not_ready_when_portable_edge_dependency_is_missing(
++    monkeypatch,
++):
++    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {})
++    monkeypatch.setattr(
++        tts_tool,
++        "_import_edge_tts",
++        lambda: (_ for _ in ()).throw(ImportError("edge_tts missing")),
++    )
++    monkeypatch.setattr(tts_tool, "_check_neutts_available", lambda: False)
++
++    assert tts_tool.check_tts_requirements() is False
++
++
+ def test_edge_telegram_converts_to_opus_voice(tmp_path, monkeypatch):
+     out = tmp_path / "speech.mp3"
+     opus = tmp_path / "speech.ogg"
+diff --git a/tests/tools/test_video_analyze.py b/tests/tools/test_video_analyze.py
+index 020cfc358c5d8cb907cbb8172e9f148c63a1dbb9..49f96639c8f70fd09906b9f46b265f990f0240fc 100644
+--- a/tests/tools/test_video_analyze.py
++++ b/tests/tools/test_video_analyze.py
+@@ -12,6 +12,8 @@ from tools.vision_tools import (
+     _video_to_base64_data_url,
+     _handle_video_analyze,
+     _MAX_VIDEO_BASE64_BYTES,
++    check_vision_requirements,
++    check_video_requirements,
+     video_analyze_tool,
+     VIDEO_ANALYZE_SCHEMA,
+ )
+@@ -80,6 +82,153 @@ class TestVideoAnalyzeSchema:
+     def test_schema_description_mentions_video(self):
+         assert "video" in VIDEO_ANALYZE_SCHEMA["description"].lower()
+ 
++    def test_video_gate_requires_video_input_modality(self):
++        with (
++            patch(
++                "agent.auxiliary_client._resolve_task_provider_model",
++                return_value=("gemini", "image-only", None, None, None),
++            ),
++            patch(
++                "agent.auxiliary_client.resolve_vision_provider_client",
++                return_value=("gemini", object(), "image-only"),
++            ),
++            patch(
++                "agent.models_dev.get_model_info",
++                return_value=SimpleNamespace(input_modalities=("text", "image")),
++            ),
++        ):
++            assert check_video_requirements() is False
++
++    def test_video_gate_accepts_explicit_video_input_modality(self):
++        with (
++            patch(
++                "agent.auxiliary_client._resolve_task_provider_model",
++                return_value=("gemini", "video-model", None, None, None),
++            ),
++            patch(
++                "agent.auxiliary_client.resolve_vision_provider_client",
++                return_value=("gemini", object(), "video-model"),
++            ),
++            patch(
++                "agent.models_dev.get_model_info",
++                return_value=SimpleNamespace(
++                    input_modalities=("text", "image", "video")
++                ),
++            ),
++        ):
++            assert check_video_requirements() is True
++
++    def test_vision_gate_does_not_cache_session_model_across_contexts(
++        self, monkeypatch
++    ):
++        import agent.auxiliary_client as aux
++        import model_tools
++        from tools.registry import invalidate_check_fn_cache
++
++        monkeypatch.setattr(aux, "_read_main_provider", lambda: "deepseek")
++        monkeypatch.setattr(aux, "_read_main_model", lambda: "deepseek-v4-flash")
++
++        def resolve_for_current_runtime(*args, **kwargs):
++            del args, kwargs
++            runtime = aux._RUNTIME_MAIN_CONTEXT.get()
++            provider = runtime.get("provider") if runtime else aux._read_main_provider()
++            model = runtime.get("model") if runtime else aux._read_main_model()
++            if provider == "gemini":
++                return provider, object(), model
++            return provider, None, None
++
++        monkeypatch.setattr(
++            aux,
++            "resolve_vision_provider_client",
++            resolve_for_current_runtime,
++        )
++        invalidate_check_fn_cache()
++        model_tools._clear_tool_defs_cache()
++
++        with aux.scoped_runtime_main(
++            {"provider": "gemini", "model": "gemini-2.5-flash"}
++        ):
++            session_defs = model_tools.get_tool_definitions(
++                enabled_toolsets=["vision"],
++                quiet_mode=True,
++                skip_tool_search_assembly=True,
++            )
++        sessionless_defs = model_tools.get_tool_definitions(
++            enabled_toolsets=["vision"],
++            quiet_mode=True,
++            skip_tool_search_assembly=True,
++        )
++
++        assert [item["function"]["name"] for item in session_defs] == [
++            "vision_analyze"
++        ]
++        assert sessionless_defs == []
++        assert check_vision_requirements._hermes_check_fn_cache_bypass is True
++        invalidate_check_fn_cache()
++        model_tools._clear_tool_defs_cache()
++
++    def test_video_gate_does_not_cache_session_model_across_contexts(
++        self, monkeypatch
++    ):
++        import agent.auxiliary_client as aux
++        import model_tools
++        from tools.registry import invalidate_check_fn_cache
++
++        monkeypatch.setattr(aux, "_read_main_provider", lambda: "deepseek")
++        monkeypatch.setattr(aux, "_read_main_model", lambda: "deepseek-v4-flash")
++
++        def resolve_task(task):
++            assert task == "video"
++            runtime = aux._RUNTIME_MAIN_CONTEXT.get()
++            provider = runtime.get("provider") if runtime else aux._read_main_provider()
++            model = runtime.get("model") if runtime else aux._read_main_model()
++            return provider, model, None, None, None
++
++        monkeypatch.setattr(aux, "_resolve_task_provider_model", resolve_task)
++        monkeypatch.setattr(
++            aux,
++            "resolve_vision_provider_client",
++            lambda provider=None, model=None, **kwargs: (
++                provider,
++                object(),
++                model,
++            ),
++        )
++        monkeypatch.setattr(
++            "agent.models_dev.get_model_info",
++            lambda provider, model, allow_network=False: SimpleNamespace(
++                input_modalities=(
++                    ("text", "image", "video")
++                    if provider == "gemini"
++                    else ("text",)
++                )
++            ),
++        )
++        invalidate_check_fn_cache()
++        model_tools._clear_tool_defs_cache()
++
++        with aux.scoped_runtime_main(
++            {"provider": "gemini", "model": "gemini-2.5-flash"}
++        ):
++            session_defs = model_tools.get_tool_definitions(
++                enabled_toolsets=["video"],
++                quiet_mode=True,
++                skip_tool_search_assembly=True,
++            )
++        sessionless_defs = model_tools.get_tool_definitions(
++            enabled_toolsets=["video"],
++            quiet_mode=True,
++            skip_tool_search_assembly=True,
++        )
++
++        assert [item["function"]["name"] for item in session_defs] == [
++            "video_analyze"
++        ]
++        assert sessionless_defs == []
++        assert check_video_requirements._hermes_check_fn_cache_bypass is True
++        invalidate_check_fn_cache()
++        model_tools._clear_tool_defs_cache()
++
+ 
+ # ---------------------------------------------------------------------------
+ # _handle_video_analyze handler
+@@ -275,6 +424,7 @@ class TestVideoToolsetRegistration:
+         entry = registry.get_entry("video_analyze")
+         assert entry is not None
+         assert entry.toolset == "video"
++        assert entry.check_fn is check_video_requirements
+         assert entry.is_async is True
+         assert entry.emoji == "🎬"
+ 
+diff --git a/tests/tools/test_web_providers_ddgs.py b/tests/tools/test_web_providers_ddgs.py
+index 959f3c703b7c9686960446e01fd1c2348eded33b..890ab8da15ece1a1813f7c21da882db16f9f2816 100644
+--- a/tests/tools/test_web_providers_ddgs.py
++++ b/tests/tools/test_web_providers_ddgs.py
+@@ -255,6 +255,32 @@ class TestDDGSBackendWiring:
+         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: True)
+         assert web_tools.check_web_api_key() is True
+ 
++    def test_ddgs_exposes_search_schema_but_not_extract_schema(self, monkeypatch):
++        """A working search-only provider must not advertise extraction."""
++        from agent.web_search_registry import (
++            _reset_for_tests as reset_web_registry,
++            register_provider,
++        )
++        from plugins.web.ddgs.provider import DDGSWebSearchProvider
++        from tools import web_tools
++        from tools.registry import invalidate_check_fn_cache, registry
++
++        _install_fake_ddgs(monkeypatch)
++        reset_web_registry()
++        register_provider(DDGSWebSearchProvider())
++        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
++        invalidate_check_fn_cache()
++
++        definitions = registry.get_definitions(
++            {"web_search", "web_extract"},
++            quiet=True,
++        )
++        names = {definition["function"]["name"] for definition in definitions}
++
++        assert names == {"web_search"}
++        reset_web_registry()
++        invalidate_check_fn_cache()
++
+ 
+ # ---------------------------------------------------------------------------
+ # ddgs is search-only: web_extract returns a clear error
+diff --git a/tests/tui_gateway/test_tools_policy_rpc.py b/tests/tui_gateway/test_tools_policy_rpc.py
+index c35cc093486a9a07c5830f25e0dd88edc844eb32..a110233778fdde92d1b01f7ac76ff922b7cb55c7 100644
+--- a/tests/tui_gateway/test_tools_policy_rpc.py
++++ b/tests/tui_gateway/test_tools_policy_rpc.py
+@@ -140,6 +140,7 @@ def test_catalog_never_calls_keyless_unready_providers_configured(monkeypatch):
+ 
+ def test_catalog_reports_seeded_local_browser_ready_after_native_setup(monkeypatch):
+     import hermes_cli.tools_config as tools_config
++    from tools.registry import registry
+ 
+     _write_config(
+         {
+@@ -162,6 +163,19 @@ def test_catalog_reports_seeded_local_browser_ready_after_native_setup(monkeypat
+         "ddgs",
+         lambda: True,
+     )
++    monkeypatch.setattr(
++        registry,
++        "get_definitions",
++        lambda names, quiet=False: [
++            {
++                "type": "function",
++                "function": {"name": tool_name, "parameters": {}},
++            }
++            for tool_name in sorted(
++                set(names) & {"browser_navigate", "web_search"}
++            )
++        ],
++    )
+ 
+     rows = _catalog_rows(monkeypatch)
+ 
+@@ -199,6 +213,89 @@ def test_catalog_does_not_report_ready_when_native_setup_probe_fails(monkeypatch
+     assert browser["readiness"] == "needs_setup"
+ 
+ 
++def test_catalog_projects_only_registry_filtered_available_tools(monkeypatch):
++    from tools.registry import registry
++
++    _write_config(
++        {
++            "platform_toolsets": {"cli": ["web"]},
++            "web": {"search_backend": "ddgs"},
++        }
++    )
++
++    def definitions(names, quiet=False):
++        del quiet
++        if "web_search" in names:
++            return [
++                {
++                    "type": "function",
++                    "function": {"name": "web_search", "parameters": {}},
++                }
++            ]
++        return []
++
++    monkeypatch.setattr(registry, "get_definitions", definitions)
++
++    web = _catalog_rows(monkeypatch)["web"]
++    assert web["tools"] == ["web_search"]
++    assert web["configured"] is True
++    assert web["readiness"] == "ready"
++
++
++def test_catalog_discovers_builtin_registry_before_filtering(monkeypatch):
++    import tools.registry as registry_module
++
++    _write_config({"platform_toolsets": {"cli": ["web"]}})
++    discovered = False
++
++    def discover():
++        nonlocal discovered
++        discovered = True
++        return []
++
++    def definitions(names, quiet=False):
++        del names, quiet
++        assert discovered is True
++        return []
++
++    monkeypatch.setattr(registry_module, "discover_builtin_tools", discover)
++    monkeypatch.setattr(registry_module.registry, "get_definitions", definitions)
++
++    rows = _catalog_rows(monkeypatch)
++
++    assert rows
++    assert discovered is True
++
++
++def test_catalog_never_marks_zero_available_tools_ready(monkeypatch):
++    from tools.registry import registry
++
++    _write_config({"platform_toolsets": {"cli": []}})
++    monkeypatch.setattr(
++        registry,
++        "get_definitions",
++        lambda names, quiet=False: [],
++    )
++
++    rows = _catalog_rows(monkeypatch)
++    false_positive_regressions = {
++        "video",
++        "bfl",
++        "tts",
++        "context_engine",
++        "yuanbao",
++    }
++    assert false_positive_regressions <= rows.keys()
++    for name in false_positive_regressions:
++        assert rows[name]["tools"] == []
++        assert rows[name]["configured"] is False
++        assert rows[name]["readiness"] != "ready"
++    assert rows
++    assert all(row["tools"] == [] for row in rows.values())
++    assert all(row["configured"] is False for row in rows.values())
++    assert all(row["readiness"] != "ready" for row in rows.values())
++
++
+ def test_tools_set_persists_toolsets_and_approval_in_one_native_save(monkeypatch):
+     import hermes_cli.tools_config as tools_config
+     from tools.approval import _normalize_approval_mode
+@@ -1747,9 +1844,26 @@ def test_approval_request_always_emits_native_choices(monkeypatch):
+             "choices": ["once", "always", "once", "invalid"],
+         },
+     )
++    server._emit_approval_request(
++        "session-1",
++        {
++            "allow_session": False,
++            "allow_permanent": False,
++            "choices": ["once", "session", "always", "deny"],
++        },
++    )
++    server._emit_approval_request(
++        "session-1",
++        {
++            "allow_session": False,
++            "allow_permanent": False,
++        },
++    )
+ 
+     assert emitted[0][2]["choices"] == ["once", "deny"]
+     assert emitted[1][2]["choices"] == ["once"]
++    assert emitted[2][2]["choices"] == ["once", "deny"]
++    assert emitted[3][2]["choices"] == ["once", "deny"]
+     for _, _, payload in emitted:
+         choices = payload["choices"]
+         assert choices
+diff --git a/tools/approval.py b/tools/approval.py
+index 59c807ebc428d91ea4709337d4fd9ce5cea58797..d30e3fb743d2d025b224c5127cc2eaa74ba1bb85 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -5671,9 +5671,11 @@ def check_execute_code_guard(code: str, env_type: str,
+     """
+     pattern_key = "execute_code"
+     description = (
+-        "execute_code script execution. The script can spawn subprocesses or "
+-        "mutate files without passing through terminal command approval; "
+-        "approval is one-shot for this run."
++        "execute_code script execution. Review the complete displayed script: "
++        "Once authorizes only that script, while session or permanent approval "
++        "authorizes the coarse execute_code capability for future scripts. The "
++        "script can spawn subprocesses or mutate files without passing through "
++        "terminal command approval."
+     )
+ 
+     # Isolated backends already sandbox the child — matches the container skip
+@@ -5713,7 +5715,7 @@ def check_execute_code_guard(code: str, env_type: str,
+             }
+         return {"approved": True, "message": None}
+ 
+-    # Only gateway/ask contexts get the one-shot whole-script approval.
++    # Only gateway/ask contexts get the whole-script approval prompt.
+     #   * CLI interactive: the script's terminal() calls are guarded per-call
+     #     (context now propagates into the RPC thread, #33057); a whole-script
+     #     prompt would fire on every execute_code call.
+diff --git a/tools/registry.py b/tools/registry.py
+index 627987ab1bd6caaf2a69b607decb151bbdd43a36..d5699ace9f5ac232019f5742c4b20dec3d48fda5 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -330,6 +330,22 @@ def _check_fn_cached(fn: Callable) -> bool:
+     re-probes) to keep flaky external checks (Docker daemon busy, socket
+     contention, probe timeout) from silently stripping tools mid-session.
+     """
++    # Model-capability probes may depend on a turn/session ContextVar rather
++    # than only profile/process state. Those probes opt out explicitly so one
++    # session's model cannot seed a verdict reused by another session (or by a
++    # sessionless catalog read) for the next 30 seconds.
++    if getattr(fn, "_hermes_check_fn_cache_bypass", False):
++        try:
++            return bool(fn())
++        except Exception:
++            logger.warning(
++                "uncached check_fn %s raised; dependent tools will be "
++                "unavailable this turn",
++                getattr(fn, "__qualname__", fn),
++                exc_info=True,
++            )
++            return False
++
+     now = time.monotonic()
+     scope = check_fn_cache_scope()
+     if scope == CHECK_FN_CACHE_BYPASS:
+@@ -407,6 +423,8 @@ def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
+     availability without triggering network / auth / SDK work inside a request
+     path. Returns ``None`` when there is no fresh cached verdict.
+     """
++    if getattr(fn, "_hermes_check_fn_cache_bypass", False):
++        return None
+     now = time.monotonic()
+     scope = check_fn_cache_scope()
+     if scope == CHECK_FN_CACHE_BYPASS:
+diff --git a/tools/vision_tools.py b/tools/vision_tools.py
+index e84daaff7ffe12cbb890e1ad58e5872905b47663..85b3f7171ed933726d089a09354a20dc15d2144c 100644
+--- a/tools/vision_tools.py
++++ b/tools/vision_tools.py
+@@ -1653,6 +1653,57 @@ def check_vision_requirements() -> bool:
+         return False
+ 
+ 
++def check_video_requirements() -> bool:
++    """Check that the resolved auxiliary model explicitly accepts video.
++
++    A resolvable image client is not sufficient: many vision models accept
++    ``image_url`` but reject ``video_url``.  Keep video analysis out of the
++    model schema unless the cached models.dev metadata for the exact resolved
++    provider/model declares ``video`` as an input modality.
++    """
++    try:
++        from agent.auxiliary_client import (
++            _resolve_task_provider_model,
++            aux_probe_mode,
++            resolve_vision_provider_client,
++        )
++        from agent.models_dev import get_model_info
++    except ImportError:
++        return False
++
++    try:
++        with aux_probe_mode():
++            requested, model, base_url, api_key, _api_mode = (
++                _resolve_task_provider_model("video")
++            )
++            provider, client, resolved_model = resolve_vision_provider_client(
++                provider=requested,
++                model=model,
++                base_url=base_url,
++                api_key=api_key,
++            )
++        if client is None or not provider or not resolved_model:
++            return False
++        info = get_model_info(provider, resolved_model, allow_network=False)
++        return bool(
++            info is not None
++            and any(
++                str(modality).strip().lower() == "video"
++                for modality in info.input_modalities
++            )
++        )
++    except Exception:
++        return False
++
++
++# These probes resolve against ``auxiliary_runtime_main``, a per-session
++# ContextVar. Process/profile TTL caching would let one session's Gemini
++# capability verdict leak into another model's schema. They are deliberately
++# cheap probe-mode/cache-only checks, so evaluate them for each schema build.
++check_vision_requirements._hermes_check_fn_cache_bypass = True
++check_video_requirements._hermes_check_fn_cache_bypass = True
++
++
+ 
+ if __name__ == "__main__":
+     """
+@@ -2218,7 +2269,7 @@ registry.register(
+     toolset="video",
+     schema=VIDEO_ANALYZE_SCHEMA,
+     handler=_handle_video_analyze,
+-    check_fn=check_vision_requirements,
++    check_fn=check_video_requirements,
+     is_async=True,
+     emoji="🎬",
+ )
+diff --git a/tools/web_tools.py b/tools/web_tools.py
+index e8c62142af8b94f1dcf3dda822b02729ce74314e..7d35bfd4e004016bbf78e7d2f2d74ce96548431c 100644
+--- a/tools/web_tools.py
++++ b/tools/web_tools.py
+@@ -1052,45 +1052,72 @@ async def web_extract_tool(
+         return tool_error(error_msg)
+ 
+ 
+-# Convenience function to check Firecrawl credentials
+-def check_web_api_key() -> bool:
+-    """Check whether the configured web backend is available.
+-
+-    Used as the ``check_fn`` gate for the ``web_search`` and ``web_extract``
+-    tool registry entries — so a plugin-registered provider that reports
+-    ``is_available()`` must light the tools up even when no built-in backend
+-    has credentials (issues #28651, #31873). Resolution funnels through
+-    :func:`_is_backend_available`, which delegates non-legacy names to the
+-    registry.
++def _check_web_capability(capability: str) -> bool:
++    """Return whether the active provider can serve one web capability.
++
++    Search-only providers such as DDGS, Brave Free, and SearXNG must not make
++    ``web_extract`` appear in the model schema.  Provider resolution itself
++    intentionally returns an explicitly configured provider even when it is
++    unavailable (so direct dispatch can report a precise setup error), so the
++    registry gate also verifies ``is_available()`` here.
+     """
+-    # ``or ""``: a null ``web.backend`` value yields None from ``.get``, and
+-    # ``None.lower()`` would raise. Mirrors ``_get_backend``.
+-    configured = (_load_web_config().get("backend") or "").lower().strip()
+-    if configured and _is_backend_available(configured):
+-        return True
+-    # Any built-in backend with credentials present. This is a boolean OR, so
+-    # unlike _get_backend() the probe order is irrelevant.
+-    if any(_is_backend_available(backend) for backend in _LEGACY_WEB_BACKENDS):
+-        return True
+-    # Any plugin-registered provider the registry considers active for either
+-    # capability. Delegating to the registry's own availability-filtered
+-    # resolvers keeps a single authority for "is a custom provider usable"
+-    # rather than re-implementing the walk here.
++    _ensure_web_plugins_loaded()
+     try:
+         from agent.web_search_registry import (
+-            get_active_search_provider,
+             get_active_extract_provider,
++            get_active_search_provider,
+         )
+ 
+-        return (
+-            get_active_search_provider() is not None
+-            or get_active_extract_provider() is not None
++        if capability == "search":
++            provider = get_active_search_provider()
++            supports = provider.supports_search if provider is not None else None
++        elif capability == "extract":
++            provider = get_active_extract_provider()
++            supports = provider.supports_extract if provider is not None else None
++        else:
++            return False
++
++        return bool(
++            provider is not None
++            and supports is not None
++            and supports()
++            and provider.is_available()
+         )
+-    except Exception as exc:  # noqa: BLE001 — registry optional; never fatal
+-        logger.debug("web provider registry availability check failed: %s", exc)
++    except Exception as exc:  # noqa: BLE001 — provider probes must never be fatal
++        logger.debug("web %s provider availability check failed: %s", capability, exc)
+         return False
+ 
+ 
++def check_web_search_requirements() -> bool:
++    """Return whether ``web_search`` has an available search provider."""
++    return _check_web_capability("search")
++
++
++def check_web_extract_requirements() -> bool:
++    """Return whether ``web_extract`` has an available extract provider."""
++    return _check_web_capability("extract")
++
++
++def check_web_api_key() -> bool:
++    """Backward-compatible aggregate web availability probe.
++
++    New registry entries use the capability-specific probes above.  Existing
++    integrations that only need to know whether *any* web capability works can
++    continue calling this function.
++    """
++    if check_web_search_requirements() or check_web_extract_requirements():
++        return True
++    # Preserve the legacy aggregate probe contract for setup/integration
++    # callers that run before plugin discovery. Registry schema exposure does
++    # not use this broad fallback; each tool is gated by its capability probe.
++    configured = (_load_web_config().get("backend") or "").lower().strip()
++    if configured and _is_backend_available(configured):
++        return True
++    return any(
++        _is_backend_available(backend) for backend in _LEGACY_WEB_BACKENDS
++    )
++
++
+ if __name__ == "__main__":
+     """
+     Simple test/demo when run directly
+@@ -1222,7 +1249,7 @@ registry.register(
+     toolset="web",
+     schema=WEB_SEARCH_SCHEMA,
+     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
+-    check_fn=check_web_api_key,
++    check_fn=check_web_search_requirements,
+     requires_env=_web_requires_env(),
+     emoji="🔍",
+     max_result_size_chars=100_000,
+@@ -1236,7 +1263,7 @@ registry.register(
+         "markdown",
+         char_limit=args.get("char_limit"),
+     ),
+-    check_fn=check_web_api_key,
++    check_fn=check_web_extract_requirements,
+     requires_env=_web_requires_env(),
+     is_async=True,
+     emoji="📄",
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 160c9d0e56d1e3fa5204e31f062083a4d113b6b8..4f081c589b1c309c1b27af940bdbb117e01a07ad 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -1725,6 +1725,7 @@ def _(rid, params: dict) -> dict:
+         )
+         from toolsets import resolve_toolset
+         from tools.approval import _get_approval_mode
++        from tools.registry import discover_builtin_tools, registry
+ 
+         platform = "cli"
+         config = load_config()
+@@ -1746,6 +1747,12 @@ def _(rid, params: dict) -> dict:
+         }
+         features = get_nous_subscription_features(config)
+ 
++        # The catalog is intentionally usable before a chat session exists.
++        # In that cold-start path model_tools has not necessarily imported the
++        # self-registering built-ins yet, so populate the registry explicitly
++        # before treating it as the availability authority.
++        discover_builtin_tools()
++
+         def category_readiness(toolset_name: str) -> str:
+             category = TOOL_CATEGORIES.get(toolset_name)
+             if not category:
+@@ -1805,9 +1812,26 @@ def _(rid, params: dict) -> dict:
+         for name, label, description in catalog:
+             readiness = category_readiness(name)
+             try:
+-                tools = sorted(set(resolve_toolset(name)))
++                declared_tools = set(resolve_toolset(name))
++                definitions = registry.get_definitions(
++                    declared_tools,
++                    quiet=True,
++                )
++                tools = sorted(
++                    {
++                        definition.get("function", {}).get("name")
++                        for definition in definitions
++                        if definition.get("function", {}).get("name")
++                    }
++                )
+             except Exception:
+                 tools = []
++            # Provider setup and the runtime registry are both required.  The
++            # registry may narrow a configured provider's schema, but a tool
++            # registered for some alternate backend must not override a
++            # failed native setup/auth/key probe for this selected provider.
++            if not tools and readiness == "ready":
++                readiness = "needs_setup"
+             rows.append(
+                 {
+                     "name": name,
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 2e23e1248bb53c9904b09bd30312d0869262fcfc..001993965d1b28a5fbaf68d9375c98ff60565f9b 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2732,19 +2732,22 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
+         choices = [choice for choice in choices if choice in {"once", "deny"}]
+         if not choices:
+             choices = ["once", "deny"]
+-    elif payload.get("allow_permanent") is False:
+-        choices = [choice for choice in choices if choice != "always"]
++    elif "allow_permanent" in payload or "allow_session" in payload:
++        allowed = {"once", "deny"}
++        if payload.get("allow_session") is not False:
++            allowed.add("session")
++        if payload.get("allow_permanent") is not False:
++            allowed.add("always")
++        choices = [choice for choice in choices if choice in allowed]
+         if not choices:
+-            choices = ["once", "session", "deny"]
++            choices = [
++                choice for choice in canonical_choices if choice in allowed
++            ]
+     elif not choices:
+-        if "allow_permanent" in payload:
+-            choices = ["once", "session", "always", "deny"]
+-        else:
+-            # MCP elicitation and any legacy request without policy metadata
+-            # are per-operation consent prompts.  Never make a client invent
+-            # persistence semantics when the native producer did not offer
+-            # them.
+-            choices = ["once", "deny"]
++        # MCP elicitation and any legacy request without policy metadata are
++        # per-operation consent prompts. Never make a client invent
++        # persistence semantics when the native producer did not offer them.
++        choices = ["once", "deny"]
+     payload["choices"] = choices
+     if "command" in payload:
+         from gateway.run import _redact_approval_command

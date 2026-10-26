@@ -1,0 +1,1865 @@
+Subject: [lilith-core-seam] Close failed turns without replay contamination
+
+Persist a turn-scoped, redacted terminal boundary for provider failures so a
+later model cannot inherit or replay the failed request. Large-context failures
+rewind only when the marked user row is still the durable session head;
+otherwise they close durably. Gateway recovery deduplicates only against the
+exact returned turn marker and preserves terminal-error evidence.
+
+Upstream base: 3c5fd918e3e2537cd74f4f88c990c5de5cbd9f63
+
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index a9bf1a1..4fc8fdb 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -754,6 +754,14 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
+                 # bytes previously sent for the pre-merge message) — drop it
+                 # so replay can't substitute stale bytes.
+                 drop_stale_api_content(prev)
++                # Keep typed metadata from the later (fresh) user row while
++                # retaining the earlier row's display_kind timeline carrier.
++                # Later values win because they identify the current turn.
++                next_metadata = msg.get("display_metadata")
++                if isinstance(next_metadata, dict):
++                    merged_metadata = dict(prev.get("display_metadata") or {})
++                    merged_metadata.update(next_metadata)
++                    prev["display_metadata"] = merged_metadata
+                 repairs += 1
+                 continue
+         merged.append(msg)
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index c05167d..3dded88 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -161,6 +161,115 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
+     "Context was compacted. The previous response is complete — "
+     "awaiting your next message."
+ )
++_TERMINAL_ERROR_TEXT_MAX_CHARS = 2000
++
++
++def _force_safe_terminal_error_text(value: Any) -> str:
++    """Force-redact and bound provider-controlled terminal text."""
++    text = _sanitize_surrogates(str(value or "").strip())
++    try:
++        from agent.redact import redact_sensitive_text
++
++        text = redact_sensitive_text(
++            text,
++            force=True,
++            redact_url_credentials=True,
++        )
++    except Exception:
++        return "The model request failed before an assistant response was returned."
++    if not text:
++        text = "The model request failed before an assistant response was returned."
++    if len(text) > _TERMINAL_ERROR_TEXT_MAX_CHARS:
++        text = text[: _TERMINAL_ERROR_TEXT_MAX_CHARS - 3].rstrip() + "..."
++    return text
++
++
++def _close_terminal_error_turn(
++    agent,
++    messages: List[Dict[str, Any]],
++    conversation_history: List[Dict[str, Any]],
++    final_response: Any,
++    *,
++    persist: bool,
++) -> bool:
++    """Close a terminal provider failure with a canonical assistant row.
++
++    A non-retryable provider error can happen before the provider returns any
++    assistant message. Persisting that user row alone lets a later model-switch
++    marker and the next prompt merge with the failed request during role repair.
++    The caller supplies the same sanitized text returned to the user, so the
++    transcript is closed without storing a second raw-error representation.
++
++    ``persist=False`` preserves the large-context-overflow policy: the live
++    result is safe for continuation, but the oversized failed turn is not
++    written to durable storage.
++    """
++    text = _force_safe_terminal_error_text(final_response)
++
++    tail = messages[-1] if messages and isinstance(messages[-1], dict) else None
++    turn_id = str(getattr(agent, "_current_turn_id", "") or "")
++    reusable_tail = bool(
++        tail is not None
++        and tail.get("role") == "assistant"
++        and not tail.get("_db_persisted")
++        and not tail.get("tool_calls")
++        and not tail.get("tool_call_id")
++        and tail.get("finish_reason")
++        not in {
++            "tool_calls",
++            "incomplete",
++            "verification_required",
++            "verify_hook_continue",
++            "kanban_terminal_required",
++        }
++    )
++    closed = False
++    if reusable_tail:
++        current = tail.get("content")
++        current_text = current if isinstance(current, str) else ""
++        if not current_text.strip():
++            tail["content"] = text
++            tail.pop("_db_persisted", None)
++            agent._db_flush_scan_prefix = None
++        elif text not in current_text:
++            tail["content"] = current_text.rstrip() + "\n\n" + text
++            tail.pop("_db_persisted", None)
++            agent._db_flush_scan_prefix = None
++        tail["_terminal_error_closed"] = True
++        metadata = dict(tail.get("display_metadata") or {})
++        if turn_id:
++            metadata["terminal_error_turn_id"] = turn_id
++        if metadata:
++            tail["display_metadata"] = metadata
++        closed = bool(turn_id)
++    elif (
++        tail is not None
++        and tail.get("role") == "assistant"
++        and tail.get("_db_persisted")
++    ):
++        # SessionDB is append-only. Mutating a durable assistant and flushing
++        # would append a second assistant row rather than update the old one.
++        # The existing assistant already separates this failed user from the
++        # next turn, so retain the error out-of-band instead of corrupting role
++        # alternation with another assistant row.
++        closed = False
++    else:
++        metadata = {"terminal_error_turn_id": turn_id} if turn_id else None
++        messages.append(
++            {
++                "role": "assistant",
++                "content": text,
++                "_terminal_error_closed": True,
++                **({"display_metadata": metadata} if metadata else {}),
++            }
++        )
++        closed = bool(turn_id)
++
++    if persist:
++        agent._persist_session(messages, conversation_history)
++    else:
++        agent._session_messages = messages
++    return closed
+ 
+ 
+ # Stable prefix of the local interrupt status string emitted when a turn is
+@@ -1593,6 +1702,8 @@ def run_conversation(
+     # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
+     # did and returns the locals the loop below reads back.  See
+     # ``agent/turn_context.py``.
++    _turn_db = getattr(agent, "_session_db", None)
++
+     _ctx = build_turn_context(
+         agent,
+         user_message,
+@@ -1626,6 +1737,31 @@ def run_conversation(
+     _should_review_memory = _ctx.should_review_memory
+     _plugin_user_context = _ctx.plugin_user_context
+     _ext_prefetch_cache = _ctx.ext_prefetch_cache
++    _persisted_turn_session_id = str(getattr(agent, "session_id", None) or "")
++    _persisted_turn_user_row_id = None
++    if _turn_db is not None and _persisted_turn_session_id:
++        try:
++            _persisted_rows = _turn_db.get_messages_as_conversation(
++                _persisted_turn_session_id,
++                include_row_ids=True,
++            )
++            for _persisted_row in reversed(_persisted_rows or []):
++                if not isinstance(_persisted_row, dict):
++                    continue
++                _persisted_metadata = _persisted_row.get("display_metadata")
++                if (
++                    _persisted_row.get("role") == "user"
++                    and isinstance(_persisted_metadata, dict)
++                    and str(_persisted_metadata.get("hermes_turn_id") or "")
++                    == turn_id
++                    and _persisted_row.get("_row_id") is not None
++                ):
++                    _persisted_turn_user_row_id = int(
++                        _persisted_row["_row_id"]
++                    )
++                    break
++        except Exception:
++            logger.debug("failed to identify persisted current-turn user row", exc_info=True)
+ 
+     # Commentary deduplication spans all provider continuations and tool calls
+     # within one user turn, but must not suppress the same phrase next turn.
+@@ -1865,6 +2001,7 @@ def run_conversation(
+         # an assistant message makes the model echo it and self-replicate
+         # (#81841). Dropping before repair lets repair_message_sequence fix
+         # any user→user adjacency the filter creates.
++        _hidden_scaffold_count_before = len(messages)
+         messages = [
+             msg for msg in messages
+             if not (
+@@ -1882,6 +2019,7 @@ def run_conversation(
+                 )
+             )
+         ]
++        _hidden_scaffold_removed = len(messages) != _hidden_scaffold_count_before
+ 
+         # Defensive: repair malformed role-alternation before API call.
+         # Catches cases where the history got wedged into a
+@@ -1895,12 +2033,22 @@ def run_conversation(
+         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
+         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+         repaired_seq = repair_message_sequence_with_cursor(agent, messages)
+-        if repaired_seq > 0:
+-            request_logger.info(
+-                "Repaired %s message-alternation violations before request (session=%s)",
+-                repaired_seq,
+-                agent.session_id or "-",
++        if repaired_seq > 0 or _hidden_scaffold_removed:
++            # Role repair can merge the current user row into an adjacent
++            # model-switch/user row. Keep the explicit current-turn boundary
++            # aligned; gateway exception recovery must never rediscover it by
++            # comparing prompt text (which is ambiguous for repeated prompts
++            # and API-only enrichment).
++            current_turn_user_idx = reanchor_current_turn_user_idx(
++                messages, user_message
+             )
++            agent._persist_user_message_idx = current_turn_user_idx
++            if repaired_seq > 0:
++                request_logger.info(
++                    "Repaired %s message-alternation violations before request (session=%s)",
++                    repaired_seq,
++                    agent.session_id or "-",
++                )
+ 
+         api_messages = []
+         for idx, msg in enumerate(messages):
+@@ -1931,6 +2079,10 @@ def run_conversation(
+             # Bookkeeping, never a provider field — only the chat-completions
+             # transport strips underscore keys, so drop it centrally here.
+             api_msg.pop("_row_id", None)
++            # Internal terminal-error boundary marker used by the gateway to
++            # distinguish a genuine closed failure from assistant tool/interim
++            # rows. It is transcript bookkeeping, never a provider field.
++            api_msg.pop("_terminal_error_closed", None)
+ 
+             # Inject ephemeral context into the current turn's user message.
+             # Sources: memory manager prefetch + plugin pre_llm_call hooks
+@@ -3265,12 +3417,15 @@ def run_conversation(
+                         "⚠️ The model declined to respond to this request (safety refusal)."
+                     )
+ 
++                    _safe_refusal_text = _force_safe_terminal_error_text(
++                        _refusal_text or "model declined (content_filter)"
++                    )
+                     _refusal_detail = (
+-                        f"Model's explanation: {_refusal_text}"
++                        f"Model's explanation: {_safe_refusal_text}"
+                         if _refusal_text
+                         else "The model returned no explanation."
+                     )
+-                    _refusal_response = (
++                    _refusal_response = _force_safe_terminal_error_text(
+                         "⚠️  The model declined to respond to this request "
+                         "(safety refusal — not a Hermes/gateway failure).\n\n"
+                         f"{_refusal_detail}\n\n"
+@@ -3278,13 +3433,25 @@ def run_conversation(
+                     )
+ 
+                     agent._cleanup_task_resources(effective_task_id)
+-                    agent._persist_session(messages, conversation_history)
+-                    return _content_policy_blocked_result(
++                    _terminal_result = _content_policy_blocked_result(
+                         messages,
+                         api_call_count,
+                         final_response=_refusal_response,
+-                        error_detail=_refusal_text or "model declined (content_filter)",
++                        error_detail=_safe_refusal_text,
+                     )
++                    _terminal_closed = _close_terminal_error_turn(
++                        agent,
++                        messages,
++                        conversation_history,
++                        _refusal_response,
++                        persist=True,
++                    )
++                    _terminal_result["terminal_closed"] = _terminal_closed
++                    if _terminal_closed:
++                        _terminal_result["terminal_error_turn_id"] = str(
++                            getattr(agent, "_current_turn_id", "") or ""
++                        )
++                    return _terminal_result
+ 
+                 if finish_reason == "length":
+                     if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
+@@ -5650,7 +5817,9 @@ def run_conversation(
+                     # returned ``error`` field and downstream consumers deliver
+                     # it verbatim (e.g. a cron failure notification dumped a
+                     # ~60KB Cloudflare challenge page as 31 Discord messages).
+-                    _nonretryable_summary = agent._summarize_api_error(api_error)
++                    _nonretryable_summary = _force_safe_terminal_error_text(
++                        agent._summarize_api_error(api_error)
++                    )
+                     if classified.reason == FailoverReason.content_policy_blocked:
+                         agent._emit_status(
+                             f"❌ Provider safety filter blocked this request: "
+@@ -5772,19 +5941,21 @@ def run_conversation(
+                             force=True,
+                         )
+                     logger.error("%sNon-retryable client error: %s", agent.log_prefix, api_error)
+-                    # Skip session persistence when the error is likely
++                    # Skip durable persistence when the error is likely
+                     # context-overflow related (status 400 + large session).
+-                    # Persisting the failed user message would make the
+-                    # session even larger, causing the same failure on the
+-                    # next attempt. (#1630)
+-                    if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
++                    # The in-memory result is still closed below so a live
++                    # continuation cannot merge the failed request into the
++                    # next user turn. (#1630)
++                    _persist_nonretryable = not (
++                        status_code == 400
++                        and (approx_tokens > 50000 or len(api_messages) > 80)
++                    )
++                    if not _persist_nonretryable:
+                         agent._vprint(
+                             f"{agent.log_prefix}⚠️  Skipping session persistence "
+                             f"for large failed session to prevent growth loop.",
+                             force=True,
+                         )
+-                    else:
+-                        agent._persist_session(messages, conversation_history)
+                     if classified.reason == FailoverReason.content_policy_blocked:
+                         _policy_response = (
+                             "⚠️  The model provider's safety filter blocked this request "
+@@ -5792,17 +5963,18 @@ def run_conversation(
+                             f"Provider message: {_nonretryable_summary}\n\n"
+                             f"{_CONTENT_POLICY_RECOVERY_HINT}"
+                         )
+-                        return _content_policy_blocked_result(
++                        _terminal_result = _content_policy_blocked_result(
+                             messages,
+                             api_call_count,
+                             final_response=_policy_response,
+                             error_detail=_nonretryable_summary,
+                         )
++                        _terminal_response = _policy_response
+                     # Billing walls are the common non-retryable abort: enrich
+                     # the result with the same structured recovery descriptor as
+                     # the max-retries path so every surface (CLI, TUI, desktop)
+                     # renders one consistent billing signal.
+-                    if classified.reason == FailoverReason.billing:
++                    elif classified.reason == FailoverReason.billing:
+                         _ce_guidance = _billing_or_entitlement_message(
+                             capability="model access",
+                             provider=_provider,
+@@ -5813,7 +5985,7 @@ def run_conversation(
+                         if _ce_guidance:
+                             _ce_final += f"\n\n{_ce_guidance}"
+                         _ce_block = _billing_block_dict(_provider, _base, _model, _ce_guidance)
+-                        return {
++                        _terminal_result = {
+                             "final_response": _ce_final,
+                             "messages": messages,
+                             "api_calls": api_call_count,
+@@ -5823,14 +5995,85 @@ def run_conversation(
+                             "failure_reason": classified.reason.value,
+                             "billing_block": _ce_block,
+                         }
+-                    return {
+-                        "final_response": _nonretryable_summary,
+-                        "messages": messages,
+-                        "api_calls": api_call_count,
+-                        "completed": False,
+-                        "failed": True,
+-                        "error": _nonretryable_summary,
+-                    }
++                        _terminal_response = _ce_final
++                    else:
++                        _terminal_result = {
++                            "final_response": _nonretryable_summary,
++                            "messages": messages,
++                            "api_calls": api_call_count,
++                            "completed": False,
++                            "failed": True,
++                            "error": _nonretryable_summary,
++                        }
++                        _terminal_response = _nonretryable_summary
++
++                    if not _persist_nonretryable:
++                        _turn_rolled_back = False
++                        if (
++                            _turn_db is not None
++                            and _persisted_turn_session_id
++                            and _persisted_turn_user_row_id is not None
++                        ):
++                            try:
++                                _active_head_row_id = _turn_db.latest_message_row_id(
++                                    _persisted_turn_session_id
++                                )
++                                if _active_head_row_id != _persisted_turn_user_row_id:
++                                    raise RuntimeError(
++                                        "current turn is no longer the durable session head"
++                                    )
++                                _turn_db.rewind_to_message(
++                                    _persisted_turn_session_id,
++                                    _persisted_turn_user_row_id,
++                                )
++                                _reloaded_after_rewind = (
++                                    _turn_db.get_messages_as_conversation(
++                                        _persisted_turn_session_id,
++                                        repair_alternation=True,
++                                    )
++                                )
++                                messages[:] = [
++                                    dict(item)
++                                    for item in (_reloaded_after_rewind or [])
++                                    if isinstance(item, dict)
++                                ]
++                                for _durable_item in messages:
++                                    _durable_item["_db_persisted"] = True
++                                agent._session_messages = messages
++                                agent._persist_user_message_idx = None
++                                agent._db_flush_scan_prefix = messages[:]
++                                agent._last_flushed_db_idx = len(messages)
++                                _terminal_result["messages"] = messages
++                                _terminal_result["turn_rolled_back"] = True
++                                _terminal_result["terminal_closed"] = False
++                                _turn_rolled_back = True
++                            except Exception:
++                                logger.warning(
++                                    "Large failed turn rewind failed; durably closing "
++                                    "the turn instead of leaving an orphan user row.",
++                                    exc_info=True,
++                                )
++                        if _turn_rolled_back:
++                            return _terminal_result
++                        # The early user row could not be identified/rewound.
++                        # A durable assistant closure is safer than the old
++                        # half-persisted state; it also prevents role repair
++                        # from replaying the request on the next provider.
++                        _persist_nonretryable = True
++
++                    _terminal_closed = _close_terminal_error_turn(
++                        agent,
++                        messages,
++                        conversation_history,
++                        _terminal_response,
++                        persist=True,
++                    )
++                    _terminal_result["terminal_closed"] = _terminal_closed
++                    if _terminal_closed:
++                        _terminal_result["terminal_error_turn_id"] = str(
++                            getattr(agent, "_current_turn_id", "") or ""
++                        )
++                    return _terminal_result
+ 
+                 if retry_count >= max_retries:
+                     # Before falling back, try rebuilding the primary
+@@ -5863,7 +6106,9 @@ def run_conversation(
+                         break
+                     # Terminal — flush buffered retry/fallback trace.
+                     agent._flush_status_buffer()
+-                    _final_summary = agent._summarize_api_error(api_error)
++                    _final_summary = _force_safe_terminal_error_text(
++                        agent._summarize_api_error(api_error)
++                    )
+                     _billing_guidance = ""
+                     if classified.reason == FailoverReason.billing:
+                         agent._emit_status(f"❌ Billing or credits exhausted — {_final_summary}")
+@@ -5983,7 +6228,6 @@ def run_conversation(
+                         agent._dump_api_request_debug(
+                             api_kwargs, reason="max_retries_exhausted", error=api_error,
+                         )
+-                    agent._persist_session(messages, conversation_history)
+                     _billing_block = None
+                     if classified.reason == FailoverReason.billing:
+                         _final_response = f"Billing or credits exhausted: {_final_summary}"
+@@ -6018,7 +6262,7 @@ def run_conversation(
+                             "execute_code with Python's open() for large "
+                             "files, or to write in smaller sections."
+                         )
+-                    return {
++                    _terminal_result = {
+                         "final_response": _final_response,
+                         "messages": messages,
+                         "api_calls": api_call_count,
+@@ -6035,6 +6279,19 @@ def run_conversation(
+                         # descriptor (provider, billing_url, is_nous, message).
+                         "billing_block": _billing_block,
+                     }
++                    _terminal_closed = _close_terminal_error_turn(
++                        agent,
++                        messages,
++                        conversation_history,
++                        _final_response,
++                        persist=True,
++                    )
++                    _terminal_result["terminal_closed"] = _terminal_closed
++                    if _terminal_closed:
++                        _terminal_result["terminal_error_turn_id"] = str(
++                            getattr(agent, "_current_turn_id", "") or ""
++                        )
++                    return _terminal_result
+ 
+                 # For rate limits, respect the Retry-After header if present
+                 _retry_after = None
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index dfa5fbb..2f4eecc 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -282,6 +282,19 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
+             continue
+         if msg.get("content") == user_message:
+             return i
++        # Role repair joins adjacent user rows with a blank-line boundary.
++        # A model-switch timeline row keeps its display_kind when the fresh
++        # prompt is merged into it, so is_user_originated_turn() deliberately
++        # excludes that row. The current ask is nevertheless the exact suffix;
++        # recognize that structural merge without fuzzy/text-wide matching.
++        content = msg.get("content")
++        if (
++            isinstance(content, str)
++            and isinstance(user_message, str)
++            and user_message
++            and content.endswith("\n\n" + user_message)
++        ):
++            return i
+         # Prefer a real human turn over a synthetic handoff / continuation
+         # marker when the exact content was rewritten by merge-into-tail.
+         if fallback < 0 and is_user_originated_turn(msg):
+@@ -659,6 +672,15 @@ def build_turn_context(
+         if persist_user_display_metadata:
+             user_msg["display_metadata"] = persist_user_display_metadata
+ 
++    # Durable current-turn identity. SessionDB is append-only and turn setup
++    # may append other synthetic user rows (todo snapshots, compaction
++    # carriers) after this prompt, so "latest user" is not a safe rollback
++    # target. display_metadata is stripped from provider messages but
++    # round-trips through SessionDB with row identity.
++    _turn_metadata = dict(user_msg.get("display_metadata") or {})
++    _turn_metadata["hermes_turn_id"] = turn_id
++    user_msg["display_metadata"] = _turn_metadata
++
+     messages.append(user_msg)
+     current_turn_user_idx = len(messages) - 1
+     agent._persist_user_message_idx = current_turn_user_idx
+diff --git a/run_agent.py b/run_agent.py
+index 12e7da6..6768b7d 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -8050,9 +8050,11 @@ class AIAgent:
+             "task_id": effective_task_id,
+             "platform": getattr(self, "platform", None) or "",
+         }
+-        relay_turn_id = (
+-            f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+-        )
++        relay_turn_id = str(getattr(self, "_relay_pending_turn_id", "") or "")
++        if not relay_turn_id:
++            relay_turn_id = (
++                f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
++            )
+         self._relay_pending_turn_id = relay_turn_id
+         relay_parent_session_id = (
+             str(getattr(self, "_parent_session_id", None) or "")
+diff --git a/tests/run_agent/test_1630_context_overflow_loop.py b/tests/run_agent/test_1630_context_overflow_loop.py
+index b976f43..d4f8647 100644
+--- a/tests/run_agent/test_1630_context_overflow_loop.py
++++ b/tests/run_agent/test_1630_context_overflow_loop.py
+@@ -10,6 +10,8 @@ Verifies that:
+ 
+ from unittest.mock import MagicMock, patch
+ 
++from hermes_state import SessionDB
++
+ 
+ # ---------------------------------------------------------------------------
+ # Test 1: Agent heuristic — generic 400 with large session → compression
+@@ -222,4 +224,110 @@ class TestAgentSkipsPersistenceForLargeFailedSessions:
+         should_skip = status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80)
+         assert should_skip
+ 
++    def test_large_400_rewinds_the_early_persisted_current_turn(self, tmp_path):
++        """The old ``persist=False`` policy must actually remove the user row.
++
++        Turn setup flushes the inbound user before the provider call. Merely
++        skipping the final flush therefore left an active orphan that grew and
++        replayed on every retry. This drives the real SessionDB boundary twice
++        and proves the active transcript stays at the pre-turn baseline.
++        """
++        db = SessionDB(db_path=tmp_path / "state.db")
++        sid = "large-400-rewind"
++        db.create_session(session_id=sid, source="test", model="gpt-5.5")
++        for index in range(82):
++            db.append_message(
++                session_id=sid,
++                role="user" if index % 2 == 0 else "assistant",
++                content=f"baseline-{index}",
++            )
++        baseline = db.get_messages_as_conversation(sid)
++
++        with (
++            patch("run_agent.get_tool_definitions", return_value=[]),
++            patch("run_agent.check_toolset_requirements", return_value={}),
++            patch("run_agent.OpenAI"),
++        ):
++            from run_agent import AIAgent
++
++            agent = AIAgent(
++                api_key="test-key-1234567890",
++                base_url="https://api.openai.com/v1",
++                provider="openai",
++                api_mode="chat_completions",
++                model="gpt-5.5",
++                quiet_mode=True,
++                skip_context_files=True,
++                skip_memory=True,
++                skip_background_review=True,
++                session_id=sid,
++                session_db=db,
++            )
++
++        for row in baseline:
++            row["_db_persisted"] = True
++        agent._session_messages = list(baseline)
++        agent._session_db_created = True
++        agent._last_flushed_db_idx = len(baseline)
++        agent._db_flush_scan_prefix = list(agent._session_messages)
++        agent._cached_system_prompt = "You are helpful."
++        agent._use_prompt_caching = False
++        agent.compression_enabled = False
++        agent.save_trajectories = False
++        agent._save_session_log = MagicMock()
++        agent._save_trajectory = MagicMock()
++        agent._cleanup_task_resources = MagicMock()
++
++        error = Exception(
++            "invalid request schema for selected endpoint and supplied arguments"
++        )
++        error.status_code = 400
++        agent.client = MagicMock()
++        agent.client.chat.completions.create.side_effect = error
++
++        for _ in range(2):
++            result = agent.run_conversation(
++                "oversized failed turn",
++                conversation_history=agent._session_messages,
++            )
++            assert result["failed"] is True
++            assert result["turn_rolled_back"] is True
++            assert result["terminal_closed"] is False
++            active = db.get_messages_as_conversation(sid)
++            assert [row["content"] for row in active] == [
++                row["content"] for row in baseline
++            ]
++            assert "oversized failed turn" not in {
++                row.get("content") for row in active
++            }
++            assert [row.get("content") for row in result["messages"]] == [
++                row["content"] for row in baseline
++            ]
++
++        def _fail_after_concurrent_marker(*_args, **_kwargs):
++            db.append_message(
++                session_id=sid,
++                role="user",
++                content="[System: model changed while request was running]",
++                display_kind="model_switch",
++            )
++            raise error
+ 
++        agent.client.chat.completions.create.side_effect = (
++            _fail_after_concurrent_marker
++        )
++        result = agent.run_conversation(
++            "oversized failed turn with concurrent marker",
++            conversation_history=agent._session_messages,
++        )
++        assert result["failed"] is True
++        assert result.get("turn_rolled_back") is not True
++        assert result["terminal_closed"] is True
++        active_contents = [
++            row.get("content") for row in db.get_messages_as_conversation(sid)
++        ]
++        assert "oversized failed turn with concurrent marker" in active_contents
++        assert (
++            "[System: model changed while request was running]"
++            in active_contents
++        )
+diff --git a/tests/run_agent/test_nonretryable_error_html_summary.py b/tests/run_agent/test_nonretryable_error_html_summary.py
+index 7980547..1a8ccb0 100644
+--- a/tests/run_agent/test_nonretryable_error_html_summary.py
++++ b/tests/run_agent/test_nonretryable_error_html_summary.py
+@@ -18,6 +18,7 @@ terminal path is taken, ``result['error']`` is a short, HTML-free summary.
+ from unittest.mock import MagicMock, patch
+ 
+ import run_agent
++from agent.agent_runtime_helpers import repair_message_sequence
+ from run_agent import AIAgent
+ 
+ 
+@@ -102,10 +103,15 @@ def test_non_retryable_failure_error_is_summarized_not_raw_html():
+     pass vacuously by aborting on some earlier, unrelated error.
+     """
+     agent = _make_agent()
++    agent._relay_pending_turn_id = "gateway-owned-turn-id"
+     agent.client.chat.completions.create.side_effect = _make_403_html_error()
++    persisted = []
++
++    def _capture_persist(messages, _history=None):
++        persisted.append([dict(message) for message in messages])
+ 
+     with (
+-        patch.object(agent, "_persist_session"),
++        patch.object(agent, "_persist_session", side_effect=_capture_persist),
+         patch.object(agent, "_save_trajectory"),
+         patch.object(agent, "_cleanup_task_resources"),
+     ):
+@@ -127,3 +133,113 @@ def test_non_retryable_failure_error_is_summarized_not_raw_html():
+     # The original page was tens of kilobytes; a summary is short.
+     assert len(error) < 500
+     assert len(error) < len(_CLOUDFLARE_CHALLENGE_HTML)
++
++    # A terminal provider failure is a complete conversation turn, not an
++    # orphan user row. The exact sanitized response delivered to the user also
++    # closes both the returned and durable transcripts.
++    terminal = result["messages"][-1]
++    assert terminal["role"] == "assistant"
++    assert terminal["content"] == result["final_response"]
++    assert terminal["_terminal_error_closed"] is True
++    turn_id = terminal["display_metadata"]["terminal_error_turn_id"]
++    assert turn_id == "gateway-owned-turn-id"
++    assert result["terminal_error_turn_id"] == turn_id
++    assert persisted and persisted[-1][-1] == terminal
++
++    # Reproduce the real follow-up shape: Hermes records a model-switch marker
++    # as a user row, then the user sends a fresh request. Role repair may merge
++    # those two current rows, but it must never merge the failed request from
++    # the preceding, now-closed turn into the new prompt.
++    replay = [dict(message) for message in result["messages"]]
++    replay.extend(
++        [
++            {
++                "role": "user",
++                "content": "[System: The active model for this chat has changed to next-model.]",
++                "display_kind": "model_switch",
++            },
++            {"role": "user", "content": "fresh request only"},
++        ]
++    )
++    repair_message_sequence(None, replay)
++    assert replay[-1]["role"] == "user"
++    assert "fresh request only" in replay[-1]["content"]
++    assert "daily briefing please" not in replay[-1]["content"]
++
++
++def test_billing_failure_closes_before_model_switch_followup():
++    """A 402 must not make the next provider execute the failed request."""
++    agent = _make_agent()
++    billing_error = Exception("Payment required: insufficient balance")
++    billing_error.status_code = 402
++    agent.client.chat.completions.create.side_effect = billing_error
++
++    with (
++        patch.object(agent, "_persist_session"),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++    ):
++        result = agent.run_conversation("old request that must not run again")
++
++    assert result.get("failed") is True
++    assert result.get("failure_reason") == "billing"
++    assert result["messages"][-1]["role"] == "assistant"
++    assert result["messages"][-1]["content"] == result["final_response"]
++
++    replay = [dict(message) for message in result["messages"]]
++    replay.extend(
++        [
++            {
++                "role": "user",
++                "content": "[System: The active model for this chat has changed to recovery-model.]",
++                "display_kind": "model_switch",
++            },
++            {"role": "user", "content": "RECOVERY_TURN_ONLY"},
++        ]
++    )
++    repair_message_sequence(None, replay)
++
++    assert replay[-1]["role"] == "user"
++    assert "RECOVERY_TURN_ONLY" in replay[-1]["content"]
++    assert "old request that must not run again" not in replay[-1]["content"]
++
++
++def test_non_retryable_error_force_redacts_before_durable_closure():
++    agent = _make_agent()
++    raw_secret = "sk-terminal-secret-123456789"
++    raw_password = "user:password"
++    error = Exception(
++        f"Authorization: Bearer {raw_secret} "
++        f"https://{raw_password}@example.invalid/path?token=signed-secret "
++        + ("x" * 3000)
++    )
++    error.status_code = 403
++    agent.client.chat.completions.create.side_effect = error
++    persisted = []
++
++    with (
++        patch.object(
++            agent,
++            "_persist_session",
++            side_effect=lambda messages, _history=None: persisted.append(
++                [dict(message) for message in messages]
++            ),
++        ),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++    ):
++        result = agent.run_conversation("credential echo probe")
++
++    rendered = "\n".join(
++        str(value)
++        for value in (
++            result.get("error"),
++            result.get("final_response"),
++            result.get("messages"),
++            persisted,
++        )
++    )
++    assert raw_secret not in rendered
++    assert raw_password not in rendered
++    assert "signed-secret" not in rendered
++    assert len(result["messages"][-1]["content"]) <= 2000
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+index 17243d8..a0b0ff1 100644
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -4682,6 +4682,13 @@ class TestRetryExhaustion:
+         assert "content_policy_blocked" in result.get("error", "")
+         # The model's refusal text is surfaced to the user, not swallowed.
+         assert "I won't help with that." in (result.get("final_response") or "")
++        # A terminal refusal closes the durable/model transcript so the next
++        # prompt cannot be merged with and replay the refused request.
++        terminal = result["messages"][-1]
++        assert terminal["role"] == "assistant"
++        assert terminal["content"] == result["final_response"]
++        assert terminal["_terminal_error_closed"] is True
++        assert terminal["display_metadata"]["terminal_error_turn_id"]
+         # Crucial regression guard: a deterministic refusal is NOT retried —
+         # exactly one API call, no empty-response retry loop.
+         assert agent.client.chat.completions.create.call_count == 1
+diff --git a/tests/test_tui_gateway_server_crash_history.py b/tests/test_tui_gateway_server_crash_history.py
+index f7a4098..912ce75 100644
+--- a/tests/test_tui_gateway_server_crash_history.py
++++ b/tests/test_tui_gateway_server_crash_history.py
+@@ -3,6 +3,8 @@
+ import threading
+ import types
+ 
++from agent.agent_runtime_helpers import repair_message_sequence
++from agent.turn_context import reanchor_current_turn_user_idx
+ from tui_gateway import server
+ 
+ 
+@@ -35,3 +37,229 @@ def test_turn_error_with_no_agent_transcript_does_not_overwrite_history():
+     assert server._restore_agent_history_after_turn_error(session, agent) is False
+     assert session["history"] == [{"role": "user", "content": "first"}]
+     assert session["history_version"] == 4
++
++
++def test_exception_turn_closes_matching_user_with_sanitized_assistant():
++    persisted = []
++    agent = types.SimpleNamespace(
++        _session_messages=[
++            {"role": "user", "content": "first"},
++            {"role": "assistant", "content": "completed work"},
++            {
++                "role": "user",
++                "content": "current failed request",
++                "display_metadata": {"hermes_turn_id": "turn-current"},
++            },
++        ],
++        _current_turn_id="turn-current",
++        _persist_user_message_idx=2,
++        _persist_session=lambda messages: persisted.append(list(messages)),
++    )
++    session = {
++        "history": [{"role": "user", "content": "first"}],
++        "history_lock": threading.Lock(),
++        "history_version": 0,
++        "inflight_turn": {
++            "user": "current failed request",
++            "assistant": "partial output",
++            "turn_id": "turn-current",
++        },
++    }
++
++    assert server._close_agent_history_after_turn_error(session, agent) is True
++    terminal = session["history"][-1]
++    assert terminal["role"] == "assistant"
++    assert terminal["content"] == (
++        "partial output\n\n"
++        "[This turn ended with an error before completion.]"
++    )
++    assert terminal["_terminal_error_closed"] is True
++    assert terminal["display_metadata"]["terminal_error_turn_id"] == "turn-current"
++    assert agent._session_messages == session["history"]
++    assert persisted and persisted[-1][-1] == session["history"][-1]
++
++
++def test_exception_turn_without_matching_user_remains_inflight_only():
++    agent = types.SimpleNamespace(
++        _session_messages=[
++            {"role": "user", "content": "older request"},
++            {"role": "assistant", "content": "older answer"},
++        ],
++        _current_turn_id="turn-not-captured",
++        _persist_user_message_idx=None,
++    )
++    session = {
++        "history": list(agent._session_messages),
++        "history_lock": threading.Lock(),
++        "history_version": 2,
++        "inflight_turn": {"user": "not captured", "assistant": ""},
++    }
++
++    assert server._close_agent_history_after_turn_error(session, agent) is False
++    assert session["history"] == agent._session_messages
++    assert session["history_version"] == 2
++
++
++def test_repeated_prompt_does_not_close_an_older_equal_text_turn():
++    """Text equality must never stand in for current-turn ownership."""
++    messages = [
++        {"role": "user", "content": "same prompt"},
++        {"role": "assistant", "content": "old answer"},
++    ]
++    agent = types.SimpleNamespace(
++        _session_messages=messages,
++        _current_turn_id="new-turn-not-captured",
++        _persist_user_message_idx=None,
++    )
++    session = {
++        "history": list(messages),
++        "history_lock": threading.Lock(),
++        "history_version": 2,
++        "inflight_turn": {"user": "same prompt", "assistant": ""},
++    }
++
++    assert server._close_agent_history_after_turn_error(session, agent) is False
++    assert session["history"] == messages
++
++
++def test_model_switch_merged_current_prompt_reanchors_by_structural_suffix():
++    messages = [
++        {"role": "user", "content": "old failed prompt"},
++        {"role": "assistant", "content": "old failure"},
++        {
++            "role": "user",
++            "content": "[System: model changed]\n\nfresh prompt",
++            "display_kind": "model_switch",
++            "display_metadata": {"hermes_turn_id": "fresh-turn"},
++        },
++    ]
++    index = reanchor_current_turn_user_idx(messages, "fresh prompt")
++    assert index == 2
++
++    persisted = []
++    agent = types.SimpleNamespace(
++        _session_messages=messages,
++        _current_turn_id="fresh-turn",
++        _persist_user_message_idx=index,
++        _persist_session=lambda rows: persisted.append(list(rows)),
++    )
++    session = {
++        "history": list(messages[:2]),
++        "history_lock": threading.Lock(),
++        "history_version": 2,
++        "inflight_turn": {
++            "user": "fresh prompt",
++            "assistant": "",
++            "turn_id": "fresh-turn",
++        },
++    }
++
++    assert server._close_agent_history_after_turn_error(session, agent) is True
++    assert session["history"][-1]["display_metadata"][
++        "terminal_error_turn_id"
++    ] == "fresh-turn"
++    assert persisted
++
++
++def test_unpersisted_incomplete_assistant_is_completed_in_place():
++    messages = [
++        {
++            "role": "user",
++            "content": "current",
++            "display_metadata": {"hermes_turn_id": "partial-turn"},
++        },
++        {
++            "role": "assistant",
++            "content": "partial",
++            "finish_reason": "incomplete",
++        },
++    ]
++    persisted = []
++    agent = types.SimpleNamespace(
++        _session_messages=messages,
++        _current_turn_id="partial-turn",
++        _persist_user_message_idx=0,
++        _persist_session=lambda rows: persisted.append(list(rows)),
++    )
++    session = {
++        "history": [],
++        "history_lock": threading.Lock(),
++        "history_version": 0,
++        "inflight_turn": {
++            "user": "current",
++            "assistant": "partial",
++            "turn_id": "partial-turn",
++        },
++    }
++
++    assert server._close_agent_history_after_turn_error(session, agent) is True
++    assert [row["role"] for row in session["history"]] == ["user", "assistant"]
++    terminal = session["history"][-1]
++    assert terminal["finish_reason"] == "stop"
++    assert terminal["content"].endswith(
++        "[This turn ended with an error before completion.]"
++    )
++    assert persisted
++
++
++def test_persisted_assistant_is_not_mutated_or_duplicated():
++    messages = [
++        {
++            "role": "user",
++            "content": "current",
++            "_db_persisted": True,
++            "display_metadata": {"hermes_turn_id": "durable-tail-turn"},
++        },
++        {
++            "role": "assistant",
++            "content": "already durable",
++            "finish_reason": "stop",
++            "_db_persisted": True,
++        },
++    ]
++    persisted = []
++    agent = types.SimpleNamespace(
++        _session_messages=messages,
++        _current_turn_id="durable-tail-turn",
++        _persist_user_message_idx=0,
++        _persist_session=lambda rows: persisted.append(list(rows)),
++    )
++    session = {
++        "history": list(messages),
++        "history_lock": threading.Lock(),
++        "history_version": 1,
++        "inflight_turn": {
++            "user": "current",
++            "assistant": "",
++            "turn_id": "durable-tail-turn",
++        },
++    }
++
++    assert server._close_agent_history_after_turn_error(session, agent) is False
++    assert len(session["history"]) == 2
++    assert "display_metadata" not in session["history"][-1]
++    assert persisted and len(persisted[-1]) == 2
++
++
++def test_role_repair_preserves_the_later_current_turn_identity():
++    messages = [
++        {
++            "role": "user",
++            "content": "[System: model changed]",
++            "display_kind": "model_switch",
++            "display_metadata": {"provider": "gemini"},
++        },
++        {
++            "role": "user",
++            "content": "fresh prompt",
++            "display_metadata": {"hermes_turn_id": "fresh-turn"},
++        },
++    ]
++
++    assert repair_message_sequence(None, messages) == 1
++    assert len(messages) == 1
++    assert messages[0]["display_kind"] == "model_switch"
++    assert messages[0]["display_metadata"] == {
++        "provider": "gemini",
++        "hermes_turn_id": "fresh-turn",
++    }
+diff --git a/tests/tui_gateway/test_failed_turn_retention.py b/tests/tui_gateway/test_failed_turn_retention.py
+index 064a1fd..8897449 100644
+--- a/tests/tui_gateway/test_failed_turn_retention.py
++++ b/tests/tui_gateway/test_failed_turn_retention.py
+@@ -132,7 +132,11 @@ def test_healthy_snapshot_carries_no_error_keys():
+     server._append_inflight_delta(session, "hello")
+ 
+     snapshot = server._inflight_snapshot(session)
+-    assert snapshot == {"assistant": "hello", "streaming": True, "user": "hi"}
++    assert snapshot["assistant"] == "hello"
++    assert snapshot["streaming"] is True
++    assert snapshot["user"] == "hi"
++    assert snapshot["turn_id"]
++    assert set(snapshot) == {"assistant", "streaming", "turn_id", "user"}
+ 
+ 
+ # ── Returned-error path (run_conversation returns an error result) ────
+@@ -143,6 +147,7 @@ def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
+ ):
+     agent = types.SimpleNamespace(
+         session_id="session-key",
++        _current_turn_id="returned-error-turn",
+         run_conversation=lambda *a, **k: {
+             "final_response": "",
+             "error": "provider 402: billing wall",
+@@ -171,6 +176,53 @@ def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
+     assert session["running"] is False
+ 
+ 
++def test_canonically_closed_returned_error_dedupes_resume_but_keeps_snapshot(
++    emits, turn_env, monkeypatch
++):
++    agent = types.SimpleNamespace(session_id="session-key")
++
++    def _returned_error(*_args, **_kwargs):
++        turn_id = agent._relay_pending_turn_id
++        agent._current_turn_id = turn_id
++        return {
++            "final_response": "provider failed safely",
++            "error": "provider failed safely",
++            "failed": True,
++            "messages": [
++                {"role": "user", "content": "do the thing"},
++                {
++                    "role": "assistant",
++                    "content": "provider failed safely",
++                    "_terminal_error_closed": True,
++                    "display_metadata": {
++                        "terminal_error_turn_id": turn_id
++                    },
++                },
++            ],
++        }
++
++    agent.run_conversation = _returned_error
++    agent.clear_interrupt = lambda: None
++    session = _session(agent=agent, running=True)
++    server._start_inflight_turn(session, "do the thing")
++
++    server._run_prompt_submit("rid", "sid", session, "do the thing")
++
++    # The evidence remains available internally until the next turn starts.
++    snapshot = server._inflight_snapshot(session)
++    assert snapshot is not None
++    assert snapshot["status"] == "error"
++    assert session["inflight_turn"]["canonical_closed"] is True
++
++    # A reconnect hydrates the canonical assistant closure and must not paint a
++    # second copy of the same failed turn from the retained evidence record.
++    monkeypatch.setattr(server, "_get_db", lambda: None)
++    payload = server._live_session_payload("sid", session)
++    assert "inflight" not in payload
++    assert payload["terminal_error"]["turn_id"] == agent._current_turn_id
++    assert payload["messages"][-1]["role"] == "assistant"
++
++
+ def test_completed_turn_still_clears_inflight(emits, turn_env):
+     agent = types.SimpleNamespace(
+         session_id="session-key",
+@@ -226,6 +278,48 @@ def test_exception_closes_turn_with_terminal_complete_and_partial(emits, turn_en
+     assert session["running"] is False
+ 
+ 
++def test_exception_with_agent_transcript_closes_history_and_dedupes_resume(
++    emits, turn_env, monkeypatch
++):
++    persisted = []
++
++    agent = types.SimpleNamespace(session_id="session-key")
++
++    def _boom(*_args, **_kwargs):
++        agent._current_turn_id = agent._relay_pending_turn_id
++        agent._persist_user_message_idx = 0
++        agent._session_messages[0]["display_metadata"] = {
++            "hermes_turn_id": agent._current_turn_id
++        }
++        raise RuntimeError("private provider detail")
++
++    agent._session_messages = [{"role": "user", "content": "do the thing"}]
++    agent._persist_session = lambda messages: persisted.append(list(messages))
++    agent.run_conversation = _boom
++    agent.clear_interrupt = lambda: None
++    session = _session(agent=agent, running=True)
++    server._start_inflight_turn(session, "do the thing")
++
++    server._run_prompt_submit("rid", "sid", session, "do the thing")
++
++    assert persisted
++    terminal = session["history"][-1]
++    assert terminal["role"] == "assistant"
++    assert terminal["content"] == "[This turn ended with an error before completion.]"
++    assert terminal["_terminal_error_closed"] is True
++    assert terminal["display_metadata"]["terminal_error_turn_id"] == agent._current_turn_id
++    # Raw exception detail remains in replay evidence / terminal event, not in
++    # the model-visible durable transcript.
++    assert "private provider detail" not in session["history"][-1]["content"]
++    assert server._inflight_snapshot(session)["error"] == "private provider detail"
++    assert session["inflight_turn"]["canonical_closed"] is True
++
++    monkeypatch.setattr(server, "_get_db", lambda: None)
++    payload = server._live_session_payload("sid", session)
++    assert "inflight" not in payload
++    assert payload["terminal_error"]["turn_id"] == agent._current_turn_id
++
++
+ # ── Resume replay (the reason retention exists) ───────────────────────
+ 
+ 
+@@ -255,6 +349,79 @@ def test_live_session_payload_exposes_retained_failure(emits, turn_env, monkeypa
+     assert inflight["user"] == "long job"
+ 
+ 
++def test_stale_db_projection_keeps_full_inflight_snapshot(monkeypatch):
++    agent = types.SimpleNamespace()
++    session = _session(agent=agent, session_key="session-key")
++    server._start_inflight_turn(session, "current")
++    turn_id = session["inflight_turn"]["turn_id"]
++    agent._current_turn_id = turn_id
++    terminal = {
++        "role": "assistant",
++        "content": "safe closure",
++        "display_metadata": {"terminal_error_turn_id": turn_id},
++    }
++    session["history"] = [{"role": "user", "content": "current"}, terminal]
++    server._fail_inflight_turn(session, "safe error", canonical_closed=True)
++
++    class _StaleDb:
++        def get_messages_as_conversation(self, *_args, **_kwargs):
++            return [{"role": "user", "content": "diverged persisted row"}]
++
++    monkeypatch.setattr(server, "_get_db", lambda: _StaleDb())
++    payload = server._live_session_payload("sid", session)
++
++    assert "terminal_error" not in payload
++    assert payload["inflight"]["turn_id"] == turn_id
++    assert payload["messages"] == [
++        {"role": "user", "text": "diverged persisted row"}
++    ]
++
++
++def test_omit_messages_never_hides_the_retained_terminal_error(monkeypatch):
++    agent = types.SimpleNamespace()
++    session = _session(agent=agent)
++    server._start_inflight_turn(session, "current")
++    turn_id = session["inflight_turn"]["turn_id"]
++    agent._current_turn_id = turn_id
++    terminal = {
++        "role": "assistant",
++        "content": "safe closure",
++        "display_metadata": {"terminal_error_turn_id": turn_id},
++    }
++    session["history"] = [{"role": "user", "content": "current"}, terminal]
++    server._fail_inflight_turn(session, "safe error", canonical_closed=True)
++
++    monkeypatch.setattr(server, "_get_db", lambda: None)
++    payload = server._live_session_payload("sid", session, omit_messages=True)
++    assert payload["messages"] == []
++    assert payload["messages_omitted"] is True
++    assert payload["inflight"]["turn_id"] == turn_id
++
++
++def test_gateway_error_funnel_force_redacts_and_bounds_strings():
++    raw = (
++        "Authorization: Bearer sk-super-secret-123456789 "
++        "https://user:password@example.invalid/path?token=signed-secret "
++        + "x" * 2000
++    )
++    safe = server._safe_turn_error(types.SimpleNamespace(), raw)
++
++    assert "sk-super-secret-123456789" not in safe
++    assert "user:password" not in safe
++    assert "signed-secret" not in safe
++    assert len(safe) <= 500
++
++
++def test_gateway_error_funnel_replaces_raw_html_even_from_bad_summarizer():
++    html = "<!DOCTYPE html><html><title>Proxy</title>" + ("x" * 2000)
++    agent = types.SimpleNamespace(_summarize_api_error=lambda _error: html)
++    safe = server._safe_turn_error(agent, RuntimeError(html))
++
++    assert "<html" not in safe.lower()
++    assert "<!doctype" not in safe.lower()
++    assert len(safe) <= 500
++
++
+ # ── Retained failure must not leak into the next turn ─────────────────
+ 
+ 
+@@ -289,3 +456,40 @@ def test_next_turn_replaces_retained_error_snapshot(emits, turn_env):
+     completes = _events(emits, "message.complete")
+     assert len(completes) == 1
+     assert completes[0]["status"] == "complete"
++
++
++def test_turn_rollback_replaces_a_concurrent_history_projection(emits, turn_env):
++    baseline = [
++        {"role": "user", "content": "old"},
++        {"role": "assistant", "content": "answer"},
++    ]
++    session = _session(history=list(baseline), history_version=4, running=True)
++
++    def _rolled_back(*_args, **_kwargs):
++        with session["history_lock"]:
++            session["history"].append(
++                {"role": "user", "content": "concurrent cosmetic row"}
++            )
++            session["history_version"] += 1
++        return {
++            "final_response": "request rejected",
++            "error": "request rejected",
++            "failed": True,
++            "turn_rolled_back": True,
++            "terminal_closed": False,
++            "messages": list(baseline),
++        }
++
++    agent = types.SimpleNamespace(
++        session_id="session-key",
++        run_conversation=_rolled_back,
++        clear_interrupt=lambda: None,
++    )
++    session["agent"] = agent
++    server._start_inflight_turn(session, "oversized current")
++
++    server._run_prompt_submit("rid", "sid", session, "oversized current")
++
++    assert session["history"] == baseline
++    assert session["history_version"] == 6
++    assert server._inflight_snapshot(session)["status"] == "error"
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 04b3c95..62baf83 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2337,8 +2337,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
+             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
+             _schedule_mcp_late_refresh(sid, agent)
+         except Exception as e:
+-            current["agent_error"] = str(e)
+-            _emit("error", sid, {"message": f"agent init failed: {e}"})
++            safe_error = _safe_turn_error(current.get("agent"), e)
++            current["agent_error"] = safe_error
++            _emit("error", sid, {"message": f"agent init failed: {safe_error}"})
+         finally:
+             if home_token is not None:
+                 reset_hermes_home_override(home_token)
+@@ -7343,15 +7344,119 @@ def _inflight_text(value: Any) -> str:
+     return _content_display_text(value).strip()
+ 
+ 
++_TERMINAL_ERROR_TURN_ID_KEY = "terminal_error_turn_id"
++_TERMINAL_ERROR_TOMBSTONE = "[This turn ended with an error before completion.]"
++_TERMINAL_ERROR_MAX_CHARS = 500
++
++
++def _safe_turn_error(agent: Any, error: Any) -> str:
++    """Return one force-redacted, bounded gateway error string.
++
++    Provider exceptions can contain HTML, authorization headers, signed URLs,
++    or echoed request bodies. Every immediate event and retained resume record
++    crosses this funnel; protected local diagnostics may still record the full
++    traceback through the normal logging boundary.
++    """
++    raw = ""
++    if isinstance(error, BaseException):
++        summarize = getattr(agent, "_summarize_api_error", None)
++        if callable(summarize):
++            try:
++                raw = str(summarize(error) or "")
++            except Exception:
++                raw = ""
++        if not raw:
++            raw = str(error) or type(error).__name__
++    else:
++        raw = str(error or "")
++    if "<!doctype html" in raw.lower() or "<html" in raw.lower():
++        summarize = getattr(agent, "_summarize_api_error", None)
++        if callable(summarize):
++            try:
++                raw = str(summarize(RuntimeError(raw)) or "")
++            except Exception:
++                raw = ""
++        if not raw or "<html" in raw.lower() or "<!doctype html" in raw.lower():
++            raw = "Service temporarily unavailable (HTML error page returned)"
++    try:
++        from agent.redact import redact_sensitive_text
++
++        raw = redact_sensitive_text(
++            raw,
++            force=True,
++            redact_url_credentials=True,
++        )
++    except Exception:
++        # A broken scrubber must not fail open at a provider-error boundary.
++        return "The model request failed. See the protected local log for details."
++    raw = raw.encode("utf-8", "replace").decode("utf-8")
++    raw = " ".join(raw.split()).strip()
++    if not raw:
++        raw = type(error).__name__ if isinstance(error, BaseException) else "turn failed"
++    if len(raw) > _TERMINAL_ERROR_MAX_CHARS:
++        raw = raw[: _TERMINAL_ERROR_MAX_CHARS - 3].rstrip() + "..."
++    return raw
++
++
++def _terminal_error_turn_id(message: Any) -> str:
++    if not isinstance(message, dict):
++        return ""
++    metadata = message.get("display_metadata")
++    if not isinstance(metadata, dict):
++        return ""
++    return str(metadata.get(_TERMINAL_ERROR_TURN_ID_KEY) or "").strip()
++
++
++def _is_marked_terminal_error_assistant(message: Any, turn_id: str = "") -> bool:
++    if not isinstance(message, dict) or message.get("role") != "assistant":
++        return False
++    marked_turn_id = _terminal_error_turn_id(message)
++    if not marked_turn_id or (turn_id and marked_turn_id != turn_id):
++        return False
++    if message.get("tool_calls") or message.get("tool_call_id"):
++        return False
++    if message.get("finish_reason") in {
++        "length",
++        "incomplete",
++        "tool_calls",
++        "verification_required",
++        "verify_hook_continue",
++        "kanban_terminal_required",
++    }:
++        return False
++    if any(
++        message.get(flag)
++        for flag in (
++            "_length_continuation_fragment",
++            "_empty_recovery_synthetic",
++            "_empty_terminal_sentinel",
++            "_verification_stop_synthetic",
++            "_pre_verify_synthetic",
++            "_dropped_toolcall_nudge",
++        )
++    ):
++        return False
++    return bool(_inflight_text(message.get("content")))
++
++
+ def _start_inflight_turn(session: dict, text: Any) -> None:
+     now = time.time()
++    turn_id = uuid.uuid4().hex
+     session["inflight_turn"] = {
+         "assistant": "",
+         "started_at": now,
+         "streaming": True,
++        "turn_id": turn_id,
+         "updated_at": now,
+         "user": _inflight_text(text),
+     }
++    agent = session.get("agent")
++    if agent is not None:
++        # build_turn_context consumes this exact id and promotes it to
++        # _current_turn_id. The gateway, agent transcript marker, and retained
++        # reconnect evidence therefore describe one turn rather than three
++        # independently guessed identities.
++        agent._relay_pending_turn_id = turn_id
+ 
+ 
+ def _append_inflight_delta(session: dict, delta: Any) -> None:
+@@ -7394,7 +7499,12 @@ def _clear_inflight_turn(session: dict) -> None:
+     session["inflight_turn"] = None
+ 
+ 
+-def _fail_inflight_turn(session: dict, error: Any) -> None:
++def _fail_inflight_turn(
++    session: dict,
++    error: Any,
++    *,
++    canonical_closed: bool = False,
++) -> None:
+     """Mark the in-flight turn terminal-error but keep it replayable.
+ 
+     Normal completion clears ``inflight_turn`` because the response is now in
+@@ -7408,7 +7518,7 @@ def _fail_inflight_turn(session: dict, error: Any) -> None:
+ 
+     Caller must hold ``session["history_lock"]``.
+     """
+-    message = str(error) if not isinstance(error, BaseException) else (str(error) or type(error).__name__)
++    message = _safe_turn_error(session.get("agent"), error)
+     now = time.time()
+     turn = session.get("inflight_turn")
+     if not isinstance(turn, dict):
+@@ -7419,6 +7529,21 @@ def _fail_inflight_turn(session: dict, error: Any) -> None:
+     turn["status"] = "error"
+     turn["recoverable"] = True
+     turn["streaming"] = False
++    turn_id = str(turn.get("turn_id") or "").strip()
++    history = session.get("history") or []
++    tail = history[-1] if history else None
++    canonical_closed = bool(
++        canonical_closed
++        and turn_id
++        and _is_marked_terminal_error_assistant(tail, turn_id)
++    )
++    turn["canonical_closed"] = canonical_closed
++    if canonical_closed:
++        turn["canonical_message_count"] = len(history)
++        turn["canonical_assistant"] = _inflight_text(tail.get("content"))
++    else:
++        turn.pop("canonical_message_count", None)
++        turn.pop("canonical_assistant", None)
+     turn["updated_at"] = now
+     session["inflight_turn"] = turn
+ 
+@@ -7774,7 +7899,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+                     rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                 )
+             if resp.get("error"):
+-                message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
++                message = _safe_turn_error(
++                    session.get("agent"),
++                    ((resp.get("error") or {}).get("message"))
++                    or "queued prompt failed",
++                )
+                 with session["history_lock"]:
+                     session["running"] = False
+                     _clear_inflight_turn(session)
+@@ -7799,9 +7928,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+                     queued_prompt_generation=queue_generation,
+                 )
+     except Exception as exc:
++        safe_error = _safe_turn_error(session.get("agent"), exc)
+         print(
+             f"[tui_gateway] queued prompt dispatch failed: "
+-            f"{type(exc).__name__}: {exc}",
++            f"{type(exc).__name__}: {safe_error}",
+             file=sys.stderr,
+         )
+         with session["history_lock"]:
+@@ -7830,6 +7960,7 @@ def _inflight_snapshot(session: dict) -> dict | None:
+     snapshot = {
+         "assistant": assistant,
+         "streaming": streaming,
++        "turn_id": str(turn.get("turn_id") or ""),
+         "user": user,
+     }
+     corrections = [c for c in (turn.get("corrections") or []) if str(c).strip()]
+@@ -7857,7 +7988,11 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
+     ``session.resume``'s ``inflight`` payload.
+     """
+     with session["history_lock"]:
+-        _fail_inflight_turn(session, error)
++        _fail_inflight_turn(
++            session,
++            error,
++            canonical_closed=_history_closes_inflight_turn_locked(session),
++        )
+         turn = session.get("inflight_turn") or {}
+         message = str(turn.get("error") or "turn failed")
+         partial = str(turn.get("assistant") or "")
+@@ -7899,6 +8034,156 @@ def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
+     return True
+ 
+ 
++def _history_closes_inflight_turn_locked(session: dict) -> bool:
++    """Whether the live tail carries this exact inflight turn's marker."""
++    turn = session.get("inflight_turn")
++    if not isinstance(turn, dict):
++        return False
++    history = session.get("history") or []
++    if not history:
++        return False
++    marked_turn_id = _terminal_error_turn_id(history[-1])
++    expected_turn_id = str(turn.get("turn_id") or "").strip()
++    if (
++        not marked_turn_id
++        or (expected_turn_id and marked_turn_id != expected_turn_id)
++        or not _is_marked_terminal_error_assistant(
++            history[-1], marked_turn_id
++        )
++    ):
++        return False
++    turn["turn_id"] = marked_turn_id
++    return True
++
++
++def _is_plain_terminal_assistant(message: Any) -> bool:
++    if not isinstance(message, dict) or message.get("role") != "assistant":
++        return False
++    if message.get("tool_calls") or message.get("tool_call_id"):
++        return False
++    if message.get("finish_reason") != "stop":
++        return False
++    return bool(_inflight_text(message.get("content")))
++
++
++def _close_agent_history_after_turn_error(session: dict, agent) -> bool:
++    """Durably close an exception turn when the agent captured its user row.
++
++    The retained in-flight record remains the detailed reconnect evidence. The
++    canonical transcript receives only a generic assistant tombstone (plus any
++    already-streamed partial text), so the next request cannot merge and replay
++    the failed user prompt and no raw exception details are persisted.
++
++    If the agent never captured the current user row, this leaves history alone
++    and the retained in-flight snapshot remains the sole recovery carrier.
++    """
++    agent_messages = getattr(agent, "_session_messages", None)
++    if not isinstance(agent_messages, list):
++        return False
++    messages = list(agent_messages)
++    user_index = getattr(agent, "_persist_user_message_idx", None)
++    if (
++        not isinstance(user_index, int)
++        or not (0 <= user_index < len(messages))
++        or not isinstance(messages[user_index], dict)
++        or messages[user_index].get("role") != "user"
++    ):
++        return False
++
++    turn = session.get("inflight_turn")
++    if not isinstance(turn, dict):
++        return False
++    turn_id = str(turn.get("turn_id") or "").strip()
++    agent_turn_id = str(getattr(agent, "_current_turn_id", "") or "").strip()
++    if not turn_id or agent_turn_id != turn_id:
++        return False
++    user_metadata = messages[user_index].get("display_metadata")
++    if (
++        not isinstance(user_metadata, dict)
++        or str(user_metadata.get("hermes_turn_id") or "") != turn_id
++    ):
++        return False
++    turn["turn_id"] = turn_id
++
++    # Repair any incomplete assistant(tool_calls) tail before closing. The
++    # canonical replay helper preserves possible side effects as UNKNOWN and
++    # removes unanswered read-only calls, so the tombstone cannot leave a
++    # provider-invalid tool sequence behind.
++    messages = list(sanitize_replay_history(messages))
++    tail = messages[-1] if messages else None
++    canonical_closed = False
++    if _is_marked_terminal_error_assistant(tail, turn_id):
++        canonical_closed = True
++    elif (
++        isinstance(tail, dict)
++        and tail.get("role") == "assistant"
++        and not tail.get("tool_calls")
++        and not tail.get("tool_call_id")
++        and not tail.get("_db_persisted")
++    ):
++        if not _is_plain_terminal_assistant(tail):
++            partial = _inflight_text(tail.get("content"))
++            tail["content"] = (
++                f"{partial}\n\n{_TERMINAL_ERROR_TOMBSTONE}"
++                if partial
++                else _TERMINAL_ERROR_TOMBSTONE
++            )
++            tail["finish_reason"] = "stop"
++            for flag in (
++                "_length_continuation_fragment",
++                "_empty_recovery_synthetic",
++                "_empty_terminal_sentinel",
++                "_verification_stop_synthetic",
++                "_pre_verify_synthetic",
++                "_dropped_toolcall_nudge",
++            ):
++                tail.pop(flag, None)
++        metadata = dict(tail.get("display_metadata") or {})
++        metadata[_TERMINAL_ERROR_TURN_ID_KEY] = turn_id
++        tail["display_metadata"] = metadata
++        tail["_terminal_error_closed"] = True
++        canonical_closed = True
++    elif isinstance(tail, dict) and tail.get("role") == "assistant":
++        # A durable assistant cannot be updated in the append-only session DB.
++        # It already prevents user/user replay, so keep the retained inflight
++        # error instead of appending an invalid assistant/assistant closure.
++        canonical_closed = False
++    else:
++        partial = str(turn.get("assistant") or "").strip()
++        content = (
++            f"{partial}\n\n{_TERMINAL_ERROR_TOMBSTONE}"
++            if partial
++            else _TERMINAL_ERROR_TOMBSTONE
++        )
++        messages.append(
++            {
++                "role": "assistant",
++                "content": content,
++                "_terminal_error_closed": True,
++                "display_metadata": {
++                    _TERMINAL_ERROR_TURN_ID_KEY: turn_id,
++                },
++            }
++        )
++        canonical_closed = True
++
++    agent._session_messages = messages
++    with session["history_lock"]:
++        session["history"] = list(messages)
++        session["history_version"] = int(session.get("history_version", 0)) + 1
++
++    # Always invoke marker-aware persistence. It is idempotent for durable
++    # prefix rows and is the only way an unflushed plain assistant/closure can
++    # become reconnect-visible in the DB projection.
++    persist = getattr(agent, "_persist_session", None)
++    if callable(persist):
++        try:
++            persist(messages)
++        except Exception:
++            logger.debug("failed to persist terminal-error history closure", exc_info=True)
++    return canonical_closed
++
++
+ def _queued_prompt_snapshot(session: dict) -> dict | None:
+     """Return the accepted next-turn prompt without its transport handle.
+ 
+@@ -8237,6 +8522,7 @@ def _live_session_payload(
+             session.get("history") or []
+         )
+         inflight = _inflight_snapshot(session)
++        inflight_turn = dict(session.get("inflight_turn") or {})
+         queued = _queued_prompt_snapshot(session)
+         running = bool(session.get("running"))
+     # Prefer the persisted display lineage (candidate-inclusive) so this payload
+@@ -8258,8 +8544,28 @@ def _live_session_payload(
+         "started_at": float(session.get("created_at") or time.time()),
+         "status": _session_live_status(sid, session),
+     }
++    projection_closes_inflight = bool(
++        not omit_messages
++        and inflight_turn.get("canonical_closed")
++        and history
++        and _is_marked_terminal_error_assistant(
++            history[-1],
++            str(inflight_turn.get("turn_id") or ""),
++        )
++    )
+     if inflight:
+-        payload["inflight"] = inflight
++        if projection_closes_inflight:
++            # The returned transcript already contains the user/assistant
++            # bubbles. Preserve terminal state as metadata instead of painting
++            # the retained inflight snapshot a second time.
++            payload["terminal_error"] = {
++                "error": str(inflight.get("error") or "turn failed"),
++                "recoverable": bool(inflight.get("recoverable")),
++                "status": str(inflight.get("status") or "error"),
++                "turn_id": str(inflight.get("turn_id") or ""),
++            }
++        else:
++            payload["inflight"] = inflight
+     if queued:
+         payload["queued"] = queued
+     return payload
+@@ -10145,7 +10451,15 @@ def _run_prompt_submit(
+                 if isinstance(result.get("messages"), list):
+                     with session["history_lock"]:
+                         current_version = int(session.get("history_version", 0))
+-                        if current_version == history_version:
++                        if result.get("turn_rolled_back"):
++                            # A large rejected request was already soft-rewound
++                            # and reloaded from SessionDB by the agent. Adopt
++                            # that exact active projection; concatenating it to
++                            # a concurrent snapshot would duplicate the whole
++                            # baseline and resurrect the failed user turn.
++                            session["history"] = list(result["messages"])
++                            session["history_version"] = current_version + 1
++                        elif current_version == history_version:
+                             session["history"] = result["messages"]
+                             session["history_version"] = history_version + 1
+                         else:
+@@ -10247,6 +10561,15 @@ def _run_prompt_submit(
+                 raw = str(result)
+                 status = "complete"
+ 
++            gateway_error_text = ""
++            if status == "error":
++                gateway_error_text = _safe_turn_error(
++                    agent,
++                    (result.get("error") if isinstance(result, dict) else "")
++                    or raw,
++                )
++                raw = _safe_turn_error(agent, raw or gateway_error_text)
++
+             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+             if last_reasoning:
+                 payload["reasoning"] = last_reasoning
+@@ -10273,14 +10596,13 @@ def _run_prompt_submit(
+                     _fail_inflight_turn(
+                         session,
+                         result.get("error") if isinstance(result, dict) else raw,
++                        canonical_closed=_history_closes_inflight_turn_locked(session),
+                     )
+                     turn_error_retained = True
+                 else:
+                     _clear_inflight_turn(session)
+             if status == "error":
+-                payload["error"] = str(
+-                    (result.get("error") if isinstance(result, dict) else "") or raw
+-                )
++                payload["error"] = gateway_error_text
+                 payload["recoverable"] = True
+             _retire_turn_marker(session, marker_key)
+             _emit("message.complete", sid, payload)
+@@ -10413,6 +10735,17 @@ def _run_prompt_submit(
+             import traceback
+ 
+             trace = traceback.format_exc()
++            try:
++                from agent.redact import redact_sensitive_text
++
++                trace = redact_sensitive_text(
++                    trace,
++                    force=True,
++                    redact_url_credentials=True,
++                )
++            except Exception:
++                trace = f"{type(e).__name__}: protected details unavailable\n"
++            safe_error = _safe_turn_error(agent, e)
+             try:
+                 os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
+                 with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+@@ -10424,14 +10757,17 @@ def _run_prompt_submit(
+             except Exception:
+                 pass
+             print(
+-                f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
++                f"[gateway-turn] {type(e).__name__}: {safe_error}",
++                file=sys.stderr,
++                flush=True,
+             )
+             # The agent persists its working transcript on normal finalization,
+             # but an exception in that finalizer can otherwise leave the
+             # gateway's separate in-memory history at the turn-start snapshot.
+             # Keep the partial turn available to the next prompt; the durable
+             # inflight record still carries the recoverable error state.
+-            _restore_agent_history_after_turn_error(session, agent)
++            if not _close_agent_history_after_turn_error(session, agent):
++                _restore_agent_history_after_turn_error(session, agent)
+             try:
+                 # Close the turn with the same terminal error frame shape as
+                 # the returned-error path (uniform client handling), retaining
+@@ -10441,11 +10777,12 @@ def _run_prompt_submit(
+             except Exception as emit_exc:
+                 print(
+                     f"[gateway-turn] terminal error emit failed: "
+-                    f"{type(emit_exc).__name__}: {emit_exc}",
++                    f"{type(emit_exc).__name__}: "
++                    f"{_safe_turn_error(agent, emit_exc)}",
+                     file=sys.stderr,
+                     flush=True,
+                 )
+-                _emit("error", sid, {"message": str(e)})
++                _emit("error", sid, {"message": safe_error})
+         finally:
+             # Drop both local snapshots of the pre-turn history before asking
+             # glibc to return pages. session["history"] already points at the

@@ -1,0 +1,368 @@
+diff --git a/agent/native_extension_delivery.py b/agent/native_extension_delivery.py
+new file mode 100644
+--- /dev/null
++++ b/agent/native_extension_delivery.py
+@@ -0,0 +1,113 @@
++"""Economic ownership for ONE already-admitted durable native event.
++
++Not a human turn, model tool, scheduler, retry or new consent authority. Only
++the existing authenticated hidden-game RPC calls this after its durable claim.
++"""
++from contextlib import contextmanager
++from dataclasses import dataclass
++import re
++import time
++import os
++
++from agent.usage_budget import BudgetError
++from agent.usage_budget_runtime import AcceptedOrigin, get_runtime
++from agent.usage_budget_entrypoints import (
++    bind_native_agent_origin, native_origin_scope, complete_primary, stop_origin,
++)
++
++
++@dataclass(frozen=True)
++class NativeExtensionOrigin:
++    ticket: AcceptedOrigin
++    event_id: str
++    turn_id: str
++    owner_token: str
++
++
++def accept_claim(profile, claim):
++    """Host-only: freeze policy after fresh claim, before launching the worker.
++
++    Reconciliation only returns the original terminal; it never calls this
++    function. Economic IDs are durable-event-based, not a fresh random turn.
++    """
++    if (not isinstance(claim, dict) or claim.get("status") != "streaming"
++            or claim.get("already_processed") is not False or claim.get("attempted") is not True
++            or claim.get("assistant_row_id") is not None
++            or any(not isinstance(claim.get(key), str)
++                   or re.fullmatch(r"[a-f0-9]{32}", claim[key]) is None
++                   for key in ("event_id", "turn_id", "owner_token"))):
++        raise BudgetError("native_event_claim_invalid")
++    # This allowance belongs to the existing independently-enabled event,
++    # never the last human turn. The store prevents cross-restart ID replay.
++    ticket = get_runtime(profile).accept_new_origin("native-event-" + claim["event_id"])
++    return NativeExtensionOrigin(ticket, claim["event_id"], claim["turn_id"], claim["owner_token"])
++
++
++@contextmanager
++def delivery_scope(origin, agent, *, profile, event_id, turn_id, owner_token):
++    if (type(origin) is not NativeExtensionOrigin
++            or type(origin.ticket) is not AcceptedOrigin
++            or (origin.event_id, origin.turn_id, origin.owner_token) != (event_id, turn_id, owner_token)):
++        raise BudgetError("native_event_origin_mismatch")
++    if os.path.normcase(os.path.abspath(origin.ticket._owner.store.profile_root)) != os.path.normcase(os.path.abspath(profile)):
++        raise BudgetError("native_event_origin_mismatch")
++    handle = bind_native_agent_origin(origin.ticket, agent)
++    missing = object()
++    previous = {key: getattr(agent, key, missing) for key in ("_usage_budget_handle", "_lilith_paired_speech")}
++    agent._usage_budget_handle = handle
++    # The native route is a one-object text contract, not the preceding F7
++    # paired-speech turn. Never leak its old nonce/instructions into this turn.
++    agent._lilith_paired_speech = None
++    try:
++        with native_origin_scope(handle):
++            yield handle
++    except BaseException:
++        stop_origin(handle)
++        raise
++    finally:
++        for key, value in previous.items():
++            if value is missing:
++                if hasattr(agent, key):
++                    delattr(agent, key)
++            else:
++                setattr(agent, key, value)
++        complete_primary(handle)
++
++
++class DeliveryTrace:
++    """Closed metadata only; never log exception prose, prompt, scene or IDs."""
++    def __init__(self, foreground):
++        self.started = time.monotonic()
++        self.kind = "foreground" if foreground else "official_continuation"
++        self.stage = "admission"
++        self.scene_status = "not_requested"
++        self.scene_code = "none"
++        self.budget_code = "none"
++        self.provider_invoked = False
++
++    def scene(self, observation):
++        from tools.lilith_scene.errors import CODES
++        status = observation.get("status") if isinstance(observation, dict) else None
++        code = observation.get("code") if isinstance(observation, dict) else None
++        self.scene_status = status if isinstance(status, str) and status in {"ready", "disabled", "unavailable", "silent", "clarify"} else "invalid"
++        self.scene_code = code if isinstance(code, str) and code in CODES else "none"
++
++    def failure(self, error):
++        if isinstance(error, BudgetError):
++            self.budget_code = error.code if error.code in {
++                "origin_context_missing", "origin_budget_scope_missing", "origin_context_conflict",
++                "native_event_origin_mismatch", "native_event_claim_invalid", "origin_already_admitted",
++                "native_budget_route_unverified", "policy_capabilities_unavailable", "origin_stopped",
++            } else "budget_rejected"
++
++    def emit(self, logger, status):
++        try:
++            logger.info("native_extension_delivery kind=%s stage=%s outcome=%s scene=%s scene_code=%s "
++                        "budget_code=%s provider_invoked=%s elapsed_ms=%s", self.kind, self.stage,
++                        status if status in {"completed", "silent", "abandoned"} else "unavailable",
++                        self.scene_status, self.scene_code, self.budget_code,
++                        int(self.provider_invoked), max(0, int((time.monotonic()-self.started)*1000)))
++        except Exception:
++            # A broken diagnostic sink must not strand the existing queue/stop
++            # cleanup. The durable event receipt remains the outcome authority.
++            pass
+diff --git a/tests/test_proactive_delivery.py b/tests/test_proactive_delivery.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_proactive_delivery.py
+@@ -0,0 +1,124 @@
++"""One already-claimed host event, ownership and privacy invariants."""
++import logging
++import uuid
++from types import SimpleNamespace
++
++import pytest
++
++from agent import native_extension_delivery as delivery
++from agent.usage_budget import BudgetError
++from agent.usage_budget_preferences import PreferenceUpdate
++from agent.usage_budget_runtime import get_runtime, capture_origin
++
++
++def claim():
++    return dict(status="streaming", already_processed=False, attempted=True, assistant_row_id=None,
++                event_id=uuid.uuid4().hex, turn_id=uuid.uuid4().hex, owner_token=uuid.uuid4().hex)
++
++
++def selected_agent(**attributes):
++    return SimpleNamespace(model="test-model", provider="test", api_mode="chat_completions", **attributes)
++
++
++def scope(origin, agent, profile, **kw):
++    args = dict(profile=profile, event_id=origin.event_id, turn_id=origin.turn_id, owner_token=origin.owner_token)
++    args.update(kw)
++    return delivery.delivery_scope(origin, agent, **args)
++
++
++@pytest.mark.parametrize("override", [dict(status="silent"), dict(already_processed=True), dict(attempted=False),
++    dict(assistant_row_id=1), dict(event_id="not-a-host-event"), dict(turn_id=""), dict(owner_token=None)])
++def test_only_fresh_claim_is_accepted(tmp_path, override):
++    value = claim()
++    value.update(override)
++    with pytest.raises(BudgetError, match="native_event_claim_invalid"):
++        delivery.accept_claim(tmp_path, value)
++
++
++def test_same_event_cannot_mint_another_origin(tmp_path):
++    value = claim()
++    first = delivery.accept_claim(tmp_path, value)
++    with pytest.raises(BudgetError, match="origin_already_admitted"):
++        delivery.accept_claim(tmp_path, {**value, "turn_id": uuid.uuid4().hex, "owner_token": uuid.uuid4().hex})
++    assert first.ticket.origin_id == "native-event-" + value["event_id"]
++
++
++@pytest.mark.parametrize("field", ["event_id", "turn_id", "owner_token", "profile"])
++def test_exact_identity_and_profile_required(tmp_path, field):
++    origin = delivery.accept_claim(tmp_path, claim())
++    replacement = tmp_path / "other" if field == "profile" else uuid.uuid4().hex
++    with pytest.raises(BudgetError, match="native_event_origin_mismatch"):
++        args = dict(profile=tmp_path, event_id=origin.event_id, turn_id=origin.turn_id, owner_token=origin.owner_token)
++        args[field] = replacement
++        with delivery.delivery_scope(origin, SimpleNamespace(), **args):
++            pytest.fail("identity mismatch admitted")
++
++
++@pytest.mark.parametrize("fail", [False, True])
++def test_scope_restores_old_state_and_finishes_own_origin(tmp_path, fail):
++    origin = delivery.accept_claim(tmp_path, claim())
++    old, pair = object(), object()
++    agent = selected_agent(_usage_budget_handle=old, _lilith_paired_speech=pair)
++    handle = None
++    try:
++        with scope(origin, agent, tmp_path) as handle:
++            assert capture_origin() is handle and agent._usage_budget_handle is handle
++            assert agent._lilith_paired_speech is None
++            if fail:
++                raise InterruptedError("synthetic cancellation")
++    except InterruptedError:
++        assert fail
++    assert capture_origin() is None
++    assert agent._usage_budget_handle is old and agent._lilith_paired_speech is pair
++    assert handle._lifecycle.primary_complete
++    assert handle.ledger.snapshot().stopped is fail
++
++
++def test_acceptance_freezes_preference_before_worker(tmp_path):
++    runtime = get_runtime(tmp_path)
++    # Freeze one selected policy, then change the next-event preference.
++    runtime.store.set(PreferenceUpdate(uuid.uuid4().hex, runtime.store.get().revision, 5))
++    origin = delivery.accept_claim(tmp_path, claim())
++    frozen = origin.ticket.preference
++    runtime.store.set(PreferenceUpdate(uuid.uuid4().hex, runtime.store.get().revision, 6))
++    with scope(origin, selected_agent(), tmp_path) as handle:
++        assert handle.preference == frozen and handle.preference.level == 5
++    assert runtime.store.get().level == 6
++
++
++def test_missing_agent_attributes_are_not_left_behind(tmp_path):
++    agent = selected_agent()
++    origin = delivery.accept_claim(tmp_path, claim())
++    with scope(origin, agent, tmp_path):
++        assert agent._lilith_paired_speech is None
++    assert not hasattr(agent, "_usage_budget_handle") and not hasattr(agent, "_lilith_paired_speech")
++
++
++def test_trace_never_logs_private_payload(caplog):
++    trace = delivery.DeliveryTrace(True)
++    trace.scene({"status": "unavailable", "code": "PRIVATE TITLE"})
++    trace.failure(BudgetError("PRIVATE KEY"))
++    with caplog.at_level(logging.INFO):
++        trace.emit(logging.getLogger("fixture-delivery"), "PRIVATE BODY")
++    assert "PRIVATE" not in caplog.text
++    assert "outcome=unavailable" in caplog.text and "budget_code=budget_rejected" in caplog.text
++    assert "provider_invoked=0" in caplog.text
++
++
++@pytest.mark.parametrize("status", ["ready", "disabled", "unavailable", "silent", "clarify", "invalid"])
++def test_trace_scene_has_closed_vocabulary(status):
++    trace = delivery.DeliveryTrace(False)
++    trace.scene({"status": status})
++    assert trace.scene_status == status
++
++
++def test_malformed_scene_metadata_is_not_logged():
++    trace = delivery.DeliveryTrace(False)
++    trace.scene({"status": [], "code": {"private": "payload"}})
++    assert trace.scene_status == "invalid" and trace.scene_code == "none"
++
++
++def test_diagnostic_failure_does_not_strand_cleanup():
++    def broken(*args, **kwargs):
++        raise OSError("synthetic log sink unavailable")
++    delivery.DeliveryTrace(False).emit(SimpleNamespace(info=broken), "silent")
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 881aa66..739789b 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -3605,6 +3605,8 @@ def _(rid, params: dict) -> dict:
+                     return _ok(rid, public_receipt(claim))
+ 
+                 try:
++                    from agent.native_extension_delivery import accept_claim
++                    budget_origin = accept_claim(_session_home(session), claim)
+                     # Clear only residue from the preceding turn, before the
+                     # extension owner is published. The worker must never
+                     # clear an interrupt accepted after this point.
+@@ -3641,6 +3643,7 @@ def _(rid, params: dict) -> dict:
+                             ],
+                             "owner_token": claim["owner_token"],
+                             "start_gate": start_gate,
++                            "budget_origin": budget_origin,
+                         },
+                         daemon=True,
+                         name=f"native-extension-{event_id[:8]}",
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 66bee58..f75f549 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -14864,6 +14864,7 @@ def _run_native_assistant_extension(
+     assistant_message_id: str,
+     owner_token: str,
+     start_gate: threading.Event | None = None,
++    budget_origin=None,
+ ) -> None:
+     """Execute one already-durable native extension claim."""
+     perception_source = str(perception.get("source") or "")
+@@ -14886,12 +14887,14 @@ def _run_native_assistant_extension(
+     durable_message = None
+     agent = session.get("agent")
+     scene = None
++    from agent.native_extension_delivery import DeliveryTrace, delivery_scope
++    trace = DeliveryTrace(is_foreground)
+     try:
+         if start_gate is not None:
+             # message.start must be published before provider dispatch. The
+             # handler owns this gate and always releases it after that emit.
+             start_gate.wait()
+-        with _session_profile_runtime_scope(session):
++        with _session_profile_runtime_scope(session), contextlib.ExitStack() as origin_scope:
+             session_tokens = _set_session_context(session.get("session_key") or "")
+             if agent is None:
+                 raise RuntimeError("native extension agent is unavailable")
+@@ -14908,6 +14911,9 @@ def _run_native_assistant_extension(
+                         "native extension cancelled before provider dispatch"
+                     )
+                 history = list(session.get("history") or [])
++            origin_scope.enter_context(delivery_scope(budget_origin, agent, profile=_session_home(session), event_id=event_id,
++                turn_id=turn_id, owner_token=owner_token))
++            trace.stage = "identity"
+             if not str(
+                 getattr(agent, "_cached_system_prompt", "") or ""
+             ).strip():
+@@ -14938,6 +14944,7 @@ def _run_native_assistant_extension(
+                     "native extension transport cannot guarantee one physical attempt"
+                 )
+             if is_foreground:
++                trace.stage = "scene"
+                 from tools.lilith_scene.host import proactive_context
+                 def scene_cancelled():
+                     with session["history_lock"]:
+@@ -14946,10 +14953,12 @@ def _run_native_assistant_extension(
+                             isinstance(owner, dict) and owner.get("owner_token") == owner_token
+                         )
+                 observation = proactive_context(agent, scene_cancelled)
++                trace.scene(observation)
+                 if observation["status"] != "disabled":
+                     if observation["status"] != "ready" or scene_cancelled():
+                         raise InterruptedError("local scene unavailable; no provider attempt")
+                     scene = observation
++            trace.stage = "request"
+             messages = _native_assistant_extension_model_messages(
+                 agent,
+                 history,
+@@ -15023,12 +15032,15 @@ def _run_native_assistant_extension(
+                 expected_system_prompt=effective_system,
+                 label="native assistant extension provider request",
+             )
++            trace.stage = "provider"
++            trace.provider_invoked = True
+             response = agent._interruptible_api_call(
+                 api_kwargs,
+                 physical_attempt_limit=1,
+             )
+             normalized = agent._get_transport().normalize_response(response)
+             if scene is not None:
++                trace.stage = "freshness"
+                 from tools.lilith_scene.host import still_current
+                 if not still_current(scene):
+                     raise InterruptedError("local scene no longer current")
+@@ -15040,13 +15052,15 @@ def _run_native_assistant_extension(
+                     and owner.get("turn_id") == turn_id
+                 )
+             if not cancelled:
++                trace.stage = "decode"
+                 terminal_status, reply = _decode_native_assistant_extension_decision(
+                     normalized.content
+                 )
+-    except BaseException:
++    except BaseException as error:
+         # Stop, provider failure, malformed output, and process-local races all
+         # converge on silence. The durable claim prevents any later retry.
+         logger.debug("native assistant extension model attempt ended silently", exc_info=True)
++        trace.failure(error)
+         terminal_status, reply = "silent", ""
+ 
+     try:
+@@ -15161,6 +15175,7 @@ def _run_native_assistant_extension(
+         with _turn_event_scope(turn_id, assistant_message_id):
+             _emit("message.complete", sid, payload)
+     finally:
++        trace.emit(logger, terminal_status)
+         try:
+             _native_assistant_extension_wait_for_interrupt_fence(
+                 session,

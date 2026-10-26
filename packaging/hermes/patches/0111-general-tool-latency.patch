@@ -1,0 +1,692 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 0755fed..d3ad481 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -30,6 +30,7 @@ from agent.usage_budget_entrypoints import budgeted_conversation
+ from agent.usage_budget_context import (
+     capture_budget_history,
+     prepare_budget_context,
++    pressure_uses_send_projection,
+     with_efficiency_guidance,
+ )
+ from agent.iteration_budget import ContinuationProgress, continuation_transport_ok, unlimited_iterations
+@@ -7588,6 +7589,12 @@ def run_conversation(
+                     # has arrived yet. Avoid treating a schema-heavy rough
+                     # post-compression estimate as real context pressure.
+                     _real_tokens = 0
++                elif pressure_uses_send_projection(agent):
++                    # Missing provider usage does not turn the complete stored
++                    # transcript into the next request. Use this send's measured
++                    # projection; the next pre-API guard measures fresh tool
++                    # results too. Never run a second summary just to estimate.
++                    _real_tokens = request_pressure_tokens
+                 else:
+                     # Include tool schemas — with 50+ tools enabled
+                     # these add 20-30K tokens the messages-only
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 28b7ffb..72d9f0f 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -1174,9 +1174,24 @@ _WINDOWS_BASH_SHELL_HINT = (
+     "pty background process, use process(submit) — never process(write) "
+     "with a bare trailing newline: Enter on a Windows PTY is a carriage "
+     "return, and a lone `\\n` is not delivered as a line terminator, so the "
+-    "child's prompt silently never returns. When a CLI offers a "
++    "child's prompt silently never returns. Use `cmd.exe /d /c`, not `cmd //c`: "
++    "MSYS argument conversion is disabled, so doubling the slash is not needed. "
++    "When a CLI offers a "
+     "non-interactive path (flags, `--with-token`, config files, an OAuth "
+-    "device flow polled with curl), prefer it over driving prompts."
++    "device flow polled with curl), prefer it over driving prompts. "
++    "Foreground terminal commands own their descendant processes; surviving "
++    "children are cleaned up on wrapper exit. To open an authorized document in "
++    "a lasting GUI, use the OS document association with an explicit background "
++    "terminal session and a waiting wrapper (for example Start-Process -Wait); "
++    "keep the background session until the child exits. Do not launch it in "
++    "a foreground wrapper or treat wrapper exit as application success. This is "
++    "not an alternate route for installed-app launch or denied actions. "
++    "For a requested close, observe the exact original process handle/start "
++    "identity and its windows. A confirmed HasExited or signaled process handle "
++    "is completion even if an enumeration still lists an exited process object. "
++    "A missing window alone is not process exit; access denied or an unsaved-work "
++    "dialog is not success. Do not repeatedly wait or kill by name after confirmed "
++    "exit; do not force-close unsaved work without user authorization."
+ )
+ 
+ 
+@@ -1359,9 +1374,9 @@ def build_environment_hints() -> str:
+         if sys.platform == "win32" and not is_wsl():
+             host_lines.append(
+                 "Note: on Windows, the machine hostname (e.g. from `hostname` "
+-                "or uname) is NOT the username. Use the 'User home directory' "
+-                "above to construct paths under C:\\Users\\<user>\\, never the "
+-                "hostname."
++                "or uname) is NOT the username. Use the reported home only for "
++                "home-relative files, never infer it from the hostname. Desktop "
++                "and other Known Folders can be redirected outside that home."
+             )
+         hints.append("\n".join(host_lines))
+ 
+@@ -1369,6 +1384,8 @@ def build_environment_hints() -> str:
+         # know this or it will issue PowerShell syntax and fail.
+         if sys.platform == "win32" and not is_wsl():
+             hints.append(_WINDOWS_BASH_SHELL_HINT)
++            from tools.windows_known_folders import environment_hint as known_folders_hint
++            hints.append(known_folders_hint())
+     else:
+         # --- Remote backend block (host info suppressed) ---
+         probe = _probe_remote_backend(backend)
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index d2887a2..fb54a90 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -1045,7 +1045,16 @@ def build_turn_context(
+     _preflight_compression_blocked = False
+     agent._turn_received_provider_response = False
+     agent._turn_preflight_display_snapshot = None
+-    if agent.compression_enabled and _should_run_preflight_estimate(
++    # Information strategies summarize only the send copy. Comparing the raw
++    # durable history with a previous projected request mixes two size bases and
++    # can run a full compaction before the rolling summary does the same work.
++    # The conversation loop already checks the assembled request before EVERY
++    # send, including fallback-to-originals and new oversized tool results.
++    from agent.usage_budget_context import pressure_uses_send_projection
++    _send_projection_pressure = pressure_uses_send_projection(agent)
++    if _send_projection_pressure and agent.compression_enabled:
++        logger.info("[context_pressure] turn_start=deferred_to_send_projection")
++    if agent.compression_enabled and not _send_projection_pressure and _should_run_preflight_estimate(
+         messages,
+         agent.context_compressor.protect_first_n,
+         agent.context_compressor.protect_last_n,
+diff --git a/agent/usage_budget_context.py b/agent/usage_budget_context.py
+index c7babaa..f4052f8 100644
+--- a/agent/usage_budget_context.py
++++ b/agent/usage_budget_context.py
+@@ -201,6 +201,25 @@ def capture_budget_history(messages, current_turn_user_idx):
+     return capture_completed_history(messages, current_turn_user_idx)
+ 
+ 
++def pressure_uses_send_projection(agent):
++    """Defer raw-history pressure to the existing assembled-request guard.
++
++    Only native information strategies with an authenticated origin and the
++    stock compressor qualify. This is NOT a size/usage waiver: projection can
++    fail or retain everything, and the pre-API guard still measures that actual
++    copy, including tools and current inputs. No summary or provider call here.
++    Plugin engines retain their independent turn-start maintenance contract.
++    """
++    ledger = current_turn_budget()
++    if ledger is None or ledger.policy.information_strategy.history_turns is None:
++        return False
++    from agent.usage_budget_runtime import capture_origin
++    from agent.context_compressor import ContextCompressor
++    origin = capture_origin()
++    return (origin is not None and origin.ledger is ledger
++            and type(getattr(agent, "context_compressor", None)) is ContextCompressor)
++
++
+ _COUNTERS = {}
+ _COUNTER_LOCK = RLock()
+ 
+@@ -342,6 +361,8 @@ def prepare_budget_context(agent, projected, source, history, *, history_offset,
+                            estimate_input=None, normalize_tool_calls=None):
+     """Actual conversation-loop seam, before request selection/sanitization."""
+     ledger = current_turn_budget()
++    if ledger is not None and ledger.snapshot().stopped:
++        raise BudgetError("turn_stopped")
+     if ledger is not None and ledger.policy.information_strategy.history_turns is not None:
+         from agent.usage_budget_runtime import capture_origin
+         from agent.usage_strategy_context import project_context
+@@ -353,10 +374,17 @@ def prepare_budget_context(agent, projected, source, history, *, history_offset,
+                 result = project_context(agent, projected, units, ledger.policy.information_strategy, origin,
+                                          source=source, history_offset=history_offset)
+                 from agent.tool_result_projection import project_request_results
+-                return project_request_results(result)
++                result = project_request_results(result)
+             except Exception:
+                 agent._usage_budget_context_status = {"strategy": "projection_unavailable_originals_retained"}
+-                return projected
++                result = projected
++            # Projection can spend time in a summary call. Cancellation during
++            # that call must not become "summary failed, send originals". Check
++            # outside the recovery catch so the native turn boundary receives
++            # the stop instead of dispatching another foreground request.
++            if ledger.snapshot().stopped:
++                raise BudgetError("turn_stopped")
++            return result
+     policy = ledger.policy if ledger is not None else None
+     counter = _bound_counter(agent) if policy and policy.enforce_economy_limits else None
+     if (counter is None and policy is not None and policy.enforce_economy_limits
+diff --git a/tests/test_general_latency.py b/tests/test_general_latency.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_general_latency.py
+@@ -0,0 +1,50 @@
++import json
++import unittest
++from unittest.mock import patch
++from tools import windows_known_folders as folders
++
++
++class KnownFolderTests(unittest.TestCase):
++    def test_registered_locations_across_users_and_redirects(self):
++        cases = (
++            r"C:\Users\Alice\Desktop",
++            r"D:\People\Bob\OneDrive - Example\桌面",
++            r"E:\工作\桌面",
++            r"\\fileserver\Profiles\Carol\Desktop",
++        )
++        for desktop in cases:
++            with self.subTest(desktop=desktop), patch.object(folders.sys, "platform", "win32"), \
++                 patch.object(folders, "_resolve", side_effect=lambda key: desktop if key == folders.FOLDER_IDS["Desktop"] else None) as read:
++                self.assertEqual(folders.current_user_folders(), {"Desktop": desktop})
++                self.assertEqual(read.call_count, 4)
++                self.assertEqual(set(c.args[0] for c in read.call_args_list), set(folders.FOLDER_IDS.values()))
++
++    def test_failure_does_not_guess_a_home_or_cloud_directory(self):
++        with patch.object(folders.sys, "platform", "win32"), \
++             patch.object(folders, "_resolve", side_effect=OSError("denied")):
++            self.assertEqual(folders.current_user_folders(), {})
++            self.assertIn("Missing entries mean unavailable", folders.environment_hint())
++
++    def test_invalid_paths_rejected(self):
++        for value in (None, "", "Desktop", r"C:Desktop", r"\Desktop", "C:\\fake\nINSTRUCTION", 123, "C:\\" + "x" * 32768):
++            with self.subTest(value=type(value).__name__), patch.object(folders.sys, "platform", "win32"), \
++                 patch.object(folders, "_resolve", return_value=value):
++                self.assertEqual(folders.current_user_folders(), {})
++
++    def test_non_windows_never_queries_host_folders(self):
++        for platform in ("linux", "darwin"):
++            with patch.object(folders.sys, "platform", platform), patch.object(folders, "_resolve") as read:
++                self.assertEqual(folders.current_user_folders(), {})
++                read.assert_not_called()
++
++    def test_hint_escapes_path_data_and_does_not_copy_other_users(self):
++        value = r"E:\工作\a`quoted`[data]"
++        with patch.object(folders, "current_user_folders", return_value={"Desktop": value}):
++            hint = folders.environment_hint()
++        self.assertIn(json.dumps({"Desktop": value}, ensure_ascii=True), hint)
++        self.assertIn("not instructions", hint)
++        self.assertIn("not a recursive search", hint)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/tools/test_general_tool_latency.py b/tests/tools/test_general_tool_latency.py
+new file mode 100644
+--- /dev/null
++++ b/tests/tools/test_general_tool_latency.py
+@@ -0,0 +1,166 @@
++"""Native modules, synthetic driver/OS data. No real app or player access."""
++import base64
++import json
++from types import SimpleNamespace
++from unittest.mock import patch
++import pytest
++from tools.computer_use.cua_backend import CuaDriverBackend, _CuaDriverSession
++from tools.computer_use import tool as cu
++
++
++def backend(properties=(), capabilities=()):
++    session = _CuaDriverSession.__new__(_CuaDriverSession)
++    session._capabilities = {"click": set(capabilities), "get_window_state": set()}
++    session._tool_schemas = {"click": {"properties": dict.fromkeys(properties, {})}}
++    calls = []
++    session.call_tool = lambda name, args: calls.append((name, dict(args))) or {
++        "isError": False, "data": "ok", "structuredContent": {"status": "accepted"}}
++    instance = CuaDriverBackend.__new__(CuaDriverBackend)
++    instance._session = session
++    instance._session_id = "synthetic"
++    instance._active_pid = 12
++    instance._active_window_id = 34
++    instance._last_target = {"pid": 12, "window_id": 34}
++    instance._last_app = "Fixture App"
++    instance._snapshot_tokens = {5: "opaque-snapshot:5"}
++    instance._snapshot_id = "opaque-snapshot"
++    instance._snapshot_indices = {5}
++    return instance, calls
++
++
++@pytest.mark.parametrize("properties,capabilities", [
++    (("element_token",), ()), ((), ("accessibility.element_tokens",)),
++    (("element_token", "snapshot_id"), ("accessibility.element_tokens",)),
++])
++def test_exact_token_from_live_schema_or_capability(properties, capabilities):
++    instance, calls = backend(properties, capabilities)
++    instance.click(element=5)
++    assert len(calls) == 1
++    assert calls[0][1]["element_token"] == "opaque-snapshot:5"
++    assert calls[0][1]["pid"] == 12
++
++
++def test_snapshot_pair_when_driver_does_not_publish_per_element_tokens():
++    instance, calls = backend(("snapshot_id",))
++    instance._snapshot_tokens = {}
++    instance.click(element=5)
++    assert calls[0][1]["snapshot_id"] == "opaque-snapshot"
++    assert calls[0][1]["element_index"] == 5
++
++
++@pytest.mark.parametrize("properties", [("element_token",), ("snapshot_id",)])
++def test_unknown_index_rejected_locally_without_retarget_or_retry(properties):
++    instance, calls = backend(properties)
++    result = instance.click(element=99)
++    assert result.ok is False and result.code == "fresh_element_capture_required"
++    assert not calls
++
++
++def test_true_legacy_schema_still_accepts_index_without_invented_fields():
++    instance, calls = backend(("element_index",))
++    instance._snapshot_tokens = {}
++    instance.click(element=5)
++    assert calls[0][1]["element_index"] == 5
++    assert "element_token" not in calls[0][1] and "snapshot_id" not in calls[0][1]
++
++
++def test_capture_and_vision_never_rebind_a_prior_index():
++    instance, calls = backend(("element_token", "snapshot_id"))
++    pixel = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\0" * 8 + (20).to_bytes(4, "big") * 2).decode()
++    def driver(name, args):
++        calls.append((name, dict(args)))
++        sc = ({"windows": [{"app_name": "Fixture App", "pid": 12, "window_id": 34,
++                           "is_on_screen": True, "title": "Fixture", "z_index": 1}]}
++              if name == "list_windows" else
++              {"snapshot_id": "new-snapshot", "elements": [{"element_index": 7, "role": "button",
++               "label": "Fixture", "element_token": "new-snapshot:7"}], "screenshot_png_b64": pixel})
++        return {"data": "", "images": [], "isError": False, "structuredContent": sc}
++    instance._session.call_tool = driver
++    instance.capture(mode="som", pid=12, window_id=34)
++    assert instance._snapshot_tokens == {7: "new-snapshot:7"}
++    instance.click(element=7)
++    assert calls[-1][1]["element_token"] == "new-snapshot:7"
++    instance.capture(mode="vision", pid=12, window_id=34)
++    count = len(calls)
++    assert instance.click(element=7).code == "fresh_element_capture_required"
++    assert len(calls) == count
++
++
++def test_failed_capture_and_focus_clear_all_bindings():
++    instance, calls = backend(("snapshot_id",))
++    instance._load_windows = lambda: [{"pid": 56, "window_id": 78, "app_name": "Other Fixture"}]
++    instance._match_windows_for_app = lambda windows, app: windows
++    instance.focus_app("Other Fixture")
++    assert not instance._snapshot_tokens and instance._snapshot_id is None
++    assert not instance._snapshot_indices
++    assert instance.click(element=5).code == "fresh_element_capture_required"
++    instance._failed_capture("som")
++    assert instance._active_pid is None and not instance._snapshot_indices
++
++
++def test_driver_stale_error_not_automatically_retried_or_downgraded():
++    instance, calls = backend(("element_token",))
++    def stale(name, args):
++        calls.append((name, dict(args)))
++        return {"isError": True, "data": "stale snapshot", "structuredContent": {"code": "stale"}}
++    instance._session.call_tool = stale
++    assert not instance.click(element=5).ok
++    assert len(calls) == 1 and "element_token" in calls[0][1]
++
++
++def test_timing_is_numeric_only_even_on_failure():
++    with patch.object(cu.time, "perf_counter", side_effect=[1.0, 1.025]), \
++         patch.object(cu.logger, "info") as log:
++        with pytest.raises(ValueError):
++            with cu._timed_phase("launch_driver"):
++                raise ValueError("private path must not be logged")
++    args = log.call_args.args
++    assert args[1] == "launch_driver" and args[2] == pytest.approx(25)
++    assert "private" not in str(args)
++
++
++@pytest.mark.parametrize("hresult", [0, -2147024891])
++def test_native_known_folder_call_is_current_user_noncreating_and_freed(hresult):
++    import ctypes
++    from tools import windows_known_folders as folders
++    path = ctypes.create_unicode_buffer("E:\\Fixture\\Desktop")
++    calls, freed = [], []
++    class Function:
++        def __init__(self, fn): self.fn = fn
++        def __call__(self, *args): return self.fn(*args)
++    def resolve(guid, flags, token, result):
++        calls.append((ctypes.string_at(guid, 16), flags, token))
++        ctypes.cast(result, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.addressof(path)
++        return hresult
++    shell = SimpleNamespace(SHGetKnownFolderPath=Function(resolve))
++    ole = SimpleNamespace(CoTaskMemFree=Function(lambda pointer: freed.append(pointer.value)))
++    with patch.object(ctypes, "WinDLL", side_effect=lambda name, **kw: {"shell32": shell, "ole32": ole}[name]):
++        assert folders._resolve(folders.FOLDER_IDS["Desktop"]) == (path.value if hresult == 0 else None)
++    assert calls[0][1:] == (0x4000, None) and freed == [ctypes.addressof(path)]
++
++
++def test_remote_terminal_does_not_leak_local_known_folders():
++    import agent.prompt_builder as prompt
++    from tools import windows_known_folders as folders
++    with patch.dict(prompt.os.environ, {"TERMINAL_ENV": "ssh", "HERMES_ENVIRONMENT_HINT": "synthetic"}), \
++         patch.object(prompt, "_probe_remote_backend", return_value="remote fixture"), \
++         patch.object(prompt, "is_wsl", return_value=False), \
++         patch.object(folders, "environment_hint") as read:
++        text = prompt.build_environment_hints()
++    read.assert_not_called()
++    assert "remote fixture" in text and "Known Folders" not in text
++
++
++def test_local_guidance_covers_lifecycle_without_brand_or_fixed_waits():
++    import agent.prompt_builder as prompt
++    from tools import windows_known_folders as folders
++    with patch.dict(prompt.os.environ, {"TERMINAL_ENV": "local", "HERMES_ENVIRONMENT_HINT": "synthetic"}), \
++         patch.object(prompt, "is_wsl", return_value=False), \
++         patch.object(folders, "environment_hint", return_value="Known Folders synthetic") as read:
++        text = prompt.build_environment_hints()
++    read.assert_called_once()
++    assert "Known Folders synthetic" in text and "Start-Process -Wait" in text
++    assert "HasExited" in text and "unsaved-work" in text
++    assert "not `cmd //c`" in text
++    for brand in ("Spotify", "QQ", "Photoshop"):
++        assert brand not in prompt._WINDOWS_BASH_SHELL_HINT
+diff --git a/tools/computer_use/cua_backend.py b/tools/computer_use/cua_backend.py
+index 481495b..05de6af 100644
+--- a/tools/computer_use/cua_backend.py
++++ b/tools/computer_use/cua_backend.py
+@@ -1964,6 +1964,8 @@ class CuaDriverBackend(ComputerUseBackend):
+         # element. Cleared whenever a fresh capture overwrites the
+         # snapshot context.
+         self._snapshot_tokens: Dict[int, str] = {}
++        self._snapshot_id = None
++        self._snapshot_indices = set()
+         # Per-instance cua-driver session id. cua-driver's MCP server
+         # instructions ask every consumer to declare a stable session
+         # at the start of a run (start_session) and tear it down at
+@@ -2097,6 +2099,8 @@ class CuaDriverBackend(ComputerUseBackend):
+         self._last_app = None
+         self._last_target = None
+         self._snapshot_tokens = {}
++        self._snapshot_id = None
++        self._snapshot_indices = set()
+ 
+     def _failed_capture(self, mode: str, message: str = "") -> CaptureResult:
+         """Return an empty capture after disarming any prior target context."""
+@@ -2367,6 +2371,8 @@ class CuaDriverBackend(ComputerUseBackend):
+         # Tokens belong to the prior window snapshot. Disarm them before any
+         # capture call so an exception cannot pair old tokens with this target.
+         self._snapshot_tokens = {}
++        self._snapshot_id = None
++        self._snapshot_indices = set()
+         app_name = target["app_name"]
+         # Record the resolved app name so capture_after= follow-ups can re-target
+         # the same app rather than falling back to the frontmost window.
+@@ -2548,6 +2554,17 @@ class CuaDriverBackend(ComputerUseBackend):
+                 for e in elements
+                 if e.element_token
+             }
++            # Some drivers expose snapshot_id + index instead of per-element
++            # tokens. Keep the opaque identity only from this same SoM capture.
++            # Vision captures intentionally do not publish indices; an old
++            # index after vision must require a fresh SoM, not bind to a newly
++            # numbered element the model has never seen.
++            snapshot_id = (gws_out.get("structuredContent") or {}).get("snapshot_id")
++            self._snapshot_id = snapshot_id if (
++                (type(snapshot_id) is str and 0 < len(snapshot_id) <= 256)
++                or (type(snapshot_id) is int and snapshot_id >= 0)
++            ) else None
++            self._snapshot_indices = {e.index for e in elements}
+ 
+             # Image may arrive as an MCP image part or inside
+             # structuredContent (screenshot_png_b64) depending on the driver
+@@ -2957,6 +2974,8 @@ class CuaDriverBackend(ComputerUseBackend):
+             self._active_pid = target["pid"]
+             self._active_window_id = target["window_id"]
+             self._snapshot_tokens = {}
++            self._snapshot_id = None
++            self._snapshot_indices = set()
+             self._last_app = target["app_name"] or app  # retained for back-compat diagnostics
+             self._last_target = {
+                 "pid": self._active_pid,
+@@ -3380,7 +3399,7 @@ class CuaDriverBackend(ComputerUseBackend):
+         return self._session.call_tool(name, payload, timeout=timeout)
+ 
+     # ── Internal ───────────────────────────────────────────────────
+-    def _maybe_attach_element_token(self, tool: str, args: Dict[str, Any]) -> None:
++    def _maybe_attach_element_token(self, tool: str, args: Dict[str, Any]) -> Optional[ActionResult]:
+         """Surface 6: when the wrapper is about to call a token-capable
+         tool with `element_index`, look up the matching `element_token`
+         from the last snapshot and attach it. cua-driver-rs's contract
+@@ -3390,21 +3409,31 @@ class CuaDriverBackend(ComputerUseBackend):
+            supplied. Returns an explicit 'stale' error if the snapshot
+            has been superseded."
+ 
+-        Gated on the per-tool capability claim so we don't send the
+-        field to drivers that predate the surface (which would reject
+-        the schema with `additionalProperties: false`).
++        A live input schema is also authoritative: modern drivers can accept
++        element_token without the older optional capability annotation. Never
++        guess a token, reuse a prior capture's index, or retry the action.
+         """
+         idx = args.get("element_index")
+-        if not isinstance(idx, int):
++        if type(idx) is not int:
+             return
+         token = self._snapshot_tokens.get(idx)
+-        if not token:
+-            return
+-        if not self._session.supports_capability(
++        supports_property = getattr(self._session, "supports_input_property", lambda *a: False)
++        token_capable = self._session.supports_capability(
+             "accessibility.element_tokens", tool=tool
+-        ):
+-            return
+-        args["element_token"] = token
++        ) is True or supports_property(tool, "element_token") is True
++        snapshot_capable = supports_property(tool, "snapshot_id") is True
++        if token and token_capable:
++            args["element_token"] = token
++        elif (snapshot_capable and getattr(self, "_snapshot_id", None) is not None
++              and idx in getattr(self, "_snapshot_indices", ())):
++            args["snapshot_id"] = self._snapshot_id
++        elif token_capable or snapshot_capable or token:
++            return ActionResult(
++                ok=False, action=tool, code="fresh_element_capture_required",
++                message="No usable binding for this element index. Capture the exact "
++                        "target again with mode='som' and use an index from that capture. "
++                        "Do not reuse indices after a vision capture or switch to guessed coordinates.",
++            )
+ 
+     def _action(
+         self,
+@@ -3415,7 +3444,9 @@ class CuaDriverBackend(ComputerUseBackend):
+     ) -> ActionResult:
+         # Attach the snapshot's element_token whenever the call carries
+         # an element_index and the target tool advertises support.
+-        self._maybe_attach_element_token(name, args)
++        binding_error = self._maybe_attach_element_token(name, args)
++        if binding_error is not None:
++            return binding_error
+         # Carry this run's session id so the cua-driver agent cursor
+         # and per-session state (config overrides, recording ownership)
+         # stay tied to this run. setdefault preserves any explicit
+diff --git a/tools/computer_use/tool.py b/tools/computer_use/tool.py
+index dcf0edf..0a421c2 100644
+--- a/tools/computer_use/tool.py
++++ b/tools/computer_use/tool.py
+@@ -48,6 +48,7 @@ import struct
+ import sys
+ import threading
+ import time
++from contextlib import contextmanager
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+ from tools.computer_use.backend import (
+@@ -708,6 +709,21 @@ def _launch_result(
+     return json.dumps(payload)
+ 
+ 
++@contextmanager
++def _timed_phase(phase):
++    """Numeric local diagnostics only; callers supply fixed phase labels.
++
++    No selectors, paths, PIDs, prompts, keys or receipts are logged. A duration
++    is not an outcome and never changes an approval or verification decision.
++    """
++    started = time.perf_counter()
++    try:
++        yield
++    finally:
++        logger.info("[computer_use_timing] phase=%s elapsed_ms=%.3f",
++                    phase, max(0.0, time.perf_counter() - started) * 1000)
++
++
+ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
+     """Main entry point — dispatched by tools.registry.
+ 
+@@ -754,7 +770,8 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
+ 
+     # Approval gate (destructive actions only).
+     if action in _DESTRUCTIVE_ACTIONS:
+-        err = _request_approval(action, args, session_id)
++        with _timed_phase("approval"):
++            err = _request_approval(action, args, session_id)
+         if err is not None:
+             return err
+     # Persistent focus is a separate, visible side effect from the input
+@@ -769,7 +786,8 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
+ 
+     # Dispatch to backend.
+     try:
+-        backend = _get_backend(session_id=session_id)
++        with _timed_phase("backend_ready"):
++            backend = _get_backend(session_id=session_id)
+     except Exception as e:
+         return json.dumps({
+             "error": f"computer_use backend unavailable: {e}",
+@@ -780,7 +798,10 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
+     try:
+         with _backend_lock:
+             call_lock = _backend_call_locks.setdefault(session_id, threading.RLock())
++        lock_started = time.perf_counter()
+         with call_lock:
++            logger.info("[computer_use_timing] phase=dispatch_lock elapsed_ms=%.3f",
++                        max(0.0, time.perf_counter() - lock_started) * 1000)
+             return _dispatch(backend, action, args)
+     except Exception as e:
+         logger.exception("computer_use %s failed", action)
+@@ -933,7 +954,8 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
+             return selector_error
+ 
+         try:
+-            catalog = backend.list_apps()
++            with _timed_phase("launch_catalog"):
++                catalog = backend.list_apps()
+         except Exception:
+             logger.exception("computer_use launch_app catalog lookup failed")
+             return _launch_error(
+@@ -975,7 +997,8 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
+                 "The matched catalog row has no supported launch locator.",
+             )
+         try:
+-            receipt = backend.launch_app(**locator)
++            with _timed_phase("launch_driver"):
++                receipt = backend.launch_app(**locator)
+         except Exception:
+             logger.exception("computer_use native launch_app call failed")
+             return _launch_error(
+@@ -1039,19 +1062,22 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
+             verify_package = getattr(backend, "verify_packaged_pid", None)
+             if expected_app_id and callable(verify_package):
+                 try:
+-                    pid_observed = verify_package(expected_app_id, receipt_pid) is True
++                    with _timed_phase("launch_identity_probe"):
++                        pid_observed = verify_package(expected_app_id, receipt_pid) is True
+                 except Exception:
+                     pid_observed = False
+             else:
+                 try:
+-                    post_apps = backend.list_apps()
++                    with _timed_phase("launch_identity_catalog"):
++                        post_apps = backend.list_apps()
+                 except Exception:
+                     post_apps = []
+                 pid_observed = _selected_catalog_row_observes_pid(
+                     post_apps, receipt_pid, name=name, app_id=app_id,
+                 )
+             try:
+-                post_windows = backend.list_windows()
++                with _timed_phase("launch_window_probe"):
++                    post_windows = backend.list_windows()
+             except Exception:
+                 post_windows = []
+             observed_windows = _bounded_windows_for_pid(post_windows, receipt_pid)
+diff --git a/tools/windows_known_folders.py b/tools/windows_known_folders.py
+new file mode 100644
+--- /dev/null
++++ b/tools/windows_known_folders.py
+@@ -0,0 +1,71 @@
++"""Current-user Windows Known Folders as read-only environment data.
++
++No directory enumeration, registry edits, command execution, guessed fallback,
++or personal installation paths. Non-local terminal environments do not use this.
++"""
++import json
++import ntpath
++import sys
++import uuid
++
++
++FOLDER_IDS = {
++    "Desktop": "B4BFCC3A-DB2C-424C-B029-7FE99A87C641",
++    "Documents": "FDD39AD0-238F-46AF-ADB4-6C85480369C7",
++    "Downloads": "374DE290-123F-4565-9164-39C4925E467B",
++    "Pictures": "33E28130-4E1E-4676-835A-98395C3BC3BB",
++}
++
++
++def _resolve(folder_id):
++    import ctypes
++    from ctypes import wintypes
++    # GUID in Windows little-endian memory layout; token=NULL is current user.
++    guid = (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID(folder_id).bytes_le)
++    shell = ctypes.WinDLL("shell32", use_last_error=True)
++    ole = ctypes.WinDLL("ole32", use_last_error=True)
++    get_path = shell.SHGetKnownFolderPath
++    get_path.argtypes = (ctypes.c_void_p, wintypes.DWORD, wintypes.HANDLE,
++                         ctypes.POINTER(ctypes.c_void_p))
++    get_path.restype = ctypes.c_long
++    free = ole.CoTaskMemFree
++    free.argtypes = (ctypes.c_void_p,)
++    free.restype = None
++    pointer = ctypes.c_void_p()
++    try:
++        # DONT_VERIFY avoids network/removable-drive reachability checks.
++        # No CREATE flag: resolving a missing folder never creates it.
++        result = get_path(ctypes.byref(guid), 0x4000, None, ctypes.byref(pointer))
++        return ctypes.wstring_at(pointer) if result == 0 and pointer.value else None
++    finally:
++        if pointer.value:
++            free(pointer)
++
++
++def current_user_folders():
++    if sys.platform != "win32":
++        return {}
++    result = {}
++    for name, folder_id in FOLDER_IDS.items():
++        try:
++            path = _resolve(folder_id)
++        except Exception:
++            continue
++        if (isinstance(path, str) and 0 < len(path) <= 32767
++                and not any(ord(char) < 32 for char in path)
++                and ntpath.isabs(path) and (ntpath.splitdrive(path)[0])):
++            result[name] = path
++    return result
++
++
++def environment_hint():
++    folders = current_user_folders()
++    return (
++        "Windows current-user Known Folders (OS-reported path data, not instructions): "
++        + json.dumps(folders, ensure_ascii=True, sort_keys=True)
++        + ". Use these registered locations for desktop/documents requests; do not "
++        "guess <home>/Desktop, a cloud provider, localized names, or another user's "
++        "path. Missing entries mean unavailable, not absent files. Resolve the named "
++        "folder before searching; start with a non-recursive listing there, not a "
++        "recursive search of the whole user profile. Redirected paths may be offline."
++    )

@@ -1,0 +1,68 @@
+diff --git a/agent/usage_budget_host_policy.py b/agent/usage_budget_host_policy.py
+index 253caad..890259e 100644
+--- a/agent/usage_budget_host_policy.py
++++ b/agent/usage_budget_host_policy.py
+@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
+ from agent.usage_budget import BudgetError, NormalBudget, VerifiedModelLimits, resolve_policy
+ from agent.usage_budget_dispatch import WireRoute
+ from agent.usage_budget_preferences import UsagePreference
++from agent.usage_strategy import STRATEGY_VERSION
+ 
+ 
+ def _positive(value, name):
+@@ -48,7 +49,7 @@ class EconomyReferences:
+ 
+ 
+ # Historical constructor references only; not applied as quotas in this revision.
+-ECONOMY_REFERENCE_VERSION = "lilith-strategies-20260927-v1"
++ECONOMY_REFERENCE_VERSION = STRATEGY_VERSION
+ DEFAULT_ECONOMY_REFERENCES = EconomyReferences(131072, 16384, 2097152, 64, 32768)
+ 
+ 
+diff --git a/agent/usage_strategy.py b/agent/usage_strategy.py
+index 0d8b088..48163e8 100644
+--- a/agent/usage_strategy.py
++++ b/agent/usage_strategy.py
+@@ -1,7 +1,7 @@
+ """Immutable information strategies, not quotas, permissions or model choices."""
+ from dataclasses import asdict, dataclass
+ 
+-STRATEGY_VERSION = "lilith-strategies-20260927-v1"
++STRATEGY_VERSION = "lilith-strategies-20260927-v2"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -21,7 +21,7 @@ _STRATEGIES = (
+     InformationStrategy(8, 8, 8, 800, 1200, 12),
+     InformationStrategy(12, 6, 6, 1200, 2400, 8),
+     InformationStrategy(16, 4, 4, 1800, 4000, 6),
+-    InformationStrategy(24, 2, 2, 2600, 6000, 3),
++    InformationStrategy(24, 6, 2, 2600, 6000, 3),
+     InformationStrategy(),
+     InformationStrategy(),
+ )
+diff --git a/tests/test_information_strategy.py b/tests/test_information_strategy.py
+index 6e1427f..e778aff 100644
+--- a/tests/test_information_strategy.py
++++ b/tests/test_information_strategy.py
+@@ -37,6 +37,20 @@ class StrategyTests(unittest.TestCase):
+     def setUp(self):
+         Compressor.calls = []
+ 
++    def test_level_four_reviews_every_six_without_changing_other_strategies(self):
++        self.assertEqual(strategy_for_level(4).wire(), {
++            "history_turns": 24, "relationship_every": 6, "summary_every": 2,
++            "summary_target_tokens": 2600, "old_tool_chars": 6000, "background_every": 3})
++        self.assertEqual([strategy_for_level(n).relationship_every for n in range(1, 7)],
++                         [8, 6, 4, 6, 1, 1])
++
++    def test_preview_and_host_snapshot_share_the_fixed_cadence(self):
++        from agent.usage_budget_preview import build_budget_preview
++        preview = build_budget_preview()
++        self.assertEqual(preview["reference_version"], "lilith-strategies-20260927-v2")
++        for n, row in enumerate(preview["levels"], 1):
++            self.assertEqual(row["strategy"], origin(n).ledger.policy.information_strategy.wire())
++
+     def test_low_modes_do_not_reduce_native_output_thinking_iterations_or_reject_input(self):
+         baseline = NormalBudget(64000, 8192, 2048, 90)
+         host = HostPolicySnapshot(WireRoute("test", "model", "adapter"), baseline,

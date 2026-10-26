@@ -1,0 +1,111 @@
+{
+  "schema_version": 2,
+  "scope": "reference_preview",
+  "reference_version": "lilith-strategies-20261007-v4",
+  "input_count_mode": "native",
+  "memory_policy": "batch_relationship_keep_explicit_profile",
+  "levels": [
+    {
+      "level": 1,
+      "request_input_tokens": null,
+      "request_output_tokens": null,
+      "request_thinking_tokens": null,
+      "logical_iterations": null,
+      "turn_token_allowance": null,
+      "turn_actual_call_allowance": null,
+      "strategy": {
+        "history_turns": 6,
+        "relationship_every": 8,
+        "summary_every": 8,
+        "summary_target_tokens": 650,
+        "old_tool_chars": 1500,
+        "background_every": 12
+      }
+    },
+    {
+      "level": 2,
+      "request_input_tokens": null,
+      "request_output_tokens": null,
+      "request_thinking_tokens": null,
+      "logical_iterations": null,
+      "turn_token_allowance": null,
+      "turn_actual_call_allowance": null,
+      "strategy": {
+        "history_turns": 12,
+        "relationship_every": 8,
+        "summary_every": 4,
+        "summary_target_tokens": 1300,
+        "old_tool_chars": 3000,
+        "background_every": 6
+      }
+    },
+    {
+      "level": 3,
+      "request_input_tokens": null,
+      "request_output_tokens": null,
+      "request_thinking_tokens": null,
+      "logical_iterations": null,
+      "turn_token_allowance": null,
+      "turn_actual_call_allowance": null,
+      "strategy": {
+        "history_turns": 18,
+        "relationship_every": 8,
+        "summary_every": 3,
+        "summary_target_tokens": 1950,
+        "old_tool_chars": 4500,
+        "background_every": 4
+      }
+    },
+    {
+      "level": 4,
+      "request_input_tokens": null,
+      "request_output_tokens": null,
+      "request_thinking_tokens": null,
+      "logical_iterations": null,
+      "turn_token_allowance": null,
+      "turn_actual_call_allowance": null,
+      "strategy": {
+        "history_turns": 24,
+        "relationship_every": 6,
+        "summary_every": 2,
+        "summary_target_tokens": 2600,
+        "old_tool_chars": 6000,
+        "background_every": 3
+      }
+    },
+    {
+      "level": 5,
+      "request_input_tokens": null,
+      "request_output_tokens": null,
+      "request_thinking_tokens": null,
+      "logical_iterations": null,
+      "turn_token_allowance": null,
+      "turn_actual_call_allowance": null,
+      "strategy": {
+        "history_turns": 36,
+        "relationship_every": 3,
+        "summary_every": 2,
+        "summary_target_tokens": 3900,
+        "old_tool_chars": 9000,
+        "background_every": 3
+      }
+    },
+    {
+      "level": 6,
+      "request_input_tokens": null,
+      "request_output_tokens": null,
+      "request_thinking_tokens": null,
+      "logical_iterations": null,
+      "turn_token_allowance": null,
+      "turn_actual_call_allowance": null,
+      "strategy": {
+        "history_turns": 42,
+        "relationship_every": 1,
+        "summary_every": 2,
+        "summary_target_tokens": 4550,
+        "old_tool_chars": 10500,
+        "background_every": 3
+      }
+    }
+  ]
+}

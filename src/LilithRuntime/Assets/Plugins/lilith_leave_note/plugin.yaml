@@ -1,0 +1,6 @@
+name: lilith_leave_note
+version: 1.0.0
+kind: standalone
+description: "Leave a short illustrated Lilith note in the game's NoteInbox, with a verified local delivery receipt."
+provides_tools:
+  - lilith_leave_note

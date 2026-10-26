@@ -1,0 +1,790 @@
+diff --git a/agent/lilith_speech_segments.py b/agent/lilith_speech_segments.py
+new file mode 100644
+index 0000000..707cbfc
+--- /dev/null
++++ b/agent/lilith_speech_segments.py
+@@ -0,0 +1,82 @@
++"""Pure bounded sentence-first planning; no model, I/O or speech authority."""
++import unicodedata
++
++MAX_TEXT = 5000
++MAX_SEGMENTS = 64
++TARGET_CHARS = 80
++MAX_SEGMENT_CHARS = 120
++_CLOSERS = '\"\'\u300d\u300f\u3011\uff09)]\u201d\u2019'
++_SENTENCE = "\u3002\uff01\uff1f!?;\uff1b\n"
++_CLAUSE = ",\u3001\uff0c:\uff1a"
++
++
++def _attached(char):
++    return (unicodedata.category(char) in ("Mn", "Mc", "Me")
++            or char == "\u200d" or 0xfe00 <= ord(char) <= 0xfe0f
++            or 0xe0100 <= ord(char) <= 0xe01ef)
++
++
++def _safe_cut(text, index):
++    if index == len(text):
++        return True
++    left, right = text[index - 1], text[index]
++    if _attached(right) or left == "\u200d" or right in _CLOSERS:
++        return False
++    # Preserve ASCII words/identifiers and decimal/rate tokens. A token longer
++    # than the hard cap is rejected rather than sent oversized or dropped.
++    token = lambda c: c.isascii() and (c.isalnum() or c in "._/-:%+")
++    return not (token(left) and token(right))
++
++
++def split_speech_text(text):
++    """Retain all input characters, preferring sentences, then clauses/spaces.
++
++    The cap counts Unicode code points conservatively. Combining marks,
++    variation selectors and ZWJ sequences stay attached; no UTF-16 slicing.
++    All planning finishes before the first synthesis request.
++    """
++    if type(text) is not str or not text.strip() or len(text) > MAX_TEXT:
++        raise ValueError("Lilith speech text exceeds limit")
++    if any(unicodedata.category(char) == "Cs" for char in text):
++        raise ValueError("Lilith speech text contains invalid Unicode")
++    spoken_positions = [index for index, char in enumerate(text) if char.isalnum()]
++    if not spoken_positions:
++        raise ValueError("Lilith speech text has no spoken content")
++    segments = []
++    start = 0
++    while start < len(text):
++        if len(segments) >= MAX_SEGMENTS:
++            raise ValueError("Lilith speech segment count exceeds limit")
++        end = min(start + MAX_SEGMENT_CHARS, len(text))
++        if len(text) - start <= TARGET_CHARS:
++            segments.append(text[start:])
++            break
++        first_spoken = next(index for index in spoken_positions if index >= start)
++        safe, sentences, clauses, spaces = [], [], [], []
++        for index in range(start + 1, end + 1):
++            if not _safe_cut(text, index):
++                continue
++            # Never leave a punctuation-only or whitespace-only piece.
++            if first_spoken >= index:
++                continue
++            if index < len(text) and spoken_positions[-1] < index:
++                continue
++            safe.append(index)
++            tail = text[start:index].rstrip(_CLOSERS + " \t\r")
++            last = tail[-1] if tail else ""
++            if last in _SENTENCE or (last == "." and (index == len(text) or text[index].isspace())):
++                sentences.append(index)
++            elif last in _CLAUSE and not (index < len(text) and text[index].isdigit()):
++                clauses.append(index)
++            elif text[index - 1].isspace():
++                spaces.append(index)
++        choices = sentences or clauses or spaces or safe
++        if not choices:
++            raise ValueError("Lilith speech token exceeds segment limit")
++        early = [index for index in choices if index - start <= TARGET_CHARS]
++        cut = early[-1] if early else choices[0]
++        segments.append(text[start:cut])
++        start = cut
++    if "".join(segments) != text or any(len(part) > MAX_SEGMENT_CHARS for part in segments):
++        raise ValueError("Lilith speech segmentation is incomplete")
++    return segments
+diff --git a/agent/lilith_telegram_tts.py b/agent/lilith_telegram_tts.py
+index fdfedb9..d74b8bf 100644
+--- a/agent/lilith_telegram_tts.py
++++ b/agent/lilith_telegram_tts.py
+@@ -6,6 +6,7 @@ from functools import wraps
+ import http.client
+ import io
+ import json
++import logging
+ import os
+ from pathlib import Path
+ import stat
+@@ -21,6 +22,10 @@ from agent.tts_provider import TTSProvider
+ PROVIDER = "lilith_gpt_sovits"
+ ENVIRONMENT = "LILITH_TELEGRAM_VOICE_PROFILE"
+ MAX_AUDIO = 25 * 1024 * 1024
++SYNTHESIS_TIMEOUT = 120
++MAX_DURATION_SECONDS = 300
++SEGMENT_PAUSE_MS = 120
++logger = logging.getLogger(__name__)
+ _ACTIVE = ContextVar("lilith_telegram_tts", default=False)
+ _ALLOWED = ContextVar("lilith_telegram_tts_allowed", default=None)
+ _PROJECTOR = ContextVar("lilith_telegram_speech_projector", default=None)
+@@ -155,12 +160,56 @@ def _wav(data):
+                     or not 8000 <= rate <= 96000 or not 0 < count / rate <= 300
+                     or compression != "NONE"):
+                 raise ValueError()
+-            if len(wav.readframes(count)) != count * channels * width:
++            frames = wav.readframes(count)
++            if len(frames) != count * channels * width:
+                 raise ValueError()
++            return (channels, width, rate), count, frames
+     except (ValueError, wave.Error, EOFError):
+         raise ValueError("Lilith synthesis returned invalid WAV audio") from None
+ 
+ 
++class _PcmAssembly:
++    """One in-memory, size/duration-bounded output; no partial files."""
++    def __init__(self):
++        self.format = None
++        self.frames = 0
++        self.parts = []
++        self.first = None
++
++    def add(self, data):
++        format_, count, frames = _wav(data)
++        if self.format is not None and format_ != self.format:
++            raise ValueError("Lilith speech segments have different audio formats")
++        channels, width, rate = format_
++        gap = rate * SEGMENT_PAUSE_MS // 1000 if self.parts else 0
++        total = self.frames + gap + count
++        if total > rate * MAX_DURATION_SECONDS or total * channels * width + 44 > MAX_AUDIO:
++            raise ValueError("Lilith combined speech exceeds audio limit")
++        if not self.parts:
++            self.format, self.first = format_, data
++        if gap:
++            # 8-bit PCM is unsigned; larger PCM widths use signed zero.
++            silence = (b"\x80" if width == 1 else b"\x00" * width) * channels * gap
++            self.parts.append(silence)
++        self.parts.append(frames)
++        self.frames = total
++
++    def finish(self):
++        if not self.parts:
++            raise ValueError("Lilith speech has no audio")
++        if len(self.parts) == 1:
++            return self.first
++        output = io.BytesIO()
++        channels, width, rate = self.format
++        with wave.open(output, "wb") as wav:
++            wav.setparams((channels, width, rate, self.frames, "NONE", "not compressed"))
++            for frames in self.parts:
++                wav.writeframesraw(frames)
++        data = output.getvalue()
++        _wav(data)
++        return data
++
++
+ def validate_opus(path):
+     """Validate the bounded Ogg page/container and actual Opus identification.
+ 
+@@ -286,14 +335,19 @@ class LilithGptSovitsProvider(TTSProvider):
+         return {"name": self.display_name, "badge": "local", "tag": "Host-supplied Lilith voice", "env_vars": []}
+ 
+     def synthesize(self, text, output_path, **_options):
++        from agent.lilith_speech_segments import split_speech_text
+         profile = _PROFILE.get() if scoped() else read_snapshot()
+-        if (profile is None or (scoped() and not scope_permits_speech())
+-                or not selected_profile_is_current(profile)):
+-            raise ValueError("Lilith speech selection is no longer current")
+-        if Path(output_path).exists():
++
++        def ensure_current():
++            if (profile is None or (scoped() and not scope_permits_speech())
++                    or not selected_profile_is_current(profile)):
++                raise ValueError("Lilith speech selection is no longer current")
++
++        ensure_current()
++        destination = Path(output_path).with_suffix(".wav")
++        if Path(output_path).exists() or destination.exists():
+             raise ValueError("Lilith synthesis output already exists")
+-        if type(text) is not str or not text.strip() or len(text) > 5000:
+-            raise ValueError("Lilith speech text exceeds limit")
++        segments = split_speech_text(text)
+         for reference in [profile["reference_path"], *profile["aux_reference_paths"]]:
+             try:
+                 info = Path(reference).lstat()
+@@ -303,65 +357,78 @@ class LilithGptSovitsProvider(TTSProvider):
+             except OSError:
+                 raise ValueError("Lilith voice reference is unavailable") from None
+         url = urlsplit(profile["endpoint"])
+-        payload = json.dumps({
+-            "text": text, "text_lang": profile["locale"],
+-            "ref_audio_path": profile["reference_path"],
+-            "aux_ref_audio_paths": profile["aux_reference_paths"],
+-            "prompt_text": profile["prompt_text"], "prompt_lang": profile["locale"],
+-            "media_type": "wav", "streaming_mode": False,
+-            "text_split_method": "cut0", "batch_size": 1, "seed": 42,
+-        }, ensure_ascii=False).encode("utf-8")
+-        connection = http.client.HTTPConnection(url.hostname, url.port, timeout=120)
+-        # HTTPConnection connects directly to a numeric loopback address. It
+-        # has no proxy/environment handling and never follows redirects.
+-        try:
+-            deadline = time.monotonic() + 120
+-            connection.request("POST", "/tts", payload, {"Content-Type": "application/json"})
+-            if connection.sock:
+-                connection.sock.settimeout(max(0.1, deadline - time.monotonic()))
+-            response = connection.getresponse()
+-            if response.status != 200:
+-                raise ValueError("Lilith synthesis service rejected the request")
+-            length = response.getheader("Content-Length")
+-            if length and (not length.isdecimal() or not 44 <= int(length) <= MAX_AUDIO):
+-                raise ValueError("Lilith synthesis response exceeds limit")
+-            chunks = []
+-            total = 0
+-            while True:
+-                remaining = deadline - time.monotonic()
+-                if remaining <= 0:
+-                    raise TimeoutError()
++        deadline = time.monotonic() + SYNTHESIS_TIMEOUT
++        assembly = _PcmAssembly()
++        received = 0
++
++        def remaining_time():
++            ensure_current()
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise ValueError("Lilith synthesis exceeded its total deadline")
++            return remaining
++
++        for segment in segments:
++            remaining = remaining_time()
++            payload = json.dumps({
++                "text": segment, "text_lang": profile["locale"],
++                "ref_audio_path": profile["reference_path"],
++                "aux_ref_audio_paths": profile["aux_reference_paths"],
++                "prompt_text": profile["prompt_text"], "prompt_lang": profile["locale"],
++                "media_type": "wav", "streaming_mode": False,
++                # The host has already bounded the exact segment; do not ask
++                # the backend to merge or independently re-split the script.
++                "text_split_method": "cut0", "batch_size": 1, "seed": 42,
++            }, ensure_ascii=False).encode("utf-8")
++            # Direct numeric loopback, no redirects/proxies/environment. All
++            # segments share one deadline, not 120 seconds for each segment.
++            connection = http.client.HTTPConnection(url.hostname, url.port, timeout=remaining)
++            try:
++                connection.request("POST", "/tts", payload, {"Content-Type": "application/json"})
++                remaining = remaining_time()
+                 if connection.sock:
+                     connection.sock.settimeout(remaining)
+-                chunk = response.read1(min(65536, MAX_AUDIO + 1 - total))
+-                if not chunk:
+-                    break
+-                total += len(chunk)
+-                if total > MAX_AUDIO:
++                response = connection.getresponse()
++                if response.status != 200:
++                    raise ValueError("Lilith synthesis service rejected the request")
++                length = response.getheader("Content-Length")
++                if length and (not length.isdecimal() or not 44 <= int(length) <= MAX_AUDIO - received):
+                     raise ValueError("Lilith synthesis response exceeds limit")
+-                chunks.append(chunk)
+-            data = b"".join(chunks)
+-            _wav(data)
+-        except (OSError, http.client.HTTPException):
+-            raise ValueError("Lilith synthesis service is unavailable") from None
+-        finally:
+-            connection.close()
+-        if ((scoped() and not scope_permits_speech())
+-                or not selected_profile_is_current(profile)):
+-            raise ValueError("Lilith speech selection is no longer current")
+-        destination = Path(output_path).with_suffix(".wav")
+-        if destination.exists():
+-            raise ValueError("Lilith synthesis output already exists")
++                chunks = []
++                while True:
++                    remaining = remaining_time()
++                    if connection.sock:
++                        connection.sock.settimeout(remaining)
++                    chunk = response.read1(min(65536, MAX_AUDIO + 1 - received))
++                    if not chunk:
++                        break
++                    received += len(chunk)
++                    if received > MAX_AUDIO:
++                        raise ValueError("Lilith synthesis response exceeds limit")
++                    chunks.append(chunk)
++                remaining_time()
++                assembly.add(b"".join(chunks))
++            except (OSError, http.client.HTTPException):
++                raise ValueError("Lilith synthesis service is unavailable") from None
++            finally:
++                connection.close()
++        remaining_time()
++        data = assembly.finish()
++        remaining_time()
+         destination.parent.mkdir(parents=True, exist_ok=True)
+         fd, scratch = tempfile.mkstemp(prefix=".lilith-voice-", suffix=".tmp", dir=destination.parent)
+         created = False
+         try:
+             with os.fdopen(fd, "wb") as handle:
+                 handle.write(data)
++            remaining_time()
+             # Exclusive output creation cannot replace a user-supplied file.
+             with destination.open("xb") as handle:
+                 created = True
+                 handle.write(Path(scratch).read_bytes())
++            remaining_time()
++            logger.info("Lilith speech assembled: segments=%d, chars=%d, frames=%d, bytes=%d",
++                        len(segments), len(text), assembly.frames, len(data))
+             return str(destination)
+         except Exception:
+             if created:
+diff --git a/tests/gateway/test_lilith_bounded_speech.py b/tests/gateway/test_lilith_bounded_speech.py
+new file mode 100644
+index 0000000..da62629
+--- /dev/null
++++ b/tests/gateway/test_lilith_bounded_speech.py
+@@ -0,0 +1,320 @@
++"""Bounded synthetic scripts/PCM only; no real synthesis, messages or accounts."""
++import io
++import json
++from pathlib import Path
++import struct
++import threading
++from types import SimpleNamespace
++import wave
++
++import pytest
++
++from agent import lilith_telegram_tts as voice
++from tools import tts_text_normalize as normalize
++
++
++def pcm(value=1, *, rate=16000, width=2, channels=1, count=1600):
++    output = io.BytesIO()
++    with wave.open(output, "wb") as wav:
++        wav.setparams((channels, width, rate, 0, "NONE", "not compressed"))
++        wav.writeframes(value.to_bytes(width, "little") * channels * count)
++    return output.getvalue()
++
++
++@pytest.fixture
++def profile(tmp_path, monkeypatch):
++    reference = tmp_path / "reference.wav"
++    reference.write_bytes(pcm())
++    profile = dict(version=1, locale="ja", endpoint="http://127.0.0.1:9881/tts",
++                   reference_path=str(reference), aux_reference_paths=[], prompt_text="これは試験です。",
++                   config_fingerprint="A" * 64)
++    monkeypatch.setattr(voice, "read_snapshot", lambda: dict(profile))
++    return profile
++
++
++def http(monkeypatch, *, effect=None, payload=None):
++    requests, connections = [], []
++    class Connection:
++        sock = None
++        def __init__(self, host, port, timeout):
++            self.index, self.timeout, self.closed = len(connections), timeout, False
++            connections.append(self)
++        def request(self, method, target, body, headers):
++            assert method == "POST" and target == "/tts"
++            requests.append(json.loads(body))
++            if effect:
++                effect(self.index)
++        def getresponse(self):
++            data = payload(self.index) if payload else pcm(self.index + 1)
++            stream = io.BytesIO(data)
++            return SimpleNamespace(status=200, getheader=lambda _: str(len(data)), read1=stream.read)
++        def close(self):
++            self.closed = True
++    monkeypatch.setattr(voice.http.client, "HTTPConnection", Connection)
++    return requests, connections
++
++
++def script():
++    return " ".join(f"これは第{index}段の試験です。音声の順番と内容が保たれることを確認します。" for index in range(1, 9)) + " 最後まで届いたよ。"
++
++
++def test_provider_splits_long_script_and_keeps_tail(profile, tmp_path, monkeypatch):
++    requests, connections = http(monkeypatch)
++    text = script()
++    path = voice.LilithGptSovitsProvider().synthesize(text, str(tmp_path / "out.ogg"))
++    assert len(requests) > 1
++    assert all(0 < len(row["text"]) <= 120 for row in requests)
++    assert "".join(row["text"] for row in requests) == text
++    assert requests[-1]["text"].endswith("最後まで届いたよ。")
++    assert sum(row["text"].count("第3段") for row in requests) == 1
++    assert all(row["text_lang"] == row["prompt_lang"] == "ja" for row in requests)
++    assert all(row["ref_audio_path"] == profile["reference_path"] for row in requests)
++    assert all(row["text_split_method"] == "cut0" for row in requests)
++    assert all(row.closed and 0 < row.timeout <= 120 for row in connections)
++    with wave.open(path, "rb") as wav:
++        frames = wav.readframes(wav.getnframes())
++        expected = b"\x00\x00" * 1920
++        expected = expected.join((index + 1).to_bytes(2, "little") * 1600 for index in range(len(requests)))
++        assert frames == expected
++    assert list(tmp_path.glob("out*")) == [Path(path)]
++    assert not list(tmp_path.glob(".lilith-voice-*"))
++
++
++@pytest.mark.parametrize("raw,expected", [
++    ("受け取ったよ。\n\n私も愛してる。", "受け取ったよ。 私も愛してる。"),
++    ("你好。\n\n我也愛你。", "你好。 我也愛你。"),
++    ("好了！\n可以嗎？", "好了！ 可以嗎？"),
++    ("收到。．\n聽到了。.", "收到。 聽到了。"),
++    ("今日は18°Cです。\n降水確率は1%です。", "今日は18°Cです。 降水確率は1%です。"),
++    ("**測試**\n- 下一句\n最後一句", "測試。 下一句。 最後一句。"),
++    ("「おやすみ。」\n『また明日！』", "「おやすみ。」 『また明日！』"),
++    ("第一段——這裡停頓——繼續。", "第一段、這裡停頓、繼續。"),
++    ("數值3.14。\n省略...", "數值3.14。 省略..."),
++])
++def test_cjk_normalization_preserves_language(raw, expected):
++    assert normalize.prepare_spoken_text(raw, max_chars=None, cjk=True) == expected
++
++
++def test_default_normalizer_keeps_existing_english_behavior():
++    assert normalize.prepare_spoken_text("Hello\nWorld") == "Hello. World."
++    assert "degrees Celsius" in normalize.prepare_spoken_text("18°C")
++
++
++@pytest.mark.parametrize("text", [
++    script(), "あ" * 300, "はい。" * 90, "他說：「測試，還有下一句。」" * 30,
++    ("Cafe\u0301 3.14% 18°C. 次の文です。 " * 20),
++    ("は\u3099" * 170), "你好！怎麼了？我在這裡。" * 30,
++    "這是長句，先看第一部分，再接第二部分，最後應該完整結束。" * 20,
++    "測試" * 51 + " A_B/C-D:3.14% " + "繼續" * 130,
++    " ".join(f"token{index}" for index in range(250)),
++])
++def test_segmenter_exact_coverage_and_unicode(text):
++    from agent.lilith_speech_segments import split_speech_text, MAX_SEGMENT_CHARS
++    segments = split_speech_text(text)
++    assert "".join(segments) == text
++    assert all(0 < len(part) <= MAX_SEGMENT_CHARS and any(c.isalnum() for c in part) for part in segments)
++    assert all(not part.startswith(("\u0301", "\u3099", "\ufe0f", "\u200d")) for part in segments)
++    if "3.14%" in text:
++        assert sum(part.count("3.14%") for part in segments) == text.count("3.14%")
++
++
++def test_segmenter_prefers_sentence_boundaries_and_retains_quotes():
++    from agent.lilith_speech_segments import split_speech_text
++    text = "最初の説明です。" * 9 + "「最後の説明です。」" * 9
++    parts = split_speech_text(text)
++    assert all(part.endswith(("。", "」")) for part in parts)
++    assert all(not part.startswith("」") for part in parts)
++
++
++@pytest.mark.parametrize("text", ["", "   ", "。！？", "測試" * 2501, "A" * 121, "あ" + "\u3099" * 130, "bad\ud800text"])
++def test_invalid_plan_has_zero_requests(profile, tmp_path, monkeypatch, text):
++    requests, _ = http(monkeypatch)
++    with pytest.raises(ValueError):
++        voice.LilithGptSovitsProvider().synthesize(text, str(tmp_path / "out.ogg"))
++    assert requests == []
++    assert not list(tmp_path.glob("out*"))
++
++
++@pytest.mark.parametrize("reason", ["cancel", "off", "locale", "timeout", "http"])
++def test_midway_failure_never_creates_partial_output(profile, tmp_path, monkeypatch, reason):
++    current, allowed, timer = dict(profile), [True], [0.0]
++    cancellation = threading.Event()
++    monkeypatch.setattr(voice, "read_snapshot", lambda: dict(current))
++    monkeypatch.setattr(voice.time, "monotonic", lambda: timer[0])
++    token = voice._CANCELLED.set(cancellation)
++    def effect(index):
++        if index != 1:
++            return
++        if reason == "cancel": cancellation.set()
++        elif reason == "off": allowed[0] = False
++        elif reason == "locale": current["locale"] = "zh"
++        elif reason == "timeout": timer[0] = 121
++        else: raise TimeoutError()
++    requests, connections = http(monkeypatch, effect=effect)
++    try:
++        with voice.voice_scope(profile=profile, allowed=lambda: allowed[0]):
++            with pytest.raises(ValueError):
++                voice.LilithGptSovitsProvider().synthesize(script(), str(tmp_path / "out.ogg"))
++    finally:
++        voice._CANCELLED.reset(token)
++    assert len(requests) == 2 and all(row.closed for row in connections)
++    assert not list(tmp_path.glob("out*"))
++    assert not list(tmp_path.glob(".lilith-voice-*"))
++
++
++def test_deadline_is_shared_between_segments(profile, tmp_path, monkeypatch):
++    timer = [0.0]
++    monkeypatch.setattr(voice.time, "monotonic", lambda: timer[0])
++    def effect(index): timer[0] += 30
++    requests, connections = http(monkeypatch, effect=effect)
++    with pytest.raises(ValueError, match="deadline"):
++        voice.LilithGptSovitsProvider().synthesize(script(), str(tmp_path / "out.ogg"))
++    assert [row.timeout for row in connections] == [120, 90, 60, 30]
++    assert not (tmp_path / "out.wav").exists()
++
++
++@pytest.mark.parametrize("fault", ["format", "corrupt", "truncated"])
++def test_bad_later_wav_discards_earlier_segments(profile, tmp_path, monkeypatch, fault):
++    def payload(index):
++        if index == 0: return pcm()
++        return {"format": pcm(rate=22050), "corrupt": b"bad", "truncated": pcm()[:-3]}[fault]
++    requests, connections = http(monkeypatch, payload=payload)
++    with pytest.raises(ValueError):
++        voice.LilithGptSovitsProvider().synthesize(script(), str(tmp_path / "out.ogg"))
++    assert len(requests) == 2 and all(row.closed for row in connections)
++    assert not (tmp_path / "out.wav").exists()
++
++
++@pytest.mark.parametrize("width,channels", [(1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (4, 2)])
++def test_pcm_joins_all_frames_and_correct_silence(width, channels):
++    assembly = voice._PcmAssembly()
++    assembly.add(pcm(1, width=width, channels=channels))
++    assembly.add(pcm(2, width=width, channels=channels))
++    with wave.open(io.BytesIO(assembly.finish()), "rb") as wav:
++        expected = (1).to_bytes(width, "little") * channels * 1600
++        expected += (b"\x80" if width == 1 else b"\0" * width) * channels * 1920
++        expected += (2).to_bytes(width, "little") * channels * 1600
++        assert wav.readframes(wav.getnframes()) == expected
++
++
++def test_short_synthesis_preserves_exact_original_wav(profile, tmp_path, monkeypatch):
++    original = pcm(17)
++    requests, _ = http(monkeypatch, payload=lambda _: original)
++    path = voice.LilithGptSovitsProvider().synthesize("短い試験です。", str(tmp_path / "out.ogg"))
++    assert Path(path).read_bytes() == original and len(requests) == 1
++
++
++@pytest.mark.parametrize("limit", ["bytes", "duration"])
++def test_aggregate_limits_include_every_segment_and_pause(profile, tmp_path, monkeypatch, limit):
++    if limit == "bytes": monkeypatch.setattr(voice, "MAX_AUDIO", len(pcm()) * 2 + 100)
++    else: monkeypatch.setattr(voice, "MAX_DURATION_SECONDS", .25)
++    requests, _ = http(monkeypatch)
++    with pytest.raises(ValueError, match="limit"):
++        voice.LilithGptSovitsProvider().synthesize(script(), str(tmp_path / "out.ogg"))
++    assert len(requests) == 2
++    assert not (tmp_path / "out.wav").exists()
++
++
++@pytest.mark.parametrize("suffix", [".ogg", ".wav"])
++def test_existing_destination_blocks_before_first_request(profile, tmp_path, monkeypatch, suffix):
++    existing = tmp_path / ("out" + suffix)
++    existing.write_bytes(b"preserve")
++    requests, _ = http(monkeypatch)
++    with pytest.raises(ValueError):
++        voice.LilithGptSovitsProvider().synthesize(script(), str(tmp_path / "out.ogg"))
++    assert existing.read_bytes() == b"preserve" and requests == []
++
++
++def test_native_tool_normalizes_after_one_projection_and_returns_one_file(profile, tmp_path, monkeypatch):
++    from tools import tts_tool
++    from agent import tts_registry
++    import hermes_cli.plugins
++    from tests.gateway.test_lilith_telegram_voice import ogg_bytes
++    requests, _ = http(monkeypatch)
++    projections, conversions = [], []
++    monkeypatch.setattr(tts_registry, "get_provider", lambda _: voice.LilithGptSovitsProvider())
++    monkeypatch.setattr(hermes_cli.plugins, "_ensure_plugins_discovered", lambda **_: None)
++    def project(text, selected):
++        projections.append((text, selected["locale"]))
++        return "受け取ったよ。\n\n" + script() + "\n\nこれは18°C、1%の試験です。"
++    def convert(path):
++        conversions.append(Path(path).read_bytes())
++        output = Path(path).with_suffix(".ogg")
++        output.write_bytes(ogg_bytes())
++        return str(output)
++    monkeypatch.setattr(tts_tool, "_convert_to_opus", convert)
++    def no_generic_packing(*args, **kwargs):
++        pytest.fail("Lilith speech must not be split into separately delivered files")
++    monkeypatch.setattr(tts_tool, "_build_audio_delivery_files", no_generic_packing)
++    with voice.voice_scope(profile=profile, projector=project):
++        result = json.loads(tts_tool.text_to_speech_tool("原本中文", str(tmp_path / "result.ogg"), provider="edge"))
++    assert result["success"] is True and result["voice_compatible"]
++    assert projections == [("原本中文", "ja")] and len(conversions) == 1
++    prepared = "".join(row["text"] for row in requests)
++    assert "。." not in prepared and "degrees" not in prepared and "percent" not in prepared
++    assert prepared.endswith("これは18°C、1%の試験です。")
++    assert result["file_paths"] == [result["file_path"]]
++    assert not (tmp_path / "result.wav").exists()
++
++
++def test_total_text_limit_is_not_reset_by_generic_chunking(profile, tmp_path, monkeypatch):
++    from tools import tts_tool
++    requests, _ = http(monkeypatch)
++    with voice.voice_scope(profile=profile, projector=lambda *_: "日本語。" * 1500):
++        result = json.loads(tts_tool.text_to_speech_tool("原文", str(tmp_path / "out.ogg")))
++    assert result["success"] is False and requests == []
++    assert not list(tmp_path.glob("out*"))
++
++
++def test_tool_does_not_add_ascii_periods_to_japanese(profile, tmp_path, monkeypatch):
++    from tools import tts_tool
++    from agent import tts_registry
++    import hermes_cli.plugins
++    from tests.gateway.test_lilith_telegram_voice import ogg_bytes
++    requests, _ = http(monkeypatch)
++    monkeypatch.setattr(tts_registry, "get_provider", lambda _: voice.LilithGptSovitsProvider())
++    monkeypatch.setattr(hermes_cli.plugins, "_ensure_plugins_discovered", lambda **_: None)
++    def convert(path):
++        output = Path(path).with_suffix(".ogg")
++        output.write_bytes(ogg_bytes())
++        return str(output)
++    monkeypatch.setattr(tts_tool, "_convert_to_opus", convert)
++    monkeypatch.setattr(tts_tool, "_build_audio_delivery_files", lambda paths, *_a, **_k: (list(paths), False))
++    with voice.voice_scope(profile=profile, projector=lambda *_: "受け取ったよ。\n\n私も愛してる。"):
++        result = json.loads(tts_tool.text_to_speech_tool("原文", str(tmp_path / "out.ogg")))
++    assert result["success"] is True
++    assert "".join(row["text"] for row in requests) == "受け取ったよ。 私も愛してる。"
++
++
++def test_segment_count_limit_precedes_http(profile, tmp_path, monkeypatch):
++    from agent import lilith_speech_segments as planner
++    monkeypatch.setattr(planner, "MAX_SEGMENTS", 2)
++    requests, _ = http(monkeypatch)
++    with pytest.raises(ValueError, match="count"):
++        voice.LilithGptSovitsProvider().synthesize(script(), str(tmp_path / "out.ogg"))
++    assert requests == []
++
++
++def test_profile_change_during_final_write_removes_owned_output(profile, tmp_path, monkeypatch):
++    http(monkeypatch)
++    original = Path.open
++    def open_then_change(path, *args, **kwargs):
++        handle = original(path, *args, **kwargs)
++        if path.name == "out.wav" and args and args[0] == "xb":
++            monkeypatch.setattr(voice, "read_snapshot", lambda: {**profile, "locale": "zh"})
++        return handle
++    monkeypatch.setattr(Path, "open", open_then_change)
++    with pytest.raises(ValueError, match="current"):
++        voice.LilithGptSovitsProvider().synthesize(script(), str(tmp_path / "out.ogg"))
++    assert not list(tmp_path.glob("out*"))
++    assert not list(tmp_path.glob(".lilith-voice-*"))
++
++
++def test_chinese_voice_selection_is_preserved_across_segments(profile, tmp_path, monkeypatch):
++    profile.update(locale="zh", endpoint="http://127.0.0.1:9880/tts")
++    requests, _ = http(monkeypatch)
++    text = "今天是文字與語音順序的測試，這段之後還有下一段。" * 15
++    voice.LilithGptSovitsProvider().synthesize(text, str(tmp_path / "out.ogg"))
++    assert len(requests) > 1
++    assert all(row["text_lang"] == row["prompt_lang"] == "zh" for row in requests)
++    assert "".join(row["text"] for row in requests) == text
+diff --git a/tests/gateway/test_lilith_telegram_voice.py b/tests/gateway/test_lilith_telegram_voice.py
+index eb16ea7..c85165a 100644
+--- a/tests/gateway/test_lilith_telegram_voice.py
++++ b/tests/gateway/test_lilith_telegram_voice.py
+@@ -142,7 +142,7 @@ def test_provider_uses_fixed_local_profile(profile, tmp_path, monkeypatch):
+     result = voice.LilithGptSovitsProvider().synthesize("這是測試。", str(tmp_path / "out.ogg"), voice="wrong", model="wrong")
+     assert Path(result).suffix == ".wav"
+     voice._wav(Path(result).read_bytes())
+-    assert seen[0] == ("127.0.0.1", 9880, 120)
++    assert seen[0][:2] == ("127.0.0.1", 9880) and 0 < seen[0][2] <= 120
+     assert seen[1][0:2] == ("POST", "/tts")
+     assert seen[1][2]["ref_audio_path"] == profile["reference_path"]
+     assert seen[1][2]["prompt_text"] == profile["prompt_text"]
+@@ -712,14 +712,14 @@ def test_native_tool_projects_once_before_chunking_with_fixed_selected_voice(pro
+     projections = []
+     def project(text, selected):
+         projections.append((text, selected["locale"]))
+-        return "日本語。" * 2600
++        return "日本語。" * 100
+     with voice.voice_scope(projector=project):
+         result = json.loads(tts_tool.text_to_speech_tool("原本的中文。", str(tmp_path / "long.ogg")))
+     assert result["success"] is True
+     assert projections == [("原本的中文。", "ja")]
+     payloads = [item[2] for item in seen if isinstance(item, tuple) and item[0] == "POST"]
+     assert len(payloads) >= 2 and all(row["text_lang"] == row["prompt_lang"] == "ja" for row in payloads)
+-    assert "".join(row["text"] for row in payloads) == "日本語。" * 2600
++    assert "".join(row["text"] for row in payloads) == "日本語。" * 100
+     assert all("中文" not in row["text"] for row in payloads)
+ 
+ 
+diff --git a/tools/tts_text_normalize.py b/tools/tts_text_normalize.py
+index 5693e74..19eb1ad 100644
+--- a/tools/tts_text_normalize.py
++++ b/tools/tts_text_normalize.py
+@@ -258,7 +258,33 @@ def flatten_newlines_for_payload(text: str) -> str:
+     return text.strip()
+ 
+ 
+-def prepare_spoken_text(text: str, max_chars: int | None = 4000) -> str:
++def _prepare_cjk_spoken_text(text: str) -> str:
++    """Preserve the already translated script for the host-selected CJK voice.
++
++    Do not expand units into English or add ASCII periods after CJK punctuation.
++    This opt-in path does not change normalization for other native providers.
++    """
++    text = _VARIATION_SELECTOR_RE.sub("", text)
++    text = _EMOJI_RE.sub("", text)
++    text = re.sub(r"[\u00a0\u2007\u202f]", " ", text)
++    # Recognize artifacts produced by the previous newline smoother. Preserve
++    # decimals and genuine ellipses; only remove one redundant terminal dot.
++    text = re.sub(r"([\u3002\uff01\uff1f])[ \t]*[.\uff0e](?=\s|$)", r"\1", text)
++    text = re.sub(r"[\u2014\u2013]{2,}", "\u3001", text)
++    lines = []
++    for raw in text.splitlines():
++        heading = raw.rstrip().endswith(_HEAD)
++        line = re.sub(r"[ \t]+", " ", raw.replace(_HEAD, "")).strip()
++        if not line:
++            continue
++        tail = line.rstrip('\"\'\u300d\u300f\u3011\uff09)]\u201d\u2019')
++        if tail and tail[-1] not in ".!?;:,\u3002\uff01\uff1f\uff1b\uff1a\u3001\uff0c\u2026":
++            line += "\u3001" if heading else "\u3002"
++        lines.append(line)
++    return " ".join(lines)
++
++
++def prepare_spoken_text(text: str, max_chars: int | None = 4000, *, cjk: bool = False) -> str:
+     """Return a TTS-friendly script from assistant text.
+ 
+     Deterministic cleanup, not a semantic rewrite: it removes ``<think>``
+@@ -270,9 +296,12 @@ def prepare_spoken_text(text: str, max_chars: int | None = 4000) -> str:
+     """
+     spoken = strip_nonspoken_blocks(text)
+     spoken = strip_markdown_for_tts(spoken)
+-    spoken = normalize_symbols_for_tts(spoken)
+-    spoken = smooth_whitespace_for_tts(spoken)
+-    spoken = flatten_newlines_for_payload(spoken)
++    if cjk:
++        spoken = _prepare_cjk_spoken_text(spoken)
++    else:
++        spoken = normalize_symbols_for_tts(spoken)
++        spoken = smooth_whitespace_for_tts(spoken)
++        spoken = flatten_newlines_for_payload(spoken)
+     if max_chars is not None and max_chars > 0 and len(spoken) > max_chars:
+         spoken = spoken[:max_chars].rstrip()
+     return spoken
+diff --git a/tools/tts_tool.py b/tools/tts_tool.py
+index 615a943..79372a9 100644
+--- a/tools/tts_tool.py
++++ b/tools/tts_tool.py
+@@ -3825,18 +3825,22 @@ def text_to_speech_tool(
+     if not text or not text.strip():
+         return tool_error("Text is required", success=False)
+ 
+-    # Normalize text via the shared cleaner: markdown, emoji, think blocks,
+-    # verifier footer, units, newline flattening.
++    from agent.lilith_telegram_tts import PROVIDER, scoped, scope_permits_speech
++    lilith_voice = scoped() or (isinstance(provider, str) and provider.lower().strip() == PROVIDER)
++    # Lilith receives an already translated CJK script. Keep its units and
++    # punctuation in that language instead of applying English expansions.
+     try:
+         from tools.tts_text_normalize import prepare_spoken_text
+-        text = prepare_spoken_text(text, max_chars=None)
++        text = (prepare_spoken_text(text, max_chars=None, cjk=True) if lilith_voice
++                else prepare_spoken_text(text, max_chars=None))
+     except Exception:
++        if lilith_voice:
++            return tool_error("Lilith speech text preparation failed", success=False)
+         text = text.strip()
+     if not text:
+         return tool_error("Text is empty after TTS cleanup", success=False)
+ 
+     tts_config = _load_tts_config()
+-    from agent.lilith_telegram_tts import PROVIDER, scoped, scope_permits_speech
+     if scoped():
+         if not scope_permits_speech():
+             return tool_error("Lilith voice is disabled for the current chat", success=False)
+@@ -3857,7 +3861,15 @@ def text_to_speech_tool(
+ 
+     command_provider_config = _resolve_command_provider_config(provider, tts_config)
+     max_len = _resolve_max_text_length(provider, tts_config)
+-    chunks = _split_text_for_tts(text, max_len)
++    if provider == PROVIDER:
++        from agent.lilith_speech_segments import MAX_TEXT
++        if len(text) > MAX_TEXT:
++            return tool_error("Lilith speech text exceeds limit", success=False)
++        # One provider operation owns every synthesis segment and its total
++        # budget. Generic packing must not create independent partial replies.
++        chunks = [text]
++    else:
++        chunks = _split_text_for_tts(text, max_len)
+     if not chunks:
+         return tool_error("Text is required", success=False)
+     if len(chunks) > 1:
+@@ -3973,7 +3985,9 @@ def text_to_speech_tool(
+             bool(result.get("voice_compatible")) for result in chunk_results
+         )
+         delivery_base = base_path.with_suffix(Path(encoded_paths[0]).suffix)
+-        if provider == "sapi":
++        if provider == PROVIDER:
++            final_paths, combined_chunks = [encoded_paths[0]], False
++        elif provider == "sapi":
+             final_paths, combined_chunks = _build_sapi_wav_delivery_files(
+                 encoded_paths,
+                 str(delivery_base),

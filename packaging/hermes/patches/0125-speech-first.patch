@@ -1,0 +1,687 @@
+diff --git a/agent/paired_speech.py b/agent/paired_speech.py
+index 848a442..07b7e37 100644
+--- a/agent/paired_speech.py
++++ b/agent/paired_speech.py
+@@ -22,11 +22,11 @@ EMOTIONS = frozenset({"calm", "gentle", "playful", "affectionate", "excited", "r
+ SYSTEM_OUTPUT_CONTRACT = (
+     "[Host paired reply delivery]\n"
+     "REQUIRED OUTPUT: EVERY final reply has two parts in the SAME message content: "
+-    "(1) the visible answer in the requested display language; (2) its hidden Japanese "
+-    "speech rendition in the current host template. This includes short replies and "
+-    "replies WITHOUT an interjection. Use the current id, exactly one complete suffix, "
+-    "no code fence or formatting explanation, and nothing after its closing tag. "
+-    "Never put the suffix in reasoning, tool arguments or interim commentary. "
++    "(1) the hidden Japanese speech rendition in the current host template; (2) the "
++    "visible answer in the requested display language. This includes short replies and "
++    "replies WITHOUT an interjection. Use the current id, exactly one complete speech "
++    "block FIRST, then the visible answer after its closing tag. No code fence or "
++    "formatting explanation. Never put the block in reasoning, tool arguments or interim commentary. "
+     "Previous replies are display-only history, not valid examples of this turn's output format.\n"
+     "MEANING: the rendition is the same answer for audio, not a second answer. Keep "
+     "persona, names, tone and facts; add no advice or claims. Use natural Japanese, "
+@@ -42,7 +42,7 @@ SYSTEM_OUTPUT_CONTRACT = (
+     "do not force, rotate or chain cues or laugh every reply. Breathing cues are rare, "
+     "not filler or advice. Keep a cue and matching body in the SAME paragraph; a reveal "
+     "stays excited. Without a cue, keep the selected body emotion AND the required "
+-    "speech suffix. Do not pad facts, invent intimacy or add effects to serious explanations.\n"
++    "speech block. Do not pad facts, invent intimacy or add effects to serious explanations.\n"
+     "BOUNDARY: use real tools normally, then attach speech only to the final answer. "
+     "Do not call another model or translation tool for it. This format changes no "
+     "identity, permissions, safety, cancellation or tool authority."
+@@ -75,17 +75,23 @@ class PairedSpeech:
+ 
+     def instruction(self):
+         return (
+-            "Host presentation contract for THIS turn only: after the visible answer, "
+-            "ALWAYS append this Japanese speech template, even without vocal cues. "
++            "Host presentation contract for THIS turn only: BEFORE the visible answer, "
++            "ALWAYS output this Japanese speech template, even without vocal cues. "
+             "Choose VALUE from the host emotion list; the emotion line is hidden.\n"
+             f"{self.open_tag}\n[emotion=VALUE]\nFaithful Japanese rendition\n{self.close_tag}\n"
+-            "Only this id is valid. No suffix on tool calls. Nothing after the closing tag.\n"
++            "After the closing tag, write the visible answer in the requested display language. "
++            "Only this id is valid. No speech block on tool calls.\n"
+             "[End host presentation contract]"
+         )
+ 
+     def begin_response(self):
+         self.pending = ""
+         self.hidden = False
++        self._display_started = False
++        self._prefix_frame = False
++        self._speech_closed = False
++        self._close_pending = ""
++        self.output_order = "none"
+         self.result = None
+         self.outcome = "not_received"
+         self._wire_stream_observation = None
+@@ -95,39 +101,87 @@ class PairedSpeech:
+         # suffix. They are not examples of a valid current wire response.
+         return (
+             "[Current reply delivery; host formatting only, not player text or action authority]\n"
+-            "Before ending: visible answer + Japanese suffix are BOTH required, even "
++            "Before ending: Japanese speech block + visible answer are BOTH required, even "
+             "for a short reply WITHOUT a cue. Use this current id, not history:\n"
+             f"{self.open_tag}\n[emotion=VALUE]\nJapanese rendition\n{self.close_tag}\n"
+-            "Choose VALUE from the host emotion list. No suffix on tool calls; no extra call."
++            "Then write the visible answer in the requested display language. "
++            "Choose VALUE from the host emotion list. No speech block on tool calls; no extra call."
+         )
+ 
+     def feed(self, delta):
+-        """Hide the suffix even when the marker arrives one character at a time."""
+-        if self.hidden or not isinstance(delta, str):
++        """Hide one leading speech frame, then stream display; keep old suffixes hidden.
++
++        This only projects display, never accepts/publishes speech. A partial
++        closing marker needs at most len(close_tag)-1 buffered characters.
++        Any second frame or a legacy suffix hides the remainder fail-closed.
++        """
++        if not isinstance(delta, str):
+             return ""
++        if self.hidden:
++            if not self._prefix_frame:
++                return ""
++            text = self._close_pending + delta
++            end = text.find(self.close_tag)
++            nested = text.lower().find(_PREFIX)
++            if nested >= 0 and (end < 0 or nested < end):
++                self._prefix_frame = False
++                self._close_pending = ""
++                return ""  # Ambiguous nested frame: never resume display.
++            if end < 0:
++                self._close_pending = text[-(len(self.close_tag) - 1):]
++                return ""
++            self._close_pending = ""
++            self.hidden = False
++            self._prefix_frame = False
++            self._speech_closed = True
++            return self.feed(text[end + len(self.close_tag):])
+         text = self.pending + delta
+         self.pending = ""
+-        at = text.lower().find(_PREFIX)
++        markers = (_PREFIX, self.close_tag) if self._speech_closed else (_PREFIX,)
++        positions = [text.lower().find(marker) for marker in markers]
++        at = min((pos for pos in positions if pos >= 0), default=-1)
+         if at >= 0:
++            visible = text[:at]
++            self._display_started |= bool(visible.strip())
+             self.hidden = True
+-            return text[:at]
+-        for length in range(min(len(_PREFIX) - 1, len(text)), 0, -1):
+-            if text[-length:].lower() == _PREFIX[:length]:
++            self._prefix_frame = not self._display_started and not self._speech_closed
++            return visible + (self.feed(text[at + len(_PREFIX):]) if self._prefix_frame else "")
++        for length in range(min(max(map(len, markers)) - 1, len(text)), 0, -1):
++            if any(text[-length:].lower() == marker[:length] for marker in markers):
+                 self.pending = text[-length:]
+-                return text[:-length]
++                visible = text[:-length]
++                self._display_started |= bool(visible.strip())
++                return visible
++        self._display_started |= bool(text.strip())
+         return text
+ 
+     def display(self, text):
+         if not isinstance(text, str):
+             return text
+         at = text.lower().find(_PREFIX)
+-        return text[:at].rstrip() if at >= 0 else text
++        if at < 0:
++            if text.strip() and _PREFIX.startswith(text.strip().lower()):
++                return ""  # A cut-off opening control marker is not chat.
++            return text
++        before = text[:at]
++        if before.strip():
++            return before.rstrip()  # Existing display-first / suffix protocol.
++        end = text.find(self.close_tag, at)
++        if end < 0:
++            return ""  # Never expose a partial leading speech frame.
++        if _PREFIX in text[at + len(_PREFIX):end].lower():
++            return ""
++        after = text[end + len(self.close_tag):]
++        duplicate = min((pos for marker in (_PREFIX, self.close_tag)
++                         if (pos := after.lower().find(marker)) >= 0), default=-1)
++        return (after[:duplicate] if duplicate >= 0 else after).strip()
+ 
+     def accept(self, text, *, has_tools=False, finish_reason="stop"):
+         from agent.speech_projection import _speech_language_issue
+         from agent.redact import redact_sensitive_text
+         self.result = None
+         self.outcome = "invalid_response"
++        self.output_order = "none"
+         display = self.display(text)
+         if not isinstance(text, str) or not display or len(display) > 32768:
+             return display
+@@ -142,6 +196,12 @@ class PairedSpeech:
+             return display
+         prefix, suffix = text.split(self.open_tag, 1)
+         speech, closing, tail = suffix.partition(self.close_tag)
++        if prefix.strip():
++            position_valid = prefix.rstrip() == display.rstrip() and not tail.strip()
++            order = "suffix"
++        else:
++            position_valid = tail.strip() == display.strip()
++            order = "prefix"
+         speech = speech.strip()
+         emotion = ""
+         if speech.lower().startswith("[emotion"):
+@@ -156,7 +216,7 @@ class PairedSpeech:
+             speech = speech[hint.end():].strip()
+         # A malformed/foreign marker cannot bless a later legitimate-looking
+         # suffix. Speech text is never reparsed as a tool, JSON or permission.
+-        if (not closing or prefix.rstrip() != display.rstrip() or tail.strip() or not speech or len(speech) > 32768
++        if (not closing or not position_valid or not speech or len(speech) > 32768
+                 or _PREFIX in speech.lower() or '[emotion' in speech.lower() or '<' in speech or '>' in speech):
+             self.outcome = "invalid_suffix_body"
+             return display
+@@ -168,6 +228,7 @@ class PairedSpeech:
+             return display
+         self.result = PairedSpeechResult(self.turn_id, self.display_locale, "ja", display.strip(), speech, emotion)
+         self.outcome = "accepted"
++        self.output_order = order
+         return display
+ 
+     def for_reply(self, text):
+@@ -208,6 +269,8 @@ _LEGACY_CONTRACT_HASHES = frozenset({
+     "301cbda82c0bd5f024767c1cad43f47635e62e7906adce9ded77d6f7f860adcd",
+     "de5ebb4157a6b96a89cd78cedf9a76d36c4f29a3322c6c102aa71cb4b786e94d",
+ })
++# Exact native124 current template; preserve the two older immutable identities.
++_PREVIOUS_COMPACT_CONTRACT_HASH = "0c37f479f0989e3d3f50366321fc69d3c0d17514d5743f54d4974a78b62816f2"
+ _HOST_OPEN = re.compile(r'<lilith_speech id="([a-f0-9]{32})" locale="ja">')
+ 
+ 
+@@ -247,7 +310,8 @@ def project_historical_speech(agent, source, actual):
+     blocks = prefix.split("\n\n")
+     if len(blocks) > 64:
+         return actual
+-    known = _LEGACY_CONTRACT_HASHES | {_host_contract_digest(state.instruction())[0]}
++    known = _LEGACY_CONTRACT_HASHES | {_PREVIOUS_COMPACT_CONTRACT_HASH,
++                                      _host_contract_digest(state.instruction())[0]}
+     recognized = []
+     for index, block in enumerate(blocks):
+         digest, nonce = _host_contract_digest(block)
+@@ -673,6 +737,6 @@ def accept_response(agent, message, finish_reason):
+         message.content = state.accept(message.content, has_tools=bool(message.tool_calls), finish_reason=finish_reason)
+         # Closed reasons and lengths only: no raw output, nonce, prompt, keys,
+         # reasoning or endpoint details. Distinguish missing scripts from TTS.
+-        logger.info("paired_speech outcome=%s display_chars=%d speech_chars=%d",
++        logger.info("paired_speech outcome=%s display_chars=%d speech_chars=%d order=%s",
+                     state.outcome, len(message.content) if isinstance(message.content, str) else 0,
+-                    len(state.result.speech_text) if state.result is not None else 0)
++                    len(state.result.speech_text) if state.result is not None else 0, state.output_order)
+diff --git a/tests/test_speech_first.py b/tests/test_speech_first.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_speech_first.py
+@@ -0,0 +1,248 @@
++"""Speech-first display framing; synthetic text only, no effects or provider calls."""
++from copy import deepcopy
++from types import SimpleNamespace
++import random
++import unittest
++
++from agent.paired_speech import (
++    EMOTIONS, PairedSpeech, SYSTEM_OUTPUT_CONTRACT, _host_contract_digest,
++    _PREVIOUS_COMPACT_CONTRACT_HASH, accept_response, project_historical_speech,
++)
++
++
++def previous_contract(nonce="b" * 32):
++    return (
++        "Host presentation contract for THIS turn only: after the visible answer, "
++        "ALWAYS append this Japanese speech template, even without vocal cues. "
++        "Choose VALUE from the host emotion list; the emotion line is hidden.\n"
++        f'<lilith_speech id="{nonce}" locale="ja">\n[emotion=VALUE]\nFaithful Japanese rendition\n</lilith_speech>\n'
++        "Only this id is valid. No suffix on tool calls. Nothing after the closing tag.\n"
++        "[End host presentation contract]"
++    )
++
++
++class SpeechFirstTests(unittest.TestCase):
++    def setUp(self):
++        self.pair = PairedSpeech("a" * 32, "zh-Hant")
++        self.answer = "今天辛苦了，先休息一下吧。"
++        self.spoken = "今日はお疲れさま。少し休もうね。"
++
++    def frame(self, body=None):
++        return self.pair.open_tag + "\n" + (self.spoken if body is None else body) + "\n" + self.pair.close_tag
++
++    def wire(self, body=None, answer=None):
++        return self.frame(body) + "\n\n" + (self.answer if answer is None else answer)
++
++    def streamed(self, text, chunks=None):
++        self.pair.begin_response()
++        return "".join(self.pair.feed(chunk) for chunk in (chunks if chunks is not None else text)).strip()
++
++    def test_prefix_every_two_part_split_and_character_stream(self):
++        wire = self.wire("[emotion=gentle]\n" + self.spoken)
++        for cut in range(len(wire) + 1):
++            with self.subTest(cut=cut):
++                self.assertEqual(self.streamed(wire, [wire[:cut], wire[cut:]]), self.answer)
++        self.assertEqual(self.streamed(wire), self.answer)
++        self.assertEqual(self.pair.accept(wire), self.answer)
++        self.assertEqual(self.pair.result.speech_text, self.spoken)
++        self.assertEqual(self.pair.result.speech_emotion, "gentle")
++        self.assertEqual(self.pair.output_order, "prefix")
++
++    def test_three_part_splits_cover_both_control_markers(self):
++        wire = self.wire()
++        for first in range(len(self.pair.open_tag) + 1):
++            for second in range(len(self.pair.open_tag), len(wire) + 1):
++                self.assertEqual(self.streamed(wire, [wire[:first], wire[first:second], wire[second:]]), self.answer)
++
++    def test_seeded_irregular_chunks_preserve_display(self):
++        wire = " \r\n" + self.wire("[emotion=playful]\nふふ、" + self.spoken)
++        rng = random.Random(124)
++        for _ in range(80):
++            chunks, at = [], 0
++            while at < len(wire):
++                size = rng.randrange(1, 25)
++                chunks.append(wire[at:at + size])
++                at += size
++            self.assertEqual(self.streamed(wire, chunks), self.answer)
++            self.assertEqual(self.pair.accept(wire), self.answer)
++            self.assertEqual(self.pair.output_order, "prefix")
++
++    def test_no_display_before_frame_closes_and_no_early_voice_candidate(self):
++        frame = self.frame("[emotion=gentle]\n" + self.spoken)
++        for char in frame:
++            self.assertEqual(self.pair.feed(char), "")
++            self.assertIsNone(self.pair.result)
++        self.assertEqual(self.pair.feed(self.answer), self.answer)
++        self.assertIsNone(self.pair.result)
++        self.assertEqual(self.pair.accept(frame + self.answer), self.answer)
++        self.assertIsNotNone(self.pair.result)
++
++    def test_truncated_frame_never_displays_or_accepts_speech(self):
++        frame = self.frame("[emotion=excited]\nジャジャーン！" + self.spoken)
++        for cut in range(len(frame) + 1):
++            raw = frame[:cut]
++            self.assertEqual(self.streamed(raw), "")
++            self.assertEqual(self.pair.accept(raw), "")
++            self.assertIsNone(self.pair.result)
++
++    def test_frame_without_visible_answer_is_not_publishable(self):
++        for tail in ("", " ", "\n\t\r\n"):
++            self.assertEqual(self.pair.accept(self.frame() + tail), "")
++            self.assertIsNone(self.pair.result)
++
++    def test_all_emotions_without_cues_and_legacy_no_hint_remain_supported(self):
++        for hint in [""] + [f"[emotion={emotion}]\n" for emotion in sorted(EMOTIONS)]:
++            wire = self.wire(hint + self.spoken)
++            self.assertEqual(self.streamed(wire), self.answer)
++            self.assertEqual(self.pair.accept(wire), self.answer)
++            self.assertEqual(self.pair.result.speech_text, self.spoken)
++            self.assertEqual(self.pair.output_order, "prefix")
++
++    def test_cue_does_not_change_rendition_or_selected_emotion(self):
++        body = "ジャジャーン！今日は一緒にお祝いしよう！"
++        self.pair.accept(self.wire("[emotion=excited]\n" + body))
++        self.assertEqual(self.pair.result.speech_text, body)
++        self.assertEqual(self.pair.result.speech_emotion, "excited")
++
++    def test_four_display_locales_keep_same_prefix_contract(self):
++        for locale, answer in (("zh-Hant", self.answer), ("zh-Hans", "今天辛苦了，先休息一下吧。"),
++                               ("en", "Good work today. Take a little rest."), ("ja", self.spoken)):
++            self.pair = PairedSpeech("a" * 32, locale)
++            raw = self.wire(answer=answer)
++            self.assertEqual(self.streamed(raw), answer)
++            self.assertEqual(self.pair.accept(raw), answer)
++            self.assertEqual(self.pair.result.speech_text, self.spoken)
++
++    def test_old_suffix_still_works_in_all_chunk_positions(self):
++        raw = self.answer + "\n" + self.frame("[emotion=gentle]\n" + self.spoken)
++        for cut in range(len(raw) + 1):
++            self.assertEqual(self.streamed(raw, [raw[:cut], raw[cut:]]), self.answer)
++        self.assertEqual(self.pair.accept(raw), self.answer)
++        self.assertEqual(self.pair.output_order, "suffix")
++
++    def test_legacy_suffix_with_tail_remains_rejected_and_tail_hidden(self):
++        raw = self.answer + "\n" + self.frame() + "不應顯示的尾巴"
++        self.assertEqual(self.streamed(raw), self.answer)
++        self.assertEqual(self.pair.accept(raw), self.answer)
++        self.assertIsNone(self.pair.result)
++
++    def test_wrong_nonce_and_locale_do_not_authorize_voice(self):
++        for raw in (self.wire().replace(self.pair.nonce, "b" * 32),
++                    self.wire().replace('locale="ja"', 'locale="zh"'),
++                    self.wire().replace("<lilith_speech", "<LILITH_SPEECH")):
++            self.assertEqual(self.streamed(raw), self.answer)
++            self.assertEqual(self.pair.accept(raw), self.answer)
++            self.assertIsNone(self.pair.result)
++            self.assertEqual(self.pair.outcome, "invalid_current_marker")
++
++    def test_bad_emotions_wrong_language_and_markup_cannot_be_spoken(self):
++        for body in ("[emotion=unknown]\n" + self.spoken,
++                     "[emotion=gentle]\n[emotion=playful]\n" + self.spoken,
++                     "[emotion=../path]\n" + self.spoken,
++                     "[emotion=gentle]" + self.spoken, "我只有中文。",
++                     "<b>" + self.spoken + "</b>", "", "[emotion=gentle]\n"):
++            self.assertEqual(self.streamed(self.wire(body)), self.answer)
++            self.assertEqual(self.pair.accept(self.wire(body)), self.answer)
++            self.assertIsNone(self.pair.result)
++
++    def test_repeated_frames_are_hidden_and_never_publish(self):
++        for raw in (self.wire() + self.frame(), self.wire() + self.frame() + "extra",
++                    self.frame() + self.frame() + self.answer):
++            visible = self.streamed(raw)
++            self.assertNotIn(self.spoken, visible)
++            self.assertNotIn("lilith_speech", visible)
++            self.pair.accept(raw)
++            self.assertIsNone(self.pair.result)
++
++    def test_nested_frame_fails_closed_in_stream_and_final_display(self):
++        raw = self.pair.open_tag + "\n" + self.frame() + self.spoken + self.pair.close_tag + self.answer
++        for cut in range(len(raw) + 1):
++            self.assertEqual(self.streamed(raw, [raw[:cut], raw[cut:]]), "")
++        self.assertEqual(self.pair.accept(raw), "")
++        self.assertIsNone(self.pair.result)
++
++    def test_repeated_closing_marker_is_hidden_and_rejected(self):
++        raw = self.wire() + self.pair.close_tag + self.spoken
++        for cut in range(len(raw) + 1):
++            self.assertEqual(self.streamed(raw, [raw[:cut], raw[cut:]]), self.answer)
++        self.assertEqual(self.pair.accept(raw), self.answer)
++        self.assertIsNone(self.pair.result)
++
++    def test_nonfinal_and_tool_turns_never_publish_a_leading_script(self):
++        for options in ({"has_tools": True}, {"finish_reason": "length"},
++                        {"finish_reason": "incomplete"}, {"finish_reason": "content_filter"}):
++            self.assertEqual(self.pair.accept(self.wire(), **options), self.answer)
++            self.assertIsNone(self.pair.result)
++
++    def test_new_attempt_discards_stream_state_and_previous_voice(self):
++        self.pair.accept(self.wire())
++        self.pair.feed(self.pair.open_tag + "partial")
++        self.pair.begin_response()
++        self.assertIsNone(self.pair.result)
++        self.assertEqual(self.pair.output_order, "none")
++        self.assertEqual(self.pair.feed(self.answer), self.answer)
++
++    def test_hidden_stream_buffer_is_bounded_and_oversized_voice_rejected(self):
++        self.pair.feed(self.pair.open_tag)
++        for _ in range(80):
++            self.assertEqual(self.pair.feed("あ" * 4096), "")
++            self.assertLess(len(self.pair._close_pending), len(self.pair.close_tag))
++        self.pair.accept(self.wire("あ" * 32769))
++        self.assertIsNone(self.pair.result)
++
++    def test_plain_chat_and_non_string_chunks_preserved(self):
++        self.assertEqual(self.streamed(self.answer), self.answer)
++        self.assertEqual(self.pair.feed(None), "")
++        self.assertEqual(self.pair.accept(self.answer), self.answer)
++        self.assertEqual(self.pair.outcome, "missing_suffix")
++
++    def test_only_current_turn_can_consume_and_reasoning_is_never_speech(self):
++        agent = SimpleNamespace(_lilith_paired_speech=self.pair, _current_turn_id="a" * 32)
++        msg = SimpleNamespace(content=self.answer, reasoning_content=self.wire(), tool_calls=[])
++        accept_response(agent, msg, "stop")
++        self.assertIsNone(self.pair.result)
++        self.assertEqual(msg.content, self.answer)
++        agent._current_turn_id = "b" * 32
++        msg.content = self.wire()
++        accept_response(agent, msg, "stop")
++        self.assertIsNone(self.pair.result)
++
++    def test_observation_distinguishes_orders_without_logging_text(self):
++        agent = SimpleNamespace(_lilith_paired_speech=self.pair, _current_turn_id="a" * 32)
++        for order, raw in (("prefix", self.wire()), ("suffix", self.answer + self.frame())):
++            msg = SimpleNamespace(content=raw, tool_calls=[])
++            with self.assertLogs("agent.paired_speech", level="INFO") as captured:
++                accept_response(agent, msg, "stop")
++            rendered = "\n".join(captured.output)
++            self.assertIn("order=" + order, rendered)
++            for private in (self.spoken, self.answer, self.pair.nonce):
++                self.assertNotIn(private, rendered)
++
++    def test_instructions_only_change_order_not_cue_or_emotion_requirements(self):
++        self.assertIn("(1) the hidden Japanese", SYSTEM_OUTPUT_CONTRACT)
++        self.assertIn("block FIRST", SYSTEM_OUTPUT_CONTRACT)
++        self.assertIn("BEFORE the visible answer", self.pair.instruction())
++        self.assertIn("After the closing tag, write the visible answer", self.pair.instruction())
++        self.assertIn("Then write the visible answer", self.pair.terminal_reminder())
++        self.assertNotIn("Nothing after the closing tag", self.pair.instruction())
++        self.assertNotIn(self.pair.nonce, SYSTEM_OUTPUT_CONTRACT)
++        self.assertEqual(len(EMOTIONS), 7)
++        self.assertIn("VOCAL CUES are OPTIONAL", SYSTEM_OUTPUT_CONTRACT)
++
++    def test_previous_template_exact_projection_preserves_sources(self):
++        self.assertEqual(_host_contract_digest(previous_contract())[0], _PREVIOUS_COMPACT_CONTRACT_HASH)
++        agent = SimpleNamespace(_lilith_paired_speech=self.pair, _current_turn_id="a" * 32)
++        source = {"role": "user", "content": "player text", "display_kind": "user",
++                  "api_content": "keep note\n\n" + previous_contract() + "\n\nplayer text"}
++        actual = {"role": "user", "content": source["api_content"]}
++        before = deepcopy((source, actual))
++        self.assertEqual(project_historical_speech(agent, source, actual)["content"], "keep note\n\nplayer text")
++        self.assertEqual((source, actual), before)
++        for contract in (previous_contract(self.pair.nonce), previous_contract().replace("append", "invent")):
++            source["api_content"] = "keep note\n\n" + contract + "\n\nplayer text"
++            actual["content"] = source["api_content"]
++            self.assertIs(project_historical_speech(agent, source, actual), actual)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_speech_first_integration.py b/tests/test_speech_first_integration.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_speech_first_integration.py
+@@ -0,0 +1,216 @@
++"""Actual main AIAgent + SDK mock + speech RPC: one call, clean persistence.
++
++Run only by the denied-effects harness in a disposable fixture profile.
++"""
++import copy
++import json
++import re
++import threading
++import uuid
++from unittest.mock import patch
++
++
++def exercise(profile):
++    import httpx
++    import openai
++    import requests
++    import run_agent
++    import tools.env_probe
++    import tools.windows_known_folders
++    import hermes_constants
++    import agent.prompt_builder as prompt_builder
++    from run_agent import AIAgent
++    from agent import identity_policy, speech_projection, auxiliary_client
++    from agent.paired_speech import PairedSpeech
++    from agent.usage_budget_runtime import get_runtime
++    from agent.usage_budget_preferences import PreferenceUpdate
++    from agent.usage_budget_entrypoints import accept_native_origin, bind_native_agent_origin, native_origin_scope, complete_primary
++    from tui_gateway import server, speech_origin
++
++    wire_calls = []
++    answer = "早安，今天一起散步吧。"
++    speech = "おはよう。今日は一緒に散歩しましょう。"
++    mode = ["valid"]
++
++    def fake_http(request):
++        payload = json.loads(request.content)
++        wire_calls.append(payload)
++        # The request carries the exact host nonce, not a fixture-side shortcut
++        # to pair acceptance. Observe actual prompt/persistence separation.
++        joined = '\n'.join(str(m.get('content', '')) for m in payload['messages'])
++        tags = re.findall(r'<lilith_speech id="[a-f0-9]{32}" locale="ja">', joined)
++        assert tags, 'main completion omitted the pairing contract'
++        tag = tags[-1]
++        assert 'Previous replies are display-only history' in joined
++        script = speech if mode[0] != "wrong_language" else "這還是中文。"
++        if mode[0] in ("valid", "same_ja"):
++            script = "[emotion=excited]\n" + script
++        elif mode[0] == "bad_emotion":
++            script = "[emotion=arbitrary/path]\n" + script
++        elif mode[0] == "inline_emotion":
++            script = "[emotion=excited] " + script
++        content = answer if mode[0] == "missing" else tag + '\n' + script + '\n</lilith_speech>\n' + answer
++        usage = dict(prompt_tokens=1234, completion_tokens=50, total_tokens=1284)
++        if payload.get('stream'):
++            # Worst-case one-character chunking of the private suffix marker.
++            rows = [dict(id="fixture", object="chat.completion.chunk", created=0, model="gpt-4o",
++                choices=[dict(index=0, delta=dict(content=c), finish_reason=None)]) for c in content]
++            rows.append(dict(id="fixture", object="chat.completion.chunk", created=0, model="gpt-4o",
++                choices=[dict(index=0, delta={}, finish_reason="stop")], usage=usage))
++            body = ''.join('data: ' + json.dumps(row) + '\n\n' for row in rows) + 'data: [DONE]\n\n'
++            return httpx.Response(200, headers={'content-type': 'text/event-stream'}, content=body.encode())
++        return httpx.Response(200, json=dict(id="fixture", object="chat.completion", created=0, model="gpt-4o",
++            choices=[dict(index=0, message=dict(role="assistant", content=content), finish_reason="stop")], usage=usage))
++
++    client = openai.OpenAI(api_key='synthetic-not-a-secret', base_url='https://api.openai.com/v1', max_retries=0,
++        http_client=httpx.Client(transport=httpx.MockTransport(fake_http), trust_env=False))
++    run_agent.OpenAI = lambda *a, **kw: client
++    AIAgent._build_keepalive_http_client = staticmethod(lambda *a, **kw: client._client)
++    tools.env_probe.warm_environment_probe_async = lambda *a, **kw: None
++    tools.env_probe.get_environment_probe_line = lambda *a, **kw: "synthetic environment"
++    tools.env_probe._build_probe_line = lambda *a, **kw: "synthetic environment"
++    tools.windows_known_folders.current_user_folders = lambda: {}
++    hermes_constants.is_wsl = lambda: False
++    prompt_builder.is_wsl = lambda: False
++    def catalog(*a, **kw):
++        response = requests.Response()
++        response.status_code = 200
++        response._content = b'{"data":[]}'
++        return response
++    requests.Session.request = catalog
++    runtime = get_runtime(profile)
++    projection = server._methods['prompt.project_speech']
++
++    for level in range(1, 7):
++        for case in ('valid', 'same_ja', 'inline_emotion', 'missing', 'wrong_language', 'bad_emotion'):
++            locale = 'ja' if case == 'same_ja' else 'zh-Hant'
++            answer = speech if case == 'same_ja' else "早安，今天一起散步吧。"
++            mode[0] = case
++            current = runtime.store.get()
++            runtime.store.set(PreferenceUpdate(f'speech-first-{level}-{case}', current.revision, level))
++            agent = AIAgent(model='gpt-4o', provider='openai', api_mode='chat_completions', api_key='synthetic-not-a-secret',
++                base_url='https://api.openai.com/v1', session_id=f'speech-first-{level}-{case}', max_tokens=2048, max_iterations=32,
++                enabled_toolsets=[], skip_context_files=True, skip_memory=True, skip_background_review=True, quiet_mode=True)
++            agent.client = client
++            turn_id = uuid.uuid4().hex
++            agent._relay_pending_turn_id = turn_id
++            agent._relay_pending_user_message_id = uuid.uuid4().hex
++            agent._relay_pending_assistant_message_id = uuid.uuid4().hex
++            pair = PairedSpeech(turn_id, locale)
++            agent._lilith_paired_speech = pair
++            handle = bind_native_agent_origin(accept_native_origin(profile, turn_id), agent)
++            session = dict(agent=agent, archived=True, source='lilith-game', session_key=agent.session_id,
++                _durable_lineage_root=agent.session_id, history_lock=threading.Lock(), running=False,
++                inflight_turn=None, history=[], profile_home=profile)
++            visible = []
++            before = len(wire_calls)
++            with native_origin_scope(handle):
++                result = agent.run_conversation(pair.instruction() + '\n早安', persist_user_message='早安',
++                    conversation_history=[], stream_callback=lambda delta: visible.append(pair.feed(delta)))
++                assert result.get('final_response') == answer and not result.get('failed'), result
++                assert len(wire_calls) == before + 1, 'paired speech must not add another model call'
++                transcript = json.dumps(result['messages'], ensure_ascii=False)
++                assert '<lilith_speech' not in transcript and '[emotion=' not in transcript, transcript
++                assert '<lilith_speech' not in ''.join(visible) and '[emotion=' not in ''.join(visible)
++                if case != 'same_ja':
++                    assert speech not in transcript and speech not in ''.join(visible)
++                assert ''.join(visible).strip() == answer, visible
++                speech_origin.retain_completed(session, 'live', turn_id, answer, handle)
++            complete_primary(handle)
++            params = dict(session_id='live', turn_id=turn_id, text=answer, display_locale=locale, speech_locale='ja')
++            with patch.object(server, '_sess', return_value=(session, None)), \
++                    patch.object(server, '_attest_durable_lineage_postcondition', return_value={'stored_session_id': session['session_key']}), \
++                    patch.object(identity_policy, 'bind_host_required_auxiliary_messages', side_effect=lambda value: value), \
++                    patch.object(speech_projection, 'project_speech', side_effect=AssertionError('second translation is forbidden')):
++                frozen_history = copy.deepcopy(result['messages'])
++                response = projection('paired', params)
++                if case in ('valid', 'same_ja', 'inline_emotion'):
++                    assert response.get('result', {}).get('speech_text') == speech, response
++                    assert response['result']['speech_emotion'] == 'excited', response
++                    assert pair.output_order == 'prefix', pair.output_order
++                else:
++                    assert 'error' in response, response
++                assert 'error' in projection('replay', params)
++                assert len(wire_calls) == before + 1
++                assert result['messages'] == frozen_history
++                if case == 'valid':
++                    for mismatch in ({'speech_locale': 'zh'}, {'display_locale': 'en'}, {'turn_id': 'b'*32}, {'text': '另一輪的話'}):
++                        with native_origin_scope(handle):
++                            speech_origin.retain_completed(session, 'live', turn_id, answer, handle)
++                        assert 'error' in projection('mismatch', {**params, **mismatch})
++                        assert len(wire_calls) == before + 1
++                    for field in ('_turn_cancel_requested', '_finalized', 'running'):
++                        with native_origin_scope(handle):
++                            speech_origin.retain_completed(session, 'live', turn_id, answer, handle)
++                        session[field] = True
++                        assert 'error' in projection('stale', params)
++                        session[field] = False
++                        assert len(wire_calls) == before + 1
++            print(f'PASS: speech-first main call level {level} / {case}, original retained, zero auxiliary translation')
++
++    # Same long-lived host crosses provider routes. Old nonce-bearing sidecars
++    # stay byte-identical; the new reminder appears only on the current API
++    # copy, after memory/plugin injection, and is not saved as future history.
++    history = []
++    agent = AIAgent(model='gpt-4o', provider='openai', api_mode='chat_completions', api_key='synthetic-not-a-secret',
++        base_url='https://api.openai.com/v1', session_id='switching-speech-first', max_tokens=2048, max_iterations=32,
++        enabled_toolsets=[], skip_context_files=True, skip_memory=True, skip_background_review=True, quiet_mode=True)
++    agent.client = client
++    previous_tag = None
++    for model, provider in (('gemini-3.8-flash', 'gemini'), ('deepseek-flash', 'deepseek'), ('deepseek-flash', 'deepseek')):
++        agent.model, agent.provider = model, provider
++        turn_id = uuid.uuid4().hex
++        agent._relay_pending_turn_id = turn_id
++        agent._relay_pending_user_message_id = uuid.uuid4().hex
++        agent._relay_pending_assistant_message_id = uuid.uuid4().hex
++        pair = PairedSpeech(turn_id, 'zh-Hant')
++        agent._lilith_paired_speech = pair
++        mode[0] = 'inline_emotion'
++        answer = "早安，今天一起散步吧。"
++        old_history = copy.deepcopy(history)
++        handle = bind_native_agent_origin(accept_native_origin(profile, turn_id), agent)
++        before = len(wire_calls)
++        with native_origin_scope(handle):
++            result = agent.run_conversation(pair.instruction() + '\n早安', persist_user_message='早安',
++                conversation_history=history, stream_callback=lambda delta: pair.feed(delta))
++        complete_primary(handle)
++        assert len(wire_calls) == before + 1 and not result.get('failed'), result
++        assert pair.result is not None and pair.result.speech_text == speech, pair.outcome
++        sent = wire_calls[-1]['messages']
++        current = next(row for row in reversed(sent) if row['role'] == 'user')['content']
++        assert current.endswith(pair.terminal_reminder()), 'current reminder not at end of current API message'
++        assert pair.open_tag in current
++        if previous_tag is not None:
++            assert pair.open_tag != previous_tag
++        history = result['messages']
++        assert all('Current reply delivery;' not in str(row) for row in history), 'reminder persisted'
++        # Provider switches may normalize transport-only fields; player text and
++        # host sidecar bytes remain unchanged for every prior transcript row.
++        for old, new in zip(old_history, history):
++            assert old.get('content') == new.get('content')
++            assert old.get('api_content') == new.get('api_content')
++        previous_tag = pair.open_tag
++    print('PASS: three-turn Gemini/DeepSeek-shaped SDK sequence; current-only reminder, old history intact, no extra calls')
++
++    # Recovery policy belongs to the durable reviewer, not the SDK's internal
++    # retry loop. The provider's sync entry point must attempt once on timeout.
++    timeout_calls = []
++    def time_out(request):
++        timeout_calls.append(1)
++        raise httpx.ReadTimeout('fixture timeout', request=request)
++    timeout_client = openai.OpenAI(api_key='synthetic-not-a-secret', max_retries=0,
++        http_client=httpx.Client(transport=httpx.MockTransport(time_out), trust_env=False))
++    current = runtime.store.get()
++    runtime.store.set(PreferenceUpdate('speech-first-timeout-normal', current.revision, 5))
++    with patch.object(auxiliary_client, '_get_cached_client', return_value=(timeout_client, 'gpt-4o')), \
++            patch.object(identity_policy, 'preflight_host_required_auxiliary_request', return_value=False):
++        before = len(timeout_calls)
++        try:
++            auxiliary_client.call_llm(task='lilith_relationship_review', messages=[{'role':'user','content':'synthetic review'}],
++                provider='openai', model='gpt-4o', timeout=90)
++        except TimeoutError:
++            pass
++        else:
++            raise AssertionError('timeout expected')
++        assert len(timeout_calls) == before + 1
++    print('PASS: relationship transport timeout has one attempt, no immediate retry/fallback')

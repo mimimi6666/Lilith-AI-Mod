@@ -1,0 +1,1688 @@
+<Window x:Class="LilithControlCenter.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:LilithControlCenter"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
+        Title="Lilith Control Center"
+        Width="1240" Height="820" MinWidth="1040" MinHeight="700"
+        WindowStartupLocation="CenterScreen"
+        WindowStyle="None" ResizeMode="CanResize"
+        Background="{DynamicResource WindowBrush}"
+        Icon="Assets/lilith-control-center-icon.ico">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter"/>
+    </Window.Resources>
+
+    <shell:WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="58" ResizeBorderThickness="7"
+                            CornerRadius="14" GlassFrameThickness="0"
+                            UseAeroCaptionButtons="False"/>
+    </shell:WindowChrome.WindowChrome>
+
+    <Border Background="{DynamicResource WindowBrush}" BorderBrush="{DynamicResource WindowBorderBrush}"
+            BorderThickness="1" CornerRadius="14" ClipToBounds="True">
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="222"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Shared navigation templates own icons and selection state. -->
+            <Border Background="{DynamicResource RailBrush}" BorderBrush="{DynamicResource BorderBrush}"
+                    BorderThickness="0,0,1,0" CornerRadius="13,0,0,13" Padding="14,22,14,16">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="36"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="60"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Image Source="Assets/lilith-control-center-icon.png"
+                               Width="60" Height="54" Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality"/>
+                        <StackPanel Grid.Column="1" Margin="10,0,0,0" VerticalAlignment="Center">
+                            <TextBlock Text="LILITH" FontSize="19" FontWeight="Bold"/>
+                            <TextBlock Text="CONTROL CENTER" FontSize="10"
+                                       Foreground="{DynamicResource MutedBrush}"
+                                       Margin="0,3,0,0"/>
+                        </StackPanel>
+                    </Grid>
+
+                    <StackPanel Grid.Row="2">
+                        <TextBlock Text="{local:UiText nav.functions}" FontSize="12" FontWeight="SemiBold"
+                                   Foreground="{DynamicResource MutedBrush}" Margin="13,0,0,7"/>
+                        <Button x:Name="HomeNav" Style="{StaticResource NavButtonStyle}"
+                                Content="{local:UiText nav.home}" Tag="Home" Click="NavigationButton_Click"/>
+                        <Button x:Name="ProvidersNav" Style="{StaticResource NavButtonStyle}"
+                                Content="{local:UiText nav.providers}" Tag="Providers" Click="NavigationButton_Click"/>
+                        <Button x:Name="LilithNav" Style="{StaticResource NavButtonStyle}"
+                                Content="{local:UiText nav.lilith}" Tag="Lilith" Click="NavigationButton_Click"/>
+                        <Button x:Name="InteractionNav" Style="{StaticResource NavButtonStyle}"
+                                Content="{local:UiText nav.interaction}" Tag="Interaction" Click="NavigationButton_Click"/>
+                        <Button x:Name="SettingsNav" Style="{StaticResource NavButtonStyle}"
+                                Content="{local:UiText nav.settings}" Tag="Settings" Click="NavigationButton_Click"/>
+                    </StackPanel>
+
+                    <Button Grid.Row="3" x:Name="StatusNav" Tag="Settings"
+                            Style="{StaticResource SecondaryButtonStyle}"
+                            HorizontalContentAlignment="Stretch"
+                            Background="{DynamicResource InputBrush}" Click="StatusButton_Click"
+                            Padding="13,11">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <Ellipse Width="8" Height="8" VerticalAlignment="Center">
+                                <Ellipse.Style>
+                                    <Style TargetType="Ellipse">
+                                        <Setter Property="Fill" Value="{DynamicResource MutedBrush}"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding Connected}" Value="True">
+                                                <Setter Property="Fill" Value="{DynamicResource GoodBrush}"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Ellipse.Style>
+                            </Ellipse>
+                            <StackPanel Grid.Column="1" Margin="10,0,0,0">
+                                <TextBlock Text="{local:OwnedUiLabel ConnectionText}" FontSize="12"
+                                           FontWeight="SemiBold"/>
+                                <TextBlock Text="{local:UiText common.diagnostics}" FontSize="12"
+                                           Foreground="{DynamicResource MutedBrush}"/>
+                            </StackPanel>
+                            <TextBlock Grid.Column="2" Text="›" FontSize="18"
+                                       Foreground="{DynamicResource MutedBrush}"
+                                       VerticalAlignment="Center"/>
+                        </Grid>
+                    </Button>
+                </Grid>
+            </Border>
+
+            <Grid Grid.Column="1">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="58"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <!-- Soft daylight diagonals remain behind the opaque form surfaces. -->
+                <Viewbox Grid.RowSpan="2" Stretch="Fill" IsHitTestVisible="False" Focusable="False">
+                    <Canvas Width="1000" Height="820" ClipToBounds="True">
+                        <Path Data="M 345,0 L 1000,0 L 1000,315 Z" Fill="{DynamicResource DecorativeBrush}" Opacity="0.42"/>
+                        <Path Data="M 0,535 L 0,650 L 338,820 L 555,820 Z" Fill="{DynamicResource DecorativeBrush}" Opacity="0.55"/>
+                        <Path Data="M 680,365 L 700,374 L 700,820 L 680,820 Z M 865,470 L 883,478 L 883,820 L 865,820 Z"
+                              Fill="{DynamicResource DecorativeBrush}" Opacity="0.3"/>
+                    </Canvas>
+                </Viewbox>
+
+                <Border Background="{DynamicResource TitleBarBrush}" CornerRadius="0,13,0,0">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="30,0,0,0">
+                        <TextBlock x:Name="HeaderBreadcrumb" Text="{local:UiText nav.home}" FontSize="13"
+                                   Foreground="{DynamicResource TextBrush}" FontWeight="SemiBold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                        <Button Style="{StaticResource WindowButtonStyle}" ToolTip="{local:UiText common.minimize}"
+                                shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                                AutomationProperties.AutomationId="MainMinimize" Click="MinimizeButton_Click">
+                            <Path Data="M 0,5 L 10,5" Width="10" Height="10" Stretch="None"
+                                  Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.3"/>
+                        </Button>
+                        <Button Style="{StaticResource WindowButtonStyle}" ToolTip="{local:UiText settings.closeHelp}"
+                                shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                                AutomationProperties.AutomationId="MainHideToTray" Click="CloseButton_Click">
+                            <Path Data="M 0,0 L 10,10 M 10,0 L 0,10" Width="10" Height="10" Stretch="None"
+                                  Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.3"/>
+                        </Button>
+                    </StackPanel>
+                </Grid>
+                </Border>
+
+                <Grid Grid.Row="1" Margin="34,32,34,28">
+                    <Grid x:Name="HomePage">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <StackPanel>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="{local:UiText ui.welcome.back}" Style="{StaticResource PageTitleStyle}"/>
+                                    </StackPanel>
+                                    <Button Grid.Column="1" Content="{local:UiText common.refresh}" Margin="18,2,0,0"
+                                            VerticalAlignment="Top" Style="{StaticResource SecondaryButtonStyle}"
+                                            Click="RefreshButton_Click"/>
+                                </Grid>
+
+                                <Border Style="{StaticResource CardStyle}" Background="{DynamicResource HeroBrush}"
+                                        BorderBrush="{DynamicResource WindowBorderBrush}" ClipToBounds="True"
+                                        Padding="28,30" Margin="0,26,0,0" MinHeight="252">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="192"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Viewbox Grid.ColumnSpan="2" Stretch="Fill" Margin="-28,-30" IsHitTestVisible="False">
+                                            <Canvas Width="900" Height="260" ClipToBounds="True">
+                                                <Canvas.Clip>
+                                                    <RectangleGeometry Rect="0,0,900,260" RadiusX="15" RadiusY="15"/>
+                                                </Canvas.Clip>
+                                                <Path Data="M 760,0 L 900,0 L 900,118 Z" Fill="{DynamicResource HeroAccentBrush}"/>
+                                                <Path Data="M 800,260 L 900,260 L 900,202 L 846,161 L 825,178 L 900,239 L 900,254 L 813,185 L 793,204 L 860,260 Z"
+                                                      Fill="{DynamicResource HeroAccentBrush}"/>
+                                                <Path Data="M 120,0 L 170,0 L 515,260 L 465,260 Z" Fill="{DynamicResource DecorativeBrush}" Opacity="0.24"/>
+                                            </Canvas>
+                                        </Viewbox>
+                                        <StackPanel VerticalAlignment="Center">
+                                            <Border Style="{StaticResource PillStyle}" HorizontalAlignment="Left"
+                                                    Background="{DynamicResource PanelRaisedBrush}">
+                                                <TextBlock Text="{local:UiText ui.game.connection}" FontSize="12" FontWeight="SemiBold"
+                                                           Foreground="{DynamicResource TextBrush}"/>
+                                            </Border>
+                                            <TextBlock Text="{local:OwnedUiLabel ConnectionText}" FontSize="27"
+                                                       FontWeight="SemiBold" Margin="0,14,0,0"/>
+                                            <WrapPanel Margin="0,20,0,0">
+                                                <Button Content="{local:UiText ui.talk.to.lilith}" Style="{StaticResource PrimaryButtonStyle}"
+                                                        Tag="Interaction" Click="QuickNavigate_Click" Margin="0,0,10,0"/>
+                                                <Button Content="{local:UiText ui.quick.check}" Style="{StaticResource SecondaryButtonStyle}"
+                                                        Click="OpenDiagnostics_Click"/>
+                                            </WrapPanel>
+                                        </StackPanel>
+                                        <Grid Grid.Column="1">
+                                            <Ellipse Width="174" Height="174" Fill="{DynamicResource PanelBrush}"
+                                                     Stroke="{DynamicResource BorderBrush}" StrokeThickness="1"/>
+                                            <Ellipse Width="156" Height="156" Stroke="{DynamicResource DecorativeBrush}" StrokeThickness="1"/>
+                                            <Image Source="Assets/lilith-control-center-icon.png"
+                                                   Width="154" Height="154" RenderOptions.BitmapScalingMode="HighQuality"/>
+                                        </Grid>
+                                    </Grid>
+                                </Border>
+
+                                <local:HomeResourceMonitor Margin="0,32,0,0"/>
+                                <local:LatestTurnUsagePanel x:Name="HomeLatestUsagePanel" Margin="0,12,0,0"/>
+                            </StackPanel>
+                        </ScrollViewer>
+                    </Grid>
+
+                    <Grid x:Name="ProvidersPage" Visibility="Collapsed">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <StackPanel Margin="0,0,8,18">
+                                <TextBlock Text="{local:UiText nav.providers}" Style="{StaticResource PageTitleStyle}"/>
+                                <TextBlock Text="{local:UiText ui.manage.model.providers.tools.and.approvals.saved.settings.readiness}"
+                                           Style="{StaticResource MutedTextStyle}" Margin="0,7,0,0"/>
+
+                                <Border x:Name="HermesCredentialCard"
+                                        Style="{StaticResource CardStyle}"
+                                        Margin="0,24,0,0"
+                                        Padding="22"
+                                        Background="{DynamicResource PanelBrush}">
+                                    <StackPanel>
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel>
+                                                <TextBlock Text="API Key" Style="{StaticResource SectionTitleStyle}"/>
+                                                <TextBlock Text="{local:UiText ui.managed.directly.by.hermes.with.one.key.per.provider}"
+                                                           Foreground="{DynamicResource MutedBrush}"
+                                                           TextWrapping="Wrap"
+                                                           Margin="0,6,18,0"/>
+                                            </StackPanel>
+                                            <Button x:Name="HermesCredentialRefreshButton"
+                                                    AutomationProperties.AutomationId="HermesCredentialRefreshButton"
+                                                    Grid.Column="1"
+                                                    Content="{local:UiText common.refresh}"
+                                                    Style="{StaticResource SecondaryButtonStyle}"
+                                                    VerticalAlignment="Top"
+                                                    Click="HermesCredentialRefresh_Click"/>
+                                        </Grid>
+
+                                        <Grid Margin="0,18,0,0">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="310"/>
+                                                <ColumnDefinition Width="22"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <ListBox x:Name="HermesCredentialProviderList"
+                                                     AutomationProperties.AutomationId="HermesCredentialProviderList"
+                                                     VerticalAlignment="Top"
+                                                     MinHeight="152"
+                                                     MaxHeight="250"
+                                                     Padding="5"
+                                                     Background="{DynamicResource InputBrush}"
+                                                     BorderBrush="{DynamicResource BorderBrush}"
+                                                     BorderThickness="1"
+                                                     SelectionChanged="HermesCredentialProviderList_SelectionChanged"
+                                                     ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                                <ListBox.ItemContainerStyle>
+                                                    <Style TargetType="ListBoxItem">
+                                                        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                                                        <Setter Property="Padding" Value="0"/>
+                                                        <Setter Property="Margin" Value="0,0,0,5"/>
+                                                        <Setter Property="Background" Value="Transparent"/>
+                                                        <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+                                                        <Setter Property="BorderThickness" Value="0"/>
+                                                        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+                                                        <Style.Triggers>
+                                                            <Trigger Property="IsSelected" Value="True">
+                                                                <Setter Property="Background" Value="{DynamicResource BorderBrush}"/>
+                                                                <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+                                                            </Trigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </ListBox.ItemContainerStyle>
+                                                <ListBox.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <Grid Margin="12,10">
+                                                            <Grid.ColumnDefinitions>
+                                                                <ColumnDefinition Width="*"/>
+                                                                <ColumnDefinition Width="Auto"/>
+                                                            </Grid.ColumnDefinitions>
+                                                            <TextBlock Text="{Binding DisplayName}"
+                                                                       TextWrapping="Wrap" ToolTip="{Binding DisplayName}"
+                                                                       FontWeight="SemiBold"
+                                                                       VerticalAlignment="Center"/>
+                                                            <TextBlock Grid.Column="1" VerticalAlignment="Center"
+                                                                       Text="{Binding StatusText}" Margin="10,0,0,0"
+                                                                       Foreground="{DynamicResource MutedBrush}"/>
+                                                        </Grid>
+                                                    </DataTemplate>
+                                                </ListBox.ItemTemplate>
+                                            </ListBox>
+
+                                            <TextBlock x:Name="HermesCredentialEmptyText"
+                                                       Text="{local:UiText management.providersNotLoaded}"
+                                                       Foreground="{DynamicResource MutedBrush}"
+                                                       TextWrapping="Wrap"
+                                                       Margin="18"
+                                                       HorizontalAlignment="Center"
+                                                       VerticalAlignment="Center"
+                                                       IsHitTestVisible="False"
+                                                       AutomationProperties.LiveSetting="Polite"/>
+                                            <StackPanel Grid.Column="2" VerticalAlignment="Top">
+                                                <TextBlock x:Name="HermesCredentialSelectedProviderText"
+                                                           Text="{local:UiText ui.choose.a.provider.first}"
+                                                           TextWrapping="Wrap"
+                                                           FontSize="17"
+                                                           FontWeight="SemiBold"/>
+                                                <StackPanel x:Name="HermesCredentialRegionPanel" Margin="0,12,0,0" Visibility="Collapsed">
+                                                    <TextBlock Text="{local:UiText credential.region.label}" Foreground="{DynamicResource MutedBrush}"/>
+                                                    <ComboBox x:Name="HermesCredentialRegionSelector" Margin="0,6,0,0"
+                                                              DisplayMemberPath="VariantLabel" IsEnabled="False"
+                                                              AutomationProperties.AutomationId="HermesCredentialRegionSelector"
+                                                              SelectionChanged="HermesCredentialRegionSelector_SelectionChanged"/>
+                                                    <TextBlock Text="{local:UiText credential.region.selectionOnly}" FontSize="12"
+                                                               Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                                                </StackPanel>
+                                                <StackPanel x:Name="HermesCredentialEndpointPanel" Margin="0,10,0,0" Visibility="Collapsed">
+                                                    <TextBlock Text="{local:UiText credential.region.endpoint}" Foreground="{DynamicResource MutedBrush}" FontSize="12"/>
+                                                    <TextBlock x:Name="HermesCredentialEndpointText" TextWrapping="Wrap" FontSize="12"
+                                                               Foreground="{DynamicResource MutedBrush}" Margin="0,3,0,0"/>
+                                                </StackPanel>
+                                                <TextBlock x:Name="HermesCredentialRegionStateText" Margin="0,8,0,0" FontSize="12"
+                                                           Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"/>
+                                                <TextBlock Text="{local:UiText ui.enter.a.new.api.key}"
+                                                           Foreground="{DynamicResource MutedBrush}"
+                                                           Margin="0,13,0,7"/>
+                                                <PasswordBox x:Name="HermesCredentialApiKeyInput"
+                                                             AutomationProperties.AutomationId="HermesCredentialApiKeyInput"
+                                                             PasswordChar="●"
+                                                             MaxLength="16384"
+                                                             Padding="14,11"
+                                                             Background="{DynamicResource InputBrush}"
+                                                             Foreground="{DynamicResource TextBrush}"
+                                                             BorderBrush="{DynamicResource BorderBrush}"
+                                                             BorderThickness="1"
+                                                             IsEnabled="False"
+                                                             PasswordChanged="HermesCredentialApiKeyInput_PasswordChanged"/>
+                                                <TextBlock Text="{local:UiText ui.leaving.this.blank.preserves.the.current.setting.the.input}"
+                                                           Foreground="{DynamicResource MutedBrush}"
+                                                           TextWrapping="Wrap"
+                                                           FontSize="12"
+                                                           Margin="0,6,0,0"/>
+                                                <StackPanel Orientation="Horizontal" Margin="0,14,0,0">
+                                                    <Button x:Name="HermesCredentialSaveButton"
+                                                            AutomationProperties.AutomationId="HermesCredentialSaveButton"
+                                                            Content="{local:UiText ui.save.replace}"
+                                                            Style="{StaticResource PrimaryButtonStyle}"
+                                                            IsEnabled="False"
+                                                            Click="HermesCredentialSave_Click"/>
+                                                    <Button x:Name="HermesCredentialDeleteButton"
+                                                            AutomationProperties.AutomationId="HermesCredentialDeleteButton"
+                                                            Content="{local:UiText ui.delete}"
+                                                            Style="{StaticResource SecondaryButtonStyle}"
+                                                            Margin="10,0,0,0"
+                                                            IsEnabled="False"
+                                                            Click="HermesCredentialDelete_Click"/>
+                                                </StackPanel>
+                                            </StackPanel>
+                                        </Grid>
+                                        <TextBlock x:Name="HermesCredentialStatusText"
+                                                   AutomationProperties.LiveSetting="Polite"
+                                                   AutomationProperties.Name="{local:UiText ui.repair.33}"
+                                                   Text="{local:UiText ui.hermes.api.key.status.is.loaded.when.this.page}"
+                                                   Foreground="{DynamicResource AccentStrongBrush}"
+                                                   TextWrapping="Wrap"
+                                                   FontSize="12"
+                                                   Margin="0,14,0,0"/>
+                                        <Border BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,1,0,0"
+                                                Margin="0,18,0,0" Padding="0,14,0,0">
+                                            <StackPanel>
+                                                <Button x:Name="OpenCustomProviderSettingsButton"
+                                                        AutomationProperties.AutomationId="OpenCustomProviderSettingsButton"
+                                                        Style="{StaticResource SecondaryButtonStyle}"
+                                                        HorizontalContentAlignment="Stretch" Padding="14,12"
+                                                        Click="OpenCustomProviderSettings_Click">
+                                                    <Grid>
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="36"/><ColumnDefinition/><ColumnDefinition Width="24"/>
+                                                        </Grid.ColumnDefinitions>
+                                                        <TextBlock Text="&#xE774;" FontFamily="Segoe MDL2 Assets" FontSize="20"
+                                                                   VerticalAlignment="Center" Foreground="{DynamicResource AccentStrongBrush}"/>
+                                                        <StackPanel Grid.Column="1" Margin="0,0,12,0">
+                                                            <TextBlock Text="{local:UiText provider.setup.title}" FontWeight="SemiBold"/>
+                                                            <TextBlock Text="{local:UiText settings.dialog.custom.summary}"
+                                                                       Foreground="{DynamicResource MutedBrush}" FontSize="12"
+                                                                       TextWrapping="Wrap" Margin="0,4,0,0"/>
+                                                        </StackPanel>
+                                                        <TextBlock Grid.Column="2" Text="&#xE76C;" FontFamily="Segoe MDL2 Assets"
+                                                                   VerticalAlignment="Center" HorizontalAlignment="Right"
+                                                                   Foreground="{DynamicResource MutedBrush}"/>
+                                                    </Grid>
+                                                </Button>
+                                                <Button x:Name="OpenTelegramSettingsButton"
+                                                        AutomationProperties.AutomationId="OpenTelegramSettingsButton"
+                                                        Style="{StaticResource SecondaryButtonStyle}"
+                                                        HorizontalContentAlignment="Stretch" Padding="14,12" Margin="0,8,0,0"
+                                                        Click="OpenTelegramSettings_Click">
+                                                    <Grid>
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="36"/><ColumnDefinition/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="24"/>
+                                                        </Grid.ColumnDefinitions>
+                                                        <TextBlock Text="&#xE8F2;" FontFamily="Segoe MDL2 Assets" FontSize="20"
+                                                                   VerticalAlignment="Center" Foreground="{DynamicResource AccentStrongBrush}"/>
+                                                        <StackPanel Grid.Column="1" Margin="0,0,12,0">
+                                                            <TextBlock Text="Telegram" FontWeight="SemiBold"/>
+                                                            <TextBlock Text="{local:UiText settings.dialog.telegram.summary}"
+                                                                       Foreground="{DynamicResource MutedBrush}" FontSize="12"
+                                                                       TextWrapping="Wrap" Margin="0,4,0,0"/>
+                                                        </StackPanel>
+                                                        <Border Grid.Column="2" Style="{StaticResource PillStyle}" VerticalAlignment="Center" Margin="0,0,10,0">
+                                                            <TextBlock Text="{Binding Text, ElementName=TelegramConnectionStateText}"
+                                                                       Foreground="{Binding Foreground, ElementName=TelegramConnectionStateText}"
+                                                                       FontSize="12"/>
+                                                        </Border>
+                                                        <TextBlock Grid.Column="3" Text="&#xE76C;" FontFamily="Segoe MDL2 Assets"
+                                                                   VerticalAlignment="Center" HorizontalAlignment="Right"
+                                                                   Foreground="{DynamicResource MutedBrush}"/>
+                                                    </Grid>
+                                                </Button>
+                                            </StackPanel>
+                                        </Border>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- One editor instance per settings surface. These are reparented
+                                     into owned windows; no duplicate draft or mutation authority. -->
+                                <StackPanel x:Name="SettingsDialogParkingPanel" Visibility="Collapsed">
+                                <local:ProviderSetupPanel x:Name="ProviderSetupSettingsPanel"
+                                    RefreshRequested="ProviderSetupRefresh_Click" SaveRequested="ProviderSetupSave_Click"
+                                    RemoveRequested="ProviderSetupRemove_Click" ModelsRequested="ProviderSetupModels_Click"/>
+
+                                <Border x:Name="TelegramMessagingCard"
+                                        Style="{StaticResource CardStyle}"
+                                        Padding="22"
+                                        Background="{DynamicResource PanelBrush}">
+                                    <StackPanel>
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel>
+                                                <StackPanel Orientation="Horizontal">
+                                                    <TextBlock Text="Telegram" Style="{StaticResource SectionTitleStyle}"/>
+                                                    <Border Margin="10,0,0,0"
+                                                            Padding="9,4"
+                                                            CornerRadius="12"
+                                                            Background="{DynamicResource PanelRaisedBrush}">
+                                                        <TextBlock x:Name="TelegramConnectionStateText"
+                                                                   AutomationProperties.AutomationId="TelegramConnectionStateText"
+                                                                   Text="{local:UiText ui.not.loaded.yet}"
+                                                                   Foreground="{DynamicResource MutedBrush}"
+                                                                   FontSize="12"
+                                                                   FontWeight="SemiBold"/>
+                                                    </Border>
+                                                </StackPanel>
+                                                <TextBlock Text="{local:UiText ui.chat.with.lilith.in.telegram.it.shares.memory.with}"
+                                                           Foreground="{DynamicResource MutedBrush}"
+                                                           TextWrapping="Wrap"
+                                                           Margin="0,7,18,0"/>
+                                            </StackPanel>
+                                            <Button x:Name="TelegramRefreshButton"
+                                                    AutomationProperties.AutomationId="TelegramRefreshButton"
+                                                    Grid.Column="1"
+                                                    Content="{local:UiText common.refresh}"
+                                                    Style="{StaticResource SecondaryButtonStyle}"
+                                                    VerticalAlignment="Top"
+                                                    Click="TelegramRefresh_Click"/>
+                                        </Grid>
+
+                                        <Grid Margin="0,18,0,0">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="22"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel>
+                                                <TextBlock Text="{local:UiText ui.connect.a.bot}" FontSize="16" FontWeight="SemiBold"/>
+                                                <TextBlock Text="{local:UiText ui.create.a.bot.with.botfather.in.telegram.then.paste}"
+                                                           Foreground="{DynamicResource MutedBrush}"
+                                                           TextWrapping="Wrap"
+                                                           Margin="0,7,0,0"/>
+                                                <PasswordBox x:Name="TelegramBotTokenInput"
+                                                             AutomationProperties.AutomationId="TelegramBotTokenInput"
+                                                             PasswordChar="●"
+                                                             MaxLength="512"
+                                                             Padding="14,11"
+                                                             Margin="0,12,0,0"
+                                                             Background="{DynamicResource InputBrush}"
+                                                             Foreground="{DynamicResource TextBrush}"
+                                                             BorderBrush="{DynamicResource BorderBrush}"
+                                                             BorderThickness="1"
+                                                             IsEnabled="False"
+                                                             PasswordChanged="TelegramBotTokenInput_PasswordChanged"/>
+                                                <TextBlock Text="{local:UiText ui.the.input.is.cleared.immediately.after.every.operation}"
+                                                           Foreground="{DynamicResource MutedBrush}"
+                                                           FontSize="12"
+                                                           Margin="0,6,0,0"/>
+                                                <StackPanel Orientation="Horizontal" Margin="0,14,0,0">
+                                                    <Button x:Name="TelegramSaveButton"
+                                                            AutomationProperties.AutomationId="TelegramSaveButton"
+                                                            Content="{local:UiText ui.save.change}"
+                                                            Style="{StaticResource PrimaryButtonStyle}"
+                                                            IsEnabled="False"
+                                                            Click="TelegramSave_Click"/>
+                                                    <Button x:Name="TelegramRemoveButton"
+                                                            AutomationProperties.AutomationId="TelegramRemoveButton"
+                                                            Content="{local:UiText ui.disconnect}"
+                                                            Style="{StaticResource SecondaryButtonStyle}"
+                                                            Margin="10,0,0,0"
+                                                            IsEnabled="False"
+                                                            Click="TelegramRemove_Click"/>
+                                                </StackPanel>
+                                            </StackPanel>
+
+                                            <StackPanel Grid.Column="2">
+                                                <TextBlock Text="{local:UiText ui.who.can.use.it}" FontSize="16" FontWeight="SemiBold"/>
+                                                <TextBlock Text="{local:UiText ui.message.your.bot.first.pending.accounts.appear.here.only}"
+                                                           Foreground="{DynamicResource MutedBrush}"
+                                                           TextWrapping="Wrap"
+                                                           Margin="0,7,0,0"/>
+
+                                                <TextBlock Text="{local:UiText ui.pending.approval}" Foreground="{DynamicResource AccentStrongBrush}" Margin="0,13,0,6"/>
+                                                <TextBlock x:Name="TelegramPendingEmptyText"
+                                                           Text="{local:UiText ui.no.accounts.awaiting.approval}"
+                                                           Foreground="{DynamicResource MutedBrush}"
+                                                           FontSize="12"/>
+                                                <ItemsControl x:Name="TelegramPendingPairingList"
+                                                              AutomationProperties.AutomationId="TelegramPendingPairingList">
+                                                    <ItemsControl.ItemTemplate>
+                                                        <DataTemplate>
+                                                            <Border Background="{DynamicResource InputBrush}" CornerRadius="8" Padding="10" Margin="0,0,0,6">
+                                                                <Grid>
+                                                                    <Grid.ColumnDefinitions>
+                                                                        <ColumnDefinition Width="*"/>
+                                                                        <ColumnDefinition Width="Auto"/>
+                                                                    </Grid.ColumnDefinitions>
+                                                                    <StackPanel>
+                                                                        <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold"/>
+                                                                        <TextBlock Text="{Binding UserId}" Foreground="{DynamicResource MutedBrush}" FontSize="12" Margin="0,3,0,0"/>
+                                                                    </StackPanel>
+                                                                    <Button Grid.Column="1"
+                                                                            Content="{local:UiText ui.approve}"
+                                                                            Style="{StaticResource SecondaryButtonStyle}"
+                                                                            Margin="10,0,0,0"
+                                                                            Tag="{Binding}"
+                                                                            Click="TelegramApprovePairing_Click"/>
+                                                                </Grid>
+                                                            </Border>
+                                                        </DataTemplate>
+                                                    </ItemsControl.ItemTemplate>
+                                                </ItemsControl>
+
+                                                <TextBlock Text="{local:UiText ui.approved}" Foreground="{DynamicResource AccentStrongBrush}" Margin="0,11,0,6"/>
+                                                <TextBlock x:Name="TelegramApprovedEmptyText"
+                                                           Text="{local:UiText ui.no.approved.accounts.yet}"
+                                                           Foreground="{DynamicResource MutedBrush}"
+                                                           FontSize="12"/>
+                                                <ItemsControl x:Name="TelegramApprovedUserList"
+                                                              AutomationProperties.AutomationId="TelegramApprovedUserList">
+                                                    <ItemsControl.ItemTemplate>
+                                                        <DataTemplate>
+                                                            <Border Background="{DynamicResource InputBrush}" CornerRadius="8" Padding="10" Margin="0,0,0,6">
+                                                                <Grid>
+                                                                    <Grid.ColumnDefinitions>
+                                                                        <ColumnDefinition Width="*"/>
+                                                                        <ColumnDefinition Width="Auto"/>
+                                                                    </Grid.ColumnDefinitions>
+                                                                    <TextBlock Text="{Binding UserId}" VerticalAlignment="Center"/>
+                                                                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                                                    <Button Content="{local:UiText ui.voice.replies}"
+                                                                            AutomationProperties.Name="{local:UiText ui.repair.34}"
+                                                                            Style="{DynamicResource SecondaryButtonStyle}"
+                                                                            Margin="10,0,0,0"
+                                                                            Tag="{Binding}"
+                                                                            Click="TelegramVoiceOpen_Click"/>
+                                                                    <Button
+                                                                            Content="{local:UiText ui.revoke}"
+                                                                            Style="{StaticResource SecondaryButtonStyle}"
+                                                                            Margin="10,0,0,0"
+                                                                            Tag="{Binding}"
+                                                                            Click="TelegramRevokeUser_Click"/>
+                                                                    </StackPanel>
+                                                                </Grid>
+                                                            </Border>
+                                                        </DataTemplate>
+                                                    </ItemsControl.ItemTemplate>
+                                                </ItemsControl>
+                                            </StackPanel>
+                                        </Grid>
+
+                                        <Border x:Name="TelegramVoicePanel" Visibility="Collapsed"
+                                                Background="{DynamicResource InputBrush}"
+                                                BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1"
+                                                CornerRadius="10" Padding="16" Margin="0,14,0,0">
+                                            <StackPanel>
+                                                <TextBlock x:Name="TelegramVoiceAccountText" FontWeight="SemiBold"
+                                                           Foreground="{DynamicResource TextBrush}" TextWrapping="Wrap"/>
+                                                <CheckBox x:Name="TelegramVoiceEnabledCheckBox" Content="{local:UiText ui.enable.voice.replies}"
+                                                          Foreground="{DynamicResource TextBrush}" Margin="0,12,0,0"
+                                                          IsEnabled="False" Click="TelegramVoiceDraft_Click"/>
+                                                <CheckBox x:Name="TelegramVoiceEveryReplyCheckBox" Content="{local:UiText ui.attach.voice.to.every.reply}"
+                                                          Foreground="{DynamicResource TextBrush}" Margin="0,10,0,0"
+                                                          IsEnabled="False" Click="TelegramVoiceDraft_Click"/>
+                                                <TextBlock Text="{local:UiText ui.when.enabled.lilith.adds.voice.when.you.send.a}"
+                                                           Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"
+                                                           FontSize="12" Margin="0,12,0,0"/>
+                                                <TextBlock x:Name="TelegramVoiceConfigurationText" Text="{local:UiText ui.voice.profile.not.loaded.yet}"
+                                                           Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"
+                                                           FontSize="12" Margin="0,8,0,0"/>
+                                                <TextBlock x:Name="TelegramVoiceStatusText" Text="{local:UiText ui.loading.voice.reply.settings}"
+                                                           AutomationProperties.LiveSetting="Polite"
+                                                           Foreground="{DynamicResource AccentStrongBrush}" TextWrapping="Wrap"
+                                                           Margin="0,8,0,0"/>
+                                                <WrapPanel Margin="0,12,0,0">
+                                                    <Button x:Name="TelegramVoiceRefreshButton" Content="{local:UiText ui.load.settings}"
+                                                            Style="{DynamicResource SecondaryButtonStyle}"
+                                                            Click="TelegramVoiceRefresh_Click"/>
+                                                    <Button x:Name="TelegramVoiceSaveButton" Content="{local:UiText ui.save.voice.settings}"
+                                                            Style="{DynamicResource PrimaryButtonStyle}" Margin="10,0,0,0"
+                                                            IsEnabled="False" Click="TelegramVoiceSave_Click"/>
+                                                    <Button x:Name="TelegramVoiceCancelButton" Content="{local:UiText ui.stop.waiting}"
+                                                            Style="{DynamicResource SecondaryButtonStyle}" Margin="10,0,0,0"
+                                                            Visibility="Collapsed" Click="TelegramVoiceCancel_Click"/>
+                                                </WrapPanel>
+                                            </StackPanel>
+                                        </Border>
+
+                                        <TextBlock x:Name="TelegramStatusText"
+                                                   AutomationProperties.LiveSetting="Polite"
+                                                   AutomationProperties.Name="{local:UiText ui.repair.35}"
+                                                   Text="{local:UiText ui.telegram.connection.status.is.loaded.when.this.page.opens}"
+                                                   Foreground="{DynamicResource AccentStrongBrush}"
+                                                   TextWrapping="Wrap"
+                                                   FontSize="12"
+                                                   Margin="0,14,0,0"/>
+                                    </StackPanel>
+                                </Border>
+                                </StackPanel>
+
+                                <Grid Margin="0,25,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="{local:UiText ui.model.assignments}" Style="{StaticResource SectionTitleStyle}"/>
+                                        <TextBlock Text="{local:UiText ui.choose.the.default.model.from.providers.connected.to.hermes}"
+                                                   Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" Margin="0,6,16,0"/>
+                                    </StackPanel>
+                                    <Border Grid.Column="1" Style="{StaticResource PillStyle}" VerticalAlignment="Center">
+                                        <TextBlock Text="{local:UiText ui.hermes.native.settings}" Foreground="{DynamicResource AccentStrongBrush}" FontSize="12"/>
+                                    </Border>
+                                </Grid>
+
+                                <Grid Margin="0,15,0,0">
+                                    <Button x:Name="TextConversationCard" Style="{StaticResource CardButtonStyle}"
+                                            Tag="TextConversation" Click="AiFunctionCard_Click">
+                                        <Grid Margin="20">
+                                            <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                            <StackPanel>
+                                                <TextBlock Text="{local:UiText ui.default.model}" FontSize="18" FontWeight="SemiBold"/>
+                                                <TextBlock x:Name="TextFunctionAssignmentText" Text="{local:UiText ui.no.model.selected}"
+                                                           Foreground="{DynamicResource AccentStrongBrush}" Margin="0,9,0,0"/>
+                                                <TextBlock x:Name="TextFunctionDetailText" Text="{local:UiText ui.load.configured.available.models.from.hermes}"
+                                                           Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" Margin="0,7,12,0"/>
+                                            </StackPanel>
+                                            <TextBlock Grid.Column="1" Text="›" FontSize="28" Foreground="{DynamicResource MutedBrush}" VerticalAlignment="Center"/>
+                                        </Grid>
+                                    </Button>
+                                </Grid>
+
+
+                                <Button x:Name="HermesNativeToolsSettingsCard"
+                                        AutomationProperties.AutomationId="HermesNativeToolsSettingsCard"
+                                        Style="{StaticResource CardButtonStyle}"
+                                        Margin="0,16,0,0"
+                                        Click="OpenHermesNativeToolsSettings_Click">
+                                    <Grid Margin="20">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="54"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Border Width="44" Height="44" CornerRadius="13" Background="{DynamicResource HeroAccentBrush}">
+                                            <TextBlock Text="⚙" FontSize="20" Foreground="{DynamicResource AccentStrongBrush}"
+                                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                        </Border>
+                                        <StackPanel Grid.Column="1" Margin="14,0,18,0" VerticalAlignment="Center">
+                                            <TextBlock Text="{local:UiText tools.title}" FontSize="18" FontWeight="SemiBold"/>
+                                            <TextBlock Text="{local:UiText ui.choose.the.native.hermes.tools.available.to.chats.each}"
+                                                       Foreground="{DynamicResource MutedBrush}"
+                                                       TextWrapping="Wrap" Margin="0,5,0,0"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="2" VerticalAlignment="Center" HorizontalAlignment="Right">
+                                            <TextBlock Text="{local:UiText ui.manage.tools}" Foreground="{DynamicResource AccentStrongBrush}" FontSize="12"/>
+                                            <TextBlock Text="›" FontSize="28" Foreground="{DynamicResource MutedBrush}"
+                                                       HorizontalAlignment="Right" Margin="0,3,0,0"/>
+                                        </StackPanel>
+                                    </Grid>
+                                </Button>
+
+                                <Button x:Name="HermesNativeToolsCard"
+                                        AutomationProperties.AutomationId="HermesNativeToolsCard"
+                                        Style="{StaticResource CardButtonStyle}"
+                                        Margin="0,16,0,0"
+                                        Click="OpenHermesCapabilityCatalog_Click">
+                                    <Grid Margin="20">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="54"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Border Width="44" Height="44" CornerRadius="13" Background="{DynamicResource SuccessSurfaceBrush}">
+                                            <TextBlock Text="⌘" FontSize="22" Foreground="{DynamicResource GoodBrush}"
+                                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                        </Border>
+                                         <StackPanel Grid.Column="1" Margin="14,0,18,0" VerticalAlignment="Center">
+                                             <TextBlock Text="{local:UiText ui.capabilities.and.compatibility}" FontSize="18" FontWeight="SemiBold"/>
+                                             <TextBlock Text="{Binding CapabilityCatalogSummaryText}"
+                                                        Foreground="{DynamicResource MutedBrush}"
+                                                        TextWrapping="Wrap" Margin="0,5,0,0"/>
+                                         </StackPanel>
+                                         <StackPanel Grid.Column="2" VerticalAlignment="Center" HorizontalAlignment="Right">
+                                             <TextBlock Text="{local:UiText ui.view.read.only.catalog}" Foreground="{DynamicResource GoodBrush}" FontSize="12"/>
+                                             <TextBlock Text="›" FontSize="28" Foreground="{DynamicResource MutedBrush}"
+                                                        HorizontalAlignment="Right" Margin="0,3,0,0"/>
+                                         </StackPanel>
+                                    </Grid>
+                                </Button>
+
+                            </StackPanel>
+                        </ScrollViewer>
+
+                        <Grid x:Name="AiFunctionAssignmentOverlay" Visibility="Collapsed" Background="{DynamicResource OverlayBrush}" Panel.ZIndex="10">
+                            <Border Style="{StaticResource CardStyle}" Width="620" MaxWidth="{Binding ActualWidth, RelativeSource={RelativeSource AncestorType=Grid}}" HorizontalAlignment="Center" VerticalAlignment="Center" Background="{DynamicResource PanelBrush}">
+                                <StackPanel>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock x:Name="AiFunctionDialogTitleText" Text="{local:UiText ui.model.for.this.function}" Style="{StaticResource SectionTitleStyle}"/>
+                                            <TextBlock x:Name="AiFunctionDialogDetailText" Text="{local:UiText ui.only.configured.models.with.verifiable.compatibility.are.listed}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" Margin="0,7,18,0"/>
+                                        </StackPanel>
+                                        <Button Grid.Column="1" Style="{StaticResource DialogCloseButtonStyle}" Click="CloseAiFunctionAssignment_Click"/>
+                                    </Grid>
+                                    <ComboBox x:Name="AiFunctionModelSelector" Margin="0,22,0,0" Style="{StaticResource DarkComboBoxStyle}" IsEnabled="False" SelectionChanged="AiFunctionModelSelector_SelectionChanged"/>
+                                    <StackPanel x:Name="AiFunctionImageModelPanel" Visibility="Collapsed" Margin="0,18,0,0">
+                                        <TextBlock Text="{local:UiText ui.image.generation.model}" FontWeight="SemiBold"/>
+                                        <TextBlock Text="{local:UiText ui.only.models.explicitly.declaring.image.output.in.the.current}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" Margin="0,5,0,8"/>
+                                        <ComboBox x:Name="AiFunctionImageModelSelector" Style="{StaticResource DarkComboBoxStyle}" IsEnabled="False"/>
+                                    </StackPanel>
+                                    <TextBlock x:Name="AiFunctionSelectionBoundaryText" Text="{local:UiText ui.no.verifiably.compatible.models}" Foreground="{DynamicResource WarningBrush}" TextWrapping="Wrap" Margin="0,10,0,0"/>
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,22,0,0">
+                                        <Button x:Name="AiFunctionOpenProviderSetupButton" Content="{local:UiText ui.add.an.ai.provider}" Style="{StaticResource SecondaryButtonStyle}" Click="OpenAddProviderFromFunction_Click"/>
+                                        <Button x:Name="AiFunctionApplyButton" Content="{local:UiText ui.save.assignment}" Style="{StaticResource PrimaryButtonStyle}" Margin="10,0,0,0" IsEnabled="False" Click="AiFunctionApplyButton_Click"/>
+                                    </StackPanel>
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+
+                        <Grid x:Name="HermesCapabilityCatalogOverlay"
+                              AutomationProperties.AutomationId="HermesCapabilityCatalogOverlay"
+                              Visibility="Collapsed"
+                              Background="{DynamicResource OverlayBrush}"
+                              Panel.ZIndex="15">
+                            <Border Style="{StaticResource CardStyle}"
+                                    Width="940" MaxWidth="{Binding ActualWidth, RelativeSource={RelativeSource AncestorType=Grid}}" MaxHeight="760"
+                                    HorizontalAlignment="Center"
+                                    VerticalAlignment="Center"
+                                    Background="{DynamicResource PanelBrush}">
+                                <Grid>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="*"/>
+                                        <RowDefinition Height="Auto"/>
+                                    </Grid.RowDefinitions>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                             <TextBlock Text="{local:UiText ui.hermes.capabilities.and.compatibility}"
+                                                       Style="{StaticResource SectionTitleStyle}"/>
+                                             <TextBlock Text="{local:UiText ui.read.only.snapshots.of.versions.interfaces.commands.tools.models}"
+                                                       Foreground="{DynamicResource MutedBrush}"
+                                                       TextWrapping="Wrap"
+                                                       Margin="0,7,18,0"/>
+                                        </StackPanel>
+                                        <Button Grid.Column="1"
+                                                Style="{StaticResource DialogCloseButtonStyle}"
+                                                Click="CloseHermesCapabilityCatalog_Click"/>
+                                    </Grid>
+
+                                    <Border Grid.Row="1"
+                                            Background="{DynamicResource SuccessSurfaceBrush}"
+                                            BorderBrush="{DynamicResource BorderBrush}"
+                                            BorderThickness="1"
+                                            CornerRadius="10"
+                                            Padding="13"
+                                            Margin="0,18,0,12">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel>
+                                                <TextBlock x:Name="HermesCapabilityCatalogStatus"
+                                                           AutomationProperties.AutomationId="HermesCapabilityCatalogStatus"
+                                                           AutomationProperties.LiveSetting="Polite"
+                                                           Text="{Binding CapabilityCatalogStatusText}"
+                                                           TextWrapping="Wrap"/>
+                                                <TextBlock Text="{Binding CapabilityCatalogBoundaryText}"
+                                                           Foreground="{DynamicResource WarningBrush}"
+                                                           FontSize="12"
+                                                           TextWrapping="Wrap"
+                                                           Margin="0,5,0,0"/>
+                                            </StackPanel>
+                                            <Button Grid.Column="1"
+                                                    x:Name="HermesCapabilityCatalogRefreshButton"
+                                                    AutomationProperties.AutomationId="HermesCapabilityCatalogRefreshButton"
+                                                    Content="{local:UiText common.refresh}"
+                                                    Style="{StaticResource SecondaryButtonStyle}"
+                                                    IsEnabled="{Binding CanRefreshCapabilityCatalog}"
+                                                    Margin="18,0,0,0"
+                                                    Click="HermesCapabilityCatalogRefresh_Click"/>
+                                        </Grid>
+                                    </Border>
+
+                                    <ScrollViewer Grid.Row="2"
+                                                  VerticalScrollBarVisibility="Auto"
+                                                  HorizontalScrollBarVisibility="Disabled"
+                                                  MaxHeight="520">
+                                        <Grid>
+                                            <TextBlock x:Name="HermesCapabilityCatalogEmptyState"
+                                                       Text="{local:UiText ui.waiting.for.the.runtime.capability.catalog}"
+                                                       Visibility="{Binding IsCapabilityCatalogEmpty, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                                       Foreground="{DynamicResource MutedBrush}"
+                                                       HorizontalAlignment="Center"
+                                                       Margin="20"/>
+                                            <ItemsControl x:Name="HermesCapabilityCatalogSections"
+                                                          AutomationProperties.AutomationId="HermesCapabilityCatalogSections"
+                                                          ItemsSource="{Binding CapabilityCatalogSections}">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <Border Background="{DynamicResource PanelRaisedBrush}"
+                                                                BorderBrush="{DynamicResource BorderBrush}"
+                                                                BorderThickness="1"
+                                                                CornerRadius="11"
+                                                                Padding="15"
+                                                                Margin="0,0,0,12">
+                                                            <Expander Style="{StaticResource DarkDisclosureExpanderStyle}"
+                                                                      HorizontalAlignment="Stretch"
+                                                                      IsEnabled="{Binding HasEntries}"
+                                                                      IsExpanded="{Binding IsExpanded, Mode=TwoWay}">
+                                                                <Expander.Header>
+                                                                    <Grid MinHeight="44">
+                                                                        <Grid.ColumnDefinitions>
+                                                                            <ColumnDefinition Width="*"/>
+                                                                            <ColumnDefinition Width="Auto"/>
+                                                                        </Grid.ColumnDefinitions>
+                                                                        <StackPanel>
+                                                                            <TextBlock Text="{Binding Title}"
+                                                                                       FontSize="16"
+                                                                                       FontWeight="SemiBold"/>
+                                                                             <TextBlock Text="{Binding Summary}"
+                                                                                        Foreground="{local:ThemeBrush SummaryBrush}"
+                                                                                       FontSize="12"
+                                                                                       TextWrapping="Wrap"
+                                                                                       Margin="0,4,16,0"/>
+                                                                        </StackPanel>
+                                                                        <Border Grid.Column="1"
+                                                                                Style="{StaticResource PillStyle}"
+                                                                                VerticalAlignment="Top">
+                                                                            <TextBlock Text="{Binding CountText}"
+                                                                                       Foreground="{DynamicResource AccentStrongBrush}"
+                                                                                       FontSize="12"/>
+                                                                        </Border>
+                                                                    </Grid>
+                                                                </Expander.Header>
+                                                                <ListBox ItemsSource="{Binding Entries}"
+                                                                         Background="Transparent"
+                                                                         BorderThickness="0"
+                                                                         MaxHeight="340"
+                                                                         Margin="0,7,0,0"
+                                                                         ScrollViewer.CanContentScroll="True"
+                                                                         ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                                                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                                                         VirtualizingPanel.IsVirtualizing="True"
+                                                                         VirtualizingPanel.VirtualizationMode="Recycling"
+                                                                         VirtualizingPanel.ScrollUnit="Pixel">
+                                                                    <ListBox.ItemsPanel>
+                                                                        <ItemsPanelTemplate>
+                                                                            <VirtualizingStackPanel/>
+                                                                        </ItemsPanelTemplate>
+                                                                    </ListBox.ItemsPanel>
+                                                                    <ListBox.ItemContainerStyle>
+                                                                        <Style TargetType="ListBoxItem">
+                                                                            <Setter Property="Background" Value="Transparent"/>
+                                                                            <Setter Property="BorderThickness" Value="0"/>
+                                                                            <Setter Property="Focusable" Value="False"/>
+                                                                            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                                                                        </Style>
+                                                                    </ListBox.ItemContainerStyle>
+                                                                    <ListBox.ItemTemplate>
+                                                                        <DataTemplate>
+                                                                            <Border BorderBrush="{DynamicResource BorderBrush}"
+                                                                                    BorderThickness="0,1,0,0"
+                                                                                    Padding="0,10">
+                                                                                <Grid>
+                                                                                    <Grid.ColumnDefinitions>
+                                                                                        <ColumnDefinition Width="*"/>
+                                                                                        <ColumnDefinition Width="180"/>
+                                                                                    </Grid.ColumnDefinitions>
+                                                                                    <StackPanel Margin="0,0,18,0">
+                                                                                        <TextBlock Text="{Binding Name}"
+                                                                                                   FontWeight="SemiBold"/>
+                                                                                        <TextBlock Text="{Binding IdentityText}"
+                                                                                                   Foreground="{DynamicResource MutedBrush}"
+                                                                                                   FontSize="12"
+                                                                                                   TextWrapping="Wrap"
+                                                                                                   Margin="0,3,0,0"/>
+                                                                                        <TextBlock Text="{Binding DetailText}"
+                                                                                                   FontSize="12"
+                                                                                                   TextWrapping="Wrap"
+                                                                                                   Margin="0,4,0,0"/>
+                                                                                    </StackPanel>
+                                                                                    <StackPanel Grid.Column="1"
+                                                                                                HorizontalAlignment="Right">
+                                                                                        <TextBlock Text="{Binding StatusText}"
+                                                                                                   Foreground="{local:ThemeBrush StatusBrush}"
+                                                                                                   FontWeight="SemiBold"
+                                                                                                   TextAlignment="Right"/>
+                                                                                        <TextBlock Text="{Binding ReadinessText}"
+                                                                                                   Foreground="{DynamicResource MutedBrush}"
+                                                                                                   FontSize="12"
+                                                                                                   TextWrapping="Wrap"
+                                                                                                   TextAlignment="Right"
+                                                                                                   Margin="0,3,0,0"/>
+                                                                                    </StackPanel>
+                                                                                </Grid>
+                                                                            </Border>
+                                                                        </DataTemplate>
+                                                                    </ListBox.ItemTemplate>
+                                                                </ListBox>
+                                                            </Expander>
+                                                        </Border>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                        </Grid>
+                                    </ScrollViewer>
+
+                                    <TextBlock Grid.Row="3"
+                                               Text="{local:UiText ui.this.page.has.no.save.apply.or.permission.changes}"
+                                               Foreground="{DynamicResource MutedBrush}"
+                                               FontSize="12"
+                                               TextWrapping="Wrap"
+                                               Margin="0,12,0,0"/>
+                                </Grid>
+                            </Border>
+                        </Grid>
+
+                        <Grid x:Name="HermesNativeToolsOverlay"
+                              AutomationProperties.AutomationId="HermesNativeToolsOverlay"
+                              Visibility="Collapsed"
+                              Background="{DynamicResource OverlayBrush}"
+                              Panel.ZIndex="14">
+                            <Border Style="{StaticResource CardStyle}"
+                                    Width="880" MaxWidth="{Binding ActualWidth, RelativeSource={RelativeSource AncestorType=Grid}}" MaxHeight="720"
+                                    HorizontalAlignment="Center"
+                                    VerticalAlignment="Center"
+                                    Background="{DynamicResource PanelBrush}">
+                                <Grid>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="*"/>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                    </Grid.RowDefinitions>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="{local:UiText tools.title}" Style="{StaticResource SectionTitleStyle}"/>
+                                            <TextBlock Text="{local:UiText tools.subtitle}"
+                                                       Foreground="{DynamicResource MutedBrush}"
+                                                       TextWrapping="Wrap" Margin="0,7,18,0"/>
+                                        </StackPanel>
+                                        <Button Grid.Column="1" Style="{StaticResource DialogCloseButtonStyle}"
+                                                Click="CloseHermesNativeTools_Click"/>
+                                    </Grid>
+
+                                    <Grid Grid.Row="1" Margin="0,18,0,12">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <Border Background="{DynamicResource PanelRaisedBrush}" CornerRadius="8" Padding="10" Margin="0,0,0,10">
+                                                <StackPanel>
+                                                    <CheckBox Content="{local:UiText tools.discovery.label}" FontWeight="SemiBold"
+                                                              AutomationProperties.AutomationId="NativeToolDiscoveryEnabled"
+                                                              IsChecked="{Binding ToolDiscoveryEnabled, Mode=TwoWay}"
+                                                              IsEnabled="{Binding CanEditToolDiscovery}"/>
+                                                    <TextBlock Text="{Binding ToolDiscoveryStateText}" TextWrapping="Wrap" FontSize="12"
+                                                               AutomationProperties.AutomationId="NativeToolDiscoveryState" Margin="20,4,0,0">
+                                                        <TextBlock.Style>
+                                                            <Style TargetType="TextBlock">
+                                                                <Setter Property="Foreground" Value="{DynamicResource MutedBrush}"/>
+                                                                <Style.Triggers>
+                                                                    <DataTrigger Binding="{Binding IsToolDiscoverySavedOff}" Value="True">
+                                                                        <Setter Property="Foreground" Value="{DynamicResource WarningBrush}"/>
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </TextBlock.Style>
+                                                    </TextBlock>
+                                                    <TextBlock Text="{Binding ToolDiscoveryHelp}" TextWrapping="Wrap" FontSize="12"
+                                                               Foreground="{DynamicResource MutedBrush}" Margin="20,4,0,0"/>
+                                                </StackPanel>
+                                            </Border>
+                                            <StackPanel Orientation="Horizontal" Margin="0,0,0,7">
+                                                <Button Content="{local:UiText tools.mode.daily}" Tag="daily"
+                                                        AutomationProperties.AutomationId="NativeToolPresetDaily"
+                                                        IsEnabled="{Binding CanSelectDailyPreset}" Click="NativeToolPreset_Click" Margin="0,0,8,0">
+                                                    <Button.Style>
+                                                        <Style TargetType="Button" BasedOn="{StaticResource SecondaryButtonStyle}">
+                                                            <Style.Triggers><DataTrigger Binding="{Binding DesiredPresetId}" Value="daily">
+                                                                <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
+                                                                <Setter Property="FontWeight" Value="SemiBold"/>
+                                                            </DataTrigger></Style.Triggers>
+                                                        </Style>
+                                                    </Button.Style>
+                                                </Button>
+                                                <Button Content="{local:UiText tools.mode.work}" Tag="work"
+                                                        AutomationProperties.AutomationId="NativeToolPresetWork"
+                                                        IsEnabled="{Binding CanSelectWorkPreset}" Click="NativeToolPreset_Click">
+                                                    <Button.Style>
+                                                        <Style TargetType="Button" BasedOn="{StaticResource SecondaryButtonStyle}">
+                                                            <Style.Triggers><DataTrigger Binding="{Binding DesiredPresetId}" Value="work">
+                                                                <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
+                                                                <Setter Property="FontWeight" Value="SemiBold"/>
+                                                            </DataTrigger></Style.Triggers>
+                                                        </Style>
+                                                    </Button.Style>
+                                                </Button>
+                                                <TextBlock Text="{Binding PresetStateText}" VerticalAlignment="Center" Margin="12,0,0,0" FontSize="12"/>
+                                            </StackPanel>
+                                            <TextBlock Text="{local:UiText tools.mode.help}" FontSize="12" TextWrapping="Wrap"
+                                                       Foreground="{DynamicResource MutedBrush}" Margin="0,0,0,7"/>
+                                            <TextBlock Text="{local:UiText tools.mode.localSceneNotice}" TextWrapping="Wrap" FontSize="12"
+                                                       Foreground="{DynamicResource WarningBrush}" Margin="0,0,0,7"
+                                                       Visibility="{Binding ShowLocalSceneNotice, Converter={StaticResource BooleanToVisibilityConverter}}"/>
+                                            <TextBlock x:Name="ControlCenterHermesNativeToolsStatus"
+                                                       AutomationProperties.AutomationId="ControlCenterHermesNativeToolsStatus"
+                                                       Text="{Binding NativeToolsStatusText}"
+                                                       TextWrapping="Wrap"/>
+                                            <TextBlock Text="{Binding NativeToolsActivationText}"
+                                                       Foreground="{DynamicResource WarningBrush}"
+                                                       FontSize="12" TextWrapping="Wrap" Margin="0,5,0,0"/>
+                                        </StackPanel>
+                                        <Button Grid.Column="1"
+                                                x:Name="ControlCenterHermesNativeToolsRefreshButton"
+                                                AutomationProperties.AutomationId="ControlCenterHermesNativeToolsRefreshButton"
+                                                Content="{local:UiText common.refresh}"
+                                                Style="{StaticResource SecondaryButtonStyle}"
+                                                IsEnabled="{Binding CanRefreshNativeTools}"
+                                                VerticalAlignment="Top"
+                                                Margin="18,0,0,0"
+                                                Click="HermesNativeToolsRefresh_Click"/>
+                                    </Grid>
+
+                                    <ScrollViewer Grid.Row="2"
+                                                  VerticalScrollBarVisibility="Auto"
+                                                  HorizontalScrollBarVisibility="Disabled"
+                                                  MaxHeight="430">
+                                        <StackPanel>
+                                            <TextBlock Text="{local:UiText tools.noTools}"
+                                                       Visibility="{Binding IsNativeToolsEmpty, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                                       Foreground="{DynamicResource MutedBrush}"
+                                                       HorizontalAlignment="Center" Margin="20"/>
+                                            <ItemsControl x:Name="ControlCenterHermesNativeToolsetList"
+                                                          AutomationProperties.AutomationId="ControlCenterHermesNativeToolsetList"
+                                                          ItemsSource="{Binding NativeToolGroups}">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <Expander Style="{StaticResource SectionExpanderStyle}" IsExpanded="{Binding IsExpanded, Mode=TwoWay}" Margin="0,0,6,8">
+                                                            <Expander.Header>
+                                                                <StackPanel Orientation="Horizontal">
+                                                                    <TextBlock Text="{Binding Label}" FontWeight="SemiBold"/>
+                                                                    <TextBlock Text="{Binding Summary}" FontSize="12" Foreground="{DynamicResource MutedBrush}" Margin="12,1,0,0"/>
+                                                                </StackPanel>
+                                                            </Expander.Header>
+                                                            <ItemsControl ItemsSource="{Binding Rows}">
+                                                                <ItemsControl.ItemTemplate>
+                                                                    <DataTemplate>
+                                                                        <Border BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1" Padding="2,8,8,8">
+                                                                            <StackPanel>
+                                                                                <Grid>
+                                                                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                                                                    <CheckBox Content="{Binding Label}" FontWeight="SemiBold"
+                                                                                              IsChecked="{Binding DesiredEnabled, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                                                                              IsEnabled="{Binding CanToggle}"/>
+                                                                                    <TextBlock Grid.Column="1" Text="{Binding ReadinessText}" FontSize="12" Margin="12,0,0,0" Foreground="{DynamicResource MutedBrush}"/>
+                                                                                </Grid>
+                                                                                <TextBlock Text="{Binding Description}" FontSize="12" Margin="20,4,0,0"
+                                                                                           TextTrimming="CharacterEllipsis" Foreground="{DynamicResource MutedBrush}"/>
+                                                                                <Expander Header="{local:UiText tools.details}" Style="{StaticResource DarkDisclosureExpanderStyle}"
+                                                                                          IsExpanded="{Binding IsDetailsExpanded, Mode=TwoWay}" Margin="12,3,0,0">
+                                                                                    <StackPanel>
+                                                                                        <TextBlock Text="{Binding Description}" TextWrapping="Wrap" FontSize="12"/>
+                                                                                        <TextBlock Text="{Binding NativeName}" FontSize="11" Margin="0,5,0,0" Foreground="{DynamicResource MutedBrush}"/>
+                                                                                        <TextBlock Text="{Binding ToolsText}" TextWrapping="Wrap" FontSize="11" Margin="0,3,0,0" Foreground="{DynamicResource MutedBrush}"/>
+                                                                                        <StackPanel Margin="0,8,0,0" Visibility="{Binding HasSetupProviders, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                                                                            <TextBlock Text="{local:UiText tools.provider}" FontSize="12"/>
+                                                                                            <ComboBox ItemsSource="{Binding SetupProviders}" SelectedItem="{Binding SelectedSetupProvider, Mode=TwoWay}"
+                                                                                                      DisplayMemberPath="Name" IsEnabled="{Binding CanToggle}" Margin="0,5,0,0"/>
+                                                                                            <StackPanel Margin="0,8,0,0" Visibility="{Binding HasSetupModels, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                                                                                <TextBlock Text="{local:UiText tools.model}" FontSize="12"/>
+                                                                                                <ComboBox ItemsSource="{Binding SetupModels}" SelectedItem="{Binding SelectedSetupModel, Mode=TwoWay}"
+                                                                                                          IsEnabled="{Binding CanToggle}" Margin="0,5,0,0"/>
+                                                                                            </StackPanel>
+                                                                                            <TextBlock Text="{Binding SetupStatusText}" TextWrapping="Wrap" FontSize="12" Margin="0,5,0,0" Foreground="{DynamicResource MutedBrush}"/>
+                                                                                            <Button Content="{local:UiText tools.saveProvider}" Tag="{Binding}" Margin="0,6,0,0" HorizontalAlignment="Left"
+                                                                                                    IsEnabled="{Binding CanSelectSetupProvider}" Click="HermesNativeSetupApply_Click"/>
+                                                                                        </StackPanel>
+                                                                                        <Button Content="{local:UiText tools.setup}" Tag="{Binding}" Margin="0,8,0,0" HorizontalAlignment="Left"
+                                                                                                IsEnabled="{Binding DataContext.CanStartSetupChat, RelativeSource={RelativeSource AncestorType=ItemsControl, AncestorLevel=2}}"
+                                                                                                Click="HermesNativeSetupGuide_Click"/>
+                                                                                        <TextBlock Text="{Binding DataContext.NativeSetupAvailabilityText, RelativeSource={RelativeSource AncestorType=ItemsControl, AncestorLevel=2}}"
+                                                                                                   TextWrapping="Wrap" FontSize="12" Margin="0,5,0,0" Foreground="{DynamicResource MutedBrush}"/>
+                                                                                    </StackPanel>
+                                                                                </Expander>
+                                                                            </StackPanel>
+                                                                        </Border>
+                                                                    </DataTemplate>
+                                                                </ItemsControl.ItemTemplate>
+                                                            </ItemsControl>
+                                                        </Expander>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                            <StackPanel Margin="0,12,0,0"
+                                                        Visibility="{Binding HasNativeMcpCatalog, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                                <TextBlock Text="{local:UiText tools.mcp}" FontWeight="SemiBold" Margin="0,0,0,8"/>
+                                                <TextBlock Text="{local:UiText tools.mcpHelp}"
+                                                           TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}" FontSize="12" Margin="0,0,0,8"/>
+                                                <ItemsControl ItemsSource="{Binding NativeMcpCatalog}"
+                                                              AutomationProperties.AutomationId="ControlCenterHermesNativeMcpCatalog">
+                                                    <ItemsControl.ItemTemplate>
+                                                        <DataTemplate>
+                                                            <Border BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="9" Padding="12" Margin="0,0,10,10">
+                                                                <StackPanel>
+                                                                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold"/>
+                                                                    <TextBlock Text="{Binding Description}" TextWrapping="Wrap" FontSize="12" Margin="0,4,0,0"/>
+                                                                    <TextBlock Text="{Binding Endpoint}" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}" FontSize="12" Margin="0,4,0,0"/>
+                                                                    <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" Foreground="{DynamicResource WarningBrush}" FontSize="12" Margin="0,4,0,0"/>
+                                                                    <CheckBox Content="{local:UiText tools.mcpEnable}" IsChecked="{Binding DesiredEnabled, Mode=TwoWay}"
+                                                                              IsEnabled="{Binding CanConfigure}" Margin="0,8,0,0"/>
+                                                                    <Button Content="{local:UiText tools.mcpSave}" IsEnabled="{Binding CanApply}" Tag="{Binding}"
+                                                                            HorizontalAlignment="Left" Margin="0,6,0,0" Click="HermesNativeMcpSetupApply_Click"/>
+                                                                </StackPanel>
+                                                            </Border>
+                                                        </DataTemplate>
+                                                    </ItemsControl.ItemTemplate>
+                                                </ItemsControl>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </ScrollViewer>
+
+                                    <Grid Grid.Row="3" Margin="0,12,0,0">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="220"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="{local:UiText tools.approval}" FontWeight="SemiBold"/>
+                                            <ComboBox x:Name="ControlCenterHermesNativeApprovalModeSelector"
+                                                      AutomationProperties.AutomationId="ControlCenterHermesNativeApprovalModeSelector"
+                                                      ItemsSource="{Binding NativeApprovalModes}"
+                                                      SelectedItem="{Binding SelectedNativeApprovalMode, Mode=TwoWay}"
+                                                      DisplayMemberPath="DisplayName"
+                                                      IsEnabled="{Binding CanEditNativeTools}"
+                                                      Margin="0,6,0,0"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="1" Margin="20,0,0,0">
+                                            <TextBlock Text="{local:UiText approval.help}" TextWrapping="Wrap" FontSize="12"
+                                                       Foreground="{DynamicResource MutedBrush}" Margin="0,7,0,0"/>
+                                        </StackPanel>
+                                    </Grid>
+
+                                    <StackPanel Grid.Row="4" Orientation="Horizontal"
+                                                HorizontalAlignment="Right" Margin="0,18,0,0">
+                                        <Button Content="{local:UiText tools.newChat}" Style="{StaticResource SecondaryButtonStyle}"
+                                                IsEnabled="{Binding CanStartNewChat}" Margin="0,0,10,0"
+                                                AutomationProperties.AutomationId="NativeSettingsNewChat" Click="NativeSettingsNewChat_Click"/>
+                                        <Button x:Name="ControlCenterHermesNativeToolsCancelButton"
+                                                AutomationProperties.AutomationId="ControlCenterHermesNativeToolsCancelButton"
+                                                Content="{local:UiText common.cancel}"
+                                                Style="{StaticResource SecondaryButtonStyle}"
+                                                IsEnabled="{Binding CanCancelNativeTools}"
+                                                Click="HermesNativeToolsCancel_Click"/>
+                                        <Button x:Name="ControlCenterHermesNativeToolsApplyButton"
+                                                AutomationProperties.AutomationId="ControlCenterHermesNativeToolsApplyButton"
+                                                Content="{local:UiText common.save}"
+                                                Style="{StaticResource PrimaryButtonStyle}"
+                                                IsEnabled="{Binding CanApplyNativeTools}"
+                                                Margin="10,0,0,0"
+                                                Click="HermesNativeToolsApply_Click"/>
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+                        </Grid>
+
+                        <Grid x:Name="ProviderCatalogOverlay" Visibility="Collapsed" Background="{DynamicResource OverlayBrush}" Panel.ZIndex="11">
+                            <Border Style="{StaticResource CardStyle}" Width="700" MaxWidth="{Binding ActualWidth, RelativeSource={RelativeSource AncestorType=Grid}}" MaxHeight="620" HorizontalAlignment="Center" VerticalAlignment="Center" Background="{DynamicResource PanelBrush}">
+                                <Grid>
+                                    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock x:Name="ProviderCatalogTitleText" Text="{local:UiText ui.model.catalog}" Style="{StaticResource SectionTitleStyle}"/>
+                                            <TextBlock x:Name="ProviderCatalogSummaryText" Text="{local:UiText ui.no.provider.selected}" Foreground="{DynamicResource MutedBrush}" Margin="0,7,0,0"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                            <Button x:Name="ProviderManageInstanceButton"
+                                                    Content="{local:UiText ui.manage.this.instance}"
+                                                    Style="{StaticResource SecondaryButtonStyle}"
+                                                    Margin="0,0,10,0"
+                                                    Click="OpenSelectedProviderSetup_Click"/>
+                                            <Button Style="{StaticResource DialogCloseButtonStyle}" Click="CloseProviderCatalog_Click"/>
+                                        </StackPanel>
+                                    </Grid>
+                                    <Border Grid.Row="1" Background="{DynamicResource PanelRaisedBrush}" CornerRadius="11" Padding="13" Margin="0,16,0,12">
+                                        <TextBlock Text="{local:UiText ui.only.capabilities.explicitly.declared.by.the.official.catalog.are}" TextWrapping="Wrap" Foreground="{DynamicResource WarningBrush}"/>
+                                    </Border>
+                                    <ListBox x:Name="ProviderCatalogList" Grid.Row="2" MaxHeight="390" Background="{DynamicResource InputBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" Padding="6" ScrollViewer.CanContentScroll="True" ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Disabled" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling">
+                                        <ListBox.ItemTemplate>
+                                            <DataTemplate>
+                                                <Grid Margin="8,6">
+                                                    <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                                    <StackPanel>
+                                                        <TextBlock Text="{Binding ModelId}" FontWeight="SemiBold"/>
+                                                        <TextBlock Text="{Binding CapabilityEvidence}" Foreground="{DynamicResource MutedBrush}" FontSize="12" Margin="0,4,0,0"/>
+                                                        <ItemsControl ItemsSource="{Binding CapabilityBadges}" Margin="0,3,0,0">
+                                                            <ItemsControl.ItemsPanel>
+                                                                <ItemsPanelTemplate>
+                                                                    <WrapPanel/>
+                                                                </ItemsPanelTemplate>
+                                                            </ItemsControl.ItemsPanel>
+                                                            <ItemsControl.ItemTemplate>
+                                                                <DataTemplate>
+                                                                    <Border Background="{DynamicResource PanelRaisedBrush}"
+                                                                            BorderBrush="{local:ThemeBrush Color}"
+                                                                            BorderThickness="1"
+                                                                            CornerRadius="8"
+                                                                            Padding="8,5"
+                                                                            Margin="0,5,6,0">
+                                                                        <StackPanel>
+                                                                            <TextBlock Text="{Binding Label}"
+                                                                                       Foreground="{local:ThemeBrush Color}"
+                                                                                       FontSize="12"
+                                                                                       FontWeight="SemiBold"/>
+                                                                            <TextBlock Text="{Binding EvidenceLabel}"
+                                                                                       Foreground="{DynamicResource MutedBrush}"
+                                                                                       FontSize="12"
+                                                                                       Margin="0,2,0,0"/>
+                                                                        </StackPanel>
+                                                                    </Border>
+                                                                </DataTemplate>
+                                                            </ItemsControl.ItemTemplate>
+                                                        </ItemsControl>
+                                                    </StackPanel>
+                                                    <TextBlock Grid.Column="1" Text="{local:UiText ui.catalog.entries}" Foreground="{DynamicResource MutedBrush}" FontSize="12" VerticalAlignment="Center"/>
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ListBox.ItemTemplate>
+                                    </ListBox>
+                                </Grid>
+                            </Border>
+                        </Grid>
+
+                        <Grid x:Name="AddProviderOverlay" Visibility="Collapsed" Background="{DynamicResource OverlayBrush}" Panel.ZIndex="12">
+                            <Border Style="{StaticResource CardStyle}" Width="790" MaxWidth="{Binding ActualWidth, RelativeSource={RelativeSource AncestorType=Grid}}" MaxHeight="680" HorizontalAlignment="Center" VerticalAlignment="Center" Background="{DynamicResource PanelBrush}">
+                                <Grid>
+                                    <Grid.Resources>
+                                        <Style x:Key="ProviderSetupCardButtonStyle"
+                                               TargetType="Button"
+                                               BasedOn="{StaticResource CardButtonStyle}">
+                                            <Style.Triggers>
+                                                <Trigger Property="IsEnabled" Value="False">
+                                                    <Setter Property="Cursor" Value="Arrow"/>
+                                                </Trigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                        <DataTemplate x:Key="ProviderSetupCardTemplate">
+                                            <Button Style="{StaticResource ProviderSetupCardButtonStyle}"
+                                                    Margin="0,0,12,12"
+                                                    Tag="{Binding ProviderId}"
+                                                    IsEnabled="{Binding CanOpenSetup}"
+                                                    Click="ProviderSetupCard_Click">
+                                                <StackPanel Margin="17">
+                                                    <Grid>
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                        </Grid.ColumnDefinitions>
+                                                        <TextBlock Text="{Binding DisplayName}" FontSize="17" FontWeight="SemiBold"/>
+                                                        <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                                            <Ellipse Width="9" Height="9" Fill="{local:ThemeBrush HealthColor}" VerticalAlignment="Center" Margin="0,0,7,0"/>
+                                                            <Border Style="{StaticResource PillStyle}" Margin="0" Padding="9,4">
+                                                                <TextBlock Text="{Binding HealthSummary}" Foreground="{local:ThemeBrush HealthColor}" FontSize="12"/>
+                                                            </Border>
+                                                        </StackPanel>
+                                                    </Grid>
+                                                    <TextBlock Text="{Binding AuthSummary}" Foreground="{DynamicResource MutedBrush}" FontSize="12" Margin="0,7,0,0"/>
+                                                    <TextBlock Text="{Binding StatusSummary}" Margin="0,8,0,0">
+                                                        <TextBlock.Style>
+                                                            <Style TargetType="TextBlock">
+                                                                <Setter Property="Foreground" Value="{DynamicResource WarningBrush}"/>
+                                                                <Style.Triggers>
+                                                                    <DataTrigger Binding="{Binding CanOpenSetup}" Value="True">
+                                                                        <Setter Property="Foreground" Value="{DynamicResource GoodBrush}"/>
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </TextBlock.Style>
+                                                    </TextBlock>
+                                                    <TextBlock Text="{Binding EndpointSummary}" TextWrapping="Wrap" Foreground="{DynamicResource TextBrush}" FontSize="12" Margin="0,7,0,0"/>
+                                                    <TextBlock Text="{Binding CatalogSummary}" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}" FontSize="12" Margin="0,5,0,0"/>
+                                                    <TextBlock Text="{Binding DisabledReason}" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}" FontSize="12" Margin="0,7,0,0">
+                                                        <TextBlock.Style>
+                                                            <Style TargetType="TextBlock">
+                                                                <Style.Triggers>
+                                                                    <DataTrigger Binding="{Binding DisabledReason}" Value="">
+                                                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </TextBlock.Style>
+                                                    </TextBlock>
+                                                </StackPanel>
+                                            </Button>
+                                        </DataTemplate>
+                                    </Grid.Resources>
+                                    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="{local:UiText ui.add.an.ai.provider}" Style="{StaticResource SectionTitleStyle}"/>
+                                            <TextBlock Text="{local:UiText ui.choose.a.provider.then.its.exact.endpoint.and.credentials}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" Margin="0,7,16,0"/>
+                                        </StackPanel>
+                                        <Button Grid.Column="1" Style="{StaticResource DialogCloseButtonStyle}" Click="CloseAddProvider_Click"/>
+                                    </Grid>
+                                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Margin="0,18,4,0">
+                                        <StackPanel>
+                                            <TextBlock Text="{local:UiText ui.cloud.providers}" Foreground="{DynamicResource AccentStrongBrush}" FontSize="12" FontWeight="SemiBold" Margin="0,0,0,10"/>
+                                            <ItemsControl x:Name="CloudProviderSetupList" ItemTemplate="{StaticResource ProviderSetupCardTemplate}">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><UniformGrid Columns="2"/></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                            </ItemsControl>
+                                            <Grid Margin="0,7,0,10">
+                                                <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                                <TextBlock Text="{local:UiText ui.local.self.hosted}" Foreground="{DynamicResource AccentStrongBrush}" FontSize="12" FontWeight="SemiBold"/>
+                                                <TextBlock Grid.Column="1" Text="{local:UiText ui.connect.only.to.your.specified.endpoint.no.automatic.lan}" Foreground="{DynamicResource MutedBrush}" FontSize="12"/>
+                                            </Grid>
+                                            <ItemsControl x:Name="LocalProviderSetupList" ItemTemplate="{StaticResource ProviderSetupCardTemplate}">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><UniformGrid Columns="2"/></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                            </ItemsControl>
+                                        </StackPanel>
+                                    </ScrollViewer>
+                                </Grid>
+                            </Border>
+                        </Grid>
+
+                        <Grid x:Name="ProviderConnectionOverlay" Visibility="Collapsed" Background="{DynamicResource OverlayBrush}" Panel.ZIndex="13">
+                            <Border Style="{StaticResource CardStyle}" Width="760" MaxWidth="{Binding ActualWidth, RelativeSource={RelativeSource AncestorType=Grid}}" MaxHeight="690" HorizontalAlignment="Center" VerticalAlignment="Center" Background="{DynamicResource PanelBrush}">
+                                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                              HorizontalScrollBarVisibility="Disabled"
+                                              Margin="0,0,4,0">
+                                <StackPanel Margin="0,0,8,0">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock x:Name="ProviderSetupTitleText" Text="{local:UiText ui.ai.provider.settings}" Style="{StaticResource SectionTitleStyle}"/>
+                                            <TextBlock Text="{local:UiText ui.save.desired.configuration.only.this.does.not.enable.or}" Foreground="{DynamicResource MutedBrush}" Margin="0,7,0,0"/>
+                                        </StackPanel>
+                                        <Button Grid.Column="1" Style="{StaticResource DialogCloseButtonStyle}" Click="CloseProviderSetup_Click"/>
+                                    </Grid>
+                                    <Grid Margin="0,20,0,0">
+                                        <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock x:Name="ProviderSetupProtocolText" Text="Provider profile" Foreground="{DynamicResource MutedBrush}"/>
+                                            <TextBlock Text="{local:UiText ui.models.endpoint.and.credentials}" FontSize="22" FontWeight="SemiBold" Margin="0,7,0,0"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                            <Ellipse x:Name="ProviderSetupHealthLight" Width="10" Height="10" Fill="{DynamicResource MutedBrush}" Margin="0,0,8,0"/>
+                                            <Border Style="{StaticResource PillStyle}"><TextBlock x:Name="ProviderSetupHealthText" Text="{local:UiText ui.not.configured}" Foreground="{DynamicResource MutedBrush}"/></Border>
+                                        </StackPanel>
+                                    </Grid>
+                                    <TextBlock Text="{local:UiText ui.configuration.name}" Foreground="{DynamicResource MutedBrush}" Margin="0,20,0,7"/>
+                                    <TextBox x:Name="ProviderInstanceIdInput" MaxLength="96" Padding="14,11" Background="{DynamicResource InputBrush}" Foreground="{DynamicResource TextBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1"/>
+
+                                    <StackPanel x:Name="ProviderEndpointProfilePanel" Visibility="Collapsed">
+                                        <TextBlock Text="{local:UiText ui.region.endpoint.profile}" Foreground="{DynamicResource MutedBrush}" Margin="0,17,0,7"/>
+                                        <ComboBox x:Name="ProviderEndpointProfileSelector" Style="{StaticResource DarkComboBoxStyle}" SelectionChanged="ProviderEndpointProfileSelector_SelectionChanged"/>
+                                    </StackPanel>
+                                    <StackPanel x:Name="ProviderWorkspacePanel" Visibility="Collapsed">
+                                        <TextBlock Text="Workspace ID" Foreground="{DynamicResource MutedBrush}" Margin="0,17,0,7"/>
+                                        <TextBox x:Name="ProviderWorkspaceInput" MaxLength="128" Padding="14,11" Background="{DynamicResource InputBrush}" Foreground="{DynamicResource TextBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" TextChanged="ProviderWorkspaceInput_TextChanged"/>
+                                    </StackPanel>
+                                    <StackPanel x:Name="ProviderRouteIntentPanel" Visibility="Collapsed">
+                                        <TextBlock Text="{local:UiText ui.endpoint.route}" Foreground="{DynamicResource MutedBrush}" Margin="0,17,0,7"/>
+                                        <ComboBox x:Name="ProviderRouteIntentSelector"
+                                                  Style="{StaticResource DarkComboBoxStyle}"
+                                                  DisplayMemberPath="DisplayName"
+                                                  SelectionChanged="ProviderRouteIntentSelector_SelectionChanged"/>
+                                        <TextBlock x:Name="ProviderRouteIntentWarningText"
+                                                   Text="{local:UiText ui.endpoints.are.never.guessed.or.scanned.lan.and.remote}"
+                                                   Foreground="{DynamicResource WarningBrush}"
+                                                   TextWrapping="Wrap"
+                                                   FontSize="12"
+                                                   Margin="0,6,0,0"/>
+                                    </StackPanel>
+                                    <StackPanel x:Name="ProviderBaseUrlPanel">
+                                        <TextBlock Text="Base URL" Foreground="{DynamicResource MutedBrush}" Margin="0,17,0,7"/>
+                                        <TextBox x:Name="ProviderBaseUrlInput" MaxLength="1024" Padding="14,11" Background="{DynamicResource InputBrush}" Foreground="{DynamicResource TextBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1"/>
+                                        <TextBlock x:Name="ProviderEndpointPolicyText" Text="{local:UiText ui.use.only.the.explicitly.selected.endpoint.never.scan.the}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" FontSize="12" Margin="0,6,0,0"/>
+                                    </StackPanel>
+                                    <StackPanel x:Name="ProviderCredentialPanel" Visibility="Collapsed">
+                                        <TextBlock Text="{local:UiText ui.api.key.access.token}" Foreground="{DynamicResource MutedBrush}" Margin="0,17,0,7"/>
+                                        <PasswordBox x:Name="ProviderApiKeyInput" PasswordChar="●" MaxLength="16384" Padding="14,11" Background="{DynamicResource InputBrush}" Foreground="{DynamicResource TextBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" IsEnabled="False"/>
+                                        <TextBlock x:Name="ProviderCredentialHintText" Text="{local:UiText ui.credentials.are.sent.only.to.the.selected.provider.during}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" FontSize="12" Margin="0,6,0,0"/>
+                                    </StackPanel>
+                                    <Border Background="{DynamicResource PanelRaisedBrush}" CornerRadius="11" Padding="13" Margin="0,18,0,0">
+                                        <TextBlock Text="{local:UiText ui.api.keys.are.managed.by.hermes.at.the.top}"
+                                                   Foreground="{DynamicResource AccentStrongBrush}"
+                                                   TextWrapping="Wrap"/>
+                                    </Border>
+
+                                    <Border Background="{DynamicResource PanelRaisedBrush}" CornerRadius="11" Padding="13" Margin="0,18,0,0">
+                                        <StackPanel>
+                                            <TextBlock Text="{local:UiText ui.connection.health.layers}" FontWeight="SemiBold"/>
+                                            <UniformGrid Columns="3" Margin="0,8,0,0">
+                                                <TextBlock x:Name="ProviderCredentialLayerText" Text="{local:UiText ui.credentials.not.verified}" Foreground="{DynamicResource MutedBrush}" FontSize="12"/>
+                                                <TextBlock x:Name="ProviderCatalogLayerText" Text="{local:UiText ui.catalog.not.verified}" Foreground="{DynamicResource MutedBrush}" FontSize="12"/>
+                                                <TextBlock x:Name="ProviderRuntimeLayerText" Text="{local:UiText ui.runtime.not.verified}" Foreground="{DynamicResource MutedBrush}" FontSize="12"/>
+                                            </UniformGrid>
+                                            <TextBlock Text="{local:UiText ui.green.successful.observation.at.that.layer.amber.unchecked.timed}"
+                                                       Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" FontSize="12" Margin="0,8,0,0"/>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <Grid Margin="0,17,0,0">
+                                        <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="{local:UiText ui.default.text.model.for.this.provider.exact.model.id}" Foreground="{DynamicResource MutedBrush}" Margin="0,0,0,7"/>
+                                            <ComboBox x:Name="ProviderModelSelector"
+                                                      MinWidth="320"
+                                                      Style="{StaticResource DarkComboBoxStyle}"
+                                                      IsEditable="True"
+                                                      IsTextSearchEnabled="True"
+                                                      IsEnabled="False"/>
+                                            <TextBlock Text="{local:UiText ui.if.the.provider.has.no.catalog.enter.the.exact}"
+                                                       Foreground="{DynamicResource MutedBrush}"
+                                                       TextWrapping="Wrap"
+                                                       FontSize="12"
+                                                       Margin="0,6,0,0"/>
+                                        </StackPanel>
+                                        <Button x:Name="ProviderApplyModelButton" Grid.Column="1" Content="{local:UiText ui.apply.text.model}" IsEnabled="False" Style="{StaticResource SecondaryButtonStyle}" Margin="10,23,0,0" Click="ProviderApplyModelButton_Click"/>
+                                    </Grid>
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+                                        <Button x:Name="ProviderPrepareValidationButton" Content="{local:UiText ui.verify.and.save.securely}" Style="{StaticResource PrimaryButtonStyle}" IsEnabled="False" Visibility="Collapsed" Click="ProviderPrepareValidationButton_Click"/>
+                                    </StackPanel>
+                                    <TextBlock x:Name="ProviderOperationStatusText" Text="{local:UiText ui.d.033.source.preview.live.validation.credential.entry.and}" Foreground="{DynamicResource AccentStrongBrush}" TextWrapping="Wrap" FontSize="12" Margin="0,11,0,0"/>
+                                </StackPanel>
+                                </ScrollViewer>
+                            </Border>
+                        </Grid>
+                    </Grid>
+
+                    <Grid x:Name="LilithPage" Visibility="Collapsed">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <StackPanel>
+                                <TextBlock Text="{local:UiText nav.lilith}" Style="{StaticResource PageTitleStyle}"/>
+                                <TextBlock Text="{local:UiText ui.view.correct.or.forget.memories.saved.by.lilith}" Style="{StaticResource MutedTextStyle}" Margin="0,7,0,0"/>
+                                <local:D048ExpressionPanel x:Name="LilithExpressionPanel" Margin="0,18,0,0"/>
+                                <local:D057MemoryManagementPanel
+                                    x:Name="LilithMemoryManagementPanel"
+                                    Margin="0,18,0,0"/>
+                            </StackPanel>
+                        </ScrollViewer>
+                    </Grid>
+
+                    <Grid x:Name="InteractionPage" Visibility="Collapsed" IsVisibleChanged="LettersPage_IsVisibleChanged">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <StackPanel>
+                                <TextBlock Text="{local:UiText nav.interaction}" Style="{StaticResource PageTitleStyle}"/>
+                                <TextBlock Text="{local:UiText ui.choose.how.lilith.interacts.with.you.full.tool.settings}" Style="{StaticResource MutedTextStyle}" Margin="0,7,0,0"/>
+                                <Border Style="{StaticResource CardStyle}" Margin="0,18,0,0">
+                                    <StackPanel>
+                                        <CheckBox x:Name="LettersEnabled" Content="{local:UiText manual.notes.auto.title}" FontSize="18" IsEnabled="False" Click="LettersSave_Click"/>
+                                        <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                                            <TextBlock Text="{local:UiText ui.daily.maximum}" VerticalAlignment="Center"/>
+                                            <TextBox x:Name="LettersDailyLimit" Text="1" Width="64" Padding="8,6" TextAlignment="Center" Margin="8,0"/>
+                                            <TextBlock Text="{local:UiText ui.letters}" VerticalAlignment="Center"/>
+                                            <Button x:Name="LettersSave" Content="{local:UiText ui.save.limit}" Margin="16,0,8,0" Click="LettersSave_Click"/>
+                                            <Button Content="{local:UiText ui.reload}" Click="LettersRefresh_Click"/>
+                                        </StackPanel>
+                                        <TextBlock Text="{local:UiText ui.letters.follow.real.conversations.and.are.left.while.you}" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}" Margin="0,12,0,0"/>
+                                        <TextBlock x:Name="LettersStatusText" Text="{local:UiText ui.settings.not.loaded.yet}" TextWrapping="Wrap" Foreground="{DynamicResource AccentStrongBrush}" Margin="0,8,0,0"/>
+                                    </StackPanel>
+                                </Border>
+                                <Border Style="{StaticResource CardStyle}" Margin="0,12,0,0" Loaded="ManualNotes_Loaded">
+                                    <StackPanel>
+                                        <CheckBox x:Name="ManualNotesEnabled" Content="{local:UiText manual.notes.title}"
+                                                  AutomationProperties.AutomationId="ManualNotesEnabled" FontSize="18"
+                                                  IsEnabled="False" Click="ManualNotes_Click"/>
+                                        <TextBlock Text="{local:UiText manual.notes.description}" TextWrapping="Wrap"
+                                                   Foreground="{DynamicResource MutedBrush}" Margin="0,12,0,0"/>
+                                        <TextBlock x:Name="ManualNotesStatusText" Text="{local:UiText ui.settings.not.loaded.yet}"
+                                                   TextWrapping="Wrap" Foreground="{DynamicResource AccentStrongBrush}" Margin="0,8,0,0"/>
+                                    </StackPanel>
+                                </Border>
+                                <Border Style="{StaticResource CardStyle}" Margin="0,18,0,0" Background="{DynamicResource HeroBrush}">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                        <StackPanel>
+                                            <TextBlock Text="{local:UiText ui.lilith.workbench}" Style="{StaticResource SectionTitleStyle}"/>
+                                            <TextBlock Text="{local:UiText ui.chat.review.history.or.work.together}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" Margin="0,8,0,0"/>
+                                        </StackPanel>
+                                        <Button Grid.Column="1" x:Name="OpenWorkbenchButton"
+                                                Content="{local:UiText ui.open.lilith.workbench}"
+                                                Style="{StaticResource PrimaryButtonStyle}"
+                                                VerticalAlignment="Center" Margin="22,0,0,0"
+                                                Click="OpenWorkbench_Click"/>
+                                    </Grid>
+                                </Border>
+                            </StackPanel>
+                        </ScrollViewer>
+                    </Grid>
+
+                    <Grid x:Name="SettingsPage" Visibility="Collapsed">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <StackPanel>
+                                <TextBlock Text="{local:UiText settings.title}" Style="{StaticResource PageTitleStyle}"/>
+                                <TextBlock Text="{local:UiText settings.subtitle}" Style="{StaticResource MutedTextStyle}" Margin="0,7,0,0"/>
+                                <Border Style="{StaticResource CardStyle}" Margin="0,18,0,0">
+                                    <StackPanel>
+                                        <TextBlock Text="{local:UiText settings.language}" FontWeight="SemiBold"/>
+                                        <ComboBox x:Name="InterfaceLanguageSelector" AutomationProperties.AutomationId="InterfaceLanguageSelector"
+                                                  SelectedValuePath="Code" DisplayMemberPath="Label" HorizontalAlignment="Left" MinWidth="220"
+                                                  Margin="0,8,0,0" SelectionChanged="InterfaceLanguage_SelectionChanged"/>
+                                        <TextBlock Text="{local:UiText settings.languageHelp}" TextWrapping="Wrap" Style="{StaticResource MutedTextStyle}" Margin="0,8,0,18"/>
+                                        <TextBlock Text="{local:UiText settings.theme}" FontWeight="SemiBold"/>
+                                        <ComboBox x:Name="ThemeModeSelector" AutomationProperties.AutomationId="ThemeModeSelector"
+                                                  AutomationProperties.Name="{local:UiText settings.theme}"
+                                                  SelectedValuePath="Tag" HorizontalAlignment="Left" MinWidth="220"
+                                                  Margin="0,8,0,0" SelectionChanged="ThemeMode_SelectionChanged">
+                                            <ComboBoxItem Tag="system" Content="{local:UiText settings.themeSystem}"/>
+                                            <ComboBoxItem Tag="light" Content="{local:UiText settings.themeLight}"/>
+                                            <ComboBoxItem Tag="dark" Content="{local:UiText settings.darkMode}"/>
+                                        </ComboBox>
+                                        <TextBlock Text="{local:UiText settings.themeHelp}" TextWrapping="Wrap" Style="{StaticResource MutedTextStyle}" Margin="0,8,0,18"/>
+                                        <CheckBox x:Name="ChatSendSoundCheckBox" AutomationProperties.AutomationId="ChatSendSoundCheckBox"
+                                                  Content="{local:UiText settings.sound}" Click="ChatSendSound_Click"/>
+                                        <TextBlock Text="{local:UiText settings.soundHelp}" TextWrapping="Wrap" Style="{StaticResource MutedTextStyle}" Margin="56,6,0,18"/>
+                                        <CheckBox x:Name="StartupCheckBox" AutomationProperties.AutomationId="StartupCheckBox"
+                                                  Content="{local:UiText settings.startup}" Click="Startup_Click"/>
+                                        <TextBlock Text="{local:UiText settings.startupHelp}" TextWrapping="Wrap" Style="{StaticResource MutedTextStyle}" Margin="56,6,0,18"/>
+                                        <TextBlock x:Name="DesktopSettingsStatus" AutomationProperties.AutomationId="DesktopSettingsStatus"
+                                                   TextWrapping="Wrap" Foreground="{DynamicResource AccentStrongBrush}" Margin="0,10,0,0"/>
+                                    </StackPanel>
+                                </Border>
+                                <local:UsageBudgetPanel x:Name="UsageBudgetSettingsPanel" Margin="0,18,0,0"/>
+                                <Border x:Name="PlayerSaveDataCard" Style="{StaticResource CardStyle}" Margin="0,18,0,0">
+                                    <StackPanel>
+                                        <TextBlock Text="{local:UiText playerSave.title}" Style="{StaticResource SectionTitleStyle}"/>
+                                        <TextBlock Text="{local:UiText playerSave.help}" TextWrapping="Wrap" Style="{StaticResource MutedTextStyle}" Margin="0,8,0,0"/>
+                                        <TextBlock Text="{local:UiText playerSave.privacy}" TextWrapping="Wrap" Style="{StaticResource MutedTextStyle}" Margin="0,8,0,14"/>
+                                        <WrapPanel>
+                                            <Button x:Name="PlayerSaveExportButton" AutomationProperties.AutomationId="PlayerSaveExportButton"
+                                                    Content="{local:UiText playerSave.export}" Style="{StaticResource SecondaryButtonStyle}"
+                                                    Margin="0,0,8,8" Click="PlayerSaveExport_Click"/>
+                                            <Button x:Name="PlayerSaveImportButton" AutomationProperties.AutomationId="PlayerSaveImportButton"
+                                                    Content="{local:UiText playerSave.import}" Style="{StaticResource SecondaryButtonStyle}"
+                                                    Margin="0,0,0,8" Click="PlayerSaveImport_Click"/>
+                                        </WrapPanel>
+                                        <ProgressBar x:Name="PlayerSaveProgress" AutomationProperties.AutomationId="PlayerSaveProgress"
+                                                     IsIndeterminate="True" Visibility="Collapsed" Height="4" Margin="0,4,0,8"/>
+                                        <TextBlock x:Name="PlayerSaveStatusText" AutomationProperties.AutomationId="PlayerSaveStatusText"
+                                                   TextWrapping="Wrap" Foreground="{DynamicResource AccentStrongBrush}" Margin="0,4,0,0"/>
+                                        <TextBlock x:Name="PlayerSaveRestartText" Text="{local:UiText playerSave.restart}"
+                                                   Visibility="Collapsed" TextWrapping="Wrap" Style="{StaticResource MutedTextStyle}" Margin="0,8,0,0"/>
+                                    </StackPanel>
+                                </Border>
+                                <local:D046GameControlsPanel Margin="0,18,0,0"/>
+                                <Expander x:Name="AdvancedDiagnosticsPanel" Header="{local:UiText common.diagnostics}" IsExpanded="False" Style="{StaticResource SectionExpanderStyle}" Margin="0,18,0,0">
+                                    <StackPanel>
+                                        <Border Style="{StaticResource CardStyle}" Margin="0,0,0,14">
+                                            <StackPanel>
+                                                <TextBlock Text="{local:UiText ui.game.observations}" Style="{StaticResource SectionTitleStyle}"/>
+                                                <TextBlock Text="{local:UiText ui.activity.reported.by.the.game.only.this.does.not}" Style="{StaticResource MutedTextStyle}" TextWrapping="Wrap" Margin="0,8,0,12"/>
+                                                <TextBlock Text="{Binding TelemetryObservedAt}" Foreground="{DynamicResource MutedBrush}"/>
+                                                <ItemsControl ItemsSource="{Binding DiagnosticTelemetryRows}" Margin="0,12,0,0">
+                                                    <ItemsControl.ItemTemplate>
+                                                        <DataTemplate>
+                                                            <Grid Margin="0,5">
+                                                                <Grid.ColumnDefinitions><ColumnDefinition Width="180"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                                                                <TextBlock Text="{Binding Label}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"/>
+                                                                <TextBlock Grid.Column="1" Text="{Binding DisplayValue}" TextWrapping="Wrap"/>
+                                                            </Grid>
+                                                        </DataTemplate>
+                                                    </ItemsControl.ItemTemplate>
+                                                </ItemsControl>
+                                            </StackPanel>
+                                        </Border>
+                                        <Border Style="{StaticResource CardStyle}">
+                                            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="210"/><ColumnDefinition/></Grid.ColumnDefinitions><Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+                                                <TextBlock Text="{local:UiText ui.game.runtime.generation}" Foreground="{DynamicResource MutedBrush}"/><TextBlock Grid.Column="1" Text="{Binding RuntimeGeneration}"/>
+                                                <TextBlock Grid.Row="1" Text="{local:UiText ui.configuration.generation}" Foreground="{DynamicResource MutedBrush}" Margin="0,10,0,0"/><TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding ConfigurationGeneration}" Margin="0,10,0,0"/>
+                                                <TextBlock Grid.Row="2" Text="{local:UiText ui.game.runtime.identity}" Foreground="{DynamicResource MutedBrush}" Margin="0,10,0,0"/><TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding RuntimeIdentity}" Margin="0,10,0,0"/>
+                                                <TextBlock Grid.Row="3" Text="{local:UiText ui.session.identity}" Foreground="{DynamicResource MutedBrush}" Margin="0,10,0,0"/><TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding SessionIdentity}" Margin="0,10,0,0"/>
+                                                <TextBlock Grid.Row="4" Text="{local:UiText ui.schema.fingerprint}" Foreground="{DynamicResource MutedBrush}" Margin="0,10,0,0"/><TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding SchemaFingerprint}" Margin="0,10,0,0"/>
+                                                <TextBlock Grid.Row="5" Text="{local:UiText ui.configuration.fingerprint}" Foreground="{DynamicResource MutedBrush}" Margin="0,10,0,0"/><TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding SemanticFingerprint}" Margin="0,10,0,0"/>
+                                                <TextBlock Grid.Row="6" Text="{local:UiText ui.observation.fingerprint}" Foreground="{DynamicResource MutedBrush}" Margin="0,10,0,0"/><TextBlock Grid.Row="6" Grid.Column="1" Text="{Binding ObservationFingerprint}" Margin="0,10,0,0"/>
+                                                <TextBlock Grid.Row="7" Text="{local:UiText ui.last.updated}" Foreground="{DynamicResource MutedBrush}" Margin="0,10,0,0"/><TextBlock Grid.Row="7" Grid.Column="1" Text="{Binding ObservedAt}" Margin="0,10,0,0"/>
+                                            </Grid>
+                                        </Border>
+                                    </StackPanel>
+                                </Expander>
+                            </StackPanel>
+                        </ScrollViewer>
+
+                    </Grid>
+                </Grid>
+            </Grid>
+            <Border x:Name="DailyNoteApprovalCard" Grid.ColumnSpan="2" Panel.ZIndex="100"
+                    Style="{StaticResource CardStyle}" Visibility="Collapsed"
+                    HorizontalAlignment="Right" VerticalAlignment="Bottom" MaxWidth="660" Margin="24">
+                <StackPanel>
+                    <TextBlock Text="{local:UiText ui.daily.image.note.native.hermes.approval}" FontSize="17" FontWeight="SemiBold"/>
+                    <TextBlock Text="{local:UiText ui.an.independent.background.note.request.no.new.chat.or}" TextWrapping="Wrap"
+                               Foreground="{DynamicResource MutedBrush}" Margin="0,7,0,0"/>
+                    <ScrollViewer MaxHeight="230" VerticalScrollBarVisibility="Auto" Margin="0,12,0,0">
+                        <StackPanel>
+                            <TextBlock x:Name="DailyNoteApprovalDescription" TextWrapping="Wrap"/>
+                            <TextBlock x:Name="DailyNoteApprovalCommand" TextWrapping="Wrap" Margin="0,7,0,0"
+                                       Foreground="{DynamicResource MutedBrush}"/>
+                        </StackPanel>
+                    </ScrollViewer>
+                    <TextBlock x:Name="DailyNoteApprovalStatus" TextWrapping="Wrap" Margin="0,12,0,0"
+                               Foreground="{DynamicResource AccentStrongBrush}"/>
+                    <WrapPanel Margin="0,13,0,0">
+                        <Button x:Name="DailyNoteAllowOnce" Tag="once" Content="{local:UiText ui.allow.once}" Margin="0,0,8,8"
+                                Style="{StaticResource PrimaryButtonStyle}" Click="DailyNoteApprovalChoice_Click"/>
+                        <Button x:Name="DailyNoteAllowSession" Tag="session" Content="{local:UiText ui.allow.this.background.job}" Margin="0,0,8,8"
+                                Style="{StaticResource SecondaryButtonStyle}" Click="DailyNoteApprovalChoice_Click"/>
+                        <Button x:Name="DailyNoteAllowAlways" Tag="always" Content="{local:UiText ui.always.allow}" Margin="0,0,8,8"
+                                ToolTip="{local:UiText ui.updates.native.hermes.approval.rules}" Style="{StaticResource SecondaryButtonStyle}" Click="DailyNoteApprovalChoice_Click"/>
+                        <Button x:Name="DailyNoteDeny" Tag="deny" Content="{local:UiText ui.deny}" Margin="0,0,0,8"
+                                Style="{StaticResource SecondaryButtonStyle}" Click="DailyNoteApprovalChoice_Click"/>
+                    </WrapPanel>
+                </StackPanel>
+            </Border>
+        </Grid>
+    </Border>
+</Window>

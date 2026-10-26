@@ -1,0 +1,758 @@
+diff --git a/hermes_cli/plugins_cmd.py b/hermes_cli/plugins_cmd.py
+index 593ba2d..d6fd7b3 100644
+--- a/hermes_cli/plugins_cmd.py
++++ b/hermes_cli/plugins_cmd.py
+@@ -1140,14 +1140,34 @@ def _get_disabled_set() -> set:
+         return set()
+ 
+ 
++def _require_plugin_configuration_writable() -> None:
++    """Do not turn managed save_config's no-op into an activation receipt."""
++    from hermes_cli.config import is_managed, format_managed_message
++
++    if is_managed():
++        message = format_managed_message("change plugin settings")
++        if os.environ.get("HERMES_LILITH_BOUND_HOME"):
++            message += (
++                "\nLilith: use Control Center > AI 與工具 > 工具與授權 after the turn ends. "
++                "Do not edit config.yaml, change approval settings, unset managed bindings, "
++                "or look for another Hermes installation. Bundled default-on plugins do not "
++                "need an explicit enable entry; inspect with hermes plugins show <name>."
++            )
++        raise SystemExit(message)
++
++
+ def _save_disabled_set(disabled: set) -> None:
+     """Write the disabled plugins list to config.yaml."""
+     from hermes_cli.config import load_config, save_config
++
++    _require_plugin_configuration_writable()
+     config = load_config()
+     if "plugins" not in config:
+         config["plugins"] = {}
+     config["plugins"]["disabled"] = sorted(disabled)
+     save_config(config)
++    if _get_disabled_set() != disabled:
++        raise SystemExit("Plugin settings were not persisted; disabled state is unchanged or managed.")
+ 
+ 
+ _BASIC_AUTH_PLUGIN_KEYS = frozenset({"basic", "dashboard_auth/basic"})
+@@ -1198,11 +1218,15 @@ def _get_enabled_set() -> set:
+ def _save_enabled_set(enabled: set) -> None:
+     """Write the enabled plugins list to config.yaml."""
+     from hermes_cli.config import load_config, save_config
++
++    _require_plugin_configuration_writable()
+     config = load_config()
+     if "plugins" not in config:
+         config["plugins"] = {}
+     config["plugins"]["enabled"] = sorted(enabled)
+     save_config(config)
++    if _get_enabled_set() != enabled:
++        raise SystemExit("Plugin settings were not persisted; enabled state is unchanged or managed.")
+ 
+ 
+ def _resolve_plugin_key(name: str) -> Optional[str]:
+@@ -1256,6 +1280,8 @@ def _resolve_plugin_key_and_source(name: str) -> Optional[tuple]:
+ def _set_plugin_entry_flag(plugin_id: str, key: str, value: bool) -> None:
+     """Write ``plugins.entries.<plugin_id>.<key> = value`` into config.yaml."""
+     from hermes_cli.config import load_config, save_config
++
++    _require_plugin_configuration_writable()
+     config = load_config()
+     plugins_cfg = config.setdefault("plugins", {})
+     if not isinstance(plugins_cfg, dict):
+@@ -1778,12 +1804,15 @@ def _discover_entrypoint_plugins() -> list[tuple[str, str, str, str]]:
+     return entries
+ 
+ 
+-def _plugin_status(name: str, enabled: set, disabled: set, key: str = "") -> str:
+-    """Return the user-facing activation state for a plugin name or key."""
++def _plugin_status(name: str, enabled: set, disabled: set, key: str = "",
++                   source: str = "", dir_path=None) -> str:
++    """Activation policy only, not proof of loading, auth or callable tools."""
+     if name in disabled or key in disabled:
+         return "disabled"
+     if name in enabled or key in enabled:
+         return "enabled"
++    if source == "bundled" and dir_path and _bundled_default_on(dir_path):
++        return "enabled"
+     return "not enabled"
+ 
+ 
+@@ -1795,7 +1824,8 @@ def _filter_plugin_entries(entries: list, args: Any, enabled: set, disabled: set
+     if getattr(args, "enabled", False):
+         filtered = [
+             entry for entry in filtered
+-            if _plugin_status(entry[0], enabled, disabled, key=entry[5]) == "enabled"
++            if _plugin_status(entry[0], enabled, disabled, key=entry[5],
++                              source=entry[3], dir_path=entry[4]) == "enabled"
+         ]
+     return filtered
+ 
+@@ -1820,7 +1850,9 @@ def cmd_list(args: Any | None = None) -> None:
+         payload = [
+             {
+                 "name": name,
+-                "status": _plugin_status(name, enabled, disabled, key=key),
++                "status": _plugin_status(name, enabled, disabled, key=key, source=source, dir_path=_dir),
++                "status_scope": "activation_policy_only_not_auth_or_tool_readiness",
++                "default_on": source == "bundled" and bool(_dir) and _bundled_default_on(_dir),
+                 "version": str(version),
+                 "description": description,
+                 "source": source,
+@@ -1832,7 +1864,7 @@ def cmd_list(args: Any | None = None) -> None:
+ 
+     if getattr(args, "plain", False):
+         for name, version, _description, source, _dir, key in entries:
+-            status = _plugin_status(name, enabled, disabled, key=key)
++            status = _plugin_status(name, enabled, disabled, key=key, source=source, dir_path=_dir)
+             print(f"{status:12} {source:8} {str(version):8} {name}")
+         return
+ 
+@@ -1848,7 +1880,7 @@ def cmd_list(args: Any | None = None) -> None:
+     table.add_column("Source", style="dim")
+ 
+     for name, version, description, source, _dir, key in entries:
+-        status_name = _plugin_status(name, enabled, disabled, key=key)
++        status_name = _plugin_status(name, enabled, disabled, key=key, source=source, dir_path=_dir)
+         if status_name == "disabled":
+             status = "[red]disabled[/red]"
+         elif status_name == "enabled":
+@@ -1863,7 +1895,9 @@ def cmd_list(args: Any | None = None) -> None:
+     console.print("[dim]Compact view:[/dim] hermes plugins list --plain --no-bundled")
+     console.print("[dim]Interactive toggle:[/dim] hermes plugins")
+     console.print("[dim]Enable/disable:[/dim] hermes plugins enable/disable <name>")
+-    console.print("[dim]Plugins are opt-in by default — only 'enabled' plugins load.[/dim]")
++    console.print("[dim]Bundled backend/platform/model-provider plugins are default-on unless disabled. "
++                  "Activation does not prove successful loading, authentication or callable tools. "
++                  "Use hermes plugins show <name> for setup details.[/dim]")
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -2064,7 +2098,7 @@ def cmd_show(name: str) -> None:
+ 
+     enabled = _get_enabled_set()
+     disabled = _get_disabled_set()
+-    status = _plugin_status(pname, enabled, disabled, key=key)
++    status = _plugin_status(pname, enabled, disabled, key=key, source=source, dir_path=dir_path)
+ 
+     console.print()
+     console.print(f"[bold]{pname}[/bold]" + (f" [dim]v{version}[/dim]" if version else ""))
+@@ -2073,6 +2107,16 @@ def cmd_show(name: str) -> None:
+     console.print(f"[dim]Status:[/dim] {status}")
+     console.print(f"[dim]Source:[/dim] {source}")
+     console.print(f"[dim]Key:[/dim] {key}")
++    console.print("[dim]Activation policy only; not proof of loading, authentication or callable tools.[/dim]")
++    if source == "bundled" and _bundled_default_on(dir_path):
++        console.print("[dim]Bundled default-on integration: no explicit plugins enable entry is required. "
++                      "An explicit disable still wins.[/dim]")
++    declared_tools = manifest.get("provides_tools") or []
++    if isinstance(declared_tools, list):
++        console.print("[dim]Declared tools (not current availability):[/dim] "
++                      + ", ".join(str(item) for item in declared_tools))
++    if source == "bundled" and key == "spotify":
++        _print_spotify_setup_status(console)
+     console.print(
+         "[dim]Emits:[/dim] " + (", ".join(emits) if emits else "[dim](none)[/dim]")
+     )
+@@ -2082,6 +2126,24 @@ def cmd_show(name: str) -> None:
+     console.print()
+ 
+ 
++def _print_spotify_setup_status(console) -> None:
++    """Use native, non-refreshing status; never emit credentials or auth URLs."""
++    from hermes_cli.auth import get_spotify_auth_status
++
++    try:
++        logged_in = bool(get_spotify_auth_status().get("logged_in"))
++        console.print("[dim]Spotify account:[/dim] " + ("authenticated" if logged_in else "not authenticated"))
++    except Exception:
++        console.print("[dim]Spotify account:[/dim] unknown; status check failed")
++    console.print("[dim]Native setup:[/dim] hermes auth spotify")
++    console.print("[dim]Setup uses Spotify Web API + PKCE OAuth, not desktop UI control. "
++                  "Without a Client ID the native wizard first opens the developer dashboard, "
++                  "not the OAuth page. The user creates their app and completes login/consent. "
++                  "Do not request passwords, Client Secrets, tokens or callback URLs in chat. "
++                  "After login check the toolset in Control Center and start a fresh tool session; "
++                  "verify a read-only spotify tool before reporting readiness.[/dim]")
++
++
+ def cmd_toggle() -> None:
+     """Interactive composite UI — general plugins + provider plugin categories."""
+     from rich.console import Console
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index 17f1310..e7dba72 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -3392,6 +3392,8 @@ def _spotify_wait_for_callback(
+     redirect_uri: str,
+     *,
+     timeout_seconds: float = 180.0,
++    on_listening=None,
++    cancelled=None,
+ ) -> dict[str, Any]:
+     host, port, path = _spotify_validate_redirect_uri(redirect_uri)
+     handler_cls, result = _make_spotify_callback_handler(path)
+@@ -3412,7 +3414,12 @@ def _spotify_wait_for_callback(
+     thread.start()
+     deadline = time.monotonic() + max(5.0, timeout_seconds)
+     try:
++        if on_listening is not None:
++            on_listening()
+         while time.monotonic() < deadline:
++            if cancelled is not None and cancelled():
++                raise AuthError("Spotify setup cancelled.", provider="spotify",
++                                code="spotify_setup_cancelled")
+             if result["code"] or result["error"]:
+                 return result
+             time.sleep(0.1)
+@@ -3669,7 +3676,7 @@ def _spotify_interactive_setup(redirect_uri_hint: str) -> str:
+ 
+     Raises SystemExit if the user aborts or submits an empty value.
+     """
+-    from hermes_cli.config import save_env_value
++    from hermes_cli.config import is_managed, save_env_value
+ 
+     print()
+     print("=" * 70)
+@@ -3711,6 +3718,15 @@ def _spotify_interactive_setup(redirect_uri_hint: str) -> str:
+         print(f"No Client ID entered. See {SPOTIFY_DOCS_URL} for the full guide.")
+         raise SystemExit("Spotify setup cancelled: empty Client ID.")
+ 
++    # A managed CLI must not claim an .env write that save_env_value refuses.
++    # Continue with the entered Client ID in memory; the existing native OAuth
++    # success path stores it with the provider state, only after login succeeds.
++    if is_managed():
++        print()
++        print("Client ID collected for this login; managed .env was not changed.")
++        print("The native auth store will remember it only after successful authorization.")
++        return raw
++
+     # Persist so subsequent `hermes auth spotify` runs skip the wizard.
+     save_env_value("HERMES_SPOTIFY_CLIENT_ID", raw)
+     # Only persist the redirect URI if it's non-default, to avoid pinning
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 71a5ce0..8982e40 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -4155,6 +4155,24 @@ TERMINAL_SCHEMA = {
+     }
+ }
+ 
++if os.environ.get("HERMES_LILITH_BOUND_HOME"):
++    TERMINAL_SCHEMA["description"] += (
++        "\nLilith native integration setup: for requests to set up/connect/authenticate a service "
++        "(for example 設定/連接 Spotify), first use native_tool_setup inspect then configure "
++        "to open the user's native secure-input/login cards. For read-only metadata inspect `hermes plugins list --json` and "
++        "`hermes plugins show <name>` using this bound CLI. An absent callable tool may mean "
++        "missing auth, not missing integration. Do not substitute a desktop media-control "
++        "Skill for account/API setup. Bundled default-on integration activation, account login "
++        "and callable tool readiness are different. Spotify uses `hermes auth spotify` "
++        "with native PKCE; a missing Client ID opens the developer dashboard first. The user "
++        "must handle app creation/login/consent. Never collect secrets/tokens/callback URLs in chat. "
++        "Plugin/toolset/approval changes belong to the user's Control Center > AI 與工具 > "
++        "工具與授權, after this turn. Do not edit protected configuration, unset managed bindings, "
++        "install another Hermes or retry rejected enable commands. After setup verify a fresh "
++        "session's read-only native tool result. Use desktop control when explicitly requested "
++        "or when a native limitation is explained, not as evidence of API connection."
++    )
++
+ 
+ def _handle_terminal(args, **kw):
+     # Mirror of execute_code's misplaced-argument recovery: models sometimes
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+index 4480419..259a3cb 100644
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -250,6 +250,11 @@ def set_secret_capture_callback(callback) -> None:
+     _secret_capture_callback = callback
+ 
+ 
++# The setup entry shares the native skills toolset rather than a second
++# enable/approval policy. Its check_fn gates it to the bound Lilith profile.
++from tools.native_tool_setup_tool import NATIVE_TOOL_SETUP_SCHEMA
++
++
+ def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
+     """Check if a skill is compatible with the current OS platform.
+ 
+@@ -2004,6 +2009,18 @@ SKILLS_LIST_SCHEMA = {
+     },
+ }
+ 
++if os.environ.get("HERMES_LILITH_BOUND_HOME"):
++    SKILLS_LIST_SCHEMA["description"] += (
++        " For setup/connect/login requests, use native_tool_setup inspect/configure for native "
++        "secure-input/login cards before desktop skills. Discover other bundled native integration metadata "
++        "with terminal: hermes plugins list --json, then hermes plugins show <name>. "
++        "This includes unauthenticated integrations whose operational tools are not visible yet. "
++        "A learned desktop-control Skill (including Spotify player control) is not account/API "
++        "setup. Follow the native setup details; do not retry plugin enable when the integration "
++        "is default-on, or edit managed configuration/approval settings. The user's Control Center "
++        "owns those settings. Desktop Skills remain useful for explicit desktop operations."
++    )
++
+ SKILL_VIEW_SCHEMA = {
+     "name": "skill_view",
+     "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a 'linked_files' dict showing available references/templates/scripts. To access those, call again with file_path parameter.",
+diff --git a/tools/native_tool_setup_tool.py b/tools/native_tool_setup_tool.py
+new file mode 100644
+index 0000000..7189111
+--- /dev/null
++++ b/tools/native_tool_setup_tool.py
+@@ -0,0 +1,268 @@
++"""Human-owned native setup, using Hermes metadata and pending-input callbacks.
++
++This is deliberately not a configuration writer or a shell-command runner.
++The model supplies only a native toolset name, never credentials or env names.
++Tool enablement, provider selection in config, packages and MCP remain with
++the existing native management transaction. Saved != loaded != API-verified.
++"""
++import json
++import os
++from pathlib import Path
++import re
++import threading
++
++_setup_lock = threading.Lock()
++_CANCEL = "取消設定"
++_CONFIRM = "繼續設定"
++
++
++def bound_setup_available():
++    from hermes_constants import get_hermes_home
++    bound = os.environ.get("HERMES_LILITH_BOUND_HOME", "")
++    return bool(bound and Path(bound).resolve() == get_hermes_home().resolve())
++
++
++def _metadata(name):
++    from hermes_cli import tools_config as tc
++    from hermes_cli.config import load_config
++    # The same platform gate and toolset catalog as native hermes tools.
++    if name not in {row[0] for row in tc._get_effective_configurable_toolsets()}:
++        return None
++    if not tc._toolset_allowed_for_platform(name, "cli"):
++        return None
++    config = load_config()
++    category = tc.TOOL_CATEGORIES.get(name, {})
++    import sys
++    if category.get("platform_gate") and sys.platform not in category["platform_gate"]:
++        return None
++    providers = tc._visible_providers(category, config) if category else []
++    return config, providers
++
++
++def _support(provider):
++    # Unknown provider hooks are NOT commands to execute. Only this bounded
++    # metadata shape can be satisfied without altering config/provider policy.
++    ordinary = {"name", "tag", "env_vars"}
++    if provider.get("post_setup") == "spotify" and not (set(provider) - ordinary - {"post_setup"}):
++        return "spotify_oauth"
++    if set(provider) - ordinary:
++        return "native_manager_required"
++    fields = provider.get("env_vars", [])
++    if any(not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", str(f.get("key", ""))) for f in fields):
++        return "native_manager_required"
++    # Credential forms must not become process/profile/loader configuration.
++    reserved = {"PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "COMSPEC",
++                "HERMES_HOME", "HERMES_ENV", "HERMES_MANAGED", "BROWSER"}
++    if any(f["key"] in reserved or f["key"].startswith(("PYTHON", "HERMES_LILITH_", "HERMES_MANAGED_"))
++           for f in fields):
++        return "native_manager_required"
++    # Never rotate model-provider secrets outside their dedicated transaction.
++    from hermes_cli.credential_lifecycle import _providers_for_env_var
++    if any(_providers_for_env_var(f["key"]) for f in fields):
++        return "native_manager_required"
++    return "secure_fields" if fields else "no_setup_fields"
++
++
++def _snapshot(name, config, providers):
++    from hermes_cli import tools_config as tc
++    from hermes_cli.config import get_env_value
++    rows = []
++    for index, provider in enumerate(providers):
++        readiness = tc.provider_readiness_status(provider, config)
++        rows.append({"index": index, "name": provider["name"],
++                     "readiness": readiness, "setup_support": _support(provider),
++                     "missing_fields": [f["key"] for f in provider.get("env_vars", [])
++                                        if not get_env_value(f["key"])]})
++    return {"toolset": name, "enabled": name in tc._get_platform_tools(config, "cli", include_default_mcp_servers=False),
++            "providers": rows, "loaded_verified": False, "api_verified": False,
++            "next_step": "設定完成後回到原生工具設定確認啟用，並重新載入／實際測試；本回報不代表 API 已可用。"}
++
++
++def native_tool_setup_tool(toolset="", action="inspect", callback=None):
++    if not bound_setup_available():
++        return json.dumps({"status": "unavailable"})
++    if not isinstance(toolset, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,95}", toolset):
++        return json.dumps({"status": "invalid_toolset"})
++    if action not in ("inspect", "configure"):
++        return json.dumps({"status": "invalid_action"})
++    if callback is None:
++        return json.dumps({"status": "interactive_setup_unavailable"})
++    try:
++        return json.dumps(callback(toolset, action), ensure_ascii=False)
++    except Exception:
++        # Exceptions from a provider may embed secrets or OAuth URLs.
++        return json.dumps({"status": "setup_failed", "detail": "設定未完成，未驗證可用。"}, ensure_ascii=False)
++
++
++def run_native_setup(name, action, *, prompt, cancelled):
++    """Gateway-only callback. prompt is the existing session-bound _block."""
++    if not bound_setup_available():
++        return {"status": "unavailable"}
++    metadata = _metadata(name)
++    if metadata is None:
++        return {"status": "unknown_or_unsupported_toolset", "toolset": name}
++    config, providers = metadata
++    snapshot = _snapshot(name, config, providers)
++    if action == "inspect":
++        return {"status": "inspected", **snapshot}
++    if not _setup_lock.acquire(blocking=False):
++        return {"status": "setup_busy", "toolset": name}
++    saved = []
++    try:
++        if cancelled():
++            return {"status": "cancelled", "toolset": name}
++        if not providers:
++            return {"status": "native_manager_required", **snapshot}
++        index = 0
++        if len(providers) > 1:
++            choices = [f"{i + 1}. {p['name']}" for i, p in enumerate(providers)]
++            selection = prompt("clarify.request", {
++                "question": f"要協助設定 {name} 的哪個供應商？這不會改變工具開關或核准模式。",
++                "choices": choices + [_CANCEL]}, timeout=300)
++            if cancelled() or selection not in choices:
++                return {"status": "cancelled", "toolset": name}
++            index = choices.index(selection)
++        provider = providers[index]
++        support = _support(provider)
++        if support == "native_manager_required":
++            return {"status": support, **snapshot}
++        if support == "no_setup_fields":
++            return {"status": "no_setup_fields", **snapshot}
++        answer = prompt("clarify.request", {
++            "question": f"協助設定 {name} / {provider['name']}：必要資料請填在接下來的安全輸入卡；Spotify 登入會開啟官方網頁，由你完成。這不會更改工具開關或核准模式。",
++            "choices": [_CONFIRM, _CANCEL]}, timeout=300)
++        if cancelled() or answer != _CONFIRM:
++            return {"status": "cancelled", "toolset": name}
++        if support == "spotify_oauth":
++            result = _spotify_setup(prompt, cancelled)
++        else:
++            from hermes_cli.config import get_env_value, load_env, save_env_value
++            for field in provider.get("env_vars", []):
++                key = field["key"]
++                if get_env_value(key):
++                    continue  # No overwrite/rotation hidden inside setup.
++                question = str(field.get("prompt") or key)
++                if field.get("url"):
++                    question += "\n" + str(field["url"])
++                if field.get("default"):
++                    question += "\n預設建議值：" + str(field["default"])
++                value = prompt("secret.request", {"env_var": key, "prompt": question,
++                    "metadata": {"toolset": name, "provider": provider["name"]}}, timeout=300)
++                if cancelled() or not value:
++                    return {"status": "cancelled", "toolset": name, "saved_fields": saved}
++                if not isinstance(value, str) or not value.strip() or len(value) > 16384 or any(ord(c) < 32 for c in value):
++                    return {"status": "invalid_input", "toolset": name, "saved_fields": saved}
++                save_env_value(key, value)
++                if load_env().get(key) != value:
++                    return {"status": "persistence_failed", "toolset": name, "saved_fields": saved}
++                saved.append(key)
++            result = {"status": "settings_saved", "saved_fields": saved}
++        updated = _metadata(name)
++        if updated is None:
++            return {**result, "status": "state_changed", "toolset": name}
++        return {**_snapshot(name, *updated), **result}
++    except Exception:
++        return {"status": "setup_failed", "toolset": name,
++                "saved_fields": saved, "state_uncertain": True}
++    finally:
++        _setup_lock.release()
++
++
++def _spotify_setup(prompt, cancelled):
++    from hermes_cli import auth
++    import uuid
++    import webbrowser
++    existing = auth.get_provider_auth_state("spotify") or {}
++    if auth.get_spotify_auth_status().get("logged_in"):
++        return {"status": "already_authenticated"}
++    try:
++        client_id = auth._spotify_client_id(None, existing)
++    except auth.AuthError as exc:
++        if exc.code != "spotify_client_id_missing":
++            raise
++        if cancelled():
++            return {"status": "cancelled"}
++        # Match the native first-time wizard: app registration precedes OAuth.
++        # A dashboard is not a login-success receipt; the secure card remains.
++        try:
++            webbrowser.open("https://developer.spotify.com/dashboard")
++        except Exception:
++            pass  # The same fixed URL is present in the user's input card.
++        client_id = prompt("secret.request", {
++            "env_var": "HERMES_SPOTIFY_CLIENT_ID",
++            "prompt": "請到 https://developer.spotify.com/dashboard 建立／開啟自己的 App，加入回呼網址 "
++                      + auth.DEFAULT_SPOTIFY_REDIRECT_URI + "，然後在此輸入 Client ID（不是 Client Secret）。不要貼進聊天。",
++            "metadata": {"toolset": "spotify", "provider": "Spotify Web API"}}, timeout=300)
++    if cancelled() or not client_id:
++        return {"status": "cancelled"}
++    if not isinstance(client_id, str) or not re.fullmatch(r"[a-fA-F0-9]{32}", client_id.strip()):
++        return {"status": "invalid_client_id"}
++    client_id = client_id.strip()
++    # Use the native production endpoints; neither model args nor profile
++    # overrides can redirect this user-input flow to a credential collector.
++    redirect = auth.DEFAULT_SPOTIFY_REDIRECT_URI
++    accounts = "https://accounts.spotify.com"
++    api = "https://api.spotify.com/v1"
++    scope = auth._spotify_scope_string(None)
++    verifier = auth._spotify_code_verifier()
++    nonce = uuid.uuid4().hex
++    url = auth._spotify_build_authorize_url(client_id=client_id, redirect_uri=redirect,
++        scope=scope, state=nonce, code_challenge=auth._spotify_code_challenge(verifier),
++        accounts_base_url=accounts)
++
++    def open_login():
++        if cancelled():
++            raise auth.AuthError("Cancelled", provider="spotify", code="spotify_setup_cancelled")
++        if not webbrowser.open(url):
++            raise auth.AuthError("Browser unavailable", provider="spotify", code="spotify_browser_unavailable")
++
++    try:
++        # Bind/listen BEFORE opening a browser. Closing/interruption releases
++        # the listener, and no token is committed after cancellation.
++        callback = auth._spotify_wait_for_callback(redirect, timeout_seconds=180,
++                                                   on_listening=open_login, cancelled=cancelled)
++        if cancelled():
++            return {"status": "cancelled"}
++        if callback.get("error"):
++            return {"status": "authorization_denied"}
++        if callback.get("state") != nonce or not callback.get("code"):
++            return {"status": "oauth_state_mismatch"}
++        token = auth._spotify_exchange_code_for_tokens(client_id=client_id,
++            code=callback["code"], redirect_uri=redirect, code_verifier=verifier,
++            accounts_base_url=accounts, timeout_seconds=20)
++        state = auth._spotify_token_payload_to_state(token, client_id=client_id,
++            redirect_uri=redirect, requested_scope=scope, accounts_base_url=accounts,
++            api_base_url=api)
++        if cancelled():
++            return {"status": "cancelled"}
++        with auth._auth_store_lock():
++            store = auth._load_auth_store()
++            auth._store_provider_state(store, "spotify", state, set_active=False)
++            auth._save_auth_store(store)
++        persisted = auth.get_provider_auth_state("spotify") or {}
++        if (persisted.get("client_id") != client_id
++                or persisted.get("access_token") != state.get("access_token")
++                or not auth.get_spotify_auth_status().get("logged_in")):
++            return {"status": "persistence_failed"}
++        return {"status": "authenticated", "authorization_verified": True}
++    except auth.AuthError as exc:
++        known = {"spotify_callback_timeout": "authorization_timeout",
++                 "spotify_callback_bind_failed": "callback_unavailable",
++                 "spotify_browser_unavailable": "browser_unavailable",
++                 "spotify_setup_cancelled": "cancelled"}
++        return {"status": known.get(exc.code, "authorization_failed")}
++
++
++NATIVE_TOOL_SETUP_SCHEMA = {
++    "name": "native_tool_setup",
++    "description": "Discover or request setup of a Hermes native integration (for example Spotify Web API), not desktop-app control. Use inspect first even when its actual tools are unavailable because credentials are missing. configure opens human-owned selection/secure-input cards and supported OAuth; NEVER ask for credentials in chat or guess terminal/config writes. Does not enable tools, change approval, select config providers or install packages. Respect cancelled/unsupported results; do not retry after decline. Saved/authenticated does not prove loaded tools or successful API calls.",
++    "parameters": {"type": "object", "properties": {
++        "toolset": {"type": "string", "description": "Native toolset identifier, e.g. spotify or homeassistant."},
++        "action": {"type": "string", "enum": ["inspect", "configure"]}},
++        "required": ["toolset", "action"], "additionalProperties": False}}
++
++
++from tools.registry import registry
++registry.register(name="native_tool_setup", toolset="skills", schema=NATIVE_TOOL_SETUP_SCHEMA,
++    handler=lambda args, **kw: native_tool_setup_tool(**args, callback=kw.get("native_tool_setup_callback")),
++    check_fn=bound_setup_available, emoji="🔧")
+diff --git a/toolsets.py b/toolsets.py
+index 9a19475..2fb27a7 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -49,7 +49,7 @@ _HERMES_CORE_TOOLS = [
+     "bfl_flux3_keyframes_to_video", "bfl_flux3_video_continuation",
+     "bfl_flux3_get_result", "bfl_flux3_prompting_guide",
+     # Skills
+-    "skills_list", "skill_view", "skill_manage",
++    "skills_list", "skill_view", "skill_manage", "native_tool_setup",
+     # Browser automation
+     "browser_navigate", "browser_snapshot", "browser_click",
+     "browser_type", "browser_scroll", "browser_back",
+@@ -200,7 +200,7 @@ TOOLSETS = {
+     
+     "skills": {
+         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
+-        "tools": ["skills_list", "skill_view", "skill_manage"],
++        "tools": ["skills_list", "skill_view", "skill_manage", "native_tool_setup"],
+         "includes": []
+     },
+     
+@@ -414,7 +414,7 @@ TOOLSETS = {
+             "terminal", "process",
+             "read_file", "write_file", "patch", "search_files",
+             "vision_analyze",
+-            "skills_list", "skill_view", "skill_manage",
++            "skills_list", "skill_view", "skill_manage", "native_tool_setup",
+             "browser_navigate", "browser_snapshot", "browser_click",
+             "browser_type", "browser_scroll", "browser_back",
+             "browser_press", "browser_get_images",
+@@ -447,7 +447,7 @@ TOOLSETS = {
+             "terminal", "process",
+             "read_file", "write_file", "patch", "search_files",
+             "vision_analyze",
+-            "skills_list", "skill_view", "skill_manage",
++            "skills_list", "skill_view", "skill_manage", "native_tool_setup",
+             "browser_navigate", "browser_snapshot", "browser_click",
+             "browser_type", "browser_scroll", "browser_back",
+             "browser_press", "browser_get_images",
+@@ -476,7 +476,7 @@ TOOLSETS = {
+             "bfl_flux3_keyframes_to_video", "bfl_flux3_video_continuation",
+             "bfl_flux3_get_result", "bfl_flux3_prompting_guide",
+             # Skills
+-            "skills_list", "skill_view", "skill_manage",
++            "skills_list", "skill_view", "skill_manage", "native_tool_setup",
+             # Browser automation
+             "browser_navigate", "browser_snapshot", "browser_click",
+             "browser_type", "browser_scroll", "browser_back",
+diff --git a/run_agent.py b/run_agent.py
+index 2885379..57b0e2f 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -481,6 +481,7 @@ class AIAgent:
+         read_preview_callback: callable = None,
+         read_window_below_callback: callable = None,
+         setup_mcp_callback: callable = None,
++        native_tool_setup_callback: callable = None,
+         step_callback: callable = None,
+         stream_delta_callback: callable = None,
+         interim_assistant_callback: callable = None,
+@@ -584,6 +585,7 @@ class AIAgent:
+             read_preview_callback=read_preview_callback,
+             read_window_below_callback=read_window_below_callback,
+             setup_mcp_callback=setup_mcp_callback,
++            native_tool_setup_callback=native_tool_setup_callback,
+             step_callback=step_callback,
+             stream_delta_callback=stream_delta_callback,
+             interim_assistant_callback=interim_assistant_callback,
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 6d50194..394d517 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -543,6 +543,7 @@ def init_agent(
+     read_preview_callback: callable = None,
+     read_window_below_callback: callable = None,
+     setup_mcp_callback: callable = None,
++    native_tool_setup_callback: callable = None,
+     step_callback: callable = None,
+     stream_delta_callback: callable = None,
+     interim_assistant_callback: callable = None,
+@@ -893,6 +894,7 @@ def init_agent(
+     agent.read_preview_callback = read_preview_callback
+     agent.read_window_below_callback = read_window_below_callback
+     agent.setup_mcp_callback = setup_mcp_callback
++    agent.native_tool_setup_callback = native_tool_setup_callback
+     agent.step_callback = step_callback
+     agent.stream_delta_callback = stream_delta_callback
+     agent.interim_assistant_callback = interim_assistant_callback
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index e1bd851..1f96919 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -1975,6 +1975,21 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+             tool_duration = time.time() - tool_start_time
+             if agent._should_emit_quiet_tool_messages():
+                 agent._vprint(f"  {_get_cute_tool_message_impl('read_window_below', function_args, tool_duration, result=function_result)}")
++        elif function_name == "native_tool_setup":
++            def _execute(next_args: dict) -> Any:
++                from tools.native_tool_setup_tool import native_tool_setup_tool
++                return native_tool_setup_tool(
++                    toolset=next_args.get("toolset", ""),
++                    action=next_args.get("action", "inspect"),
++                    callback=getattr(agent, "native_tool_setup_callback", None),
++                )
++            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
++                agent, function_name=function_name, function_args=function_args,
++                effective_task_id=effective_task_id,
++                tool_call_id=getattr(tool_call, "id", "") or "",
++                execute=_execute, scope_block=_ts_scope_block, display_index=i,
++            ))
++            tool_duration = time.time() - tool_start_time
+         elif function_name == "setup_mcp":
+             def _execute(next_args: dict) -> Any:
+                 from tools.setup_mcp_tool import setup_mcp_tool as _setup_mcp_tool
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index a8b21c9..edb97cb 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -3198,6 +3198,16 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
+                 ),
+                 next_args,
+             )
++    elif function_name == "native_tool_setup":
++        def _execute(next_args: dict) -> Any:
++            from tools.native_tool_setup_tool import native_tool_setup_tool
++            return _finish_agent_tool(
++                native_tool_setup_tool(
++                    toolset=next_args.get("toolset", ""),
++                    action=next_args.get("action", "inspect"),
++                    callback=getattr(agent, "native_tool_setup_callback", None),
++                ), next_args,
++            )
+     elif function_name == "setup_mcp":
+         def _execute(next_args: dict) -> Any:
+             from tools.setup_mcp_tool import setup_mcp_tool as _setup_mcp_tool
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 066c6c7..27f8b45 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -6119,7 +6119,7 @@ def _tool_lifecycle_required_for_ui(name: str) -> bool:
+     # wires request_id from clarify.request. If tool progress is off, suppressing
+     # clarify's lifecycle events leaves only the sidebar attention dot visible.
+     # setup_mcp is the same shape: its consent card mounts on the tool part.
+-    return name in ("clarify", "setup_mcp")
++    return name in ("clarify", "setup_mcp", "native_tool_setup")
+ 
+ 
+ def _restart_slash_worker(sid: str, session: dict):
+@@ -8731,8 +8731,36 @@ def _mirror_subagent_to_child_unscoped(event_type: str, payload: dict) -> None:
+                 _remember_completed_child_turn_locked(child_key, turn_id)
+ 
+ 
++def _native_tool_setup_callback(sid: str, name: str, action: str):
++    from tools.native_tool_setup_tool import run_native_setup
++    session = _sessions.get(sid)
++    if session and action == "configure" and session.get("source") != "lilith-runtime":
++        return {"status": "control_center_required",
++                "detail": "請從控制中心聊天室進行設定，才能顯示真人安全輸入／登入卡。"}
++    agent = session.get("agent") if session else None
++    origin_turn = getattr(agent, "_current_turn_id", None)
++
++    def cancelled():
++        current = _sessions.get(sid)
++        return (agent is None or current is not session
++                or current.get("agent") is not agent
++                or getattr(agent, "_current_turn_id", None) != origin_turn
++                or current.get("_finalized", False)
++                or bool(getattr(agent, "_interrupt_requested", False)))
++
++    def prompt(event, payload, timeout=300):
++        if cancelled():
++            return ""
++        return _block(event, sid, payload, timeout=timeout)
++
++    return run_native_setup(name, action,
++        prompt=prompt,
++        cancelled=cancelled)
++
++
+ def _agent_cbs(sid: str, *, turn_id: Any = None) -> dict:
+     callbacks = {
++        "native_tool_setup_callback": lambda name, action: _native_tool_setup_callback(sid, name, action),
+         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
+             sid, tc_id, name, args
+         ),

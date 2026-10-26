@@ -1,0 +1,418 @@
+diff --git a/agent/usage_strategy.py b/agent/usage_strategy.py
+index 118863d..d300f84 100644
+--- a/agent/usage_strategy.py
++++ b/agent/usage_strategy.py
+@@ -1,7 +1,7 @@
+ """Immutable information strategies, not quotas, permissions or model choices."""
+ from dataclasses import asdict, dataclass
+ 
+-STRATEGY_VERSION = "lilith-strategies-20261006-v3"
++STRATEGY_VERSION = "lilith-strategies-20261007-v4"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -19,17 +19,18 @@ class InformationStrategy:
+ 
+ _NEUTRAL_STRATEGY = InformationStrategy()
+ 
+-# Capacity factors relative to the unchanged fourth level are .25/.5/.75/1/1.5.
++# Information capacities relative to unchanged level four are .25/.5/.75/1/1.5/1.75.
+ # These are information targets, not bill ratios or provider token allowances.
+ # Relationship batches retain their reviewed ceiling of eight source turns.
+-# Level five carries more detail without increasing level four's review cadence.
++# Higher levels retain finite request-only history while increasing detail.
++# Level six has no human usage quota; information maintenance is not a quota.
+ _STRATEGIES = (
+     InformationStrategy(6, 8, 8, 650, 1500, 12),
+     InformationStrategy(12, 8, 4, 1300, 3000, 6),
+     InformationStrategy(18, 8, 3, 1950, 4500, 4),
+     InformationStrategy(24, 6, 2, 2600, 6000, 3),
+-    InformationStrategy(36, 6, 2, 3900, 9000, 3),
+-    _NEUTRAL_STRATEGY,
++    InformationStrategy(36, 3, 2, 3900, 9000, 3),
++    InformationStrategy(42, 1, 2, 4550, 10500, 3),
+ )
+ 
+ 
+diff --git a/tests/test_six_level_stability.py b/tests/test_six_level_stability.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_six_level_stability.py
+@@ -0,0 +1,377 @@
++"""Finite sixth-level information strategy regressions using synthetic turns and native pure helpers."""
++from contextlib import contextmanager
++from copy import deepcopy
++from dataclasses import FrozenInstanceError
++from types import SimpleNamespace
++import sys
++import unittest
++from unittest.mock import patch
++
++from agent.usage_budget import (
++    BudgetError, NormalBudget, TurnBudgetLedger, VerifiedModelLimits,
++    bind_turn_budget, current_turn_budget, resolve_policy,
++)
++from agent.usage_strategy import (
++    background_review_flags, current_strategy, neutral_strategy, strategy_for_level,
++)
++from agent.history_checkpoint import history_limit, publication_reason
++from agent.usage_strategy_context import compact_results, project_context
++
++
++def origin(level, key="turn", revision=1):
++    policy = resolve_policy(level, NormalBudget(64000, 8192, 2048, 90),
++                            VerifiedModelLimits(), version=revision)
++    return SimpleNamespace(origin_id=key, ledger=TurnBudgetLedger(key, policy))
++
++
++def background_agent(session="chat"):
++    return SimpleNamespace(session_id=session, _memory_enabled=True,
++                           _user_profile_enabled=False, _skill_nudge_interval=3,
++                           valid_tool_names={"skill_manage"})
++
++
++@contextmanager
++def captured(handle):
++    # Only the host-origin read is substituted. No fake policy implementation.
++    runtime = SimpleNamespace(capture_origin=lambda: handle)
++    with patch.dict(sys.modules, {"agent.usage_budget_runtime": runtime}):
++        yield
++
++
++def transcript(turns):
++    rows = [{"role": "system", "content": "Protected identity and memory."}]
++    for n in range(turns):
++        rows.extend([{"role": "user", "content": f"Question {n}: " + "u" * 80},
++                     {"role": "assistant", "content": f"Answer {n}: " + "a" * 80}])
++    rows.append({"role": "user", "content": "Current human request."})
++    # The current exchange and most recent completed exchange are ineligible.
++    units = tuple((i, i + 1) for i in range(1, turns * 2 - 1, 2))
++    return rows, units
++
++
++class Compressor:
++    def __init__(self):
++        self.calls = []
++        self._previous_summary = "Native compressor state stays unchanged."
++
++    def _generate_summary(self, rows):
++        self.calls.append((deepcopy(rows), self._compute_summary_budget(rows)))
++        return "[Historical summary: quoted source material.]"
++
++
++class StrategyPolicyTests(unittest.TestCase):
++    def test_first_four_exact_values_and_v4_version(self):
++        from agent.usage_strategy import STRATEGY_VERSION
++        self.assertEqual(STRATEGY_VERSION, "lilith-strategies-20261007-v4")
++        for level, values in enumerate(((6, 8, 8, 650, 1500, 12), (12, 8, 4, 1300, 3000, 6),
++                                        (18, 8, 3, 1950, 4500, 4), (24, 6, 2, 2600, 6000, 3)), 1):
++            self.assertEqual(tuple(strategy_for_level(level).wire().values()), values)
++
++    def test_actual_relationship_provider_reads_sixth_strategy_and_stop(self):
++        from strategy_relationship.batch_review import batch_interval, batch_route_stopped
++        for level, interval in enumerate((8, 8, 8, 6, 3, 1), 1):
++            handle = origin(level)
++            context = SimpleNamespace(_materialize_usage_origin_for_host=lambda: handle)
++            self.assertEqual(batch_interval(context), interval)
++            self.assertFalse(batch_route_stopped(context))
++            handle.ledger.stop()
++            self.assertTrue(batch_route_stopped(context))
++        self.assertEqual(batch_interval(SimpleNamespace()), 1)
++
++    def test_fourth_level_remains_the_accepted_baseline(self):
++        self.assertEqual(strategy_for_level(4).wire(), {
++            "history_turns": 24, "relationship_every": 6, "summary_every": 2,
++            "summary_target_tokens": 2600, "old_tool_chars": 6000, "background_every": 3})
++
++    def test_capacity_factors_and_higher_level_cadence(self):
++        base = strategy_for_level(4)
++        for level, numerator, denominator in ((1, 1, 4), (2, 1, 2), (3, 3, 4), (4, 1, 1), (5, 3, 2), (6, 7, 4)):
++            with self.subTest(level=level):
++                spec = strategy_for_level(level)
++                for field in ("history_turns", "summary_target_tokens", "old_tool_chars"):
++                    self.assertEqual(getattr(spec, field) * denominator,
++                                     getattr(base, field) * numerator)
++                self.assertEqual(spec.summary_every, (base.summary_every * denominator + numerator - 1) // numerator
++                                 if level <= 4 else base.summary_every)
++                self.assertEqual(spec.background_every, (base.background_every * denominator + numerator - 1) // numerator
++                                 if level <= 4 else base.background_every)
++                expected_relationship = min(8, (base.relationship_every * denominator + numerator - 1) // numerator)
++                self.assertEqual(spec.relationship_every, expected_relationship if level <= 4 else {5: 3, 6: 1}[level])
++
++    def test_strategies_fit_wire_and_relationship_bounds(self):
++        previous = None
++        for level in range(1, 7):
++            spec = strategy_for_level(level)
++            self.assertTrue(1 <= spec.history_turns <= 128)
++            self.assertTrue(1 <= spec.summary_target_tokens <= 16384)
++            self.assertTrue(1 <= spec.old_tool_chars <= 65536)
++            self.assertTrue(1 <= spec.relationship_every <= 8)
++            self.assertTrue(1 <= spec.summary_every <= 64)
++            self.assertTrue(1 <= spec.background_every <= 64)
++            if previous is not None:
++                for field in ("history_turns", "summary_target_tokens", "old_tool_chars"):
++                    self.assertGreater(getattr(spec, field), getattr(previous, field))
++                for field in ("relationship_every", "summary_every", "background_every"):
++                    self.assertLessEqual(getattr(spec, field), getattr(previous, field))
++            previous = spec
++
++    def test_invalid_levels_never_coerce_to_a_strategy(self):
++        for value in (True, False, 0, 7, -1, 4.0, "4", None):
++            with self.subTest(value=value), self.assertRaises(ValueError):
++                strategy_for_level(value)
++
++    def test_neutral_is_immutable_and_does_not_masquerade_as_level_five(self):
++        spec = neutral_strategy()
++        self.assertIsNone(spec.history_turns)
++        self.assertIsNone(spec.summary_target_tokens)
++        self.assertIsNone(spec.old_tool_chars)
++        self.assertEqual((spec.relationship_every, spec.summary_every, spec.background_every), (1, 1, 1))
++        self.assertNotEqual(spec, strategy_for_level(6))
++        self.assertNotEqual(spec, strategy_for_level(5))
++        with self.assertRaises(FrozenInstanceError):
++            spec.history_turns = 36
++        payload = spec.wire()
++        payload["history_turns"] = 36
++        self.assertIsNone(spec.history_turns)
++
++    def test_no_ledger_keeps_native_compaction_without_removing_limits(self):
++        with patch("agent.usage_budget.current_turn_budget", return_value=None):
++            self.assertIs(current_strategy(), neutral_strategy())
++        with bind_turn_budget(origin(5).ledger):
++            self.assertIs(current_strategy(), strategy_for_level(5))
++            self.assertEqual(current_turn_budget().policy.max_iterations, 90)
++
++    def test_all_strategy_levels_keep_native_limits_and_observe_without_quota(self):
++        for level in range(1, 6):
++            with self.subTest(level=level):
++                handle = origin(level)
++                policy = handle.ledger.policy
++                self.assertEqual((policy.input_tokens, policy.output_tokens, policy.thinking_tokens, policy.max_iterations),
++                                 (64000, 8192, 2048, 90))
++                self.assertFalse(policy.enforce_economy_limits)
++                self.assertIsNone(policy.turn_token_limit)
++                self.assertIsNone(policy.turn_call_limit)
++                handle.ledger.observe_attempt("main")
++                handle.ledger.reconcile_observation("main", input_tokens=200000, output_tokens=20000)
++                self.assertFalse(handle.ledger.snapshot().over_limit)
++
++    def test_six_removes_human_caps_but_stop_still_applies_to_every_level(self):
++        policy = origin(6).ledger.policy
++        self.assertEqual((policy.input_tokens, policy.output_tokens, policy.thinking_tokens, policy.max_iterations),
++                         (None, None, None, None))
++        for level in range(1, 7):
++            handle = origin(level)
++            handle.ledger.stop()
++            with self.assertRaises(BudgetError):
++                handle.ledger.observe_attempt("after-stop")
++
++
++class BackgroundLifecycleTests(unittest.TestCase):
++    def test_each_level_counts_completed_origins_not_repeated_finalizers(self):
++        for level in range(1, 7):
++            agent = background_agent()
++            count = strategy_for_level(level).background_every
++            with self.subTest(level=level):
++                for n in range(count):
++                    with captured(origin(level, f"human-{n}")):
++                        self.assertEqual(background_review_flags(agent, n == 0, n == 0, completed=True),
++                                         (n == count - 1, n == count - 1))
++                        self.assertEqual(background_review_flags(agent, True, True, completed=True), (False, False))
++                with captured(origin(level, "next-cycle")):
++                    self.assertEqual(background_review_flags(agent, False, False, completed=True), (False, False))
++
++    def test_failed_or_skipped_turns_do_not_advance_or_lose_pending_work(self):
++        agent = background_agent()
++        with captured(origin(5, "first")):
++            self.assertEqual(background_review_flags(agent, True, True, completed=True), (False, False))
++        before = deepcopy(agent._information_background)
++        with captured(origin(5, "failed")):
++            self.assertEqual(background_review_flags(agent, True, True, completed=False), (False, False))
++        agent.skip_background_review = True
++        with captured(origin(5, "skipped")):
++            self.assertEqual(background_review_flags(agent, True, True, completed=True), (False, False))
++        self.assertEqual(agent._information_background, before)
++        agent.skip_background_review = False
++        with captured(origin(5, "second")):
++            self.assertEqual(background_review_flags(agent, False, False, completed=True), (False, False))
++        with captured(origin(5, "third")):
++            self.assertEqual(background_review_flags(agent, False, False, completed=True), (True, True))
++
++    def test_disabled_capabilities_clear_pending_without_reenabling_them(self):
++        agent = background_agent()
++        with captured(origin(5, "first")):
++            background_review_flags(agent, True, True, completed=True)
++        agent._memory_enabled = False
++        agent.valid_tool_names.clear()
++        for key in ("second", "third"):
++            with captured(origin(5, key)):
++                self.assertEqual(background_review_flags(agent, True, True, completed=True), (False, False))
++        self.assertFalse(agent._memory_enabled)
++        self.assertEqual(agent.valid_tool_names, set())
++
++    def test_revision_change_restarts_cadence_but_preserves_enabled_pending_work(self):
++        agent = background_agent()
++        with captured(origin(4, "old", revision=1)):
++            background_review_flags(agent, True, True, completed=True)
++        for n in range(strategy_for_level(5).background_every):
++            with captured(origin(5, f"new-{n}", revision=2)):
++                self.assertEqual(background_review_flags(agent, False, False, completed=True),
++                                 (n == 2, n == 2))
++
++    def test_new_session_does_not_carry_prior_pending_work(self):
++        agent = background_agent()
++        with captured(origin(5, "old")):
++            background_review_flags(agent, True, True, completed=True)
++        agent.session_id = "different-session"
++        for n in range(3):
++            with captured(origin(5, f"new-{n}")):
++                self.assertEqual(background_review_flags(agent, False, False, completed=True), (False, False))
++
++    def test_switch_to_six_retains_cadence_and_only_enabled_pending_work(self):
++        agent = background_agent()
++        with captured(origin(5, "old")):
++            background_review_flags(agent, True, True, completed=True)
++        agent.valid_tool_names.clear()
++        for n in range(3):
++            with captured(origin(6, f"six-{n}")):
++                self.assertEqual(background_review_flags(agent, False, False, completed=True),
++                                 (n == 2, False))
++                self.assertEqual(background_review_flags(agent, True, True, completed=True), (False, False))
++        self.assertEqual(agent._information_background["key"][1], 6)
++
++    def test_unbound_native_background_behavior_is_preserved(self):
++        agent = background_agent()
++        with captured(None):
++            self.assertEqual(background_review_flags(agent, True, False, completed=True), (True, False))
++            self.assertEqual(background_review_flags(agent, True, True, completed=False), (False, False))
++        self.assertFalse(hasattr(agent, "_information_background"))
++
++
++class ContextStrategyTests(unittest.TestCase):
++    def setUp(self):
++        # The native summary-scope function is exercised; identity is a synthetic
++        # immutable fixture, not a real dedicated profile or attestation read.
++        identity = SimpleNamespace(policy_for_agent=lambda agent: SimpleNamespace(enabled=False, fingerprint="fixture"))
++        self.identity_patch = patch.dict(sys.modules, {"agent.identity_policy": identity})
++        self.identity_patch.start()
++        self.addCleanup(self.identity_patch.stop)
++
++    def test_fifth_level_uses_request_only_summary_and_keeps_recent_history(self):
++        rows, units = transcript(48)
++        before = deepcopy(rows)
++        compressor = Compressor()
++        agent = SimpleNamespace(session_id="chat", context_compressor=compressor)
++        result = project_context(agent, rows, units, strategy_for_level(5), origin(5))
++        self.assertEqual(rows, before)
++        self.assertEqual(result[0], before[0])
++        self.assertEqual(result[-73:], before[-73:])
++        self.assertLess(len(result), len(rows))
++        self.assertEqual(len(compressor.calls), 1)
++        self.assertEqual(compressor.calls[0][1], strategy_for_level(5).summary_target_tokens)
++        self.assertEqual(compressor._previous_summary, "Native compressor state stays unchanged.")
++        self.assertEqual(agent._usage_budget_context_status["uncovered_turns_retained"], 0)
++
++    def test_repeated_requests_do_not_spend_a_second_summary_in_the_same_origin(self):
++        rows, units = transcript(48)
++        agent = SimpleNamespace(session_id="chat", context_compressor=Compressor())
++        handle = origin(5)
++        for _ in range(5):
++            project_context(agent, rows, units, strategy_for_level(5), handle)
++        self.assertEqual(len(agent.context_compressor.calls), 1)
++
++    def test_summary_failure_retains_every_uncovered_original(self):
++        class Failed:
++            def _generate_summary(self, rows):
++                raise RuntimeError("synthetic failure")
++        rows, units = transcript(48)
++        before = deepcopy(rows)
++        agent = SimpleNamespace(session_id="chat", context_compressor=Failed())
++        result = project_context(agent, rows, units, strategy_for_level(5), origin(5))
++        self.assertEqual(result, before)
++        self.assertEqual(rows, before)
++        self.assertGreater(agent._usage_budget_context_status["uncovered_turns_retained"], 0)
++
++    def test_background_projection_reuses_a_summary_without_another_model_call(self):
++        from agent.background_context import attach_summary, freeze_summary, ensure_background_projection
++        for level in (5, 6):
++            with self.subTest(level=level):
++                rows, units = transcript(72)
++                handle = origin(level)
++                strategy = strategy_for_level(level)
++                parent = SimpleNamespace(session_id="chat", context_compressor=Compressor())
++                expected = project_context(parent, rows, units, strategy, handle)
++                with captured(handle):
++                    snapshot = freeze_summary(parent)
++                    self.assertIsNotNone(snapshot)
++                    child = SimpleNamespace(session_id="chat", context_compressor=Compressor())
++                    self.assertTrue(attach_summary(child, snapshot))
++                    actual = project_context(child, rows, units, strategy, handle)
++                    ensure_background_projection(child, SimpleNamespace(units=()), strategy)
++                self.assertEqual(actual, expected)
++                self.assertEqual(child.context_compressor.calls, [])
++
++    def test_unbound_fallback_alone_keeps_native_context(self):
++        rows, units = transcript(72)
++        agent = SimpleNamespace(session_id="chat")
++        self.assertIs(project_context(agent, rows, units, neutral_strategy(), origin(6)), rows)
++        self.assertFalse(hasattr(agent, "_information_summary"))
++
++    def test_six_uses_finite_request_projection_without_losing_originals(self):
++        rows, units = transcript(72)
++        original = deepcopy(rows)
++        agent = SimpleNamespace(session_id="chat-six", context_compressor=Compressor())
++        handle = origin(6)
++        result = project_context(agent, rows, units, strategy_for_level(6), handle)
++        self.assertEqual(rows, original)
++        self.assertEqual(result[-85:], original[-85:])
++        self.assertLess(len(result), len(rows))
++        self.assertEqual(agent.context_compressor.calls[0][1], 4550)
++        self.assertIsNone(handle.ledger.policy.turn_token_limit)
++        self.assertIsNone(handle.ledger.policy.max_iterations)
++        for _ in range(3):
++            project_context(agent, rows, units, strategy_for_level(6), handle)
++        self.assertEqual(len(agent.context_compressor.calls), 1)
++
++    def test_six_summary_failure_retains_originals_and_does_not_bypass_stop(self):
++        class Failed:
++            def _generate_summary(self, rows):
++                raise RuntimeError("synthetic unavailable")
++        rows, units = transcript(72)
++        original = deepcopy(rows)
++        agent = SimpleNamespace(session_id="chat-six", context_compressor=Failed())
++        handle = origin(6)
++        self.assertEqual(project_context(agent, rows, units, strategy_for_level(6), handle), original)
++        self.assertEqual(rows, original)
++        handle.ledger.stop()
++        with self.assertRaises(BudgetError):
++            handle.ledger.observe_attempt("after-stop")
++
++    def test_checkpoint_soft_size_and_batch_rules_use_the_selected_strategy(self):
++        for level in range(1, 7):
++            spec = strategy_for_level(level)
++            with self.subTest(level=level):
++                self.assertEqual(history_limit(spec), spec.history_turns * spec.old_tool_chars)
++                threshold = max(spec.summary_every, spec.history_turns // 4)
++                state = {"covered": (), "pending_covered": tuple(range(threshold - 1)), "pending_summary": "summary"}
++                self.assertEqual(publication_reason(state, [100] * threshold, spec), "staged")
++                state["pending_covered"] = tuple(range(threshold))
++                self.assertEqual(publication_reason(state, [100] * threshold, spec), "batch")
++                state["pending_covered"] = (0,)
++                self.assertEqual(publication_reason(state, [history_limit(spec) + 1], spec), "history_size")
++
++    def test_tool_projection_preserves_linkage_errors_and_original_storage(self):
++        chars = strategy_for_level(5).old_tool_chars
++        rows = [{"role": "assistant", "content": None, "tool_calls": [
++            {"id": "one", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}]},
++                {"role": "tool", "tool_call_id": "one", "content": "x" * (chars * 2) + "ERROR: permission denied"}]
++        before = deepcopy(rows)
++        result = compact_results(rows, chars)
++        self.assertEqual(rows, before)
++        self.assertEqual(result[0], rows[0])
++        self.assertEqual(result[1]["tool_call_id"], "one")
++        self.assertTrue(result[1]["content"].endswith("ERROR: permission denied"))
++        self.assertIn("full result in chat history", result[1]["content"])
++
++
++if __name__ == "__main__":
++    unittest.main()

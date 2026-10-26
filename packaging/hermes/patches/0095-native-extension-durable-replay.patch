@@ -1,0 +1,186 @@
+diff --git a/hermes_state.py b/hermes_state.py
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -9154,9 +9154,17 @@ class SessionDB:
+                 "message": message,
+             }
+ 
+-        return self._execute_write(
++        receipt = self._execute_write(
+             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+         )
++        message = receipt.get("message")
++        if isinstance(message, dict):
++            # This exact row has committed through our transaction above.
++            # The gateway hands it to the agent's live history; its generic
++            # shutdown flush must not append it again. Mark only AFTER commit,
++            # never infer persistence from a caller-supplied row id or timestamp.
++            message["_db_persisted"] = True
++        return receipt
+ 
+     def append_messages_batch(
+         self,
+diff --git a/tests/tui_gateway/test_native_extension_durable_replay.py b/tests/tui_gateway/test_native_extension_durable_replay.py
+new file mode 100644
+--- /dev/null
++++ b/tests/tui_gateway/test_native_extension_durable_replay.py
+@@ -0,0 +1,159 @@
++"""A committed synthetic reply must remain durable across the real agent flush."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import threading
++
++import pytest
++
++from tests.tui_gateway.test_native_assistant_extension import (
++    EVENT_ID,
++    FOREGROUND_ID,
++    _extend,
++    _extend_params,
++    _foreground,
++    _foreground_params,
++    _join,
++    extension_session,
++)
++
++
++def _rows(db):
++    return [dict(row) for row in db._conn.execute("SELECT * FROM messages ORDER BY id")]
++
++
++def _persistence_agent(db, messages):
++    # Use the real persistence implementation without constructing an LLM client.
++    from run_agent import AIAgent
++
++    agent = object.__new__(AIAgent)
++    agent._session_db = db
++    agent._session_db_created = True
++    agent.session_id = "game-root"
++    agent._session_messages = messages
++    agent._last_flushed_db_idx = 0
++    agent._flushed_db_message_ids = set()
++    agent._flushed_db_message_session_id = None
++    agent._persist_disabled = False
++    agent._session_persist_lock = threading.RLock()
++    return agent
++
++
++@pytest.mark.parametrize("invoke", [_extend, _foreground], ids=["native", "foreground"])
++def test_committed_gateway_handoff_survives_unscoped_shutdown_flush(
++    extension_session, invoke
++):
++    db, session, model, _emitted = extension_session
++    response = invoke()
++    assert "error" not in response
++    _join(session)
++    assert model.calls == 1
++    reply = session["history"][-1]
++    assert model._session_messages[-1] is reply
++    original = _rows(db)
++    assert len(original) == 2
++    original_id = reply["_row_id"]
++    assert original_id == original[-1]["id"]
++    assert reply["_durable_timestamp"] == original[-1]["timestamp"]
++    assert original[-1]["platform_message_id"] == reply["message_id"]
++    extension_receipt = dict(db._conn.execute(
++        "SELECT * FROM native_assistant_extensions"
++    ).fetchone())
++    assert extension_receipt["assistant_row_id"] == original_id
++
++    agent = _persistence_agent(db, list(model._session_messages))
++    # _finalize_session calls persistence without conversation_history. A row-id
++    # alone did not prevent the original bug, and no history seed is supplied.
++    for _ in range(2):
++        assert agent._flush_messages_to_session_db(agent._session_messages) is True
++        assert _rows(db) == original
++        assert reply.get("_db_persisted") is True
++        assert reply["_row_id"] == original_id
++    assert dict(db._conn.execute(
++        "SELECT * FROM native_assistant_extensions"
++    ).fetchone()) == extension_receipt
++
++
++def _claim(db, source):
++    foreground = source == "foreground-application"
++    perception = (_foreground_params() if foreground else _extend_params())["perception"]
++    event_id = FOREGROUND_ID if foreground else EVENT_ID
++    digest = hashlib.sha256(json.dumps(
++        perception, ensure_ascii=False, sort_keys=True, separators=(",", ":")
++    ).encode("utf-8")).hexdigest()
++    arguments = dict(
++        lineage_root="game-root", event_id=event_id,
++        perception_sha256=digest, turn_id="a" * 32,
++        assistant_message_id="b" * 32,
++    )
++    db.claim_native_assistant_extension(
++        "game-root", **arguments, lineage_session_ids=["game-root"],
++        perception=perception, owner_pid=os.getpid(), owner_started_at=0,
++        owner_token="c" * 32, abandon=False,
++    )
++    return dict(arguments, perception_source=source)
++
++
++@pytest.mark.parametrize("source", ["official-native-dialogue", "foreground-application"])
++def test_failed_commit_never_publishes_a_persisted_marker(
++    extension_session, monkeypatch, source
++):
++    db, _session, _model, _emitted = extension_session
++    arguments = _claim(db, source)
++    original = _rows(db)
++    captured = []
++    execute_write = db._execute_write
++
++    def fail_before_commit(operation, **kwargs):
++        def wrapped(conn):
++            receipt = operation(conn)
++            captured.append(receipt["message"])
++            assert receipt["message"].get("_db_persisted") is not True
++            raise RuntimeError("injected rollback after insert, before commit")
++        return execute_write(wrapped, **kwargs)
++
++    monkeypatch.setattr(db, "_execute_write", fail_before_commit)
++    with pytest.raises(RuntimeError, match="injected rollback"):
++        db.finish_native_assistant_extension(
++            "game-root", **arguments, status="completed", text="A private test reply."
++        )
++    assert len(captured) == 1
++    assert captured[0].get("_db_persisted") is not True
++    assert _rows(db) == original
++    row = db._conn.execute("SELECT state, assistant_row_id FROM native_assistant_extensions").fetchone()
++    assert row["state"] == "streaming"
++    assert row["assistant_row_id"] is None
++
++
++@pytest.mark.parametrize("source", ["official-native-dialogue", "foreground-application"])
++@pytest.mark.parametrize("status", ["silent", "abandoned"])
++def test_nonwriting_terminal_and_replay_have_no_saved_message(
++    extension_session, source, status
++):
++    db, _session, _model, _emitted = extension_session
++    arguments = _claim(db, source)
++    original = _rows(db)
++    for _ in range(2):
++        receipt = db.finish_native_assistant_extension("game-root", **arguments, status=status)
++        assert receipt["message"] is None
++        assert _rows(db) == original
++
++
++@pytest.mark.parametrize("source", ["official-native-dialogue", "foreground-application"])
++def test_completed_terminal_replay_retains_one_exact_row(extension_session, source):
++    db, _session, _model, _emitted = extension_session
++    arguments = _claim(db, source)
++    first = db.finish_native_assistant_extension(
++        "game-root", **arguments, status="completed", text="A private test reply."
++    )
++    assert first["message"].get("_db_persisted") is True
++    before = _rows(db)
++    second = db.finish_native_assistant_extension(
++        "game-root", **arguments, status="completed", text="A private test reply."
++    )
++    assert second["message"] is None
++    assert second["assistant_row_id"] == first["assistant_row_id"]
++    assert _rows(db) == before

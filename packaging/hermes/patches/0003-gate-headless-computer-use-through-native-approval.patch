@@ -1,0 +1,320 @@
+Subject: [lilith-core-seam] Gate headless computer use through native approval
+
+Route mutating computer-use actions through Hermes' shared approval gate when
+the CLI-specific callback is absent. Preserve safe read-only actions, use
+action-and-delivery-scoped allowlist keys, accept only native approval choices,
+and fail closed on malformed decisions, transport errors, denial, or timeout.
+
+Upstream base: 3c5fd918e3e2537cd74f4f88c990c5de5cbd9f63
+diff --git a/tests/tools/test_computer_use_approval_isolation.py b/tests/tools/test_computer_use_approval_isolation.py
+index 06ce415..2c03f00 100644
+--- a/tests/tools/test_computer_use_approval_isolation.py
++++ b/tests/tools/test_computer_use_approval_isolation.py
+@@ -6,8 +6,8 @@ stores are module-globals. Without the autouse reset fixture in
+ changes the behavior of every later computer-use test in the process:
+ a raising callback becomes ``verdict = "deny"`` (dispatch tests see an
+ empty backend call list), a blocking callback hangs the run. The pair
+-below simulates the forgetful test and asserts the next test still sees
+-default-allow behavior.
++below simulates the forgetful test and asserts the next test reaches the
++shared generic approval gate after the stale callback is cleared.
+ """
+ 
+ import json
+@@ -59,12 +59,19 @@ def test_a_forgets_a_poisoned_approval_callback():
+     # no reset — the autouse fixture must clean this up
+ 
+ 
+-def test_b_still_dispatches_with_default_allow():
++def test_b_still_dispatches_after_generic_approval(monkeypatch):
+     """Without the isolation fixture this fails: the stale callback raises
+     (arity), ``_request_approval`` converts that into a deny, and the
+     backend never sees the click."""
+     from tools.computer_use import tool as cu_tool
+ 
++    approvals = []
++
++    def approve(tool_name, reason, *, rule_key, **_kwargs):
++        approvals.append((tool_name, reason, rule_key))
++        return {"approved": True, "message": None}
++
++    monkeypatch.setattr("tools.approval.request_tool_approval", approve)
+     backend = _install_backend(cu_tool)
+     result = cu_tool.handle_computer_use({"action": "click", "element": 3})
+     call_names = [c[0] for c in backend.calls]
+@@ -73,3 +80,72 @@ def test_b_still_dispatches_with_default_allow():
+     )
+     payload = json.loads(result) if isinstance(result, str) else result
+     assert not (isinstance(payload, dict) and payload.get("error"))
++    assert approvals == [
++        (
++            "computer_use",
++            "click element #3",
++            "computer_use:click:background",
++        )
++    ]
++
++
++def test_generic_approval_denial_blocks_before_backend(monkeypatch):
++    from tools.computer_use import tool as cu_tool
++
++    monkeypatch.setattr(
++        "tools.approval.request_tool_approval",
++        lambda *_args, **_kwargs: {
++            "approved": False,
++            "message": "denied by user",
++        },
++    )
++    backend = _install_backend(cu_tool)
++
++    result = json.loads(
++        cu_tool.handle_computer_use({"action": "click", "element": 3})
++    )
++
++    assert result == {"error": "denied by user", "action": "click"}
++    assert backend.calls == []
++
++
++def test_generic_approval_unknown_or_exception_fails_closed(monkeypatch):
++    from tools.computer_use import tool as cu_tool
++
++    backend = _install_backend(cu_tool)
++    monkeypatch.setattr(
++        "tools.approval.request_tool_approval",
++        lambda *_args, **_kwargs: {"approved": "yes"},
++    )
++    unknown = json.loads(
++        cu_tool.handle_computer_use({"action": "click", "element": 3})
++    )
++
++    def fail(*_args, **_kwargs):
++        raise RuntimeError("approval transport failed")
++
++    monkeypatch.setattr("tools.approval.request_tool_approval", fail)
++    failed = json.loads(
++        cu_tool.handle_computer_use({"action": "click", "element": 4})
++    )
++
++    assert unknown == {"error": "approval failed closed", "action": "click"}
++    assert failed == {"error": "approval failed closed", "action": "click"}
++    assert backend.calls == []
++
++
++def test_safe_action_never_requests_generic_approval(monkeypatch):
++    from tools.computer_use import tool as cu_tool
++
++    monkeypatch.setattr(
++        "tools.approval.request_tool_approval",
++        lambda *_args, **_kwargs: (_ for _ in ()).throw(
++            AssertionError("safe action must not request approval")
++        ),
++    )
++    backend = _install_backend(cu_tool)
++
++    result = json.loads(cu_tool.handle_computer_use({"action": "capture"}))
++
++    assert result["mode"] == "som"
++    assert backend.calls == []
+diff --git a/tests/tools/test_request_tool_approval.py b/tests/tools/test_request_tool_approval.py
+index 5f2c8ef..d2cd408 100644
+--- a/tests/tools/test_request_tool_approval.py
++++ b/tests/tools/test_request_tool_approval.py
+@@ -28,7 +28,13 @@ def _isolate_approval_state(monkeypatch):
+     monkeypatch.setattr(
+         "tools.terminal_tool._get_approval_callback", lambda: None, raising=False
+     )
++    with approval._lock:
++        approval._gateway_queues.clear()
++        approval._gateway_notify_cbs.clear()
+     yield
++    with approval._lock:
++        approval._gateway_queues.clear()
++        approval._gateway_notify_cbs.clear()
+ 
+ 
+ class TestRequestToolApproval:
+@@ -151,3 +157,100 @@ class TestRequestToolApproval:
+         )
+         res = request_tool_approval("terminal", "curl PUT", rule_key="ext")
+         assert res == {"approved": True, "message": None}
++
++    @pytest.mark.parametrize(
++        ("choice", "approved", "session_count", "permanent_count"),
++        [
++            ("once", True, 0, 0),
++            ("session", True, 1, 0),
++            ("always", True, 1, 1),
++            ("deny", False, 0, 0),
++        ],
++    )
++    def test_gateway_native_choices_are_mapped_strictly(
++        self,
++        monkeypatch,
++        choice,
++        approved,
++        session_count,
++        permanent_count,
++    ):
++        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
++        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
++        approval.register_gateway_notify("test-session", lambda _data: None)
++        seen = []
++
++        def decide(session_key, notify_cb, approval_data, *, surface):
++            seen.append((session_key, notify_cb, approval_data, surface))
++            return {"resolved": True, "choice": choice, "reason": None}
++
++        monkeypatch.setattr(approval, "_await_gateway_decision", decide)
++        calls = {"session": [], "permanent": [], "saved": 0}
++        monkeypatch.setattr(
++            approval,
++            "approve_session",
++            lambda session_key, pattern_key: calls["session"].append(
++                (session_key, pattern_key)
++            ),
++        )
++        monkeypatch.setattr(
++            approval,
++            "approve_permanent",
++            lambda pattern_key: calls["permanent"].append(pattern_key),
++        )
++        monkeypatch.setattr(
++            approval,
++            "save_permanent_allowlist",
++            lambda _patterns: calls.__setitem__("saved", calls["saved"] + 1),
++        )
++
++        result = request_tool_approval(
++            tool_name="computer_use",
++            reason="click element #3",
++            rule_key="computer_use:click:background",
++        )
++
++        assert result["approved"] is approved
++        assert len(calls["session"]) == session_count
++        assert len(calls["permanent"]) == permanent_count
++        assert calls["saved"] == permanent_count
++        assert seen[0][0] == "test-session"
++        assert seen[0][2]["pattern_key"] == (
++            "plugin_rule:computer_use:click:background"
++        )
++        assert seen[0][3] == "gateway"
++
++    def test_gateway_unknown_choice_fails_closed(self, monkeypatch):
++        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
++        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
++        approval.register_gateway_notify("test-session", lambda _data: None)
++        monkeypatch.setattr(
++            approval,
++            "_await_gateway_decision",
++            lambda *_args, **_kwargs: {
++                "resolved": True,
++                "choice": "approve",
++                "reason": None,
++            },
++        )
++
++        result = request_tool_approval(
++            tool_name="computer_use",
++            reason="click element #3",
++            rule_key="computer_use:click:background",
++        )
++
++        assert result["approved"] is False
++        assert result["user_consent"] is False
++
++    def test_resolve_gateway_approval_rejects_unknown_choice(self):
++        entry = approval._ApprovalEntry({"pattern_key": "plugin_rule:test"})
++        with approval._lock:
++            approval._gateway_queues["test-session"] = [entry]
++
++        with pytest.raises(ValueError, match="invalid gateway approval choice"):
++            approval.resolve_gateway_approval("test-session", "approve")
++
++        assert entry.result is None
++        assert entry.event.is_set() is False
++        assert approval._gateway_queues["test-session"] == [entry]
+diff --git a/tools/approval.py b/tools/approval.py
+index 194bbd6..09cd038 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -2544,6 +2544,7 @@ class _ApprovalEntry:
+ 
+ _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
+ _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
++_GATEWAY_APPROVAL_CHOICES = frozenset({"once", "session", "always", "deny"})
+ 
+ 
+ def register_gateway_notify(session_key: str, cb) -> None:
+@@ -2587,6 +2588,8 @@ def resolve_gateway_approval(session_key: str, choice: str,
+ 
+     Returns the number of approvals resolved (0 means nothing was pending).
+     """
++    if choice not in _GATEWAY_APPROVAL_CHOICES:
++        raise ValueError("invalid gateway approval choice")
+     with _lock:
+         queue = _gateway_queues.get(session_key)
+         if not queue:
+@@ -3376,7 +3379,11 @@ def _run_approval_gate(
+             choice = decision["choice"]
+             deny_reason = decision.get("reason")
+ 
+-            if not resolved or choice is None or choice == "deny":
++            if (
++                not resolved
++                or choice not in _GATEWAY_APPROVAL_CHOICES
++                or choice == "deny"
++            ):
+                 if not resolved:
+                     reason = "timed out without user response"
+                     timeout_addendum = " Silence is not consent."
+diff --git a/tools/computer_use/tool.py b/tools/computer_use/tool.py
+index 714facf..31dad5b 100644
+--- a/tools/computer_use/tool.py
++++ b/tools/computer_use/tool.py
+@@ -533,9 +533,41 @@ def _request_approval(action: str, args: Dict[str, Any],
+             return None
+     cb = _approval_callback
+     if cb is None:
+-        # No CLI approval wired — default allow. Gateway approval is handled
+-        # one layer out via the normal tool-approval infra.
+-        return None
++        # CLI installs the computer-use-specific callback above. Gateway/API
++        # surfaces do not, so route them through the shared tool-approval gate
++        # instead of silently allowing a mutating desktop action. The shared
++        # gate owns session correlation, once/session/always persistence,
++        # timeout handling, and gateway ``approval.request`` delivery.
++        delivery_scope = "foreground" if is_foreground else "background"
++        summary = _summarize_action(action, args)
++        try:
++            from tools.approval import request_tool_approval
++
++            decision = request_tool_approval(
++                tool_name="computer_use",
++                reason=summary,
++                rule_key=f"computer_use:{action}:{delivery_scope}",
++            )
++        except Exception:
++            logger.warning(
++                "generic computer_use approval failed for %s", action,
++                exc_info=True,
++            )
++            decision = None
++
++        # Only the exact positive decision shape authorizes execution. A
++        # malformed/unknown result, transport failure, timeout, or denial is
++        # fail-closed and must never reach cua-driver.
++        if isinstance(decision, dict) and decision.get("approved") is True:
++            return None
++        message = (
++            decision.get("message")
++            if isinstance(decision, dict)
++            and isinstance(decision.get("message"), str)
++            and decision.get("message")
++            else "approval failed closed"
++        )
++        return json.dumps({"error": message, "action": action})
+     summary = _summarize_action(action, args)
+     try:
+         verdict = cb(action, args, summary)
+

@@ -1,0 +1,874 @@
+Subject: [hermes-core-seam] Bound child capabilities and session controls
+
+Add an operator-controlled child toolset ceiling that intersects the live
+parent surface and cannot implicitly regain MCP or role-granted capabilities.
+Allow status and interrupt RPCs to use exact live session ownership while
+preserving the no-session TUI helper contract.
+
+Upstream base: 3c5fd918e3e2537cd74f4f88c990c5de5cbd9f63
+
+diff --git a/tests/tools/test_delegate.py b/tests/tools/test_delegate.py
+index bb995dd..15c4aca 100644
+--- a/tests/tools/test_delegate.py
++++ b/tests/tools/test_delegate.py
+@@ -21,6 +21,7 @@ from tools.delegate_tool import (
+     DELEGATE_BLOCKED_TOOLS,
+     DELEGATE_TASK_SCHEMA,
+     DelegateEvent,
++    _get_child_toolsets,
+     _get_max_concurrent_children,
+     _load_config,
+     delegate_task,
+@@ -81,6 +82,21 @@ class TestDelegateRequirements(unittest.TestCase):
+         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
+         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+ 
++    def test_child_toolsets_config_is_trusted_and_strictly_typed(self):
++        self.assertIsNone(_get_child_toolsets({}))
++        self.assertIsNone(_get_child_toolsets({"child_toolsets": None}))
++        self.assertEqual(_get_child_toolsets({"child_toolsets": []}), [])
++        self.assertEqual(
++            _get_child_toolsets(
++                {"child_toolsets": ["skills", " session_search ", "skills"]}
++            ),
++            ["skills", "session_search"],
++        )
++        with self.assertRaisesRegex(ValueError, "must be a list"):
++            _get_child_toolsets({"child_toolsets": "skills"})
++        with self.assertRaisesRegex(ValueError, "non-empty strings"):
++            _get_child_toolsets({"child_toolsets": [""]})
++
+     def test_top_level_description_compact_and_complete(self):
+         """The top-level description must stay compact while keeping every
+         contract that exists nowhere else in the schema (keyword-level, not
+@@ -249,6 +265,83 @@ class TestStripBlockedTools(unittest.TestCase):
+             (DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names)
+         )
+ 
++    def test_trusted_cap_intersects_parent_without_implicit_additions(self):
++        parent = _make_mock_parent()
++        parent.enabled_toolsets = [
++            "skills",
++            "session_search",
++            "computer_use",
++            "mcp-example",
++        ]
++
++        with patch("run_agent.AIAgent") as MockAgent:
++            MockAgent.return_value = MagicMock()
++            _build_child_agent(
++                task_index=0,
++                goal="Learn from available context",
++                context=None,
++                toolsets=["skills", "session_search", "terminal"],
++                model=None,
++                max_iterations=10,
++                parent_agent=parent,
++                task_count=1,
++                enforce_toolset_cap=True,
++            )
++
++        self.assertEqual(
++            MockAgent.call_args[1]["enabled_toolsets"],
++            ["skills", "session_search"],
++        )
++        self.assertEqual(
++            MockAgent.return_value._delegate_enabled_toolsets,
++            ("skills", "session_search"),
++        )
++
++    def test_trusted_empty_cap_disables_all_child_tools(self):
++        parent = _make_mock_parent()
++        parent.enabled_toolsets = ["skills", "computer_use", "mcp-example"]
++
++        with patch("run_agent.AIAgent") as MockAgent:
++            MockAgent.return_value = MagicMock()
++            _build_child_agent(
++                task_index=0,
++                goal="No tools",
++                context=None,
++                toolsets=[],
++                model=None,
++                max_iterations=10,
++                parent_agent=parent,
++                task_count=1,
++                enforce_toolset_cap=True,
++            )
++
++        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], [])
++
++    def test_trusted_cap_does_not_gain_delegation_from_role(self):
++        parent = _make_mock_parent()
++        parent.enabled_toolsets = ["skills", "delegation"]
++
++        with (
++            patch("run_agent.AIAgent") as MockAgent,
++            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
++            patch("tools.delegate_tool._get_max_spawn_depth", return_value=2),
++        ):
++            MockAgent.return_value = MagicMock()
++            _build_child_agent(
++                task_index=0,
++                goal="Bounded coordinator",
++                context=None,
++                toolsets=["skills"],
++                model=None,
++                max_iterations=10,
++                parent_agent=parent,
++                task_count=1,
++                role="orchestrator",
++                enforce_toolset_cap=True,
++            )
++
++        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], ["skills"])
++
+ 
+ class TestDelegateTask(unittest.TestCase):
+     def test_no_parent_agent(self):
+@@ -262,6 +355,40 @@ class TestDelegateTask(unittest.TestCase):
+         self.assertIn("error", result)
+         self.assertIn("depth limit", result["error"].lower())
+ 
++    @patch("tools.delegate_tool._load_config")
++    def test_delegate_task_applies_configured_child_toolset_cap(self, mock_cfg):
++        mock_cfg.return_value = {
++            "child_toolsets": ["skills", "session_search", "terminal"],
++            "max_iterations": 50,
++        }
++        parent = _make_mock_parent(depth=0)
++        parent.enabled_toolsets = ["skills", "session_search", "computer_use"]
++
++        with patch("run_agent.AIAgent") as MockAgent:
++            mock_child = MagicMock()
++            mock_child.run_conversation.return_value = {
++                "final_response": "ok",
++                "completed": True,
++                "api_calls": 1,
++            }
++            MockAgent.return_value = mock_child
++            delegate_task(goal="Apply trusted cap", parent_agent=parent)
++
++        self.assertEqual(
++            MockAgent.call_args[1]["enabled_toolsets"],
++            ["skills", "session_search"],
++        )
++
++    @patch("tools.delegate_tool._load_config")
++    def test_invalid_child_toolset_config_fails_closed(self, mock_cfg):
++        mock_cfg.return_value = {"child_toolsets": "skills"}
++        parent = _make_mock_parent(depth=0)
++
++        result = json.loads(delegate_task(goal="Should not spawn", parent_agent=parent))
++
++        self.assertIn("error", result)
++        self.assertIn("delegation.child_toolsets", result["error"])
++
+ 
+     def test_child_inherits_runtime_credentials(self):
+         parent = _make_mock_parent(depth=0)
+diff --git a/tests/tools/test_subagent_steer.py b/tests/tools/test_subagent_steer.py
+index f72c6b9..9a05b5e 100644
+--- a/tests/tools/test_subagent_steer.py
++++ b/tests/tools/test_subagent_steer.py
+@@ -14,6 +14,8 @@ from unittest.mock import MagicMock
+ from tools.delegate_tool import (
+     _register_subagent,
+     _unregister_subagent,
++    interrupt_subagent,
++    list_active_subagents,
+     steer_subagent,
+ )
+ 
+@@ -23,6 +25,7 @@ class _StubAgent:
+         self.accept = accept
+         self.boom = boom
+         self.steered: list[str] = []
++        self.interrupted: list[str | None] = []
+ 
+     def steer(self, text: str) -> bool:
+         if self.boom:
+@@ -30,6 +33,9 @@ class _StubAgent:
+         self.steered.append(text)
+         return self.accept
+ 
++    def interrupt(self, message: str | None = None) -> None:
++        self.interrupted.append(message)
++
+ 
+ def _with_registered(
+     sid: str,
+@@ -38,6 +44,7 @@ def _with_registered(
+     owner_session_id: str | None = None,
+     owner_transport=None,
+     owner_session_record=None,
++    effective_enabled_toolsets: tuple[str, ...] = (),
+ ) -> None:
+     _register_subagent(
+         {
+@@ -50,6 +57,7 @@ def _with_registered(
+             "owner_session_id": owner_session_id,
+             "owner_transport": owner_transport,
+             "owner_session_record": owner_session_record,
++            "effective_enabled_toolsets": effective_enabled_toolsets,
+         }
+     )
+ 
+@@ -125,8 +133,6 @@ def test_stale_agent_teardown_cannot_unregister_recycled_id():
+ 
+ 
+ def test_status_snapshot_never_leaks_owner_or_lifecycle_metadata():
+-    from tools.delegate_tool import list_active_subagents
+-
+     agent = _StubAgent()
+     owner_transport = object()
+     owner_session_record = {"session_key": "private-owner"}
+@@ -149,6 +155,9 @@ def test_status_snapshot_never_leaks_owner_or_lifecycle_metadata():
+         assert "owner_transport" not in snapshot
+         assert "owner_session_record" not in snapshot
+         assert "accepting_steer" not in snapshot
++        assert "effective_enabled_toolsets" not in snapshot
++        assert "toolsets" not in snapshot
++        assert "session_id" not in snapshot
+         assert "private-owner" not in repr(snapshot)
+         assert all(value is not owner_transport for value in snapshot.values())
+         assert all(value is not owner_session_record for value in snapshot.values())
+@@ -156,6 +165,94 @@ def test_status_snapshot_never_leaks_owner_or_lifecycle_metadata():
+         _unregister_subagent("sid-private-metadata", agent=agent)
+ 
+ 
++def test_status_snapshot_can_be_scoped_to_exact_owner_authority():
++    owner_transport = object()
++    owner_record = {"session_key": "owner-session"}
++    owner_agent = _StubAgent()
++    foreign_agent = _StubAgent()
++    _with_registered(
++        "sid-owned-status",
++        owner_agent,
++        owner_session_id="owner-session",
++        owner_transport=owner_transport,
++        owner_session_record=owner_record,
++        effective_enabled_toolsets=("skills", "session_search"),
++    )
++    _with_registered(
++        "sid-foreign-status",
++        foreign_agent,
++        owner_session_id="foreign-session",
++        owner_transport=object(),
++        owner_session_record={"session_key": "foreign-session"},
++    )
++    try:
++        scoped = list_active_subagents(
++            owner_session_id="owner-session",
++            owner_transport=owner_transport,
++            owner_session_record=owner_record,
++        )
++        assert [item["subagent_id"] for item in scoped] == ["sid-owned-status"]
++        assert scoped[0]["session_id"] == "owner-session"
++        assert scoped[0]["toolsets"] == ["skills", "session_search"]
++        assert (
++            list_active_subagents(
++                owner_session_id="owner-session",
++                owner_transport=object(),
++                owner_session_record=owner_record,
++            )
++            == []
++        )
++    finally:
++        _unregister_subagent("sid-owned-status", agent=owner_agent)
++        _unregister_subagent("sid-foreign-status", agent=foreign_agent)
++
++
++def test_interrupt_can_be_scoped_to_exact_owner_authority():
++    owner_transport = object()
++    owner_record = {"session_key": "owner-session"}
++    agent = _StubAgent()
++    _with_registered(
++        "sid-owned-interrupt",
++        agent,
++        owner_session_id="owner-session",
++        owner_transport=owner_transport,
++        owner_session_record=owner_record,
++    )
++    try:
++        assert (
++            interrupt_subagent(
++                "sid-owned-interrupt",
++                owner_session_id="owner-session",
++                owner_transport=object(),
++                owner_session_record=owner_record,
++            )
++            is False
++        )
++        assert agent.interrupted == []
++        assert (
++            interrupt_subagent(
++                "sid-owned-interrupt",
++                owner_session_id="owner-session",
++                owner_transport=owner_transport,
++                owner_session_record=owner_record,
++            )
++            is True
++        )
++        assert len(agent.interrupted) == 1
++    finally:
++        _unregister_subagent("sid-owned-interrupt", agent=agent)
++
++
++def test_interrupt_without_owner_scope_preserves_legacy_helper_contract():
++    agent = _StubAgent()
++    _with_registered("sid-legacy-interrupt", agent)
++    try:
++        assert interrupt_subagent("sid-legacy-interrupt") is True
++        assert len(agent.interrupted) == 1
++    finally:
++        _unregister_subagent("sid-legacy-interrupt", agent=agent)
++
++
+ class TestMissedSteerRetention:
+     """The final-answer race: a steer with no boundary left is NAMED, not lost."""
+ 
+@@ -357,7 +454,14 @@ class TestSubagentSteerRPC:
+         def close(self) -> None:
+             return None
+ 
+-    def _call(self, params: dict, *, transport=None, session_record=None) -> dict:
++    def _call(
++        self,
++        params: dict,
++        *,
++        method: str = "subagent.steer",
++        transport=None,
++        session_record=None,
++    ) -> dict:
+         import tui_gateway.server as srv
+ 
+         session_id = params.get("session_id")
+@@ -369,7 +473,7 @@ class TestSubagentSteerRPC:
+             }
+         try:
+             return srv.dispatch(
+-                {"id": 1, "method": "subagent.steer", "params": params},
++                {"id": 1, "method": method, "params": params},
+                 transport=transport,
+             )
+         finally:
+@@ -384,6 +488,126 @@ class TestSubagentSteerRPC:
+         envelope = self._call({"subagent_id": "sid-rpc-1", "text": "   "})
+         assert envelope["error"]["code"] == 4002
+ 
++    def test_status_with_session_id_returns_only_exact_owned_children(self):
++        owner_transport = self._Transport()
++        owner_record = {
++            "session_key": "owner-session",
++            "history": [],
++            "transport": owner_transport,
++        }
++        owner_agent = _StubAgent()
++        foreign_agent = _StubAgent()
++        _with_registered(
++            "sid-rpc-owned-status",
++            owner_agent,
++            owner_session_id="owner-session",
++            owner_transport=owner_transport,
++            owner_session_record=owner_record,
++            effective_enabled_toolsets=("skills", "session_search"),
++        )
++        _with_registered(
++            "sid-rpc-foreign-status",
++            foreign_agent,
++            owner_session_id="foreign-session",
++            owner_transport=self._Transport(),
++            owner_session_record={"session_key": "foreign-session"},
++        )
++        try:
++            envelope = self._call(
++                {"session_id": "owner-session"},
++                method="delegation.status",
++                transport=owner_transport,
++                session_record=owner_record,
++            )
++            assert [
++                item["subagent_id"] for item in envelope["result"]["active"]
++            ] == ["sid-rpc-owned-status"]
++            assert envelope["result"]["active"][0]["session_id"] == "owner-session"
++            assert envelope["result"]["active"][0]["toolsets"] == [
++                "skills",
++                "session_search",
++            ]
++        finally:
++            _unregister_subagent("sid-rpc-owned-status", agent=owner_agent)
++            _unregister_subagent("sid-rpc-foreign-status", agent=foreign_agent)
++
++    def test_status_without_session_id_preserves_legacy_global_snapshot(self):
++        agent = _StubAgent()
++        _with_registered("sid-rpc-legacy-status", agent)
++        try:
++            envelope = self._call({}, method="delegation.status")
++            assert "sid-rpc-legacy-status" in {
++                item["subagent_id"] for item in envelope["result"]["active"]
++            }
++            legacy = next(
++                item
++                for item in envelope["result"]["active"]
++                if item["subagent_id"] == "sid-rpc-legacy-status"
++            )
++            assert "session_id" not in legacy
++            assert "toolsets" not in legacy
++        finally:
++            _unregister_subagent("sid-rpc-legacy-status", agent=agent)
++
++    def test_interrupt_with_session_id_uses_exact_owner_authority(self):
++        owner_transport = self._Transport()
++        foreign_transport = self._Transport()
++        owner_record = {
++            "session_key": "owner-session",
++            "history": [],
++            "transport": owner_transport,
++        }
++        agent = _StubAgent()
++        _with_registered(
++            "sid-rpc-owned-interrupt",
++            agent,
++            owner_session_id="owner-session",
++            owner_transport=owner_transport,
++            owner_session_record=owner_record,
++        )
++        try:
++            rejected = self._call(
++                {
++                    "session_id": "owner-session",
++                    "subagent_id": "sid-rpc-owned-interrupt",
++                },
++                method="subagent.interrupt",
++                transport=foreign_transport,
++                session_record=owner_record,
++            )
++            assert rejected["result"]["found"] is False
++            assert agent.interrupted == []
++
++            accepted = self._call(
++                {
++                    "session_id": "owner-session",
++                    "subagent_id": "sid-rpc-owned-interrupt",
++                },
++                method="subagent.interrupt",
++                transport=owner_transport,
++                session_record=owner_record,
++            )
++            assert accepted["result"] == {
++                "found": True,
++                "subagent_id": "sid-rpc-owned-interrupt",
++            }
++            assert len(agent.interrupted) == 1
++        finally:
++            _unregister_subagent("sid-rpc-owned-interrupt", agent=agent)
++
++    def test_interrupt_without_session_id_preserves_legacy_rpc(self):
++        agent = _StubAgent()
++        _with_registered("sid-rpc-legacy-interrupt", agent)
++        try:
++            envelope = self._call(
++                {"subagent_id": "sid-rpc-legacy-interrupt"},
++                method="subagent.interrupt",
++            )
++            assert envelope["result"]["found"] is True
++            assert len(agent.interrupted) == 1
++        finally:
++            _unregister_subagent("sid-rpc-legacy-interrupt", agent=agent)
++
+     def test_live_child_queues_and_receives_text(self):
+         owner_transport = self._Transport()
+         owner_record = {
+@@ -422,7 +646,7 @@ class TestSubagentSteerRPC:
+         from gateway.session_context import clear_session_vars, set_session_vars
+         from tools.delegate_tool import _run_single_child
+ 
+-        observed: dict[str, bool] = {}
++        observed: dict[str, object] = {}
+         owner_transport = self._Transport()
+         owner_session_record = {
+             "session_key": "durable-parent",
+@@ -432,6 +656,7 @@ class TestSubagentSteerRPC:
+         child = MagicMock()
+         child._subagent_id = "sid-context-owner"
+         child._delegate_depth = 1
++        child._delegate_enabled_toolsets = ("skills", "session_search")
+         child.model = "test-model"
+         child.steer.return_value = True
+ 
+@@ -450,6 +675,11 @@ class TestSubagentSteerRPC:
+                 owner_transport=self._Transport(),
+                 owner_session_record=owner_session_record,
+             )
++            observed["toolsets"] = list_active_subagents(
++                owner_session_id="ui-owner",
++                owner_transport=owner_transport,
++                owner_session_record=owner_session_record,
++            )[0]["toolsets"]
+             return {
+                 "final_response": "done",
+                 "completed": True,
+@@ -476,7 +706,11 @@ class TestSubagentSteerRPC:
+         finally:
+             clear_session_vars(tokens)
+ 
+-        assert observed == {"owner": True, "foreign": False}
++        assert observed == {
++            "owner": True,
++            "foreign": False,
++            "toolsets": ["skills", "session_search"],
++        }
+         child.steer.assert_called_once_with("owned steer")
+ 
+     def test_unknown_child_is_rejected_not_an_error(self):
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 2671b42..2de081d 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -210,19 +210,56 @@ def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
+         return pending if isinstance(pending, str) and pending.strip() else None
+ 
+ 
+-def interrupt_subagent(subagent_id: str) -> bool:
++def _subagent_owner_matches(
++    record: Dict[str, Any],
++    *,
++    owner_session_id: Optional[str] = None,
++    owner_transport: Any = None,
++    owner_session_record: Any = None,
++) -> bool:
++    """Return whether a registry record belongs to an optional exact owner.
++
++    ``owner_session_id=None`` preserves the trusted in-process/TUI helper
++    contract.  Scoped gateway callers must also present the exact live
++    transport and session-record identities captured when the child spawned;
++    the public session id alone is never authority.
++    """
++    if owner_session_id is None:
++        return True
++    return bool(
++        record.get("owner_session_id") == owner_session_id
++        and owner_transport is not None
++        and record.get("owner_transport") is owner_transport
++        and owner_session_record is not None
++        and record.get("owner_session_record") is owner_session_record
++    )
++
++
++def interrupt_subagent(
++    subagent_id: str,
++    *,
++    owner_session_id: Optional[str] = None,
++    owner_transport: Any = None,
++    owner_session_record: Any = None,
++) -> bool:
+     """Request that a single running subagent stop at its next iteration boundary.
+ 
+     Does not hard-kill the worker thread (Python can't); sets the child's
+     interrupt flag which propagates to in-flight tools and recurses into
+     grandchildren via AIAgent.interrupt().  Returns True if a matching
+-    subagent was found.
++    subagent was found. ``owner_session_id=None`` preserves the legacy trusted
++    in-process helper; scoped gateway callers must pass exact owner authority.
+     """
+     with _active_subagents_lock:
+         record = _active_subagents.get(subagent_id)
+-    if not record:
+-        return False
+-    agent = record.get("agent")
++        if not record or not _subagent_owner_matches(
++            record,
++            owner_session_id=owner_session_id,
++            owner_transport=owner_transport,
++            owner_session_record=owner_session_record,
++        ):
++            return False
++        agent = record.get("agent")
+     if agent is None:
+         return False
+     try:
+@@ -263,15 +300,13 @@ def steer_subagent(
+         record = _active_subagents.get(subagent_id)
+         if not record or not record.get("accepting_steer", False):
+             return False
+-        if owner_session_id is not None:
+-            if (
+-                record.get("owner_session_id") != owner_session_id
+-                or owner_transport is None
+-                or record.get("owner_transport") is not owner_transport
+-                or owner_session_record is None
+-                or record.get("owner_session_record") is not owner_session_record
+-            ):
+-                return False
++        if not _subagent_owner_matches(
++            record,
++            owner_session_id=owner_session_id,
++            owner_transport=owner_transport,
++            owner_session_record=owner_session_record,
++        ):
++            return False
+         agent = record.get("agent")
+         if agent is None:
+             return False
+@@ -300,17 +335,34 @@ def _capture_gateway_steer_authority(
+         return None, None
+ 
+ 
+-def list_active_subagents() -> List[Dict[str, Any]]:
++def list_active_subagents(
++    *,
++    owner_session_id: Optional[str] = None,
++    owner_transport: Any = None,
++    owner_session_record: Any = None,
++) -> List[Dict[str, Any]]:
+     """Snapshot of the currently running subagent tree.
+ 
+     Each record: {subagent_id, parent_id, depth, goal, model, started_at,
+     tool_count, status}.  Safe to call from any thread — returns a copy.
++    ``owner_session_id=None`` preserves the legacy process-wide snapshot;
++    otherwise only records matching the exact live owner are returned, with
++    that verified owner exposed as ``session_id`` and the child's immutable
++    effective capability snapshot exposed as ``toolsets``.
+     """
+     with _active_subagents_lock:
+-        return [
+-            {
++        snapshot = []
++        for record in _active_subagents.values():
++            if not _subagent_owner_matches(
++                record,
++                owner_session_id=owner_session_id,
++                owner_transport=owner_transport,
++                owner_session_record=owner_session_record,
++            ):
++                continue
++            public_record = {
+                 k: v
+-                for k, v in r.items()
++                for k, v in record.items()
+                 if k
+                 not in {
+                     "agent",
+@@ -318,10 +370,16 @@ def list_active_subagents() -> List[Dict[str, Any]]:
+                     "owner_transport",
+                     "owner_session_record",
+                     "accepting_steer",
++                    "effective_enabled_toolsets",
+                 }
+             }
+-            for r in _active_subagents.values()
+-        ]
++            if owner_session_id is not None:
++                public_record["session_id"] = owner_session_id
++                public_record["toolsets"] = list(
++                    record.get("effective_enabled_toolsets") or ()
++                )
++            snapshot.append(public_record)
++        return snapshot
+ 
+ 
+ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) -> bool:
+@@ -920,6 +978,36 @@ def _get_inherit_mcp_toolsets() -> bool:
+     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
+ 
+ 
++def _get_child_toolsets(cfg: Optional[Dict[str, Any]] = None) -> Optional[List[str]]:
++    """Return the operator-controlled child toolset cap, if configured.
++
++    The model-facing delegation schema intentionally has no toolset selector.
++    This setting is therefore a trusted, process-side capability ceiling. An
++    explicit empty list means no child tools; ``None`` or an absent key keeps
++    upstream inheritance behavior.
++    """
++    config = _load_config() if cfg is None else cfg
++    if "child_toolsets" not in config or config.get("child_toolsets") is None:
++        return None
++    raw = config.get("child_toolsets")
++    if not isinstance(raw, list):
++        raise ValueError(
++            "delegation.child_toolsets must be a list of toolset names or null"
++        )
++    normalized: List[str] = []
++    seen = set()
++    for item in raw:
++        if not isinstance(item, str) or not item.strip():
++            raise ValueError(
++                "delegation.child_toolsets entries must be non-empty strings"
++            )
++        name = item.strip()
++        if name not in seen:
++            normalized.append(name)
++            seen.add(name)
++    return normalized
++
++
+ def _is_mcp_toolset_name(name: str) -> bool:
+     """Return True for canonical MCP toolsets and their registered aliases."""
+     if not name:
+@@ -1486,6 +1574,9 @@ def _build_child_agent(
+     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
+     # toolset subject to depth/kill-switch bounds applied below.
+     role: str = "leaf",
++    # Trusted capability ceilings must not receive implicit MCP or role-based
++    # additions outside their parent-intersected set.
++    enforce_toolset_cap: bool = False,
+ ):
+     """
+     Build a child AIAgent on the main thread (thread-safe construction).
+@@ -1540,13 +1631,15 @@ def _build_child_agent(
+     else:
+         parent_toolsets = set(DEFAULT_TOOLSETS)
+ 
+-    if toolsets:
++    cap_allows_delegation = False
++    if toolsets is not None:
+         # Intersect with parent — subagent must not gain tools the parent lacks.
+         # Expand composite toolsets (e.g. hermes-cli) so that individual
+         # toolset names (e.g. web, terminal) are recognised during intersection.
+         expanded_parent = _expand_parent_toolsets(parent_toolsets)
+         child_toolsets = [t for t in toolsets if t in expanded_parent]
+-        if _get_inherit_mcp_toolsets():
++        cap_allows_delegation = "delegation" in child_toolsets
++        if not enforce_toolset_cap and _get_inherit_mcp_toolsets():
+             child_toolsets = _preserve_parent_mcp_toolsets(
+                 child_toolsets, parent_toolsets
+             )
+@@ -1580,11 +1673,14 @@ def _build_child_agent(
+         )
+     )
+ 
+-    # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
+-    # removed.  The re-add is unconditional on parent-toolset membership because
+-    # orchestrator capability is granted by role, not inherited — see the
+-    # test_intersection_preserves_delegation_bound test for the design rationale.
+-    if effective_role == "orchestrator" and "delegation" not in child_toolsets:
++    # Orchestrators normally regain the 'delegation' toolset that
++    # _strip_blocked_tools removed. A trusted cap is authoritative, so role can
++    # only restore delegation when both parent and cap contained it.
++    if (
++        effective_role == "orchestrator"
++        and (not enforce_toolset_cap or cap_allows_delegation)
++        and "delegation" not in child_toolsets
++    ):
+         child_toolsets.append("delegation")
+ 
+     workspace_hint = _resolve_workspace_hint(parent_agent)
+@@ -1825,6 +1921,10 @@ def _build_child_agent(
+     # Stash the post-degrade role for introspection (leaf if the
+     # kill switch or depth bounded the caller's requested role).
+     child._delegate_role = effective_role
++    # Preserve the exact post-intersection enabled surface used by both the
++    # live events and scoped status registry. A tuple prevents later config or
++    # agent mutation from rewriting the child capability snapshot.
++    child._delegate_enabled_toolsets = tuple(child_toolsets)
+     # Stash subagent identity for nested-delegation event propagation and
+     # for _run_single_child / interrupt_subagent to look up by id.
+     child._subagent_id = subagent_id
+@@ -2422,6 +2522,9 @@ def _run_single_child(
+                 "started_at": time.time(),
+                 "status": "running",
+                 "tool_count": 0,
++                "effective_enabled_toolsets": tuple(
++                    getattr(child, "_delegate_enabled_toolsets", ()) or ()
++                ),
+                 "agent": child,
+                 # Immutable live gateway/TUI session that commissioned this
+                 # child. Empty outside those hosts; RPC authority fails closed.
+@@ -3455,6 +3558,10 @@ def delegate_task(
+ 
+     # Load config
+     cfg = _load_config()
++    try:
++        child_toolsets = _get_child_toolsets(cfg)
++    except ValueError as exc:
++        return tool_error(str(exc))
+     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+     # Model-supplied max_iterations is ignored — the config value is authoritative
+     # so users get predictable budgets. The kwarg is retained for internal callers
+@@ -3616,9 +3723,9 @@ def delegate_task(
+             task_index=i,
+             goal=t["goal"],
+             context=_child_context,
+-            # Subagents always inherit the parent's toolsets; the model
+-            # cannot choose or narrow them (no model-facing toolsets arg).
+-            toolsets=None,
++            # The model cannot choose child capabilities. A trusted optional
++            # config cap is intersected with the live parent surface.
++            toolsets=child_toolsets,
+             model=creds["model"],
+             max_iterations=effective_max_iter,
+             task_count=n_tasks,
+@@ -3632,6 +3739,7 @@ def delegate_task(
+             override_acp_command=creds.get("command"),
+             override_acp_args=creds.get("args"),
+             role=effective_role,
++            enforce_toolset_cap=child_toolsets is not None,
+         )
+         # Attach the validated schema for the completion-side validation
+         # hook in _run_single_child. Absent (None) on schema-less tasks.
+@@ -4010,8 +4118,8 @@ def delegate_task(
+         dispatch = dispatch_async_delegation_batch(
+             goals=_goals,
+             context=context,
+-            # Metadata for the completion block only; subagents inherit the
+-            # parent's toolsets (no model-facing toolsets arg).
++            # Completion metadata stays unset; each child's live event/status
++            # carries its actual parent-intersected toolsets.
+             toolsets=None,
+             role=top_role,
+             model=creds["model"],
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index d0dc6d8..fb81d04 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -3024,10 +3024,25 @@ def _(rid, params: dict) -> dict:
+         _get_max_spawn_depth,
+     )
+ 
++    owner_scope = {}
++    if "session_id" in params:
++        _invoking_session, err = _sess_nowait(params, rid)
++        if err:
++            return err
++        invoking_session_id = str(params.get("session_id") or "").strip()
++        invoking_transport, invoking_session = _current_session_steer_authority(
++            invoking_session_id
++        )
++        owner_scope = {
++            "owner_session_id": invoking_session_id,
++            "owner_transport": invoking_transport,
++            "owner_session_record": invoking_session,
++        }
++
+     return _ok(
+         rid,
+         {
+-            "active": list_active_subagents(),
++            "active": list_active_subagents(**owner_scope),
+             "paused": is_spawn_paused(),
+             "max_spawn_depth": _get_max_spawn_depth(),
+             "max_concurrent_children": _get_max_concurrent_children(),
+@@ -3050,7 +3065,21 @@ def _(rid, params: dict) -> dict:
+     subagent_id = str(params.get("subagent_id") or "").strip()
+     if not subagent_id:
+         return _err(rid, 4000, "subagent_id required")
+-    ok = interrupt_subagent(subagent_id)
++    owner_scope = {}
++    if "session_id" in params:
++        _invoking_session, err = _sess_nowait(params, rid)
++        if err:
++            return err
++        invoking_session_id = str(params.get("session_id") or "").strip()
++        invoking_transport, invoking_session = _current_session_steer_authority(
++            invoking_session_id
++        )
++        owner_scope = {
++            "owner_session_id": invoking_session_id,
++            "owner_transport": invoking_transport,
++            "owner_session_record": invoking_session,
++        }
++    ok = interrupt_subagent(subagent_id, **owner_scope)
+     return _ok(rid, {"found": ok, "subagent_id": subagent_id})
+ 
+ 
+

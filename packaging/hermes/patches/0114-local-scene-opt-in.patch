@@ -1,0 +1,94 @@
+diff --git a/hermes_cli/tools_config.py b/hermes_cli/tools_config.py
+index b16cd1f..730ee2f 100644
+--- a/hermes_cli/tools_config.py
++++ b/hermes_cli/tools_config.py
+@@ -100,6 +100,7 @@ CONFIGURABLE_TOOLSETS = [
+     ("file",            "📁 File Operations",           "read, write, patch, search"),
+     ("code_execution",  "⚡ Code Execution",            "execute_code"),
+     ("vision",          "👁️  Vision / Image Analysis",  "vision_analyze"),
++    ("lilith_local_scene", "👁 本地畫面線索", "單次擷取前景畫面及介面文字；本地視覺＋OCR；也供既有主動接話使用，不上傳圖片"),
+     ("video",           "🎬 Video Analysis",            "video_analyze (requires video-capable model)"),
+     ("image_gen",       "🎨 Image Generation",          "image_generate"),
+     ("video_gen",       "🎬 Video Generation",          "video_generate (text/image/reference)"),
+@@ -153,7 +154,7 @@ def gui_toolset_label(label: str) -> str:
+ # `hermes tools` → X (Twitter) Search setup walks users through credential
+ # setup. The tool's check_fn means the schema still won't appear to the
+ # model if the credential later goes missing or expires.
+-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a"}
++_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a", "lilith_local_scene"}
+ 
+ 
+ # Config-only capabilities: they appear in `hermes tools` for provider/API-key
+@@ -217,6 +218,7 @@ def _homeassistant_credentials_present() -> bool:
+ # server admin, Slack workspace admin, etc.).  Keeps every other platform's
+ # checklist from filling up with irrelevant toggles.
+ _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
++    "lilith_local_scene": {"cli"},
+     "discord": {"discord"},
+     "discord_admin": {"discord"},
+ }
+diff --git a/tests/tui_gateway/test_local_scene_opt_in.py b/tests/tui_gateway/test_local_scene_opt_in.py
+new file mode 100644
+--- /dev/null
++++ b/tests/tui_gateway/test_local_scene_opt_in.py
+@@ -0,0 +1,60 @@
++"""Explicit native UI enable/disable, synthetic profile only."""
++import copy
++import pytest
++import yaml
++from hermes_cli import tools_config as tc
++from tools.lilith_scene import host
++from tests.tui_gateway.test_native_setup_selection import native_setup_env, _set
++from tests.tui_gateway.test_tools_policy_rpc import _clean_gateway_sessions, _home, _write_config
++import tui_gateway.server as server
++
++
++def test_scene_has_one_disclosed_default_off_desktop_catalog_entry():
++    rows = [row for row in tc._get_effective_configurable_toolsets() if row[0] == host.TOOL]
++    assert len(rows) == 1
++    assert "前景畫面" in rows[0][2] and "主動接話" in rows[0][2] and "不上傳圖片" in rows[0][2]
++    assert host.TOOL in tc._DEFAULT_OFF_TOOLSETS
++    assert tc._toolset_allowed_for_platform(host.TOOL, "cli")
++    for platform in ("telegram", "discord", "cron", "api"):
++        assert not tc._toolset_allowed_for_platform(host.TOOL, platform)
++    for config in ({}, {"platform_toolsets": {"cli": []}}, {"platform_toolsets": {"cli": ["hermes-cli"]}}):
++        assert host.TOOL not in tc._get_platform_tools(config, "cli", include_default_mcp_servers=False)
++
++
++def test_native_settings_enables_and_disables_scene_without_other_policy_change(monkeypatch):
++    # The existing native checklist deliberately clears the unrelated no_mcp
++    # sentinel on any save; test this capability with ordinary native settings.
++    config = {"platform_toolsets": {"cli": ["memory"]},
++              "approvals": {"mode": "manual", "timeout": 123}, "model": {"provider": "test", "default": "fake"}}
++    before = copy.deepcopy(config)
++    _write_config(config)
++    monkeypatch.setattr(tc, "_run_post_setup", lambda *_: pytest.fail("no installers or capture"))
++    assert not host.explicit_opt_in()
++    response = _set({"enabled_toolsets": ["memory", host.TOOL], "approval_mode": "manual"})
++    assert "error" not in response, response
++    assert host.TOOL in response["result"]["enabled_toolsets"]
++    assert host.explicit_opt_in()
++    saved = yaml.safe_load((_home() / "config.yaml").read_text(encoding="utf-8"))
++    assert saved["model"] == before["model"] and saved["approvals"] == before["approvals"]
++    response = _set({"enabled_toolsets": ["memory"], "approval_mode": "manual"})
++    assert "error" not in response, response
++    assert not host.explicit_opt_in()
++    saved = yaml.safe_load((_home() / "config.yaml").read_text(encoding="utf-8"))
++    assert saved["platform_toolsets"] == before["platform_toolsets"]
++    assert saved["model"] == before["model"] and saved["approvals"] == before["approvals"]
++
++
++@pytest.mark.parametrize("ready", [True, False])
++def test_real_catalog_row_reports_dependency_readiness_without_capturing(monkeypatch, ready):
++    from tools.registry import registry
++    import tools.lilith_local_scene  # native discovery registration
++    rows = [row for row in tc.CONFIGURABLE_TOOLSETS if row[0] == host.TOOL]
++    monkeypatch.setattr(tc, "_get_effective_configurable_toolsets", lambda: rows)
++    monkeypatch.setattr(registry._tools[host.TOOL], "check_fn", lambda: ready)
++    _write_config({"platform_toolsets": {"cli": []}, "approvals": {"mode": "manual"}})
++    result = server._methods["tools.catalog"]("catalog", {})
++    assert "error" not in result, result
++    row, = result["result"]["toolsets"]
++    assert row["name"] == host.TOOL and row["enabled"] is False
++    assert row["readiness"] == ("ready" if ready else "needs_setup")
++    assert row["tools"] == ([host.TOOL] if ready else [])

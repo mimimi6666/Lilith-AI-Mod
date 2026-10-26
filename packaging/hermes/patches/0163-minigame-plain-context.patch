@@ -1,0 +1,1622 @@
+diff --git a/agent/minigame_context.py b/agent/minigame_context.py
+index 0006340..738ec4e 100644
+--- a/agent/minigame_context.py
++++ b/agent/minigame_context.py
+@@ -1,7 +1,8 @@
+ """Strict host-only mini-game facts, scoped to one human conversation turn.
+ 
+-Never stored on the agent/session or appended to a human message. Only the
+-main-loop outbound system copy consumes the immutable projection below.
++Never stored on the agent/session or appended to a human message. The main-loop
++send copy carries one explicitly labelled application observation near the
++current input. The sole leading system authority remains unchanged in shape.
+ """
+ from __future__ import annotations
+ 
+@@ -10,13 +11,22 @@ from copy import deepcopy
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ import json
++import hashlib
++import logging
+ import re
+ import threading
+ import time
++import uuid
+ 
+ SCHEMA = "lilith.minigame.public.v1"
+ VIEW_SCHEMA = "lilith.minigame.lilith-view.v2"
++CONVERSATION_SCHEMA = "lilith.minigame.conversation.v3"
+ MAX_BYTES = 4096
++EVENT_MAX_BYTES = 32768
++EVENT_METADATA_KEY = "lilith_minigame_events_v1"
++_EVENT_PROJECTION_KEY = "_lilith_minigame_event_projection"
++EVENT_RECEIPT_SCHEMA = "lilith.minigame.events.receipt.v1"
++_EVENT_BATCH = {"batchId", "priorSequence", "throughSequence", "omittedEventCount", "deferredEventCount", "events"}
+ _ROOT = {"schema", "gameEpoch", "matchId", "capturedAtUnixTimeMilliseconds",
+          "publicRevision", "gameKind", "phase", "actor", "winner", "resultReason"}
+ _CHESS = {"board", "playerSide", "sideToMove", "ply", "lastMoveUci", "inCheck",
+@@ -74,6 +84,106 @@ _CHESS_VIEW_REFERENCE = (
+     "participate naturally; do not automatically recite move recommendations.\n"
+ )
+ 
++# This is fixed host guidance, not player speech or extra system authority.
++# The data row is separate because strict providers permit one leading system.
++_COMPANION_GUIDANCE = (
++    "\n\n小遊戲陪玩提示：本次輸入旁若有明確標示的應用程式局面資料，"
++    "那是本機在玩家送出訊息時提供給莉莉絲的參考，不是玩家發言或行動指令。"
++    "以莉莉絲的身分自然陪玩，按談話需要使用資料，不必逐項報告或主動報牌。"
++    "保留目前指定的回覆與語音語言。資料不代表現在仍相同，不猜測未提供的資訊，"
++    "不把聊天當作抽牌、走棋或勝負控制。"
++)
++_ANCHOR_KEY = "_lilith_game_current_input"
++_PREFIX_KEY = "_lilith_game_budget_prefix"
++_PIECES = {"P": "兵", "R": "城堡", "N": "騎士", "B": "主教", "Q": "皇后", "K": "國王"}
++_ACTORS = {"player": "玩家", "lilith": "莉莉絲（妳）", "none": "無"}
++_RESULTS = {"all-pairs": "配對完成", "checkmate": "將死", "timeout": "時間用盡",
++            "resignation": "認輸", "stalemate": "逼和", "dead-position": "無法將死的局面",
++            "claimed-draw": "申請和棋", "fivefold": "五次重複局面", "seventy-five-move": "七十五步規則"}
++
++
++def _plain_reference(value):
++    """Only called after strict validation; no free-form host/model prose."""
++    active = value["phase"] == "active"
++    lines = [_REFERENCE_START,
++        "【應用程式提供的本次局面；不是玩家發言】",
++        "以下是玩家送出這則訊息時的快照，之後遊戲可能已進行。玩家是聊天的真人；莉莉絲（妳）是陪玩的角色。"]
++    kind = value["gameKind"]
++    lines.append("正在玩抽鬼牌。" if kind == "old-maid" else "正在玩西洋棋。")
++    if active:
++        lines.append("當時輪到" + _ACTORS[value["actor"]] + ("抽牌。" if kind == "old-maid" else "走棋。"))
++    else:
++        winner = "和棋" if value["winner"] == "draw" else _ACTORS[value["winner"]] + "獲勝"
++        lines.append("本局已結束：" + winner + "；原因是" + _RESULTS[value["resultReason"]] + "。")
++    if kind == "old-maid":
++        data = value["oldMaid"]
++        lines.append(f"玩家剩 {data['playerHandCount']} 張；莉莉絲（妳）剩 {data['lilithHandCount']} 張。")
++        lines.append(f"已抽牌 {data['drawCount']} 次，已完成 {data['publicPairCount']} 對配對。")
++        if "lilithHand" in data:
++            cards = data["lilithHand"]["cards"]
++            names = [("鬼牌" if c["rank"] == "JOKER" else
++                      {"hearts": "紅心", "spades": "黑桃"}[c["suit"]] + c["rank"]) for c in cards]
++            lines.append("莉莉絲（妳）的手牌按畫面從左到右：" +
++                         ("、".join(f"第 {i+1} 張 {name}" for i,name in enumerate(names)) if names else "沒有手牌") + "。")
++            positions = [str(i+1) for i,c in enumerate(cards) if c["rank"] == "JOKER"]
++            lines.append("鬼牌在莉莉絲手牌的第 " + positions[0] + " 張。" if positions else "莉莉絲的手牌裡沒有鬼牌。")
++        else:
++            lines.append("這份舊版快照沒有提供莉莉絲的手牌明細，不能猜點數、花色或鬼牌位置。")
++        lines.append("玩家暗牌的點數、花色與順序未提供；不可假裝已看到。自己的手牌可在被問到時自然描述，不必主動全部報出。")
++    else:
++        data = value["chess"]
++        owner = lambda side: "玩家" if data["playerSide"] == side else "莉莉絲（妳）"
++        lines.append(f"白棋是{owner('white')}；粉棋是{owner('pink')}。粉棋相當於標準西洋棋的黑方。")
++        for side, white in (("white", True), ("pink", False)):
++            pieces = [f"{_PIECES[p.upper()]}在{chr(97+i%8)}{i//8+1}" for i,p in enumerate(data["board"])
++                      if p != "." and p.isupper() == white]
++            lines.append(owner(side) + "的棋子位置：" + "、".join(pieces) + "。")
++        actor = "player" if data["playerSide"] == data["sideToMove"] else "lilith"
++        lines.append("這份快照的將軍狀態只描述" + _ACTORS[actor] + "：" +
++                     ("正在被將軍。" if data["inCheck"] else "沒有被將軍。"))
++        lines.append("沒有提供另一方的獨立將軍判定；未被將軍不等於所有棋子安全，被將軍也不等於將死。")
++        awareness = data.get("awareness")
++        move = data["lastMoveUci"]
++        last = awareness.get("lastMove") if awareness else None
++        if move:
++            if last:
++                lines.append("上一手：" + _ACTORS[last["actor"]] + "把" + _PIECES[last["piece"].upper()] +
++                             "從 " + move[:2] + " 走到 " + move[2:4] +
++                             ("，並升變為" + _PIECES[move[4].upper()] if len(move) == 5 else "") + "。")
++                if last["capturedPiece"] != ".":
++                    lines.append("那一手吃掉位於 " + last["capturedSquare"] + " 的" +
++                                 _PIECES[last["capturedPiece"].upper()] + "；這是被吃棋子的格子。")
++                lines.append("那一手" + ("造成將軍。" if last["gaveCheck"] else "沒有造成將軍。"))
++            else:
++                lines.append("上一手已知從 " + move[:2] + " 走到 " + move[2:4] +
++                    ("，升變為" + _PIECES[move[4].upper()] if len(move)==5 else "") +
++                    "；行棋者、原棋種與吃子細節未提供，不能從現在棋盤倒推。")
++        else:
++            lines.append("目前還沒有已完成的上一手。")
++        if awareness and active:
++            who = _ACTORS[awareness["turnActor"]]
++            lines.append("以下合法走法資訊僅適用於當時行棋方" + who + "，不能套用到另一方。")
++            lines.append(who + ("目前有至少一步合法走法能將軍對方。" if awareness["checkingMoveAvailable"] else
++                                "目前沒有能將軍對方的合法走法。"))
++            targets = awareness["captureTargetSquares"]
++            lines.append(who + "目前可合法吃掉的對方棋子：" +
++                ("、".join(square + " 的" + _PIECES[_square_piece(data['board'],square).upper()] for square in targets)
++                 if targets else "沒有") + "。這些是被吃棋子的所在地，包含吃過路兵的被吃格，不一定是落點。")
++            lines.append("沒有提供非行棋方的合法吃子／將軍走法；不能把這份資訊當成未來安全、最佳走法、意圖或必勝判定。")
++        elif active:
++            lines.append("這份舊版快照沒有提供合法吃子／將軍走法資訊。")
++        lines.append("玩法是" + ("休閒，沒有計時。" if data["mode"] == "casual" else "挑戰。"))
++        if data["mode"] == "challenge":
++            lines.append("送出訊息當時剩餘時間：" + "；".join(
++                _ACTORS[a] + f" {data[k]//60000} 分 {(data[k]%60000)/1000:.3f} 秒"
++                for a,k in (("player","playerRemainingMilliseconds"),("lilith","lilithRemainingMilliseconds"))) +
++                "。這不是持續更新的倒數。")
++    lines.append(_REFERENCE_END)
++    result = "\n".join(lines)
++    if len(result) > 8192:
++        _reject()
++    return result
++
+ 
+ def _reject():
+     raise ValueError("invalid mini-game public context")
+@@ -176,9 +286,10 @@ def parse_public_context(value):
+     kind = value.get("gameKind")
+     _token(kind, {"chess", "old-maid"})
+     payload_key = "chess" if kind == "chess" else "oldMaid"
+-    _exact(value, _ROOT | {payload_key})
+-    _token(value["schema"], {SCHEMA, VIEW_SCHEMA})
+-    view = value["schema"] == VIEW_SCHEMA
++    conversation = value.get("schema") == CONVERSATION_SCHEMA
++    _exact(value, _ROOT | {payload_key} | ({"events"} if conversation else set()))
++    _token(value["schema"], {SCHEMA, VIEW_SCHEMA, CONVERSATION_SCHEMA})
++    view = value["schema"] in {VIEW_SCHEMA, CONVERSATION_SCHEMA}
+     for key in ("gameEpoch", "matchId"):
+         text = value[key]
+         if type(text) is not str or not _GUID.fullmatch(text) or text == "0" * 32:
+@@ -256,12 +367,24 @@ def parse_public_context(value):
+             if not active and value["winner"] == "player" and cards != [{"rank": "JOKER", "suit": "none"}]:
+                 _reject()
+     wire = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+-    if len(wire.encode("utf-8")) > MAX_BYTES:
++    if len(wire.encode("utf-8")) > (EVENT_MAX_BYTES if conversation else MAX_BYTES):
+         _reject()
+     # Correlation identities and hidden-change counters do not enter model text.
+     public = {key: value[key] for key in ("gameKind", "phase", "actor", "winner", "resultReason", payload_key)}
+-    introduction = (_VIEW_REFERENCE + (_OWN_HAND_REFERENCE if kind == "old-maid" else _CHESS_VIEW_REFERENCE)) if view else _REFERENCE
+-    reference = introduction + json.dumps(public, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n" + _REFERENCE_END
++    reference = _plain_reference(public)
++    if conversation:
++        _validate_batch(value["events"], kind)
++        for event in value["events"]["events"]:
++            if event["kind"] == "finished" and (active or event["winner"] != value["winner"]
++                    or event["resultReason"] != value["resultReason"]):
++                _reject()
++            if event["kind"] == "chess-moved":
++                move = event["move"]
++                expected = "player" if move["piece"].isupper() == (data["playerSide"] == "white") else "lilith"
++                if move["actor"] != expected:
++                    _reject()
++        interval = event_reference(_event_attachment(value), historical=False)
++        reference = reference.replace(_REFERENCE_END, interval + "\n" + _REFERENCE_END)
+     return PublicGameContext(wire, reference, value["capturedAtUnixTimeMilliseconds"])
+ 
+ 
+@@ -273,6 +396,356 @@ def fresh_public_context(value, now_ms=None):
+     return parsed if parsed.fresh(now_ms) else None
+ 
+ 
++def _validate_batch(batch, kind):
++    _exact(batch, _EVENT_BATCH)
++    if type(batch["batchId"]) is not str or not _GUID.fullmatch(batch["batchId"]) or batch["batchId"] == "0" * 32:
++        _reject()
++    for field in ("priorSequence", "throughSequence", "omittedEventCount", "deferredEventCount"):
++        _int(batch[field], 0, 1000000)
++    events = batch["events"]
++    if type(events) is not list or len(events) > 128:
++        _reject()
++    start = batch["priorSequence"] + batch["omittedEventCount"]
++    if (batch["throughSequence"] != start + len(events)
++            or batch["throughSequence"] + batch["deferredEventCount"] > 1000000):
++        _reject()
++    for offset, event in enumerate(events, 1):
++        if type(event) is not dict or event.get("sequence") != start + offset or type(event.get("sequence")) is not int:
++            _reject()
++        name = event.get("kind")
++        fields = {"sequence", "kind"}
++        if name == "started":
++            _exact(event, fields)
++            if event["sequence"] != 1:
++                _reject()
++        elif name == "finished":
++            _exact(event, fields | {"winner", "resultReason"})
++            _token(event["winner"], {"player", "lilith"} | ({"draw"} if kind == "chess" else set()))
++            reasons = {"all-pairs"} if kind == "old-maid" else _REASONS - {"none", "all-pairs"}
++            _token(event["resultReason"], reasons)
++            if kind == "chess" and ((event["winner"] == "draw") != (event["resultReason"] in _DRAWS)):
++                _reject()
++            if offset != len(events) or batch["deferredEventCount"]:
++                _reject()
++        elif kind == "old-maid" and name in {"card-drawn", "pair-discarded", "hand-reordered"}:
++            _token(event.get("actor"), {"player", "lilith"})
++            if name == "card-drawn":
++                _exact(event, fields | {"actor", "card"})
++                card = event["card"]
++                _exact(card, _CARD)
++                _token(card["rank"], _RANKS | {"JOKER"})
++                _token(card["suit"], {"hearts", "spades", "none"})
++                if (card["rank"] == "JOKER") != (card["suit"] == "none"):
++                    _reject()
++            elif name == "pair-discarded":
++                _exact(event, fields | {"actor", "rank"})
++                _token(event["rank"], _RANKS)
++            else:
++                _exact(event, fields | {"actor", "fromIndex", "toIndex"})
++                _int(event["fromIndex"], 0, 26)
++                _int(event["toIndex"], 0, 26)
++                if event["fromIndex"] == event["toIndex"]:
++                    _reject()
++        elif kind == "chess" and name == "chess-moved":
++            _exact(event, fields | {"uci", "move"})
++            uci, move = event["uci"], event["move"]
++            if type(uci) is not str or not _UCI.fullmatch(uci) or uci[:2] == uci[2:4]:
++                _reject()
++            _exact(move, _LAST_MOVE)
++            _token(move["actor"], {"player", "lilith"})
++            _token(move["piece"], set("PRNBQKprnbqk"))
++            _token(move["capturedPiece"], set(".PRNBQprnbq"))
++            if type(move["gaveCheck"]) is not bool:
++                _reject()
++            square, captured = move["capturedSquare"], move["capturedPiece"]
++            if type(square) is not str or (square and not _SQUARE.fullmatch(square)) or (captured == ".") != (square == ""):
++                _reject()
++            white = move["piece"].isupper()
++            if captured != "." and captured.isupper() == white:
++                _reject()
++            if len(uci) == 5 and (move["piece"].upper() != "P" or uci[1] != ("7" if white else "2") or uci[3] != ("8" if white else "1")):
++                _reject()
++            if captured != "." and square != uci[2:4] and not (
++                    move["piece"].upper() == "P" and captured == ("p" if white else "P")
++                    and uci[1] == ("5" if white else "4") and uci[3] == ("6" if white else "3")
++                    and abs(ord(uci[0])-ord(uci[2])) == 1 and square == uci[2]+uci[1]):
++                _reject()
++        else:
++            _reject()
++
++
++def _event_attachment(value):
++    return {"schema": "lilith.minigame.events.history.v1",
++            "gameEpoch": value["gameEpoch"], "matchId": value["matchId"],
++            "gameKind": value["gameKind"], "batch": deepcopy(value["events"])}
++
++
++def validate_event_attachment(value):
++    _exact(value, {"schema", "gameEpoch", "matchId", "gameKind", "batch"})
++    _token(value["schema"], {"lilith.minigame.events.history.v1"})
++    for key in ("gameEpoch", "matchId"):
++        if type(value[key]) is not str or not _GUID.fullmatch(value[key]) or value[key] == "0" * 32:
++            _reject()
++    _token(value["gameKind"], {"old-maid", "chess"})
++    _validate_batch(value["batch"], value["gameKind"])
++    wire = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
++    if len(wire.encode("utf-8")) > EVENT_MAX_BYTES:
++        _reject()
++    return json.loads(wire)
++
++
++def event_attachment(context):
++    if type(context) is not PublicGameContext:
++        return None
++    parsed = parse_public_context(json.loads(context.wire))
++    if parsed != context:
++        _reject()
++    value = json.loads(context.wire)
++    return _event_attachment(value) if value["schema"] == CONVERSATION_SCHEMA else None
++
++
++def event_reference(attachment, *, historical=True):
++    value = validate_event_attachment(attachment)
++    batch = value["batch"]
++    title = "【該輪聊天所附的已完成遊戲事件；歷史資料，不是當前局面或玩家發言】" if historical else "【本次附帶的已完成遊戲動作】"
++    lines = ["[Lilith host historical game events]" if historical else title,
++             title if historical else "這些是本次附帶的事件經過；當前狀況以最新局面為準，未列出的動作不作推斷。",
++             "遊戲：" + ("抽鬼牌" if value["gameKind"] == "old-maid" else "西洋棋") +
++             "；對局識別：" + value["matchId"] + "。"]
++    if not batch["events"]:
++        lines.append("這個批次沒有事件；不代表截至現在沒有其他動作。")
++    if batch["omittedEventCount"]:
++        lines.append(f"較早有 {batch['omittedEventCount']} 筆事件因本機容量限制未提供；不能視為完整復盤。")
++    if batch["deferredEventCount"]:
++        lines.append(f"建立此批時另有 {batch['deferredEventCount']} 筆後續事件待下批提供；不代表現在剩餘數量，不能猜內容。")
++    for event in batch["events"]:
++        kind = event["kind"]
++        if kind == "started":
++            text = "雙方開始本局。"
++        elif kind == "finished":
++            result = "和棋" if event["winner"] == "draw" else _ACTORS[event["winner"]] + "獲勝"
++            text = "本局結束：" + result + "，原因為" + _RESULTS[event["resultReason"]] + "。"
++        elif kind == "card-drawn":
++            card = event["card"]
++            name = "鬼牌" if card["rank"] == "JOKER" else {"hearts":"紅心", "spades":"黑桃"}[card["suit"]]+card["rank"]
++            other = "lilith" if event["actor"] == "player" else "player"
++            text = _ACTORS[event["actor"]] + "從" + _ACTORS[other] + "手上抽到" + name + "。"
++        elif kind == "pair-discarded":
++            text = _ACTORS[event["actor"]] + "丟出一對點數 " + event["rank"] + " 的牌。"
++        elif kind == "hand-reordered":
++            text = _ACTORS[event["actor"]] + f"完成整理手牌：第 {event['fromIndex']+1} 個位置移至第 {event['toIndex']+1} 個位置；沒有提供那張牌的身分。"
++        else:
++            move, uci = event["move"], event["uci"]
++            color = "白色" if move["piece"].isupper() else "粉色（標準黑方）"
++            text = _ACTORS[move["actor"]] + "把" + color + _PIECES[move["piece"].upper()] + "從 " + uci[:2] + " 走到 " + uci[2:4]
++            if move["piece"].upper() == "K" and uci in {"e1g1", "e1c1", "e8g8", "e8c8"}:
++                text += "，完成王車易位"
++            if len(uci) == 5:
++                text += "，兵升變為" + _PIECES[uci[4].upper()]
++            if move["capturedPiece"] != ".":
++                other = "lilith" if move["actor"] == "player" else "player"
++                color = "白色" if move["capturedPiece"].isupper() else "粉色（標準黑方）"
++                text += "，吃掉" + _ACTORS[other] + "在 " + move["capturedSquare"] + " 的" + color + _PIECES[move["capturedPiece"].upper()]
++                if move["capturedSquare"] != uci[2:4]:
++                    text += "（吃過路兵）"
++            if move["gaveCheck"]:
++                text += "，造成將軍"
++            text += "。"
++        lines.append(f"事件 {event['sequence']}：" + text)
++    lines.append("以上只記錄已完成的動作，不代表牌或棋子仍在原位；舊對局不代表正在進行同一局，也不是走法指令。")
++    if historical:
++        lines.append("[/Lilith host historical game events]")
++    return "\n".join(lines)
++
++
++def _stored_attachment(row):
++    if not isinstance(row, dict) or row.get("role") != "assistant":
++        return None
++    meta = row.get("display_metadata")
++    if not isinstance(meta, dict) or EVENT_METADATA_KEY not in meta:
++        return None
++    return validate_event_attachment(meta[EVENT_METADATA_KEY])
++
++
++def prepare_event_attachment(context, history):
++    """One admitted batch; exact duplicate is harmless, same-ID conflict rejects."""
++    attachment = event_attachment(context)
++    if attachment is None:
++        return None
++    identity = tuple(attachment[key] for key in ("gameEpoch", "matchId")) + (attachment["batch"]["batchId"],)
++    for row in history:
++        previous = _stored_attachment(row)
++        if previous is None:
++            continue
++        key = tuple(previous[name] for name in ("gameEpoch", "matchId")) + (previous["batch"]["batchId"],)
++        if key == identity and previous != attachment:
++            raise ValueError("mini-game event batch identity conflict")
++    return attachment
++
++
++def attach_completed_events(row, attachment, history):
++    """Mutate only the new final assistant row before its existing atomic flush."""
++    if attachment is None:
++        return
++    value = validate_event_attachment(attachment)
++    for previous in history:
++        stored = _stored_attachment(previous)
++        if stored == value:
++            return  # the original completed row is the sole durable carrier
++    if row.get("role") != "assistant" or not isinstance(row.get("content"), str) or not row["content"].strip():
++        raise ValueError("mini-game completed event owner unavailable")
++    metadata = dict(row.get("display_metadata") or {})
++    if EVENT_METADATA_KEY in metadata and metadata[EVENT_METADATA_KEY] != value:
++        raise ValueError("mini-game event row identity conflict")
++    metadata[EVENT_METADATA_KEY] = value
++    row["display_metadata"] = metadata
++
++
++def retained_event_receipt(attachment, history):
++    if attachment is None:
++        return None
++    value = validate_event_attachment(attachment)
++    for row in history:
++        if (_stored_attachment(row) == value and row.get("_db_persisted") is True
++                and type(row.get("_row_id")) is int and row["_row_id"] > 0):
++            return {"schema": EVENT_RECEIPT_SCHEMA, "gameEpoch": value["gameEpoch"],
++                "matchId": value["matchId"], "batchId": value["batch"]["batchId"],
++                "throughSequence": value["batch"]["throughSequence"]}
++    return None
++
++
++def carry_history_events(source, projected, *, exclude=None):
++    """Same API row, measured before selection; durable human/role text untouched."""
++    if isinstance(source, dict) and source.get("role") == "assistant":
++        meta = source.get("display_metadata") or {}
++        projected["_lilith_event_owner"] = {
++            "complete": not source.get("tool_calls") and not source.get("_length_continuation_fragment")
++                and isinstance(source.get("content"), str) and bool(source["content"].strip())
++                and source.get("finish_reason") in (None, "stop", "end_turn"),
++            "turn": meta.get("hermes_turn_id") if isinstance(meta, dict) else None,
++        }
++    attachment = _stored_attachment(source)
++    if attachment is not None and attachment != exclude:
++        content = projected.get("content")
++        if not isinstance(content, (str, list)):
++            return
++        note = event_reference(attachment)
++        original = deepcopy(content)
++        projected["content"] = (content + "\n\n" + note if isinstance(content, str)
++                                else list(content) + [{"type": "text", "text": note}])
++        projected["display_metadata"] = {EVENT_METADATA_KEY: attachment}
++        projected[_EVENT_PROJECTION_KEY] = {"original": original, "attachment": attachment}
++
++
++def unproject_history_event(row):
++    result = deepcopy(row)
++    result.pop("_lilith_event_owner", None)
++    marker = result.pop(_EVENT_PROJECTION_KEY, None)
++    if marker is not None:
++        _exact(marker, {"original", "attachment"})
++        attachment = validate_event_attachment(marker["attachment"])
++        original = marker["original"]
++        note = event_reference(attachment)
++        expected = (original + "\n\n" + note if isinstance(original, str) else
++                    list(original) + [{"type": "text", "text": note}] if isinstance(original, list) else None)
++        if expected is None or result.get("content") != expected:
++            raise ValueError("mini-game event projection changed")
++        result["content"] = deepcopy(original)
++    return result
++
++
++def clean_history_event_metadata(rows):
++    result = [unproject_history_event(row) for row in rows]
++    for row in result:
++        if isinstance(row, dict):
++            row.pop("display_metadata", None)
++    return result
++
++
++def project_history_events(rows, limit):
++    """Only retained rows; no summary/cached identity or new transcript writes."""
++    if type(limit) is not int or limit < 1:
++        return clean_history_event_metadata(rows)
++    limit = min(limit, 42)  # maximum existing information-strategy tail
++    selected, seen, completed = {}, {}, set()
++    for index in range(len(rows)-1, -1, -1):
++        owner = _completed_history_owner(rows[index], index)
++        if owner is not None:
++            completed.add(owner)
++        if len(completed) > limit:
++            break
++        attachment = _stored_attachment(rows[index])
++        if attachment is None:
++            continue
++        key = (attachment["gameEpoch"], attachment["matchId"], attachment["batch"]["batchId"])
++        if key in seen:
++            if seen[key] != attachment:
++                raise ValueError("mini-game historical batch conflict")
++            continue
++        seen[key] = attachment
++        selected[index] = attachment
++    result = []
++    for index, source in enumerate(rows):
++        row = deepcopy(source) if index in selected else unproject_history_event(source)
++        row.pop("display_metadata", None)
++        row.pop(_EVENT_PROJECTION_KEY, None)
++        row.pop("_lilith_event_owner", None)
++        result.append(row)
++    return result
++
++
++def extension_context_hash(perception, context=None):
++    value = perception
++    if context is not None:
++        if type(context) is not PublicGameContext:
++            context = parse_public_context(context)
++        parse_public_context(json.loads(context.wire))
++        value = {"perception": perception, "game_context": json.loads(context.wire)}
++    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
++                                   separators=(",", ":")).encode("utf-8")).hexdigest()
++
++
++def proactive_event_references(history, limit, *, exclude=None):
++    if type(limit) is not int or not 1 <= limit <= 42:
++        return []
++    result, seen, completed = [], {}, set()
++    for index in range(len(history)-1, -1, -1):
++        row = history[index]
++        owner = _completed_history_owner(row, index)
++        if owner is not None:
++            completed.add(owner)
++        if len(completed) > limit:
++            break
++        value = _stored_attachment(row)
++        if value is None or value == exclude:
++            continue
++        key = (value["gameEpoch"], value["matchId"], value["batch"]["batchId"])
++        if key in seen:
++            if seen[key] != value:
++                raise ValueError("mini-game historical batch conflict")
++            continue
++        seen[key] = value
++        result.append(event_reference(value))
++    return list(reversed(result))
++
++
++def _completed_history_owner(row, index):
++    marker = row.get("_lilith_event_owner") if isinstance(row, dict) else None
++    if isinstance(marker, dict):
++        if marker.get("complete") is not True:
++            return None
++        turn = marker.get("turn")
++        return ("turn", turn) if type(turn) is str and _GUID.fullmatch(turn) else ("row", index)
++    if (not isinstance(row, dict) or row.get("role") != "assistant" or row.get("tool_calls")
++            or row.get("_length_continuation_fragment")
++            or row.get("finish_reason") not in (None, "stop", "end_turn")
++            or not isinstance(row.get("content"), str) or not row["content"].strip()):
++        return None
++    meta = row.get("display_metadata")
++    turn = meta.get("hermes_turn_id") if isinstance(meta, dict) else None
++    return ("turn", turn) if type(turn) is str and _GUID.fullmatch(turn) else ("row", index)
++
++
+ def reference_suffix(value, *, provider=None):
+     # Native call sites alone construct this carrier. No arbitrary str/dict can
+     # become a system suffix and missing context preserves previous wire bytes.
+@@ -280,7 +753,161 @@ def reference_suffix(value, *, provider=None):
+     # Preserve ordinary chat on that route, but omit this optional snapshot.
+     if provider == "moa":
+         return ""
+-    return value.reference if type(value) is PublicGameContext else ""
++    return _COMPANION_GUIDANCE if _usable_context(value) is not None else ""
++
++
++def _usable_context(value):
++    if type(value) is not PublicGameContext:
++        return None
++    # A caller-created dataclass is not a seal. Revalidate the canonical carrier.
++    try:
++        parsed = parse_public_context(json.loads(value.wire))
++        if parsed != value:
++            _reject()
++        return parsed if parsed.fresh() else None
++    except (TypeError, ValueError, KeyError):
++        _reject()
++
++
++@dataclass(slots=True)
++class _BriefingPlacement:
++    context: PublicGameContext
++    token: str
++    anchor: dict
++    prefix: dict
++    prefix_index: int
++    baseline: list
++    inserted_index: int | None = None
++    inserted_length: int = 0
++
++
++def _omit(reason):
++    # Fixed metadata only; never interpolate text, facts or caller exceptions.
++    logging.getLogger(__name__).info("mini-game briefing omitted: %s", reason)
++
++
++def _clean_markers(messages):
++    return [{key:value for key,value in row.items() if key not in {_ANCHOR_KEY, _PREFIX_KEY}}
++            for row in messages]
++
++
++def reserve_briefing(messages, anchor, context, *, provider=None):
++    """Count a mandatory prefix without disturbing history_offset alignment.
++
++    Only the fresh API copy is annotated; the private anchor is removed before
++    provider conversion. Matching text is never a substitute for this token.
++    """
++    if provider == "moa" or (context := _usable_context(context)) is None:
++        return messages, None
++    if (type(messages) is not list or not messages or type(anchor) is not dict
++            or anchor.get("role") != "user" or sum(row is anchor for row in messages) != 1
++            or messages[0].get("role") != "system"
++            or any(_ANCHOR_KEY in row or _PREFIX_KEY in row for row in messages)):
++        _omit("anchor-unavailable")
++        return messages, None
++    token = uuid.uuid4().hex
++    expected = deepcopy(anchor)
++    anchor[_ANCHOR_KEY] = token
++    prefix = {"role":"user", "content":context.reference, _PREFIX_KEY:token}
++    placement = _BriefingPlacement(context, token, expected, deepcopy(prefix), 1, deepcopy(messages))
++    return [messages[0], prefix, *messages[1:]], placement
++
++
++def release_briefing_reservation(messages, placement):
++    if placement is None:
++        return messages, None
++    if (type(placement) is not _BriefingPlacement or type(messages) is not list
++            or len(messages) <= placement.prefix_index
++            or messages[placement.prefix_index] != placement.prefix
++            or sum(_PREFIX_KEY in row for row in messages) != 1):
++        _omit("mandatory-prefix-unavailable")
++        # Discard the uncertain projection rather than hunting for facts in a
++        # human row. Final wire admission still checks this original full copy.
++        return _clean_markers(placement.baseline), None
++    return messages[:placement.prefix_index] + messages[placement.prefix_index+1:], placement
++
++
++def place_briefing(messages, placement, *, provider=None):
++    """Reinsert after routing/sanitization, immediately before the exact input.
++
++    Missing/rewritten/duplicated anchors omit only this optional observation,
++    including identical historical questions. No content-based guessing.
++    """
++    if placement is None:
++        return messages
++    indexes = [i for i,row in enumerate(messages) if _ANCHOR_KEY in row]
++    if len(indexes) != 1 or any(_PREFIX_KEY in row for row in messages):
++        _omit("anchor-unavailable")
++        return _clean_markers(messages)
++    index = indexes[0]
++    row = dict(messages[index])
++    if row.pop(_ANCHOR_KEY) != placement.token:
++        _omit("anchor-changed")
++        return _clean_markers(messages)
++    expected = deepcopy(placement.anchor)
++    if isinstance(expected.get("content"), str):
++        expected["content"] = expected["content"].strip()
++    if row != expected:
++        _omit("anchor-changed")
++        return _clean_markers(messages)
++    result = messages[:index] + [row] + messages[index+1:]
++    if provider != "moa" and _usable_context(placement.context) is not None:
++        result.insert(index, {"role":"user", "content":placement.context.reference})
++        placement.inserted_index = index
++        placement.inserted_length = len(result)
++    return result
++
++
++def _row_text(row):
++    if type(row) is not dict:
++        return None
++    value = row.get("content")
++    if type(value) is str:
++        return value
++    if type(value) is list:
++        # Observation lookup only: ignore images, never inspect their payload.
++        return "".join(part["text"] for part in value if type(part) is dict
++                       and part.get("type", "text") in {"text", "input_text"}
++                       and type(part.get("text")) is str)
++    return None
++
++
++def _briefing_row(row, context):
++    return (type(context) is PublicGameContext and type(row) is dict
++            and row.get("role") == "user" and type(_row_text(row)) is str
++            and context.reference in _row_text(row))
++
++
++def briefing_present(request, context):
++    if type(request) is not dict:
++        return False
++    rows = request.get("messages", request.get("input"))
++    return type(rows) is list and sum(_briefing_row(row, context) for row in rows) == 1
++
++
++def refresh_briefing(messages, context, *, placement=None, provider=None):
++    """Remove the exact owned standalone row before each retry's conversion.
++
++    Runs before middleware/identity/final-wire budgets, never edits human text.
++    A freshly assembled request retains its capture-time semantics while it is
++    in flight; a later tool iteration or retry must pass freshness again.
++    """
++    if (type(context) is not PublicGameContext or type(placement) is not _BriefingPlacement
++            or placement.inserted_index is None):
++        return messages
++    if provider != "moa" and _usable_context(context) is not None:
++        return messages
++    index = placement.inserted_index
++    # Cache decoration preserves row order and human content. Never search by
++    # text: a real player may have pasted an identical observation previously.
++    if (len(messages) != placement.inserted_length or index+1 >= len(messages)
++            or messages[index].get("role") != "user"
++            or _row_text(messages[index]) != context.reference
++            or messages[index+1].get("role") != "user"):
++        _omit("retry-placement-unavailable")
++        return messages
++    placement.inserted_index = None
++    return messages[:index]+messages[index+1:]
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -460,8 +1087,8 @@ class GameContextDiagnosticObserver:
+                                      if type(row) is dict and row.get("role") in {"system", "developer"})
+                 authority.extend(_provider_authority_text(request[key])
+                                  for key in ("instructions", "system") if key in request)
+-            present = (type(context) is PublicGameContext
+-                       and any(type(text) is str and context.reference in text for text in authority))
++            rows = request.get("messages", request.get("input", [])) if type(request) is dict else []
++            present = type(rows) is list and sum(_briefing_row(row, context) for row in rows) == 1
+             status = "present" if present else "omitted-moa" if provider == "moa" and context is not None else "absent"
+             route = {"chat_completions": "chat", "codex_responses": "responses",
+                      "anthropic_messages": "anthropic", "bedrock_converse": "bedrock"}.get(api_mode, "other")
+@@ -500,19 +1127,13 @@ def bind_wire_diagnostic(observer, context, agent, *, supported):
+ 
+ 
+ def _wire_presence(request, context):
+-    """Inspect authority only, without retaining any request text or body."""
++    """Inspect exact current observation only; retain no request text/body."""
+     try:
+         if type(request) is not dict or type(request.get("messages")) is not list:
+             return "unknown"
+         if type(context) is not PublicGameContext:
+             return "absent"
+-        from agent.identity_policy import _provider_authority_text
+-        for row in request["messages"]:
+-            if type(row) is dict and row.get("role") in {"system", "developer"}:
+-                text = _provider_authority_text(row.get("content"))
+-                if type(text) is str and context.reference in text:
+-                    return "present"
+-        return "absent"
++        return "present" if sum(_briefing_row(row, context) for row in request["messages"]) == 1 else "absent"
+     except Exception:
+         return "unknown"
+ 
+@@ -603,10 +1224,12 @@ def diagnostic_request_copy(request, *, _redacted=None):
+     """Remove host facts from an owned diagnostic copy, never the SDK request.
+ 
+     Covers Chat Completions messages, Responses instructions/input and native
+-    Anthropic system text blocks. Human/tool content is deliberately untouched.
++    Anthropic text blocks. Only the delimited application observation is removed;
++    neighboring human text and images remain if an adapter merged user rows.
+     """
+     copied = deepcopy(request)
+-    pattern = re.compile(r"\n{0,2}" + re.escape(_REFERENCE_START) + r".*?" + re.escape(_REFERENCE_END), re.DOTALL)
++    pattern = re.compile(r"\n{0,2}(?:" + re.escape(_REFERENCE_START) + r".*?" + re.escape(_REFERENCE_END)
++                         + r"|\[Lilith host historical game events\].*?\[/Lilith host historical game events\])", re.DOTALL)
+ 
+     def clean(value):
+         if isinstance(value, str):
+@@ -628,7 +1251,7 @@ def diagnostic_request_copy(request, *, _redacted=None):
+             rows = copied.get(key)
+             if isinstance(rows, list):
+                 for row in rows:
+-                    if isinstance(row, dict) and row.get("role") in {"system", "developer"} and "content" in row:
++                    if isinstance(row, dict) and row.get("role") in {"system", "developer", "user", "assistant"} and "content" in row:
+                         row["content"] = clean(row["content"])
+     return copied
+ 
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index d0d60d9..a0d6ed0 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1990,6 +1990,13 @@ def run_conversation(
+     api_call_count = 0
+     final_response = None
+     _game_answer_repair_receipt = None
++    from agent.minigame_context import prepare_event_attachment
++    _game_event_attachment = prepare_event_attachment(game_context, messages)
++    _game_event_prior_receipt = None
++    if _game_event_attachment is not None and _turn_db is not None:
++        _game_event_prior_receipt = _turn_db.find_minigame_event_receipt(
++            agent.session_id, _game_event_attachment)
++    _game_events_sent = False
+     interrupted = False
+     failed = False
+     codex_ack_continuations = 0
+@@ -2255,6 +2262,7 @@ def run_conversation(
+                     agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+ 
+         api_messages = []
++        _game_current_input = None
+         for idx, msg in enumerate(messages):
+ 
+             # Structural clone, NOT msg.copy(): every in-place transform
+@@ -2417,7 +2425,11 @@ def run_conversation(
+                 agent._sanitize_tool_calls_for_strict_api(api_msg, model=_sanitize_model)
+             # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
+             # The signature field helps maintain reasoning continuity
++            from agent.minigame_context import carry_history_events
++            carry_history_events(msg, api_msg, exclude=_game_event_attachment)
+             api_messages.append(api_msg)
++            if idx == current_turn_user_idx and api_msg.get("role") == "user":
++                _game_current_input = api_msg
+ 
+         # Build the final system message: cached prompt + ephemeral system prompt.
+         # Ephemeral additions are API-call-time only (not persisted to session DB).
+@@ -2506,10 +2518,13 @@ def run_conversation(
+                 # containers (same aliasing class as the history build).
+                 api_messages.insert(sys_offset + idx, _clone_message_for_send(pfm))
+ 
+-        # Add the frozen observation only after auxiliary MoA has finished.
+-        # Clone the outbound system row so auxiliary references cannot observe
+-        # a later mutation. History, cached prompts and child agents stay clean.
+-        from agent.minigame_context import reference_suffix
++        # Only fixed source/companionship guidance joins the single authority.
++        # Facts remain an independent application-data row. Reserve it as a
++        # mandatory prefix first so budget history_offset is never misaligned.
++        from agent.minigame_context import (
++            reference_suffix, reserve_briefing, release_briefing_reservation,
++            place_briefing, refresh_briefing,
++        )
+         _game_reference = reference_suffix(game_context, provider=agent.provider)
+         if _game_reference:
+             effective_system += _game_reference
+@@ -2517,6 +2532,8 @@ def run_conversation(
+                 api_messages = [{**api_messages[0], "content": effective_system}] + api_messages[1:]
+             else:
+                 api_messages = [{"role": "system", "content": _game_reference}] + api_messages
++        api_messages, _game_placement = reserve_briefing(
++            api_messages, _game_current_input, game_context, provider=agent.provider)
+ 
+         # Only the send copy loses whole, completed, unchanged historical units.
+         # All inserted prefill/system content and this turn's inputs (including
+@@ -2531,6 +2548,7 @@ def run_conversation(
+                 if agent._should_sanitize_tool_calls() else None
+             ),
+         )
++        api_messages, _game_placement = release_briefing_reservation(api_messages, _game_placement)
+ 
+         # Per-turn context selection hook (additive, no-op by default).
+         # Lets a context engine select/replace which context enters the
+@@ -2597,6 +2615,11 @@ def run_conversation(
+         # regardless of ordering (a single-space pad here previously had to
+         # be sequenced after normalization to survive, forking the concept).
+ 
++        # Routing and ordinary user merging have finished. Reinsert only beside
++        # the token-bound unchanged current input; never search historical text.
++        # The row is counted again by final converted-wire budget admission.
++        api_messages = place_briefing(api_messages, _game_placement, provider=agent.provider)
++
+         # Build the request-local cache sections only after every transcript
+         # mutation. The canonical tool registry stays undecorated.
+         #
+@@ -3001,6 +3024,8 @@ def run_conversation(
+                 # unless the active provider needs it) so the fallback request
+                 # isn't sent with stale, primary-shaped reasoning fields.
+                 agent._reapply_reasoning_echo_for_provider(api_messages)
++                api_messages = refresh_briefing(api_messages, game_context,
++                    placement=_game_placement, provider=agent.provider)
+                 # Same story for prompt-cache decoration (#72626): try_activate_
+                 # fallback refreshes the policy flags, but the decorated list
+                 # still carries the primary's breakpoints (or none). Strip and
+@@ -3232,6 +3257,7 @@ def run_conversation(
+                         _use_streaming = False
+ 
+                 def _perform_api_call_bound(next_api_kwargs):
++                    nonlocal _game_events_sent
+                     _assert_request_transport(agent)
+                     from agent.local_compatibility import prepare_agent_request
+                     next_api_kwargs = prepare_agent_request(agent, next_api_kwargs)
+@@ -3254,6 +3280,10 @@ def run_conversation(
+                         expected_system_prompt=effective_system,
+                         label="provider dispatch",
+                     )
++                    from agent.minigame_context import briefing_present
++                    _this_game_payload = (_game_placement is not None
++                        and _game_placement.inserted_index is not None
++                        and briefing_present(next_api_kwargs, game_context))
+                     if game_context_diagnostic is not None:
+                         try:
+                             game_context_diagnostic.dispatch(
+@@ -3263,12 +3293,14 @@ def run_conversation(
+                         except Exception:
+                             pass  # Optional evidence cannot affect dispatch.
+                     if _use_streaming:
+-                        return agent._interruptible_streaming_api_call(
++                        _game_response = agent._interruptible_streaming_api_call(
+                             next_api_kwargs, on_first_delta=_stop_spinner
+                         )
++                        _game_events_sent = _game_events_sent or _this_game_payload
++                        return _game_response
+                     from agent import relay_llm
+ 
+-                    return relay_llm.execute(
++                    _game_response = relay_llm.execute(
+                         next_api_kwargs,
+                         agent._interruptible_api_call,
+                         session_id=str(agent.session_id or ""),
+@@ -3288,6 +3320,8 @@ def run_conversation(
+                         },
+                         defer_logical_completion=True,
+                     )
++                    _game_events_sent = _game_events_sent or _this_game_payload
++                    return _game_response
+ 
+                 def _perform_api_call(next_api_kwargs):
+                     from agent.local_compatibility import bind_policy, for_agent
+@@ -8458,6 +8492,10 @@ def run_conversation(
+                             pair_state.outcome = "game_answer_repaired"
+                             pair_state.recovery_display = final_response.strip()
+ 
++                from agent.minigame_context import attach_completed_events
++                if (_game_events_sent and _game_event_prior_receipt is None
++                        and not agent._hard_interrupt_requested.is_set()):
++                    attach_completed_events(final_msg, _game_event_attachment, messages)
+                 messages.append(final_msg)
+                 # Make the completed answer durable before leaving the loop —
+                 # a session torn down before finalize_turn's _persist_session
+@@ -8614,6 +8652,14 @@ def run_conversation(
+     )
+     if _game_answer_repair_receipt is not None and isinstance(completed_result, dict):
+         completed_result["_game_answer_repair_receipt"] = _game_answer_repair_receipt
++    if (isinstance(completed_result, dict) and not completed_result.get("interrupted")
++            and not completed_result.get("error") and _game_events_sent):
++        from agent.minigame_context import retained_event_receipt
++        receipt = retained_event_receipt(_game_event_attachment, messages)
++        if _turn_db is not None and _game_event_attachment is not None:
++            receipt = _turn_db.find_minigame_event_receipt(agent.session_id, _game_event_attachment)
++        if receipt is not None:
++            completed_result["game_event_receipt"] = receipt
+     return completed_result
+ 
+ 
+diff --git a/agent/minigame_answer_repair.py b/agent/minigame_answer_repair.py
+index a1900e7..80d958f 100644
+--- a/agent/minigame_answer_repair.py
++++ b/agent/minigame_answer_repair.py
+@@ -272,7 +272,9 @@ def parse_request(raw, context, question, *, display_locale="zh-Hant", now_ms=No
+     facts = _facts(data, ids)
+     if facts is None:
+         return None
+-    return RepairPlan(_ISSUER, parsed, question, ids, _json(facts), display_locale)
++    # Native163 retires automatic game-answer judging. Preserve legacy strict
++    # validation above for old carriers, but admit no automatic correction plan.
++    return None
+ 
+ 
+ def request_wire(plan):
+@@ -306,33 +308,16 @@ class _Turn:
+ 
+ @contextmanager
+ def repair_scope(plan, cancelled, *, agent, current=None):
+-    from agent.usage_budget_runtime import capture_origin
+-    if (type(plan) is not RepairPlan or plan._issuer is not _ISSUER
+-            or not callable(getattr(cancelled, "is_set", None)) or agent is None):
+-        _fail()
+-    origin = capture_origin()
+-    if origin is None:
+-        _fail()
+-    state = _Turn(plan, cancelled, agent, current or (lambda: True), origin)
+-    token = _TURN.set(state)
+-    try:
+-        yield state
+-    finally:
+-        state.closed = True
+-        _TURN.reset(token)
+-
++    # Inert compatibility scope: never hold display/audio or acquire authority.
++    yield None
++    return
+ 
+ def eligible(agent=None):
+-    state = _TURN.get()
+-    return type(state) is _Turn and (agent is None or state.agent is agent) and state.valid()
++    return False
+ 
+ 
+ def delivery_held(agent=None):
+-    state = _TURN.get()
+-    # A copied worker Context can outlive the owning scope. Its delivery must
+-    # stay suppressed even after that scope closes; only the parent reset to
+-    # None releases ordinary later turns. Closure never revives old deltas.
+-    return type(state) is _Turn and (agent is None or state.agent is agent)
++    return False
+ 
+ 
+ def cancellation_requested(agent=None):
+@@ -1583,129 +1568,7 @@ def _capture_runtime(agent):
+ 
+ 
+ def maybe_repair(agent, original_text):
+-    state = _TURN.get()
+-    unchanged = RepairResult(original_text)
+-    if not eligible(agent):
+-        _trace("final", "skipped", reason="ineligible")
+-        return unchanged
+-    if state.used:
+-        _trace("final", "skipped", reason="already-used")
+-        return unchanged
+-    state.used = True
+-    if (type(original_text) is not str or not original_text.strip() or len(original_text) > 32768
+-            or len(re.findall(r"[,，、。.!！?？;；\n]", original_text)) > MAX_ASSERTIONS):
+-        _trace("final", "skipped", reason="invalid-answer")
+-        return unchanged
+-    items = requested_items(state.plan)
+-    checks = local_checks(state.plan, original_text)
+-    _trace("local", "checked", checks)
+-    if not items or all(status == "covered" for status in checks.values()):
+-        _trace("final", "completed", checks, "complete")
+-        return unchanged
+-    deadline = time.monotonic() + DEADLINE_SECONDS
+-    cancelled, done = threading.Event(), threading.Event()
+-    outcome = {}
+-    try:
+-        snapshot, route = _capture_runtime(agent)
+-        from agent.identity_policy import bind_host_required_auxiliary_messages, identity_lock_required_by_host
+-        if not identity_lock_required_by_host():
+-            _fail()
+-        def worker():
+-            from agent.plugin_llm import PluginLlm
+-            def invoke():
+-                from agent.auxiliary_client import call_llm, _freeze_auxiliary_main_runtime
+-                runtime = _freeze_auxiliary_main_runtime(None)
+-                if runtime.get("session_id") != route["session_id"]:
+-                    _fail()
+-                for name in ("requested_provider", "auth_mode"):
+-                    if route.get(name):
+-                        runtime[name] = route[name]
+-                def call(stage, task_text, payload):
+-                    messages = bind_host_required_auxiliary_messages([
+-                        {"role": "system", "content": task_text},
+-                        {"role": "user", "content": _json(payload)}])
+-                    cap = _Capability(state, runtime, _json(messages), deadline, cancelled, stage=stage)
+-                    token = _ACTIVE.set(cap)
+-                    try:
+-                        cap.current()
+-                        response = call_llm(task=None, main_runtime=dict(runtime), messages=cap.messages(),
+-                            tools=None, stream=False, temperature=0.0, max_tokens=MAX_OUTPUT_TOKENS,
+-                            timeout=max(0.001, deadline-time.monotonic()), reasoning_config={"enabled": False})
+-                        cap.current()
+-                        if cap.attempts != 1:
+-                            _fail()
+-                        return response
+-                    except BaseException:
+-                        _trace(stage, "failed", reason="unavailable")
+-                        raise
+-                    finally:
+-                        cap.closed = True
+-                        _ACTIVE.reset(token)
+-
+-                assessed = dict(checks)
+-                uncertain = {key: items[key] for key, status in checks.items() if status == "uncertain"}
+-                if uncertain:
+-                    response = call("audit", _AUDIT_TASK, {
+-                        "question": state.plan.question, "answer": original_text,
+-                        "facts": uncertain, "checks": {key: "uncertain" for key in uncertain}})
+-                    try:
+-                        assessed = assess_audit(response, items, checks, original_text, plan=state.plan)
+-                    except Exception:
+-                        _trace("audit", "failed", reason="invalid-response")
+-                        raise
+-                    unresolved = "uncertain" in assessed.values()
+-                    _trace("audit", "unresolved" if unresolved else "accepted", assessed,
+-                        "remaining-uncertain" if unresolved else "none")
+-                else:
+-                    _trace("audit", "skipped", checks)
+-                needed = {key: items[key] for key, status in assessed.items() if status != "covered"}
+-                if not needed:
+-                    return {"checks": assessed}
+-                kind = "correction" if "wrong" in assessed.values() else "supplement"
+-                response = call("repair", _TASK, {"question": state.plan.question, "facts": needed})
+-                repair_plan = replace(state.plan, ids=tuple(needed), facts_json=_json(needed))
+-                try:
+-                    confirmed = _parse_response(response, repair_plan)
+-                except Exception:
+-                    _trace("repair", "failed", reason="invalid-response")
+-                    raise
+-                _trace("repair", "accepted", assessed, kind)
+-                return {"facts": confirmed, "kind": kind, "checks": assessed}
+-            try:
+-                outcome["result"] = PluginLlm(plugin_id="lilith-minigame-answer-repair").run_in_runtime_context(snapshot, invoke)
+-            except BaseException:
+-                outcome["failed"] = True
+-            finally:
+-                done.set()
+-        threading.Thread(target=worker, name="lilith-game-answer-repair", daemon=True).start()
+-        while not done.wait(0.05):
+-            if not state.valid() or time.monotonic() >= deadline:
+-                _fail()
+-        if not state.valid() or time.monotonic() >= deadline or outcome.get("failed") or "result" not in outcome:
+-            _fail()
+-        result = outcome["result"]
+-        if "facts" not in result:
+-            final_checks = local_checks(state.plan, original_text)
+-            if (any(status != "covered" for status in final_checks.values())
+-                    or not state.valid() or time.monotonic() >= deadline):
+-                _fail()
+-            _trace("final", "completed", final_checks, "complete")
+-            return unchanged
+-        kind = result["kind"]
+-        combined = natural_merge(state.plan, original_text, result["facts"])
+-        final_checks = local_checks(state.plan, combined)
+-        if (any(status != "covered" for status in final_checks.values())
+-                or not state.valid() or time.monotonic() >= deadline):
+-            _fail()
+-        receipt = AcceptedRepair(_ISSUER, agent, state.origin, _digest(combined), _digest(state.plan.context.wire))
+-        state.receipt = receipt
+-        limitations = sum(isinstance(value, dict) and value.get("status") == "unavailable" for value in items.values())
+-        _trace("final", "completed", final_checks, kind, limitations)
+-        return RepairResult(combined, True, kind, receipt)
+-    except Exception:
+-        reason = "cancelled" if not state.valid() else "deadline" if time.monotonic() >= deadline else "unavailable"
+-        _trace("final", "failed", checks, reason)
+-        return RepairResult(original_text, False, "unavailable")
+-    finally:
+-        cancelled.set()
++    # Preserve the exact primary display. Speech-format recovery remains the
++    # separate existing path; no game output is audited or rewritten here.
++    return RepairResult(original_text)
+ 
+diff --git a/agent/usage_strategy_context.py b/agent/usage_strategy_context.py
+index 5d39d40..765ac2f 100644
+--- a/agent/usage_strategy_context.py
++++ b/agent/usage_strategy_context.py
+@@ -47,8 +47,9 @@ def _key(rows):
+ 
+ 
+ def project_context(agent, projected, units, spec, origin, *, source=None, history_offset=0):
++    from agent.minigame_context import clean_history_event_metadata, project_history_events
+     if spec.history_turns is None or not units:
+-        return projected
++        return project_history_events(projected, spec.history_turns)
+     # Freeze each old exchange's representation independently. A new duplicate
+     # in a later exchange must not rewrite the first occurrence retroactively.
+     replacements = {}
+@@ -130,7 +131,7 @@ def project_context(agent, projected, units, spec, origin, *, source=None, histo
+                         raise RuntimeError("local summary cancellation source unavailable")
+                     try:
+                         with aux_interrupt_protection(cancel_event=cancel):
+-                            summary = checkpoint._generate_summary(compact_results(rows, spec.old_tool_chars))
++                            summary = checkpoint._generate_summary(clean_history_event_metadata(compact_results(rows, spec.old_tool_chars)))
+                     except AuxiliaryExplicitCancellation:
+                         # Preserve originals here. The existing host projection
+                         # guard sees this stopped ledger and emits turn_stopped
+@@ -138,7 +139,7 @@ def project_context(agent, projected, units, spec, origin, *, source=None, histo
+                         origin.ledger.stop()
+                         summary = None
+                 else:
+-                    summary = checkpoint._generate_summary(compact_results(rows, spec.old_tool_chars))
++                    summary = checkpoint._generate_summary(clean_history_event_metadata(compact_results(rows, spec.old_tool_chars)))
+             except Exception:
+                 summary = None
+             if isinstance(summary, str) and summary.strip() and not origin.ledger.snapshot().stopped:
+@@ -163,16 +164,23 @@ def project_context(agent, projected, units, spec, origin, *, source=None, histo
+     # Uncovered exchanges are still sent (with old-result excerpts). Current
+     # input, latest history, non-eligible rows and tool payloads are untouched.
+     result = []
++    old_event_rows = {i for unit in units[:retained_detail_count] for i in unit}
++    old_event_cutoff = max(old_event_rows, default=-1)
+     for i, row in enumerate(projected):
+         if removed and i == min(removed):
+             result.append({"role": "user", "content": state["summary"]})
+         if i not in removed:
+-            result.append(replacements.get(i, row))
++            retained = replacements.get(i, row)
++            # An uncovered original may remain after failed summarization, but
++            # its game batch is not promoted into indefinitely replayed facts.
++            if i <= old_event_cutoff:
++                retained = clean_history_event_metadata([retained])[0]
++            result.append(retained)
+     _record_projection(agent, projected, result, spec, removed_count, max(0, retained_detail_count-removed_count),
+                        0, 0, summary_attempted, summary_added_turns,
+                        pending=len(state["pending_covered"]) - len(covered),
+                        publication=publication, history_chars=sum(sizes))
+-    return result
++    return project_history_events(result, spec.history_turns)
+ 
+ 
+ def _record_projection(agent, before, after, spec, covered, uncovered, deduped, saved, attempted, added,
+diff --git a/agent/usage_budget_context.py b/agent/usage_budget_context.py
+index ccaae61..6d734bf 100644
+--- a/agent/usage_budget_context.py
++++ b/agent/usage_budget_context.py
+@@ -229,7 +229,8 @@ def _retained_boundary_unchanged(unit, source, positions, projected, offset):
+             or source[index] is not boundary.message
+             or _digest(source[index]) != boundary.digest):
+         return False
+-    actual = projected[offset + index]
++    from agent.minigame_context import unproject_history_event
++    actual = unproject_history_event(projected[offset + index])
+     # The owned assembly removes display bookkeeping; semantic event content
+     # and tool linkage must still be exactly the captured, retained row.
+     fields = ("role", "content", "tool_calls", "tool_call_id", "function_call")
+@@ -396,6 +397,8 @@ def _projection_digest(row):
+     # These fields are unconditionally removed by the owned projection loop.
+     # Every other difference (including added memory/role content, canonical
+     # tool changes or reasoning conversion) conservatively protects the unit.
++    from agent.minigame_context import unproject_history_event
++    row = unproject_history_event(row)
+     removed = {"api_content", "display_kind", "display_metadata", "_row_id",
+                "_terminal_error_closed", "reasoning", "finish_reason",
+                "_length_continuation_fragment", "_length_continuation_nudge"}
+@@ -475,7 +478,8 @@ def prepare_budget_context(agent, projected, source, history, *, history_offset,
+                 result = project_request_results(result)
+             except Exception:
+                 agent._usage_budget_context_status = {"strategy": "projection_unavailable_originals_retained"}
+-                result = projected
++                from agent.minigame_context import clean_history_event_metadata
++                result = clean_history_event_metadata(projected)
+             # Projection can spend time in a summary call. Cancellation during
+             # that call must not become "summary failed, send originals". Check
+             # outside the recovery catch so the native turn boundary receives
+@@ -500,7 +504,9 @@ def prepare_budget_context(agent, projected, source, history, *, history_offset,
+         tools=getattr(agent, "tools", None),
+     )
+     agent._usage_budget_context_status = result.status_wire()
+-    return result.messages
++    from agent.minigame_context import project_history_events
++    return project_history_events(result.messages,
++        policy.information_strategy.history_turns if policy is not None else None)
+ 
+ 
+ def _strategy_projection_units(agent, history, source, projected, offset, *, normalize_tool_calls=None):
+@@ -545,7 +551,8 @@ def _strategy_projection_units(agent, history, source, projected, offset, *, nor
+             # Native reasoning transport fields are not needed to certify the
+             # visible exchange. Tool arguments/linkage remain byte-exact.
+             fields = ("role", "content", "tool_calls", "tool_call_id", "function_call")
+-            actual = projected[offset + index]
++            from agent.minigame_context import unproject_history_event
++            actual = unproject_history_event(projected[offset + index])
+             if not isinstance(actual, dict) or any(expected.get(k) != actual.get(k) for k in fields):
+                 break
+             indices.append(offset + index)
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 370c990..af33a55 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -3383,6 +3383,14 @@ def _(rid, params: dict) -> dict:
+         )
+ 
+     perception = params.get("perception")
++    game_context = None
++    if "game_context" in params:
++        expected_fields = expected_fields | {"game_context"}
++        try:
++            from agent.minigame_context import parse_public_context
++            game_context = parse_public_context(params["game_context"])
++        except (ValueError, TypeError, KeyError):
++            return reject(4004, "mini-game context was rejected", "minigame_context_rejected")
+     from agent.proactive_context import valid_application
+     if not is_foreground and isinstance(perception, dict) and "application" in perception:
+         perception_fields = perception_fields | {"application"}
+@@ -3466,9 +3474,8 @@ def _(rid, params: dict) -> dict:
+         sort_keys=True,
+         separators=(",", ":"),
+     )
+-    perception_sha256 = hashlib.sha256(
+-        canonical_perception.encode("utf-8")
+-    ).hexdigest()
++    from agent.minigame_context import extension_context_hash
++    perception_sha256 = extension_context_hash(perception, game_context)
+     turn_id = new_message_id(excluding=(event_id,))
+     assistant_message_id = new_message_id(excluding=(event_id, turn_id))
+     owner_token = new_message_id(
+@@ -3487,7 +3494,7 @@ def _(rid, params: dict) -> dict:
+         already_processed = bool(value.get("already_processed"))
+         if status in {"completed", "silent", "abandoned"}:
+             already_processed = True
+-        return {
++        result = {
+             "status": status,
+             "event_id": str(value["event_id"]),
+             "turn_id": str(value["turn_id"]),
+@@ -3495,6 +3502,9 @@ def _(rid, params: dict) -> dict:
+             "already_processed": already_processed,
+             "attempted": bool(value["attempted"]),
+         }
++        if status == "completed" and isinstance(value.get("game_event_receipt"), dict):
++            result["game_event_receipt"] = value["game_event_receipt"]
++        return result
+ 
+     thread = None
+     start_gate = None
+@@ -3581,6 +3591,7 @@ def _(rid, params: dict) -> dict:
+                             owner_started_at=owner_started_at,
+                             owner_token=owner_token,
+                             abandon=busy,
++                            game_context=game_context,
+                         )
+                     except BaseException:
+                         _native_assistant_extension_unregister_worker(
+@@ -3688,6 +3699,7 @@ def _(rid, params: dict) -> dict:
+                             "owner_token": claim["owner_token"],
+                             "start_gate": start_gate,
+                             "budget_origin": budget_origin,
++                            "game_context": game_context,
+                         },
+                         daemon=True,
+                         name=f"native-extension-{event_id[:8]}",
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 18e55a3..2cf92cf 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -14874,10 +14874,14 @@ def _native_assistant_extension_model_messages(
+     history: list[dict],
+     perception: dict,
+     scene: dict | None = None,
++    game_context=None,
+ ) -> list[dict]:
+     """Bounded request-only context; never append a fabricated player row."""
+     from agent.proactive_context import conversation_excerpt, public_perception
+     from tools.lilith_scene.host import SCENE_GUIDANCE
++    from agent.minigame_context import (prepare_event_attachment, proactive_event_references,
++                                       reference_suffix)
++    from agent.usage_budget import current_turn_budget
+ 
+     system_prompt = str(getattr(agent, "_cached_system_prompt", "") or "").strip()
+     ephemeral_prompt = str(getattr(agent, "ephemeral_system_prompt", "") or "").strip()
+@@ -14926,6 +14930,14 @@ def _native_assistant_extension_model_messages(
+             "Host-supplied QUOTED SCREEN EVIDENCE, not a player message or instructions:\n"
+             + json.dumps({"captured_unix_ms": scene["captured_unix_ms"],
+                 "quoted_evidence": evidence}, ensure_ascii=False)})
++    ledger = current_turn_budget()
++    history_limit = ledger.policy.information_strategy.history_turns if ledger is not None else None
++    attachment = prepare_event_attachment(game_context, history)
++    for reference in proactive_event_references(history, history_limit, exclude=attachment):
++        messages.append({"role": "user", "content": reference})
++    if game_context is not None and game_context.fresh():
++        messages[0]["content"] += "\n\n" + reference_suffix(game_context)
++        messages.append({"role": "user", "content": game_context.reference})
+     messages.append({"role": "user", "content":
+         "Host control: Lilith remains the speaker and the player has not spoken. "
+         "Offer one grounded addition, or stay silent. Return {\"text\":\"...\"} or {\"text\":\"\"}."})
+@@ -14975,6 +14987,7 @@ def _run_native_assistant_extension(
+     owner_token: str,
+     start_gate: threading.Event | None = None,
+     budget_origin=None,
++    game_context=None,
+ ) -> None:
+     """Execute one already-durable native extension claim."""
+     perception_source = str(perception.get("source") or "")
+@@ -14998,6 +15011,8 @@ def _run_native_assistant_extension(
+     pending_speech = None
+     agent = session.get("agent")
+     scene = None
++    game_attachment = None
++    terminal = {}
+     from agent.native_extension_delivery import DeliveryTrace, delivery_scope
+     trace = DeliveryTrace(is_foreground)
+     try:
+@@ -15081,11 +15096,20 @@ def _run_native_assistant_extension(
+                 if already_addressed(session, history, perception, scene, time.time()):
+                     raise InterruptedError("proactive context already addressed; wait for new context or player")
+             trace.stage = "request"
++            from agent.minigame_context import prepare_event_attachment
++            effective_game_context = game_context if game_context is not None and game_context.fresh() else None
++            proposed_game_attachment = prepare_event_attachment(effective_game_context, history)
++            if proposed_game_attachment is not None:
++                with _session_db(session) as game_db:
++                    if game_db is None:
++                        raise RuntimeError("durable event metadata unavailable")
++                    game_db.find_minigame_event_receipt(claim_session_id, proposed_game_attachment)
+             messages = _native_assistant_extension_model_messages(
+                 agent,
+                 history,
+                 perception,
+                 scene,
++                effective_game_context,
+             )
+             if str(getattr(agent, "provider", "") or "").strip().lower() == "moa":
+                 raise RuntimeError(
+@@ -15160,6 +15184,9 @@ def _run_native_assistant_extension(
+                 api_kwargs,
+                 physical_attempt_limit=1,
+             )
++            from agent.minigame_context import briefing_present
++            if effective_game_context is not None and briefing_present(api_kwargs, effective_game_context):
++                game_attachment = proposed_game_attachment
+             normalized = agent._get_transport().normalize_response(response)
+             if scene is not None:
+                 trace.stage = "freshness"
+@@ -15213,6 +15240,7 @@ def _run_native_assistant_extension(
+                     status=terminal_status,
+                     text=reply if terminal_status == "completed" else None,
+                     perception_source=perception_source,
++                    game_event_attachment=game_attachment if terminal_status == "completed" else None,
+                 )
+             if terminal.get("status") == "completed" and isinstance(
+                 terminal.get("message"), dict
+@@ -15301,6 +15329,9 @@ def _run_native_assistant_extension(
+                 payload["text"] = ""
+                 payload["status"] = "interrupted"
+                 payload[status_key] = "silent"
++            if (payload.get("status") == "complete" and payload.get(status_key) == "completed"
++                    and payload.get("durable") is not None and terminal.get("game_event_receipt") is not None):
++                payload["game_event_receipt"] = terminal["game_event_receipt"]
+         except BaseException:
+             logger.warning(
+                 "native extension terminal projection failed",
+@@ -16212,6 +16243,15 @@ def _run_prompt_submit(
+                 )
+                 if durable_assistant is not None:
+                     payload["durable"] = durable_assistant
++                    from agent.minigame_context import event_attachment, retained_event_receipt
++                    attachment = event_attachment(public_context)
++                    game_receipt = retained_event_receipt(attachment, result.get("messages") or [])
++                    if attachment is not None:
++                        with _session_db(session) as game_db:
++                            if game_db is not None:
++                                game_receipt = game_db.find_minigame_event_receipt(agent.session_id, attachment)
++                    if game_receipt is not None and result.get("game_event_receipt") == game_receipt:
++                        payload["game_event_receipt"] = game_receipt
+             if last_reasoning:
+                 payload["reasoning"] = last_reasoning
+             if status_note:
+diff --git a/hermes_state.py b/hermes_state.py
+index 3da97cf..dfc3742 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -8977,6 +8977,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         owner_started_at: int,
+         owner_token: str,
+         abandon: bool,
++        game_context=None,
+     ) -> Dict[str, Any]:
+         """Durably claim one native event before any model request.
+ 
+@@ -9016,12 +9017,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             native_perception_fields = native_perception_fields | {"application"}
+             if not valid_application(perception["application"], perception.get("occurred_at_unix_ms")):
+                 raise ValueError("native assistant extension application binding was rejected")
+-        canonical_perception = json.dumps(
+-            perception,
+-            ensure_ascii=False,
+-            sort_keys=True,
+-            separators=(",", ":"),
+-        )
++        from agent.minigame_context import extension_context_hash, event_attachment
++        binding_hash = extension_context_hash(perception, game_context)
++        game_attachment = event_attachment(game_context)
+         if (
+             not isinstance(session_id, str)
+             or not session_id
+@@ -9075,8 +9073,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 )
+             )
+             or re.fullmatch(r"[0-9a-f]{64}", perception_sha256 or "") is None
+-            or hashlib.sha256(canonical_perception.encode("utf-8")).hexdigest()
+-            != perception_sha256
++            or binding_hash != perception_sha256
+             or re.fullmatch(r"[0-9a-f]{32}", turn_id or "") is None
+             or re.fullmatch(r"[0-9a-f]{32}", assistant_message_id or "") is None
+             or turn_id == assistant_message_id
+@@ -9129,11 +9126,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     raise NativeAssistantExtensionConflictError(
+                         "native assistant extension perception conflicted"
+                     )
+-                return self._native_assistant_extension_receipt(
++                receipt = self._native_assistant_extension_receipt(
+                     existing,
+                     already_processed=True,
+                 )
+-
++                if receipt["status"] == "completed" and game_attachment is not None:
++                    retained = self._find_minigame_event_receipt(conn, lineage_session_ids, game_attachment)
++                    if retained is not None:
++                        receipt["game_event_receipt"] = retained
++                return receipt
++
++            if game_context is not None and not game_context.fresh():
++                raise ValueError("stale mini-game context cannot admit a new proactive turn")
+             self._check_transcript_write_guards(conn, session_id, None)
+             if is_native:
+                 placeholders = ",".join("?" for _ in lineage_session_ids)
+@@ -9224,6 +9228,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         status: str,
+         text: Optional[str] = None,
+         perception_source: str = "official-native-dialogue",
++        game_event_attachment=None,
+     ) -> Dict[str, Any]:
+         """Atomically terminalize a claim and optionally append its reply."""
+         if (
+@@ -9235,6 +9240,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         ):
+             raise ValueError("native assistant extension terminal state was rejected")
+ 
++        from agent.minigame_context import validate_event_attachment
++        game_event_attachment = (validate_event_attachment(game_event_attachment)
++                                 if game_event_attachment is not None else None)
++        lineage_ids = self._session_lineage_root_to_tip(session_id)
++
+         def _do(conn):
+             row = conn.execute(
+                 """SELECT lineage_root, event_id, perception_sha256,
+@@ -9278,6 +9288,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     timestamp=time.time(),
+                     perception_source=perception_source,
+                 )
++                from agent.minigame_context import attach_completed_events
++                prior_receipt = self._find_minigame_event_receipt(conn, lineage_ids, game_event_attachment)
++                if prior_receipt is None:
++                    attach_completed_events(message, game_event_attachment, [])
+                 self._insert_message_rows(
+                     conn,
+                     session_id,
+@@ -9310,13 +9324,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                    WHERE event_id = ?""",
+                 (event_id,),
+             ).fetchone()
+-            return {
++            receipt = {
+                 **self._native_assistant_extension_receipt(
+                     terminal,
+                     already_processed=True,
+                 ),
+                 "message": message,
+             }
++            if status == "completed" and game_event_attachment is not None:
++                retained = self._find_minigame_event_receipt(conn, lineage_ids, game_event_attachment)
++                if retained is not None:
++                    receipt["game_event_receipt"] = retained
++            return receipt
+ 
+         receipt = self._execute_write(
+             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+@@ -9330,6 +9349,45 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             message["_db_persisted"] = True
+         return receipt
+ 
++    def _find_minigame_event_receipt(self, conn, session_ids, attachment):
++        if attachment is None:
++            return None
++        from agent.minigame_context import (EVENT_METADATA_KEY, validate_event_attachment, retained_event_receipt)
++        value = validate_event_attachment(attachment)
++        placeholders = ",".join("?" for _ in session_ids)
++        rows = conn.execute(
++            f"""SELECT id, role, display_metadata, active, compacted FROM messages WHERE session_id IN ({placeholders})
++                AND role = 'assistant' AND json_valid(display_metadata)
++                AND json_extract(display_metadata, '$.lilith_minigame_events_v1.gameEpoch') = ?
++                AND json_extract(display_metadata, '$.lilith_minigame_events_v1.matchId') = ?
++                AND json_extract(display_metadata, '$.lilith_minigame_events_v1.batch.batchId') = ? ORDER BY id DESC LIMIT 129""",
++            (*session_ids, value["gameEpoch"], value["matchId"], value["batch"]["batchId"]),
++        ).fetchall()
++        if len(rows) > 128:
++            raise ValueError("mini-game event receipt lookup limit")
++        # Compaction keeps the original accepted batch. A deliberate rewind is
++        # a tombstone, not permission to resurrect an earlier archived copy.
++        tombstone = max((row["id"] for row in rows if not row["active"] and not row["compacted"]), default=-1)
++        rows = [row for row in rows if row["id"] > tombstone and (row["active"] or row["compacted"])]
++        if not rows:
++            return None
++        for row in rows:
++            metadata = self._decode_display_metadata(row["display_metadata"]) or {}
++            if validate_event_attachment(metadata.get(EVENT_METADATA_KEY)) != value:
++                raise ValueError("conflicting retained mini-game event batch")
++        row = rows[0]
++        metadata = self._decode_display_metadata(row["display_metadata"]) or {}
++        return retained_event_receipt(value, [{"role": "assistant", "display_metadata": metadata,
++                                              "_db_persisted": True, "_row_id": row["id"]}])
++
++    def find_minigame_event_receipt(self, session_id, attachment):
++        """Read exact active/compacted lineage metadata; no prompt/history scan."""
++        if attachment is None:
++            return None
++        session_ids = self._session_lineage_root_to_tip(session_id)
++        with self._read_ctx() as conn:
++            return self._find_minigame_event_receipt(conn, session_ids, attachment)
++
+     def append_messages_batch(
+         self,
+         session_id: str,
+@@ -9377,12 +9435,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 )
+             return inserted_total
+ 
++        # Only newly appended host event sidecars are deduplicated here. The
++        # rewrite/compaction serializer keeps the accepted owner row intact.
++        from agent.minigame_context import EVENT_METADATA_KEY, validate_event_attachment
++        event_rows = [i for i, message in enumerate(messages)
++                      if isinstance(message.get("display_metadata"), dict)
++                      and EVENT_METADATA_KEY in message["display_metadata"]]
++        staged_messages = list(messages)
++        event_lineage = self._session_lineage_root_to_tip(session_id) if event_rows else []
++        for index in event_rows:
++            message = messages[index]
++            if message.get("role") != "assistant" or not isinstance(message.get("content"), str) or not message["content"].strip():
++                raise ValueError("mini-game event owner is not a completed reply")
++            validate_event_attachment(message["display_metadata"][EVENT_METADATA_KEY])
++            staged_messages[index] = {**message, "display_metadata": dict(message["display_metadata"])}
++
+         def _do(conn):
+             self._check_transcript_write_guards(
+                 conn, session_id, compression_lock_holder
+             )
++            seen_events = {}
++            for index in event_rows:
++                staged = staged_messages[index]
++                attachment = messages[index]["display_metadata"][EVENT_METADATA_KEY]
++                key = (attachment["gameEpoch"], attachment["matchId"], attachment["batch"]["batchId"])
++                if key in seen_events and seen_events[key] != attachment:
++                    raise ValueError("mini-game event batch identity conflict")
++                duplicate = key in seen_events or self._find_minigame_event_receipt(conn, event_lineage, attachment) is not None
++                staged["display_metadata"] = dict(messages[index]["display_metadata"])
++                if duplicate:
++                    staged["display_metadata"].pop(EVENT_METADATA_KEY, None)
++                seen_events[key] = attachment
+             inserted, tool_calls_total = self._insert_message_rows(
+-                conn, session_id, messages
++                conn, session_id, staged_messages
+             )
+             # One aggregated counter update for the whole batch.
+             if tool_calls_total > 0:
+@@ -9399,9 +9484,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             return inserted
+ 
+         # Same criticality as append_message: this IS the turn's transcript.
+-        return self._execute_write(
++        inserted = self._execute_write(
+             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+         )
++        for index in event_rows:
++            messages[index].update(staged_messages[index])
++        return inserted
+ 
+     def set_latest_matching_message_display_kind(
+         self, session_id: str, *, role: str, content: str, display_kind: str,

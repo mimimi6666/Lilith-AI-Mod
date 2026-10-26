@@ -1,0 +1,155 @@
+diff --git a/tests/tui_gateway/test_native_assistant_extension.py b/tests/tui_gateway/test_native_assistant_extension.py
+--- a/tests/tui_gateway/test_native_assistant_extension.py
++++ b/tests/tui_gateway/test_native_assistant_extension.py
+@@ -125,7 +125,7 @@ class _FakeAgent:
+ def extension_session(tmp_path, monkeypatch):
+     db = SessionDB(tmp_path / "state.db")
+     db.create_session("game-root", source="lilith-game", archived=True)
+-    agent = _FakeAgent('{"decision":"reply","text":"嗯，別忘了休息。"}')
++    agent = _FakeAgent('{"text":"嗯，別忘了休息。"}')
+     session = {
+         "agent": agent,
+         "archived": True,
+@@ -226,10 +226,12 @@ def test_reply_is_one_model_attempt_one_primary_assistant_and_no_user_row(
+         separators=(",", ":"),
+     )
+     assert canonical_perception in sent[0]["content"]
++    assert "A non-empty continuation is required" in sent[0]["content"]
++    assert '{"text":"the continuation"}' in sent[0]["content"]
+     assert sent[-1]["role"] == "user"
+     assert sent[-1]["content"] == (
+-        "Host control: make the native continuation decision now and return "
+-        "exactly one required JSON object."
++        "Host control: write the required native continuation now and return "
++        "exactly one required JSON object with non-empty text."
+     )
+     assert all(
+         canonical_perception not in message.get("content", "")
+@@ -302,7 +304,7 @@ def test_fresh_agent_builds_identity_prompt_before_extension_dispatch(
+     ).fetchone()[0] == 0
+ 
+ 
+-def test_silence_is_terminal_idempotent_and_never_adds_a_row(extension_session):
++def test_model_cannot_choose_silence_as_a_valid_reply(extension_session):
+     db, session, agent, emitted = extension_session
+     agent.output = '{"decision":"silent","text":""}'
+ 
+@@ -328,10 +330,34 @@ def test_silence_is_terminal_idempotent_and_never_adds_a_row(extension_session):
+     assert "durable" not in completes[0][2]
+ 
+ 
++@pytest.mark.parametrize(
++    "output, expected",
++    [
++        ('{"text":"新格式。"}', ("completed", "新格式。")),
++        (
++            '{"decision":"reply","text":"舊格式仍可接話。"}',
++            ("completed", "舊格式仍可接話。"),
++        ),
++        ('{"decision":"silent","text":""}', ("silent", "")),
++        ('{"decision":"reply","text":""}', ("silent", "")),
++        ('{"text":"多欄位。","extra":true}', ("silent", "")),
++        (
++            '{"decision":"reply","text":"多欄位。","extra":true}',
++            ("silent", ""),
++        ),
++    ],
++)
++def test_required_reply_decoder_accepts_only_current_or_legacy_reply_shapes(
++    output,
++    expected,
++):
++    assert server._decode_native_assistant_extension_decision(output) == expected
++
++
+ @pytest.mark.parametrize(
+     "output, expected_status",
+     [
+-        ('{"decision":"reply","text":"再一句。"}', "completed"),
++        ('{"text":"再一句。"}', "completed"),
+         ('{"decision":"silent","text":""}', "silent"),
+     ],
+ )
+@@ -1278,7 +1304,7 @@ def test_same_event_with_different_perception_is_a_terminal_hash_conflict(
+     extension_session,
+ ):
+     _, session, agent, _ = extension_session
+-    agent.output = '{"decision":"silent","text":""}'
++    agent.output = "not-json"
+     assert "error" not in _extend()
+     _join(session)
+     changed = _extend_params()
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -14299,16 +14299,15 @@ def _native_assistant_extension_model_messages(
+         separators=(",", ":"),
+     )
+     native_instruction = (
+-        "You are deciding whether Lilith should naturally add anything after "
+-        "an official line she has just spoken. The native perception below is "
++        "You are writing Lilith's required natural continuation after an "
++        "official line she has just spoken. The native perception below is "
+         "Lilith's own just-perceived and already-spoken event; it is not a "
+-        "player or user message. Be restrained. Do not repeat or paraphrase "
+-        "the official line. Silence is valid and often preferable; when a "
+-        "continuation is genuinely natural, usually add only one short natural "
+-        "follow-up in Lilith's established voice. Decide semantically, without "
++        "player or user message. A non-empty continuation is required whenever "
++        "this route is invoked; do not choose silence. Be restrained. Do not "
++        "repeat or paraphrase the official line. Add only one short, natural "
++        "follow-up in Lilith's established voice, chosen semantically without "
+         "mechanical keyword or length rules. Return JSON only, with exactly "
+-        "these fields: {\"decision\":\"silent\",\"text\":\"\"} or "
+-        "{\"decision\":\"reply\",\"text\":\"the continuation\"}.\n\n"
++        "this field: {\"text\":\"the continuation\"}.\n\n"
+         "Canonical host-owned native perception JSON:\n"
+         + canonical_perception
+     )
+@@ -14367,8 +14366,8 @@ def _native_assistant_extension_model_messages(
+         {
+             "role": "user",
+             "content": (
+-                "Host control: make the native continuation decision now and "
+-                "return exactly one required JSON object."
++                "Host control: write the required native continuation now and "
++                "return exactly one required JSON object with non-empty text."
+             ),
+         }
+     )
+@@ -14376,7 +14375,7 @@ def _native_assistant_extension_model_messages(
+ 
+ 
+ def _decode_native_assistant_extension_decision(raw_content: Any) -> tuple[str, str]:
+-    """Decode the model-owned silence/reply decision; invalid means silence."""
++    """Decode the required reply; invalid output fails closed without a row."""
+     raw = str(raw_content or "").strip()
+     if raw.startswith("```"):
+         lines = raw.splitlines()
+@@ -14386,14 +14385,20 @@ def _decode_native_assistant_extension_decision(raw_content: Any) -> tuple[str,
+         value = json.loads(raw)
+     except (json.JSONDecodeError, TypeError):
+         return "silent", ""
+-    if not isinstance(value, dict) or set(value) != {"decision", "text"}:
++    if not isinstance(value, dict):
+         return "silent", ""
+-    decision = value.get("decision")
+-    text = value.get("text")
+-    if decision == "reply" and isinstance(text, str) and text.strip():
+-        return "completed", text.strip()
+-    if decision == "silent" and text == "":
++    keys = set(value)
++    if keys == {"text"}:
++        text = value.get("text")
++    elif keys == {"decision", "text"} and value.get("decision") == "reply":
++        # Accept the previous reply-only wire shape so a model influenced by
++        # older session context cannot discard an otherwise valid reply.  The
++        # previous explicit-silence decision remains invalid.
++        text = value.get("text")
++    else:
+         return "silent", ""
++    if isinstance(text, str) and text.strip():
++        return "completed", text.strip()
+     return "silent", ""
+ 
+ 

@@ -1,0 +1,74 @@
+diff --git a/agent/title_generator.py b/agent/title_generator.py
+index cb8b662..527ad32 100644
+--- a/agent/title_generator.py
++++ b/agent/title_generator.py
+@@ -87,24 +87,6 @@ _TITLE_PROMPT_TEMPLATE = (
+ _LANGUAGE_RULE_MATCH_USER = "- Write the title in the same language as the user's message."
+ _LANGUAGE_RULE_PINNED = "- Write the title in {language}."
+ 
+-# JSON schema constraining the response to a single title field. Removes the
+-# whole class of "model answered the prompt instead of titling it" failures
+-# that produced titles like "<title>...</title>" and "User: Yep, that's the
+-# catch —" in real session history.
+-_TITLE_RESPONSE_FORMAT = {
+-    "type": "json_schema",
+-    "json_schema": {
+-        "name": "session_title",
+-        "strict": True,
+-        "schema": {
+-            "type": "object",
+-            "properties": {"title": {"type": "string"}},
+-            "required": ["title"],
+-            "additionalProperties": False,
+-        },
+-    },
+-}
+-
+ # Control-tag wrappers that surround machine-authored content inside what is
+ # nominally a "user" message. Titling from these is what produces a session
+ # named after a slash command or an injected reminder rather than the user's
+@@ -277,9 +259,9 @@ def derive_title(user_message: str) -> Optional[str]:
+ def _extract_title_text(content: str) -> str:
+     """Pull the title out of a model response.
+ 
+-    The JSON schema makes the object shape the expected case, but not every
+-    provider honors ``response_format``; fall back through a loose JSON scan
+-    and finally to first-line prose so a non-compliant provider still titles.
++    The prompt asks for a JSON object, but providers differ in their structured
++    output wire support. Parse a normal JSON response first, then fall back
++    through a loose JSON scan and finally to first-line prose.
+     """
+     if not content:
+         return ""
+@@ -340,8 +322,9 @@ def generate_title(
+     """Generate a session title from the user's opening message.
+ 
+     Runs on the ``title_generation`` auxiliary task, which resolves to a
+-    small/fast model tier. Thinking is disabled and the response is constrained
+-    to ``{"title": "..."}`` so there is no preamble or reasoning to strip.
++    small/fast model tier. Thinking is disabled and the prompt requests
++    ``{"title": "..."}``; local parsing keeps this single request portable
++    across endpoints without requiring structured-output wire support.
+ 
+     Titles come from the user's message alone — every surveyed implementation
+     that titles well (Claude Code, OpenCode, Cursor, OpenClaw) does the same.
+@@ -401,7 +384,6 @@ def generate_title(
+             temperature=0.3,
+             timeout=timeout,
+             main_runtime=main_runtime,
+-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+         )
+         content = response.choices[0].message.content or ""
+         return _clean_title(_extract_title_text(content))
+diff --git a/tests/agent/test_title_generator.py b/tests/agent/test_title_generator.py
+index 5619098..927322b 100644
+--- a/tests/agent/test_title_generator.py
++++ b/tests/agent/test_title_generator.py
+@@ -45,6 +45,7 @@ class TestGenerateTitle:
+ 
+         assert captured_kwargs["task"] == "title_generation"
+         assert captured_kwargs["timeout"] is None
++        assert "extra_body" not in captured_kwargs
+ 
+ 
+ 

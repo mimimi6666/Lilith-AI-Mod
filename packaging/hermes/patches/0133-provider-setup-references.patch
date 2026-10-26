@@ -1,0 +1,197 @@
+diff --git a/hermes_cli/provider_setup.py b/hermes_cli/provider_setup.py
+index b4d3567..6abd6bf 100644
+--- a/hermes_cli/provider_setup.py
++++ b/hermes_cli/provider_setup.py
+@@ -289,6 +289,51 @@ def normalize_setup_identity(value):
+     return ""
+ 
+ 
++def _has_saved_provider_reference(config, provider_id):
++    """Read only known config.yaml route slots; never repair or infer a route.
++
++    A stored dependency matters even while idle or disabled. Arbitrary text,
++    model names, provider declarations and historical session data are not
++    references. Canonical and native bare-name spellings name the same entry.
++    """
++    def matches(slot):
++        return (type(slot) is dict
++                and normalize_setup_identity(slot.get("provider")) == provider_id)
++
++    auxiliary = config.get("auxiliary")
++    if type(auxiliary) is dict and any(matches(slot) for slot in auxiliary.values()):
++        return True
++    platforms = config.get("platforms")
++    if type(platforms) is dict:
++        for platform in platforms.values():
++            overrides = platform.get("channel_overrides") if type(platform) is dict else None
++            if type(overrides) is dict and any(matches(slot) for slot in overrides.values()):
++                return True
++
++    def preset_matches(preset):
++        if type(preset) is not dict:
++            return False
++        if matches(preset.get("aggregator")):
++            return True
++        refs = preset.get("reference_models")
++        # These are the same finite legacy representations accepted by native
++        # MoA. Do not call its normalizer: that would synthesize default routes.
++        if type(refs) is str:
++            try:
++                refs = json.loads(refs)
++            except (ValueError, RecursionError):
++                return False
++        if type(refs) is dict:
++            return matches(refs)
++        return type(refs) is list and any(matches(slot) for slot in refs)
++
++    moa = config.get("moa")
++    if preset_matches(moa):
++        return True
++    presets = moa.get("presets") if type(moa) is dict else None
++    return type(presets) is dict and any(preset_matches(preset) for preset in presets.values())
++
++
+ def allows_empty_key(provider_id, base_url, api_key):
+     if not is_setup_identity(provider_id) or api_key != "":
+         return False
+@@ -400,8 +445,11 @@ def mutate(action, params, *, finalize, in_use=frozenset()):
+         old = owned_entry(config, provider_id, required=action == "remove")
+         old_key = load_env().get(slot) or ""
+         model_before = copy.deepcopy(config.get("model"))
++        referenced = (provider_id in in_use
++                      or normalize_setup_identity((model_before or {}).get("provider")) == provider_id
++                      or _has_saved_provider_reference(config, provider_id))
+         if action == "remove":
+-            if provider_id in in_use or normalize_setup_identity((model_before or {}).get("provider")) == provider_id:
++            if referenced:
+                 raise SetupError("entry_in_use")
+             del providers[name]
+             wanted_key = ""
+@@ -423,7 +471,7 @@ def mutate(action, params, *, finalize, in_use=frozenset()):
+                 comparable["lilith_setup"]["last_operation_id"] = old["lilith_setup"]["last_operation_id"]
+             changed = old != comparable or old_key != wanted_key
+             providers[name] = new
+-            if changed and (provider_id in in_use or normalize_setup_identity((model_before or {}).get("provider")) == provider_id):
++            if changed and referenced:
+                 raise SetupError("entry_in_use")
+         receipt = {"schema_version": SCHEMA, "operation_id": params["operation_id"],
+             "provider_id": provider_id, "action": action, "changed": bool(changed),
+diff --git a/tests/test_provider_setup.py b/tests/test_provider_setup.py
+index 5b7cfee..ddf6ef9 100644
+--- a/tests/test_provider_setup.py
++++ b/tests/test_provider_setup.py
+@@ -192,6 +192,114 @@ class SetupFixture(unittest.TestCase):
+         with self.assertRaisesRegex(setup.SetupError, "entry_in_use"):
+             self.remove(in_use={ID})
+ 
++    def assert_saved_reference_protected(self):
++        from hermes_cli import credential_lifecycle
++        paths = credential_lifecycle._provider_mutation_paths()
++        before = {path: path.read_bytes() if path.exists() else None for path in paths}
++        finalized = list(self.finalized)
++        changes = ({"label": "Changed label"}, {"model_id": "different-model"},
++                   {"base_url": "http://127.0.0.1:8001/v1", "auth_mode": "api_key",
++                    "key_action": "replace", "api_key": "synthetic-rotated"},
++                   {"auth_mode": "api_key", "key_action": "replace", "api_key": "synthetic-rotated"})
++        # A refusal must occur before starting the multi-store mutation, not
++        # by writing and then trying to repair a dependent task afterwards.
++        with patch.object(credential_lifecycle, "_run_provider_mutation_transaction",
++                          side_effect=AssertionError("referenced provider reached writer")):
++            with self.assertRaisesRegex(setup.SetupError, "^setup.entry_in_use$"):
++                self.remove()
++            for change in changes:
++                with self.subTest(change=tuple(change)), self.assertRaisesRegex(setup.SetupError, "^setup.entry_in_use$"):
++                    self.save(**change)
++        self.assertEqual(before, {path: path.read_bytes() if path.exists() else None for path in paths})
++        self.assertEqual(finalized, self.finalized)
++        entry = setup.owned_entry(config.read_raw_config(), ID)
++        noop = self.save(auth_mode=entry["auth_mode"],
++                         key_action="keep" if entry["auth_mode"] == "api_key" else "clear")
++        self.assertFalse(noop["changed"])
++        self.assertEqual(before, {path: path.read_bytes() if path.exists() else None for path in paths})
++        self.assertEqual(finalized, self.finalized)
++
++    def test_native_saved_auxiliary_choices_block_effective_edit_and_remove(self):
++        from hermes_cli.main import _save_aux_choice
++        self.save(auth_mode="api_key", key_action="replace", api_key="synthetic-owned")
++        for task in ("lilith_relationship_review", "lilith_profile_memory_review"):
++            for spelling in (ID, ID[7:]):
++                for base_url in ("", "http://127.0.0.1:8080/v1"):
++                    with self.subTest(task=task, bare=spelling == ID[7:], explicit_url=bool(base_url)):
++                        _save_aux_choice(task, provider=spelling, model="synthetic-model", base_url=base_url)
++                        saved = config.read_raw_config()["auxiliary"][task]
++                        self.assertEqual(spelling, saved["provider"])
++                        self.assertEqual(base_url, saved["base_url"])
++                        self.assertEqual("", saved["api_key"])
++                        self.assert_saved_reference_protected()
++                        _save_aux_choice(task, provider="auto")
++        self.assertTrue(self.remove()["changed"])
++        self.assertNotIn(setup.key_env(ID), config.load_env())
++
++    def test_auxiliary_provider_only_and_plugin_task_refs_need_no_endpoint_or_key(self):
++        from utils import atomic_roundtrip_yaml_update
++        self.save()
++        for spelling in (ID, ID[7:]):
++            atomic_roundtrip_yaml_update(self.path, "auxiliary", {"synthetic_plugin_task": {"provider": spelling}})
++            self.assert_saved_reference_protected()
++        atomic_roundtrip_yaml_update(self.path, "auxiliary", {})
++        self.assertTrue(self.remove()["changed"])
++
++    def test_saved_platform_channel_overrides_protect_exact_provider(self):
++        from gateway.config import ChannelOverride
++        from utils import atomic_roundtrip_yaml_update
++        self.save()
++        for platform in ("telegram", "discord"):
++            for spelling in (ID, ID[7:]):
++                with self.subTest(platform=platform, bare=spelling == ID[7:]):
++                    override = ChannelOverride(provider=spelling, model="synthetic-model").to_dict()
++                    atomic_roundtrip_yaml_update(self.path, "platforms", {
++                        platform: {"channel_overrides": {"synthetic-channel": override}}})
++                    self.assert_saved_reference_protected()
++        atomic_roundtrip_yaml_update(self.path, "platforms", {})
++        self.assertTrue(self.remove()["changed"])
++
++    def test_saved_moa_named_and_legacy_flat_routes_protect_exact_provider(self):
++        from utils import atomic_roundtrip_yaml_update
++        self.save()
++        for spelling in (ID, ID[7:]):
++            slot = {"provider": spelling, "model": "synthetic-model", "enabled": False}
++            shapes = ({"reference_models": [slot]}, {"reference_models": slot},
++                      {"reference_models": json.dumps([slot])},
++                      {"reference_models": json.dumps(slot)}, {"aggregator": slot})
++            for shape in shapes:
++                for nested in (False, True):
++                    with self.subTest(bare=spelling == ID[7:], field=next(iter(shape)), nested=nested):
++                        moa = {"presets": {"synthetic-preset": shape}} if nested else shape
++                        atomic_roundtrip_yaml_update(self.path, "moa", moa)
++                        self.assert_saved_reference_protected()
++        atomic_roundtrip_yaml_update(self.path, "moa", {})
++        self.assertTrue(self.remove()["changed"])
++
++    def test_unrelated_references_and_arbitrary_text_do_not_capture_provider(self):
++        from utils import atomic_roundtrip_yaml_update
++        self.save()
++        self.save(provider_id=SECOND)
++        atomic_roundtrip_yaml_update(self.path, "auxiliary", {
++            "unrelated": {"provider": SECOND, "model": ID},
++            "not_a_route": {"prompt": ID, "nested": {"provider": ID}}})
++        atomic_roundtrip_yaml_update(self.path, "platforms", {
++            "telegram": {"channel_overrides": {"other": {"provider": SECOND, "system_prompt": ID}}}})
++        atomic_roundtrip_yaml_update(self.path, "moa", {"presets": {"other": {
++            "reference_models": [{"provider": SECOND, "model": ID}],
++            "aggregator": {"provider": SECOND, "model": "synthetic-model"}, "notes": {"provider": ID}}}})
++        for malformed in (None, False, 7, "unrelated", [ID], {"nested": {"provider": ID}}):
++            atomic_roundtrip_yaml_update(self.path, "auxiliary.unrelated_value", malformed)
++            self.assertFalse(setup._has_saved_provider_reference(config.read_raw_config(), ID))
++        for section in ("auxiliary", "platforms", "moa"):
++            for malformed in (None, False, 7, "unrelated", [ID]):
++                snapshot = copy.deepcopy(config.read_raw_config())
++                snapshot[section] = malformed
++                self.assertFalse(setup._has_saved_provider_reference(snapshot, ID))
++        self.assertTrue(self.save(label="Safe unrelated change")["changed"])
++        self.assertTrue(self.remove()["changed"])
++        self.assertEqual([SECOND], [entry["provider_id"] for entry in setup.catalog()["entries"]])
++
+     def test_finalize_failure_restores_config_env_and_native_caches(self):
+         self.save(auth_mode="api_key", key_action="replace", api_key="synthetic-before")
+         paths = [self.path, config.get_env_path()]

@@ -1,0 +1,56 @@
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 61fc2e1..41e91c7 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -5651,11 +5651,35 @@ This compaction should PRIORITISE preserving all information related to the focu
+         # so charging it here spends tail budget on bytes that never ship.
+         _newest_asst_idx = _last_assistant_index(messages)
+ 
+-        for i in range(n - 1, head_end - 1, -1):
+-            msg = messages[i]
+-            msg_tokens = _estimate_msg_budget_tokens(
+-                msg, charge_stale_thinking=(i == _newest_asst_idx)
++        # Local request capacity is enforced on the provider projection, not
++        # the clean text shown in chat history. Historical user/assistant rows
++        # can replay a much larger api_content sidecar. Charging only content
++        # can protect the entire old transcript, leaving only a prior summary
++        # in the compressible window and making every subsequent pass a no-op.
++        # Count a shallow send-copy through the SAME sidecar admission helper;
++        # never rewrite stored rows or revive a rejected external-memory copy.
++        # The active user is composed afresh at send time, so its old sidecar
++        # is not replayed here. The final complete-request guard still decides
++        # whether the assembled request fits; this is only tail planning.
++        from agent.local_compatibility import compressor_policy
++        _local_tail_projection = compressor_policy(self) is not None
++        _active_user_idx = (
++            self._find_last_user_message_idx(messages, head_end)
++            if _local_tail_projection else -1
++        )
++
++        def _tail_message_tokens(index):
++            message = messages[index]
++            if _local_tail_projection and index != _active_user_idx:
++                from agent.turn_context import substitute_api_content
++                message = dict(message)
++                substitute_api_content(message)
++            return _estimate_msg_budget_tokens(
++                message, charge_stale_thinking=(index == _newest_asst_idx)
+             )
++
++        for i in range(n - 1, head_end - 1, -1):
++            msg_tokens = _tail_message_tokens(i)
+             # Stop once we exceed the soft ceiling (unless we haven't hit min_tail yet)
+             if accumulated + msg_tokens > soft_ceiling and (n - i) >= min_tail:
+                 break
+@@ -5680,10 +5704,7 @@ This compaction should PRIORITISE preserving all information related to the focu
+             raw_budget = token_budget
+             raw_accumulated = 0
+             for j in range(n - 1, head_end - 1, -1):
+-                raw_msg = messages[j]
+-                raw_tok = _estimate_msg_budget_tokens(
+-                    raw_msg, charge_stale_thinking=(j == _newest_asst_idx)
+-                )
++                raw_tok = _tail_message_tokens(j)
+                 if raw_accumulated + raw_tok > raw_budget and (n - j) >= min_tail:
+                     cut_idx = j
+                     break

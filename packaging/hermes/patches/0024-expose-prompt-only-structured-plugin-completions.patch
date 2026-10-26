@@ -1,0 +1,158 @@
+diff --git a/agent/plugin_llm.py b/agent/plugin_llm.py
+index 81209d5..0497396 100644
+--- a/agent/plugin_llm.py
++++ b/agent/plugin_llm.py
+@@ -867,6 +867,7 @@ class PluginLlm:
+         input: Sequence[PluginLlmInput],
+         json_schema: Optional[Any] = None,
+         json_mode: bool = False,
++        send_response_format: bool = True,
+         schema_name: Optional[str] = None,
+         system_prompt: Optional[str] = None,
+         provider: Optional[str] = None,
+@@ -887,6 +888,12 @@ class PluginLlm:
+         is parsed and (if a schema is given) validated; the parsed value
+         is returned in :attr:`PluginLlmStructuredResult.parsed`.
+ 
++        ``send_response_format=False`` keeps the JSON instructions and schema
++        in the prompt and preserves local parsing/validation, but omits the
++        provider wire-level ``response_format`` hint. This remains a single
++        completion and is useful for bounded tasks whose selected endpoint
++        does not expose native structured-output response formats.
++
+         Validation requires the optional ``jsonschema`` package. When it
+         isn't installed, JSON mode still works but schema enforcement is
+         skipped with a debug log.
+@@ -917,7 +924,11 @@ class PluginLlm:
+             schema_name=schema_name,
+             system_prompt=system_prompt,
+         )
+-        extra_body = self._json_response_format(json_mode=json_mode, json_schema=json_schema)
++        extra_body = (
++            self._json_response_format(json_mode=json_mode, json_schema=json_schema)
++            if send_response_format
++            else None
++        )
+ 
+         real_provider, real_model, response = self._invoke_sync(
+             messages=messages,
+@@ -1025,6 +1036,7 @@ class PluginLlm:
+         input: Sequence[PluginLlmInput],
+         json_schema: Optional[Any] = None,
+         json_mode: bool = False,
++        send_response_format: bool = True,
+         schema_name: Optional[str] = None,
+         system_prompt: Optional[str] = None,
+         provider: Optional[str] = None,
+@@ -1060,7 +1072,11 @@ class PluginLlm:
+             schema_name=schema_name,
+             system_prompt=system_prompt,
+         )
+-        extra_body = self._json_response_format(json_mode=json_mode, json_schema=json_schema)
++        extra_body = (
++            self._json_response_format(json_mode=json_mode, json_schema=json_schema)
++            if send_response_format
++            else None
++        )
+         real_provider, real_model, response = await self._invoke_async(
+             messages=messages,
+             provider_override=eff_provider,
+diff --git a/tests/agent/test_plugin_llm.py b/tests/agent/test_plugin_llm.py
+index 3801694..73ce8b4 100644
+--- a/tests/agent/test_plugin_llm.py
++++ b/tests/agent/test_plugin_llm.py
+@@ -352,6 +352,68 @@ class TestPluginLlmFacade:
+         }
+         assert result.content_type == "json"
+ 
++    def test_complete_structured_prompt_only_omits_wire_format_but_validates(self):
++        pytest.importorskip("jsonschema")
++        captured: dict = {}
++        schema = {
++            "type": "object",
++            "properties": {"event": {"type": "string"}},
++            "required": ["event"],
++            "additionalProperties": False,
++        }
++
++        def fake_caller(**kwargs):
++            captured.update(kwargs)
++            return "provider", "model", _fake_response('{"event": "repair"}')
++
++        llm = make_plugin_llm_for_test(
++            plugin_id="my-plugin",
++            policy=_TrustPolicy(plugin_id="my-plugin"),
++            sync_caller=fake_caller,
++        )
++        result = llm.complete_structured(
++            instructions="Return exactly one event",
++            input=[PluginLlmTextInput(text="witness")],
++            json_schema=schema,
++            json_mode=True,
++            send_response_format=False,
++        )
++
++        assert captured["extra_body"] is None
++        prompt = captured["messages"][-1]["content"][0]["text"]
++        assert "Return exactly one event" in prompt
++        assert "JSON schema:" in prompt
++        assert '"additionalProperties": false' in prompt
++        assert result.parsed == {"event": "repair"}
++
++    def test_complete_structured_sends_wire_format_by_default(self):
++        captured: dict = {}
++        schema = {
++            "type": "object",
++            "properties": {"event": {"type": "string"}},
++        }
++
++        def fake_caller(**kwargs):
++            captured.update(kwargs)
++            return "provider", "model", _fake_response('{"event": "repair"}')
++
++        llm = make_plugin_llm_for_test(
++            plugin_id="my-plugin",
++            policy=_TrustPolicy(plugin_id="my-plugin"),
++            sync_caller=fake_caller,
++        )
++        llm.complete_structured(
++            instructions="Return one event",
++            input=[PluginLlmTextInput(text="witness")],
++            json_schema=schema,
++        )
++
++        assert captured["extra_body"]["response_format"]["type"] == "json_schema"
++        assert (
++            captured["extra_body"]["response_format"]["json_schema"]["schema"]
++            == schema
++        )
++
+ 
+ 
+ 
+@@ -406,7 +468,10 @@ class TestAsyncSurface:
+         assert result.provider == "openai"
+ 
+     def test_acomplete_structured_parses_json(self):
+-        async def fake_async(**_kwargs):
++        captured: dict = {}
++
++        async def fake_async(**kwargs):
++            captured.update(kwargs)
+             return "openai", "gpt-4o", _fake_response('{"x": 42}')
+ 
+         llm = make_plugin_llm_for_test(
+@@ -420,11 +485,13 @@ class TestAsyncSurface:
+                 instructions="Extract x",
+                 input=[PluginLlmTextInput(text="data")],
+                 json_mode=True,
++                send_response_format=False,
+             )
+ 
+         result = asyncio.run(_run())
+         assert result.parsed == {"x": 42}
+         assert result.content_type == "json"
++        assert captured["extra_body"] is None
+ 
+ 
+ # ---------------------------------------------------------------------------

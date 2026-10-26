@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "plugin_id": "lilith_relationship",
+  "plugin_version": "1.1.20",
+  "files": [
+    {
+      "path": "__init__.py",
+      "sha256": "e4566c5a9e41cc32015332f5b06ce363a1c34bee7033eb021f7ab5d24bcbbac5"
+    },
+    {
+      "path": "batch_review.py",
+      "sha256": "578f89279eb61bacb6c0dcce965059e58f16d4830c67a470935af45e3ea6f6b6"
+    },
+    {
+      "path": "cli.py",
+      "sha256": "33d0e17a385791c9b062f7c2dcc84885718624b757520cd130a6e54f0a2e0f37"
+    },
+    {
+      "path": "domain.py",
+      "sha256": "d8621a5db3d2bd3360086b2248bc410b0912c08d4e765f677df6107e78c04793"
+    },
+    {
+      "path": "expression_store.py",
+      "sha256": "581b8e36e2db8dd14e457f4f3a74ec91cf7dc50e550a86bc4153e446181d5e4f"
+    },
+    {
+      "path": "local_review.py",
+      "sha256": "c02deebccf5f4c5da23ee3e7fff40e13d138c616eedf9d8f0679b72e7be485e8"
+    },
+    {
+      "path": "plugin.yaml",
+      "sha256": "202f30050a9136e62451de09932339261c248c8ac3f728906dfa203c35537a7d"
+    },
+    {
+      "path": "profile_domain.py",
+      "sha256": "f0c975f57a986459e38be07ad94f49691b4c3979f8dbf03f6315363b832ec2dc"
+    },
+    {
+      "path": "profile_reviewer.py",
+      "sha256": "a99408c6fcc7a1842fab069c1ca88c6346c4d812faf5dbb057da3ce897b962b3"
+    },
+    {
+      "path": "profile_store.py",
+      "sha256": "9cd822de758cfa7eabd299327f4094a8a839dbd5ff2878a5127371b35bbb5ee6"
+    },
+    {
+      "path": "reviewer.py",
+      "sha256": "0183e4918a3e81925a477a99f74300dee38ad98cf2bb77cc99b3bcccf3b366ab"
+    },
+    {
+      "path": "selector.py",
+      "sha256": "52e1860574a91a67f3880975e86ec2db802b307d203d0b614ece8d88472b79e7"
+    },
+    {
+      "path": "store.py",
+      "sha256": "26f984c03edf66136532da9ae19dba6228f011c3f80c356f19922ed1a2a40207"
+    },
+    {
+      "path": "usage_origin.py",
+      "sha256": "1078d35c84fb119afe5908a964546b17e73289971b1b6cb606c7b33f812d2e87"
+    }
+  ]
+}

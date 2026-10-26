@@ -1,0 +1,360 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 4fadb7f..bed3424 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -4756,11 +4756,11 @@ def _scoped_auxiliary_runtime_context(snapshot: object):
+     client_token = _AUXILIARY_TASK_CLIENT_CONTEXT.set(task_client)
+     try:
+         from agent.usage_budget_runtime import bind_origin
+-        from agent.local_compatibility import bind_policy
++        from agent.local_compatibility import bind_policy, current_policy
+         origin = snapshot._materialize_usage_origin_for_host()
+         with (bind_origin(origin) if origin is not None else contextlib.nullcontext()), bind_policy(snapshot._materialize_local_compatibility_for_host()):
+             sink = snapshot._materialize_local_usage_sink_for_host()
+-            if sink is None:
++            if sink is None or current_policy() is None:
+                 yield
+             else:
+                 from agent.aux_accounting import bind_local_usage_sink
+@@ -9357,6 +9357,31 @@ def _resolve_task_provider_model(
+             api_key = cfg_api_key
+ 
+     if base_url and provider and str(provider).startswith("custom:"):
++        # Native compression inherits the strict owning agent's exact route.
++        # A saved local no-auth entry remains that entry after the optional
++        # local compatibility product is retired; erasing its ID to `custom`
++        # would also erase the existing empty-key SDK authorization contract.
++        # This is not an endpoint heuristic or an ambient credential fallback.
++        from agent.identity_policy import identity_lock_required_by_host
++        from hermes_cli.provider_setup import allows_empty_key, _endpoint_identity, SetupError
++        owner_runtime = _RUNTIME_MAIN_CONTEXT.get() or {}
++        if (identity_lock_required_by_host()
++                and api_key == "" and owner_runtime.get("api_key") == ""
++                and provider == owner_runtime.get("provider")
++                and resolved_model == owner_runtime.get("model")
++                and (resolved_api_mode or owner_runtime.get("api_mode")) == "chat_completions"):
++            try:
++                # OpenAI's SDK adds a trailing slash. Use the same identity
++                # comparison as the managed entry's exact_route check; do not
++                # mistake that spelling difference for a different endpoint.
++                owned_noauth = (
++                    _endpoint_identity(base_url) == _endpoint_identity(owner_runtime.get("base_url"))
++                    and allows_empty_key(provider, base_url, api_key)
++                )
++            except (SetupError, ValueError):
++                owned_noauth = False
++            if owned_noauth:
++                return provider, resolved_model, base_url, api_key, resolved_api_mode
+         # Compression passes the owning strict agent's concrete route. The
+         # legacy generic base-url resolver deliberately erases custom IDs;
+         # doing so for an already-frozen local turn breaks its exact guard.
+diff --git a/agent/local_compatibility.py b/agent/local_compatibility.py
+index 0741c4c..344aa40 100644
+--- a/agent/local_compatibility.py
++++ b/agent/local_compatibility.py
+@@ -1,11 +1,13 @@
+-"""Opt-in local request compatibility, never routing or permission authority.
+-
+-The host freezes the preference and resolved capacity at a human-turn boundary.
+-Nothing is inferred from a model name, private-IP heuristic, or caller boolean.
+-Counts remain explicitly estimates, not a promise about an unknown tokenizer.
++"""Retired local-compatibility ABI; all providers use the shared Hermes path.
++
++Historical policy/store modules remain importable for migration evidence, not
++runtime authority. An old enabled preference or captured policy must never
++restore local-only request shaping, summary or review branches. No preference
++or capacity IO, routing, or new permission policy occurs here. Shared native
++request validation, economy accounting and approvals remain with their owners;
++these functions preserve the former Off behavior.
+ """
+ from contextlib import contextmanager
+-from contextvars import ContextVar
+ from dataclasses import dataclass, field
+ from hashlib import sha256
+ from urllib.parse import urlsplit
+@@ -14,11 +16,12 @@ from agent.usage_budget import BudgetError
+ 
+ 
+ class LocalCompatibilityError(BudgetError):
+-    pass
++    """Historical error type; retired entry points never raise it."""
+ 
+ 
+ @dataclass(frozen=True)
+ class LocalCompatibilityPolicy:
++    """Historical value type only, never accepted as a live policy."""
+     context_tokens: int
+     input_budget: int
+     output_reserve: int
+@@ -28,11 +31,8 @@ class LocalCompatibilityPolicy:
+     enabled: bool = field(default=True, init=False)
+ 
+ 
+-_CURRENT = ContextVar("lilith_local_compatibility", default=None)
+-_NATIVE_LOCAL = frozenset(("local", "ollama", "lmstudio", "lm-studio", "llamacpp", "llama.cpp", "vllm"))
+-
+-
+ def _endpoint(value):
++    """Retained pure accounting helper; this performs no endpoint IO."""
+     if not isinstance(value, str):
+         return None
+     try:
+@@ -51,164 +51,43 @@ def _digest(provider, model, endpoint, api_mode):
+     return sha256(repr((provider, model, endpoint, api_mode or "chat_completions")).encode("utf-8")).hexdigest()
+ 
+ 
+-def _declared_local(runtime):
+-    endpoint = _endpoint(runtime.get("base_url"))
+-    if endpoint is None or runtime.get("api_mode", "chat_completions") not in ("", "chat_completions"):
+-        return False
+-    provider = str(runtime.get("provider") or "").lower()
+-    requested = str(runtime.get("requested_provider") or "").lower()
+-    if provider in _NATIVE_LOCAL or (provider == "custom" and requested in _NATIVE_LOCAL):
+-        return True
+-    # Validate the exact saved entry and marker. Never load its credential.
+-    try:
+-        from hermes_cli.provider_setup import _raw_config, owned_entry
+-        entry = owned_entry(_raw_config(), provider)
+-        return (entry["lilith_setup"]["kind"] == "local"
+-                and _endpoint(entry["base_url"]) == endpoint
+-                )
+-    except Exception:
+-        return False
+-
+-
+ def freeze_for_agent(agent):
+-    """Called only at the owned turn prologue; Off/cloud do no metadata probe."""
+-    runtime = {name: getattr(agent, name, "") for name in
+-               ("provider", "requested_provider", "model", "base_url", "api_mode")}
+-    if _endpoint(runtime["base_url"]) is None:
+-        return None
+-    try:
+-        from hermes_cli.config import get_hermes_home
+-        from agent.local_compatibility_store import get_preference
+-        if get_preference(get_hermes_home()).enabled is not True or not _declared_local(runtime):
+-            return None
+-        from agent.local_compatibility_capacity import loaded_capacity
+-        capacity = loaded_capacity(runtime, getattr(agent, "api_key", ""))
+-        if type(capacity) is not int or capacity < 64000:
+-            raise LocalCompatibilityError("local_compatibility_context_unavailable")
+-        reserve = 4096
+-        # Leave explicit headroom in addition to the actual output reservation.
+-        input_budget = capacity - reserve - max(2048, capacity // 10)
+-        return LocalCompatibilityPolicy(capacity, input_budget, reserve,
+-            _digest(runtime["provider"], runtime["model"], _endpoint(runtime["base_url"]), runtime["api_mode"]),
+-            runtime["requested_provider"], runtime["provider"])
+-    except LocalCompatibilityError:
+-        raise
+-    except Exception:
+-        # An unreadable switch is never interpreted as enabled.
+-        return None
++    """Do not read legacy settings or probe capacity, even when enabled=True."""
++    return None
+ 
+ 
+ def for_agent(agent):
+-    policy = getattr(agent, "_local_compatibility_policy", None)
+-    if policy is None:
+-        return None
+-    if not matches(policy, provider=getattr(agent, "provider", ""), model=getattr(agent, "model", ""),
+-        base_url=getattr(agent, "base_url", ""), api_mode=getattr(agent, "api_mode", ""),
+-        requested_provider=getattr(agent, "requested_provider", "")):
+-        raise LocalCompatibilityError("local_compatibility_route_changed")
+-    return policy
++    """Ignore historical in-memory policies, including mismatched routes."""
++    return None
+ 
+ 
+ def matches(policy, *, provider, model, base_url, api_mode="chat_completions", requested_provider=None):
+-    return (type(policy) is LocalCompatibilityPolicy and _endpoint(base_url) is not None
+-            and policy.route_digest == _digest(provider, model, _endpoint(base_url), api_mode)
+-            and (requested_provider is None or requested_provider == policy.requested_provider))
++    """No historical policy can acquire runtime authority after retirement."""
++    return False
+ 
+ 
+ def current_policy():
+-    return _CURRENT.get()
++    return None
+ 
+ 
+ def compressor_policy(compressor):
+-    agent = getattr(compressor, "_strict_identity_agent", None)
+-    policy = getattr(agent, "_local_compatibility_policy", None)
+-    if policy is None:
+-        return None
+-    # Model-switch initialization may inspect the old compressor between
+-    # turns. It cannot borrow the old policy; actual dispatch rejects drift.
+-    try:
+-        return for_agent(agent)
+-    except LocalCompatibilityError:
+-        return None
++    return None
+ 
+ 
+ @contextmanager
+ def bind_policy(policy):
+-    if policy is not None and type(policy) is not LocalCompatibilityPolicy:
+-        raise TypeError("expected host local compatibility policy")
+-    token = _CURRENT.set(policy)
+-    try:
+-        yield
+-    finally:
+-        _CURRENT.reset(token)
++    """Compatibility no-op; a captured policy cannot reactivate the mode."""
++    yield
+ 
+ 
+ def prepare_request(policy, request, *, provider, model, base_url, api_mode="chat_completions"):
+-    """Final send-copy guard. Never truncate authority, tools or current input."""
+-    if policy is None:
+-        return request
+-    if not matches(policy, provider=provider, model=model, base_url=base_url, api_mode=api_mode):
+-        raise LocalCompatibilityError("local_compatibility_route_changed")
+-    extra = request.get("extra_body")
+-    if extra is not None and type(extra) is not dict:
+-        raise BudgetError("invalid_extra_body")
+-    if extra and any(key in extra for key in ("stream", "stream_options", "timeout",
+-            "extra_headers", "extra_query", "extra_body")):
+-        raise BudgetError("late_wire_override")
+-    body = {key: value for key, value in request.items() if key != "extra_body"}
+-    if extra:
+-        body.update(extra)
+-    if "model" in body and body["model"] != model:
+-        raise LocalCompatibilityError("local_compatibility_route_changed")
+-    from agent.usage_budget_official_routes import estimate_final_input
+-    measured = estimate_final_input(request)
+-    if measured.tokens > policy.input_budget:
+-        raise LocalCompatibilityError("local_compatibility_input_too_large")
+-    result = body
+-    fields = [key for key in ("max_tokens", "max_completion_tokens") if key in result]
+-    for key in fields:
+-        if type(result[key]) is not int or result[key] <= 0:
+-            raise LocalCompatibilityError("local_compatibility_output_cap_invalid")
+-    if len(fields) > 1 and result[fields[0]] != result[fields[1]]:
+-        raise LocalCompatibilityError("local_compatibility_output_cap_conflict")
+-    # Preserve a smaller explicit caller cap even if SDK extra_body would
+-    # otherwise overwrite that same key. Never mutate either caller container.
+-    prior_caps = [container[key] for container in (request, extra or {})
+-                  for key in ("max_tokens", "max_completion_tokens") if key in container]
+-    if any(type(value) is not int or value <= 0 for value in prior_caps):
+-        raise LocalCompatibilityError("local_compatibility_output_cap_invalid")
+-    cap = min([policy.output_reserve] + prior_caps)
+-    result[fields[0] if fields else "max_tokens"] = cap
+-    if len(fields) > 1:
+-        result[fields[1]] = cap
+-    if extra is not None:
+-        original_keys = set(request) - {"extra_body"}
+-        output_keys = {"max_tokens", "max_completion_tokens"}
+-        restored = {key: value for key, value in result.items() if key in original_keys or key in output_keys}
+-        remaining = {key: value for key, value in result.items() if key not in restored}
+-        if remaining:
+-            restored["extra_body"] = remaining
+-        return restored
+-    return result
++    """Shared native validators remain authoritative; preserve exact Off bytes."""
++    return request
+ 
+ 
+ def prepare_final_sdk_request(client, request, wire_format):
+-    """Last physical leaf after native quota shaping; local capacity wins."""
+-    policy = current_policy()
+-    if policy is None:
+-        return request
+-    import sys
+-    sdk = sys.modules.get("openai")
+-    if (sdk is None or type(client) not in (getattr(sdk, "OpenAI", None), getattr(sdk, "AsyncOpenAI", None))
+-            or wire_format not in ("chat_completions", "chat_max_tokens", "chat_max_completion_tokens")):
+-        raise LocalCompatibilityError("local_compatibility_route_changed")
+-    extra = request.get("extra_body")
+-    model = extra.get("model", request.get("model")) if isinstance(extra, dict) else request.get("model")
+-    return prepare_request(policy, request, provider=policy.provider, model=model,
+-        base_url=str(getattr(client, "base_url", "")), api_mode="chat_completions")
++    return request
+ 
+ 
+ def prepare_agent_request(agent, request):
+-    policy = for_agent(agent)
+-    return prepare_request(policy, request, provider=getattr(agent, "provider", ""), model=getattr(agent, "model", ""),
+-        base_url=getattr(agent, "base_url", ""), api_mode=getattr(agent, "api_mode", ""))
++    return request
+diff --git a/agent/plugin_llm.py b/agent/plugin_llm.py
+index ef39fca..03be4ce 100644
+--- a/agent/plugin_llm.py
++++ b/agent/plugin_llm.py
+@@ -765,11 +765,11 @@ class PluginLlm:
+         return capture_auxiliary_runtime_context(task=task)
+ 
+     def inspect_local_compatibility(self, snapshot: object):
+-        """Read the host-frozen policy without exposing route or credentials."""
++        """Retired capability: old snapshots cannot select a local-only review."""
+         from agent.auxiliary_client import _AuxiliaryRuntimeContext
+         if type(snapshot) is not _AuxiliaryRuntimeContext:
+             raise TypeError("expected an opaque auxiliary runtime context")
+-        return snapshot._materialize_local_compatibility_for_host()
++        return None
+ 
+     def run_in_runtime_context(
+         self,
+diff --git a/tui_gateway/methods_local_compatibility.py b/tui_gateway/methods_local_compatibility.py
+index 4f5a213..e6856d4 100644
+--- a/tui_gateway/methods_local_compatibility.py
++++ b/tui_gateway/methods_local_compatibility.py
+@@ -1,13 +1,10 @@
+-"""Human Runtime control-plane handlers, not agent tools or config setters.
++"""Retired human control-plane routes; no preference IO or mutation remains.
+ 
+-Registration freezes the trusted gateway launch profile. Neither a session's
+-ambient home override nor any client-supplied path can redirect this store.
+-The authenticated Runtime enforces Workbench ownership; native additionally
+-rejects generic WebSockets and hosts without the pinned identity contract.
+-The existing server-attested Runtime WebSocket is the production ingress.
++Retain native transport/identity/quarantine and shape gates for old clients,
++then return a closed retirement code. No profile path is selected and no old
++setting is read, changed, migrated or presented as an effective preference.
+ """
+ from agent.local_compatibility_preferences import PreferenceError, parse_update
+-from agent.local_compatibility_store import get_preference, set_preference
+ 
+ 
+ def _strict_host_required():
+@@ -16,7 +13,6 @@ def _strict_host_required():
+ 
+ 
+ def register(server):
+-    profile_root = server._hermes_home
+     stdio = server._stdio_transport
+ 
+     def failure(rid, code):
+@@ -40,29 +36,12 @@ def register(server):
+         # knobs for permission, maximum tokens, session identity or profile.
+         try:
+             if mutation:
+-                update = parse_update(params)
++                parse_update(params)
+             elif type(params) is not dict or params:
+                 raise PreferenceError("invalid_fields")
+         except PreferenceError:
+             return failure(rid, "invalid_request")
+-        try:
+-            if mutation:
+-                return server._ok(rid, set_preference(profile_root, update).to_wire())
+-            return server._ok(rid, get_preference(profile_root).to_wire())
+-        except PreferenceError as error:
+-            # Never echo exception text, private paths or rejected data.
+-            code = str(error)
+-            if code not in {
+-                "revision_conflict", "operation_conflict", "revision_exhausted",
+-                "store_capacity_reached", "store_busy", "store_unavailable",
+-                "store_malformed", "unsafe_store_path",
+-            }:
+-                code = "operation_failed"
+-            return failure(rid, code)
+-        except Exception:
+-            # Persistence may have committed before an IO failure; the caller
+-            # must use the same operation ID/readback, not presume rollback.
+-            return failure(rid, "operation_failed")
++        return failure(rid, "retired")
+ 
+     server._methods["local_compatibility.get"] = lambda rid, params: invoke(rid, params, method="local_compatibility.get")
+     server._methods["local_compatibility.set"] = lambda rid, params: invoke(rid, params, method="local_compatibility.set")

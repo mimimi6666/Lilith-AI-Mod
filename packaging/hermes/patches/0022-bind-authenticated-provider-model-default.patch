@@ -1,0 +1,878 @@
+diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
+index 81eacb4..51f92ab 100644
+--- a/hermes_cli/inventory.py
++++ b/hermes_cli/inventory.py
+@@ -77,6 +77,157 @@ class ConfigContext:
+         return replace(self, **kw) if kw else self
+ 
+ 
++class AuthenticatedModelPairError(RuntimeError):
++    """A provider/model pair could not be proven from authenticated inventory.
++
++    ``code`` is intentionally stable so non-Python clients can distinguish a
++    required model selection from an agent-construction failure. Provider and
++    model are identifiers already exposed by the picker; credentials never
++    cross this boundary.
++    """
++
++    code = "model_selection_required"
++
++    def __init__(self, *, provider: str = "", model: str = "") -> None:
++        super().__init__("Select an authenticated provider and compatible model.")
++        self.provider = str(provider or "").strip()
++        self.model = str(model or "").strip()
++
++
++def _authenticated_pair_rows(rows: list[dict]) -> list[tuple[str, list[str], dict]]:
++    """Normalize rows that can prove an executable provider/model pair."""
++    normalized: list[tuple[str, list[str], dict]] = []
++    for row in rows:
++        # This function consumes an attested picker projection. Missing/None is
++        # not evidence; callers must first apply picker hints or supply an
++        # explicit authenticated=True row.
++        if not isinstance(row, dict) or row.get("authenticated") is not True:
++            continue
++        slug = str(row.get("slug") or "").strip()
++        raw_models = row.get("models")
++        if not slug or not isinstance(raw_models, (list, tuple)):
++            continue
++        models: list[str] = []
++        for item in raw_models:
++            model = item if isinstance(item, str) else ""
++            if model and model not in models:
++                models.append(model)
++        if models:
++            normalized.append((slug, models, row))
++    return normalized
++
++
++def _provider_row_default(slug: str, models: list[str]) -> str:
++    """Return a provider-specific catalog default that the row actually serves.
++
++    A provider helper is authoritative only when its result belongs to the
++    authenticated row. Unknown/custom providers have no generic helper default;
++    a one-model row is still deterministic, while a multi-model row requires a
++    user selection. This never borrows a global silent default from a different
++    provider.
++    """
++    try:
++        from hermes_cli.models import get_default_model_for_provider
++
++        default = str(get_default_model_for_provider(slug.casefold()) or "").strip()
++    except Exception:
++        default = ""
++    if default and default in models:
++        return default
++    return models[0] if len(models) == 1 else ""
++
++
++def select_authenticated_model_pair(
++    rows: list[dict],
++    ctx: ConfigContext,
++    *,
++    requested_provider: Optional[str] = None,
++    requested_model: Optional[str] = None,
++) -> tuple[str, str]:
++    """Select one exact authenticated provider/model pair, or ``("", "")``.
++
++    ``None`` means "use the configured value" while ``""`` is an explicit
++    absence. This distinction lets a provider-only launch request choose that
++    provider's own default instead of inheriting a stale model configured for a
++    different provider.
++
++    Resolution is deliberately conservative:
++
++    * a full pair must be present verbatim in one authenticated row;
++    * a provider-only request uses its provider-specific default helper, and
++      accepts a sole advertised model when the provider has no helper default;
++    * a model-only request must occur under exactly one authenticated provider;
++    * an implicit choice requires exactly one non-virtual authenticated row.
++
++    Virtual routing modes remain selectable when explicitly configured, but do
++    not compete with real credential providers for an implicit default.
++    """
++    provider = str(
++        ctx.current_provider if requested_provider is None else requested_provider
++    ).strip()
++    model = str(ctx.current_model if requested_model is None else requested_model).strip()
++    candidates = _authenticated_pair_rows(rows)
++
++    if provider and model:
++        key = provider.casefold()
++        matches = [entry for entry in candidates if entry[0].casefold() == key]
++        if len(matches) != 1 or model not in matches[0][1]:
++            return "", ""
++        return matches[0][0], model
++
++    if provider:
++        key = provider.casefold()
++        matches = [entry for entry in candidates if entry[0].casefold() == key]
++        if len(matches) != 1:
++            return "", ""
++        selected = _provider_row_default(matches[0][0], matches[0][1])
++        return (matches[0][0], selected) if selected else ("", "")
++
++    if model:
++        matches = [entry for entry in candidates if model in entry[1]]
++        slugs = {entry[0].casefold() for entry in matches}
++        if len(matches) != 1 or len(slugs) != 1:
++            return "", ""
++        return matches[0][0], model
++
++    real_candidates = [
++        entry
++        for entry in candidates
++        if str(entry[2].get("source") or "").strip().casefold() != "virtual"
++    ]
++    if len(real_candidates) != 1:
++        return "", ""
++    slug, models, _row = real_candidates[0]
++    selected = _provider_row_default(slug, models)
++    return (slug, selected) if selected else ("", "")
++
++
++def require_authenticated_model_pair(
++    rows: list[dict],
++    ctx: ConfigContext,
++    *,
++    requested_provider: Optional[str] = None,
++    requested_model: Optional[str] = None,
++) -> tuple[str, str]:
++    """Return a proven pair or raise the typed selection-required error."""
++    pair = select_authenticated_model_pair(
++        rows,
++        ctx,
++        requested_provider=requested_provider,
++        requested_model=requested_model,
++    )
++    if pair[0] and pair[1]:
++        return pair
++    raise AuthenticatedModelPairError(
++        provider=(
++            ctx.current_provider
++            if requested_provider is None
++            else requested_provider
++        ),
++        model=ctx.current_model if requested_model is None else requested_model,
++    )
++
++
+ def load_picker_context() -> ConfigContext:
+     """Load the disk-config snapshot every consumer needs.
+ 
+@@ -513,7 +664,7 @@ def _selectable_root_default(
+     rows: list[dict],
+     ctx: ConfigContext,
+ ) -> tuple[str, str]:
+-    """Return a catalog-backed provider/model default or an empty pair.
++    """Return an authenticated provider/model default or an empty pair.
+ 
+     A merged/default config may carry a model after its provider was removed
+     (including a fresh profile whose host supplied a default model only).
+@@ -522,30 +673,13 @@ def _selectable_root_default(
+     the payload we actually emit: both values must be present, the provider row
+     must be selectable, and the exact model must belong to that row.
+ 
+-    Provider matching is case-insensitive only to recover the canonical slug
+-    already present in the catalog.  Model IDs remain exact because callers
+-    select and attest the emitted IDs verbatim; no vendor/model inference is
+-    performed here.
++    Explicit pairs remain exact. When config has no complete pair, the shared
++    authenticated-pair resolver may derive one only from a unique inventory row
++    and that provider's own catalog default. Provider matching is
++    case-insensitive only to recover the canonical slug already present in the
++    catalog; model IDs remain exact.
+     """
+-    provider = str(ctx.current_provider or "").strip()
+-    model = str(ctx.current_model or "").strip()
+-    if not provider or not model:
+-        return "", ""
+-
+-    provider_key = provider.casefold()
+-    for row in rows:
+-        slug = str(row.get("slug") or "").strip()
+-        if not slug or slug.casefold() != provider_key:
+-            continue
+-        if row.get("authenticated") is False:
+-            return "", ""
+-        models = row.get("models")
+-        if not isinstance(models, (list, tuple)):
+-            return "", ""
+-        if any(isinstance(item, str) and item == model for item in models):
+-            return slug, model
+-        return "", ""
+-    return "", ""
++    return select_authenticated_model_pair(rows, ctx)
+ 
+ 
+ def _append_unconfigured_rows(
+diff --git a/tests/hermes_cli/test_inventory.py b/tests/hermes_cli/test_inventory.py
+index 4c632ed..fd107f2 100644
+--- a/tests/hermes_cli/test_inventory.py
++++ b/tests/hermes_cli/test_inventory.py
+@@ -21,12 +21,17 @@ from __future__ import annotations
+ 
+ from unittest.mock import patch
+ 
++import pytest
++
+ 
+ from hermes_cli.inventory import (
++    AuthenticatedModelPairError,
+     ConfigContext,
+     build_model_options_payload,
+     build_models_payload,
+     load_picker_context,
++    require_authenticated_model_pair,
++    select_authenticated_model_pair,
+ )
+ 
+ 
+@@ -235,6 +240,99 @@ def test_model_options_root_default_must_be_selectable_and_catalog_backed():
+     assert missing_model["model"] == ""
+ 
+ 
++def test_single_authenticated_provider_uses_its_own_catalog_default():
++    ctx = _empty_ctx(provider="", model="")
++    row = {
++        "slug": "provider-a",
++        "name": "Provider A",
++        "models": ["model-a", "model-b"],
++        "total_models": 2,
++        "is_current": False,
++        "is_user_defined": False,
++        "source": "built-in",
++        "authenticated": True,
++    }
++    with (
++        _list_auth_returning([row]),
++        patch(
++            "hermes_cli.models.get_default_model_for_provider",
++            side_effect=lambda slug: "model-a" if slug == "provider-a" else "",
++        ),
++    ):
++        payload = build_models_payload(ctx, picker_hints=True)
++
++    assert payload["provider"] == "provider-a"
++    assert payload["model"] == "model-a"
++
++
++def test_multiple_authenticated_providers_never_gain_an_implicit_root_pair():
++    ctx = _empty_ctx(provider="", model="")
++    rows = [
++        {
++            "slug": "provider-a",
++            "models": ["model-a"],
++            "source": "built-in",
++            "authenticated": True,
++        },
++        {
++            "slug": "provider-b",
++            "models": ["model-b"],
++            "source": "built-in",
++            "authenticated": True,
++        },
++    ]
++
++    assert select_authenticated_model_pair(rows, ctx) == ("", "")
++    with pytest.raises(AuthenticatedModelPairError) as caught:
++        require_authenticated_model_pair(rows, ctx)
++    assert caught.value.code == "model_selection_required"
++
++
++@pytest.mark.parametrize("authenticated", ["missing", None, False])
++def test_missing_or_non_true_authentication_claim_fails_closed(authenticated):
++    ctx = _empty_ctx(provider="provider-a", model="model-a")
++    row = {
++        "slug": "provider-a",
++        "models": ["model-a"],
++        "source": "built-in",
++    }
++    if authenticated != "missing":
++        row["authenticated"] = authenticated
++
++    assert select_authenticated_model_pair([row], ctx) == ("", "")
++
++
++def test_unknown_multi_model_provider_requires_selection_without_catalog_default():
++    ctx = _empty_ctx(provider="", model="")
++    row = {
++        "slug": "custom-provider",
++        "models": ["model-a", "model-b"],
++        "source": "user-config",
++        "authenticated": True,
++    }
++    with patch("hermes_cli.models.get_default_model_for_provider", return_value=""):
++        assert select_authenticated_model_pair([row], ctx) == ("", "")
++
++
++def test_explicit_authenticated_pair_is_preserved_without_default_inference():
++    ctx = _empty_ctx(provider="", model="")
++    rows = [
++        {
++            "slug": "custom-provider",
++            "models": ["chosen-model", "other-model"],
++            "source": "user-config",
++            "authenticated": True,
++        }
++    ]
++
++    assert select_authenticated_model_pair(
++        rows,
++        ctx,
++        requested_provider="CUSTOM-PROVIDER",
++        requested_model="chosen-model",
++    ) == ("custom-provider", "chosen-model")
++
++
+ def test_explicit_only_filters_ambient_credentials_but_keeps_current_and_custom_rows():
+     rows = [
+         {"slug": "openai-codex", "name": "OpenAI Codex", "models": ["gpt-5.4"],
+@@ -575,5 +673,3 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
+ 
+     with patch("agent.models_dev.get_model_info", side_effect=_fake_get_model_info):
+         inventory._apply_featured(rows)
+-
+-
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index 7317f77..70816b1 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -3705,6 +3705,11 @@ def test_make_agent_passes_configured_fallback_chain(monkeypatch):
+     monkeypatch.delenv("HERMES_TUI_PROVIDER", raising=False)
+     monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+     monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
++    monkeypatch.setattr(
++        server,
++        "_resolve_authenticated_runtime_pair",
++        lambda **_kwargs: ("gpt-5.5", "openai-codex"),
++    )
+     monkeypatch.setattr(
+         server,
+         "_load_cfg",
+@@ -12246,6 +12251,11 @@ def test_session_create_lazy_info_reports_desktop_contract(monkeypatch):
+     monkeypatch.setattr(server, "_get_db", lambda: None)
+     monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **kw: None)
++    monkeypatch.setattr(
++        server,
++        "_resolve_session_create_model_pair",
++        lambda **_kwargs: ("test-model", "test-provider"),
++    )
+ 
+     resp = server.handle_request(
+         {"id": "1", "method": "session.create", "params": {"cols": 80}}
+@@ -12558,6 +12568,11 @@ def test_session_create_reports_requested_profile_name(monkeypatch, tmp_path):
+     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+     monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+     monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda *a, **k: None)
++    monkeypatch.setattr(
++        server,
++        "_resolve_session_create_model_pair",
++        lambda **_kwargs: ("test-model", "test-provider"),
++    )
+     monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
+     monkeypatch.setattr(server, "_profile_home", lambda p: profile_home if p == "mlperf" else None)
+     monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+@@ -15824,6 +15839,11 @@ def test_close_sessions_for_transport_closes_flagged_repoints_rest(monkeypatch):
+ 
+ def test_session_create_records_close_on_disconnect_flag(monkeypatch):
+     monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
++    monkeypatch.setattr(
++        server,
++        "_resolve_session_create_model_pair",
++        lambda **_kwargs: ("test-model", "test-provider"),
++    )
+     server._sessions.clear()
+     try:
+         on = server.handle_request(
+@@ -15840,6 +15860,11 @@ def test_session_create_records_close_on_disconnect_flag(monkeypatch):
+ 
+ def test_session_create_records_source(monkeypatch):
+     monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
++    monkeypatch.setattr(
++        server,
++        "_resolve_session_create_model_pair",
++        lambda **_kwargs: ("test-model", "test-provider"),
++    )
+     server._sessions.clear()
+     try:
+         sid = server.handle_request(
+@@ -16117,6 +16142,14 @@ def test_session_create_records_ui_model_as_session_override(monkeypatch):
+     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+     # Don't run the real deferred build in this storage-focused test.
+     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
++    monkeypatch.setattr(
++        server,
++        "_resolve_session_create_model_pair",
++        lambda *, requested_provider=None, requested_model=None, **_kwargs: (
++            requested_model or "test-model",
++            requested_provider or "test-provider",
++        ),
++    )
+     try:
+         resp = server._methods["session.create"](
+             "r1",
+@@ -16146,10 +16179,14 @@ def test_session_create_records_ui_model_as_session_override(monkeypatch):
+         normal_sess = server._sessions[normal["result"]["session_id"]]
+         assert normal_sess["create_service_tier_override"] == ""
+ 
+-        # No knobs → no overrides; the session builds from the profile default.
++        # No UI knobs still binds the profile/inventory's proven pair before
++        # deferred build; reasoning and tier continue to inherit.
+         plain = server._methods["session.create"]("r3", {"cols": 80})
+         plain_sess = server._sessions[plain["result"]["session_id"]]
+-        assert plain_sess["model_override"] is None
++        assert plain_sess["model_override"] == {
++            "model": "test-model",
++            "provider": "test-provider",
++        }
+         assert plain_sess["create_reasoning_override"] is None
+         assert plain_sess["create_service_tier_override"] is None
+     finally:
+diff --git a/tests/tui_gateway/test_authenticated_model_pairing.py b/tests/tui_gateway/test_authenticated_model_pairing.py
+new file mode 100644
+index 0000000..4a2b296
+--- /dev/null
++++ b/tests/tui_gateway/test_authenticated_model_pairing.py
+@@ -0,0 +1,151 @@
++"""Authenticated provider/model binding at the desktop gateway boundary."""
++
++from __future__ import annotations
++
++import pytest
++
++import tui_gateway.server as server
++from hermes_cli.inventory import ConfigContext
++
++
++def _row(slug: str, *models: str) -> dict:
++    return {
++        "slug": slug,
++        "name": slug,
++        "models": list(models),
++        "total_models": len(models),
++        "is_current": False,
++        "is_user_defined": False,
++        "source": "built-in",
++        "authenticated": True,
++    }
++
++
++def _install_inventory(monkeypatch, *, rows: list[dict], configured: set[str]) -> None:
++    ctx = ConfigContext(
++        current_provider="",
++        current_model="",
++        current_base_url="",
++        user_providers={},
++        custom_providers=[],
++    )
++    monkeypatch.setattr("hermes_cli.inventory.load_picker_context", lambda: ctx)
++    monkeypatch.setattr(
++        "hermes_cli.model_switch.list_authenticated_providers",
++        lambda **_kwargs: [dict(row) for row in rows],
++    )
++    monkeypatch.setattr(
++        "hermes_cli.auth.is_provider_explicitly_configured",
++        lambda slug: slug in configured,
++    )
++    monkeypatch.setattr(
++        "hermes_cli.models.get_default_model_for_provider",
++        lambda slug: f"{slug}-default",
++    )
++    monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_a, **_k: None)
++    monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_a, **_k: None)
++    monkeypatch.setattr("hermes_cli.inventory._apply_featured", lambda *_a, **_k: None)
++
++
++def test_sessionless_options_emit_one_provider_specific_exact_pair(monkeypatch):
++    _install_inventory(
++        monkeypatch,
++        rows=[
++            _row("provider-a", "provider-a-default", "provider-a-other"),
++            _row("ambient-provider", "ambient-provider-default"),
++        ],
++        configured={"provider-a"},
++    )
++    monkeypatch.setattr(
++        server,
++        "_resolve_model",
++        lambda: pytest.fail("a global silent model must not enter model.options"),
++    )
++
++    response = server._methods["model.options"](
++        "options-pair",
++        {"session_id": "", "explicit_only": True},
++    )
++
++    assert response["result"]["provider"] == "provider-a"
++    assert response["result"]["model"] == "provider-a-default"
++    assert [row["slug"] for row in response["result"]["providers"]] == [
++        "provider-a"
++    ]
++
++
++def test_session_create_resolves_unique_provider_default_before_build(
++    monkeypatch, tmp_path
++):
++    """Exercise the real preflight resolver, not its session-create seam."""
++    _install_inventory(
++        monkeypatch,
++        rows=[
++            _row("provider-a", "provider-a-default", "provider-a-other"),
++            _row("ambient-provider", "ambient-provider-default"),
++        ],
++        configured={"provider-a"},
++    )
++    scheduled: list[str] = []
++    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
++    monkeypatch.setattr(server, "_completion_cwd", lambda _params: str(tmp_path))
++    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
++    monkeypatch.setattr(server, "_schedule_agent_build", scheduled.append)
++    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
++    monkeypatch.setattr(
++        server,
++        "_resolve_model",
++        lambda: pytest.fail("session.create must not use a global silent model"),
++    )
++    before = set(server._sessions)
++
++    response = server._methods["session.create"]("create-pair", {"cols": 80})
++    sid = response["result"]["session_id"]
++    try:
++        assert set(server._sessions) == before | {sid}
++        assert server._sessions[sid]["model_override"] == {
++            "model": "provider-a-default",
++            "provider": "provider-a",
++        }
++        assert response["result"]["info"]["model"] == "provider-a-default"
++        assert response["result"]["info"]["provider"] == "provider-a"
++        assert scheduled == [sid]
++    finally:
++        server._sessions.pop(sid, None)
++
++
++@pytest.mark.parametrize(
++    ("params", "rows"),
++    [
++        (
++            {},
++            [
++                _row("provider-a", "provider-a-default"),
++                _row("provider-b", "provider-b-default"),
++            ],
++        ),
++        (
++            {"provider": "provider-a", "model": "unknown-model"},
++            [_row("provider-a", "provider-a-default")],
++        ),
++    ],
++)
++def test_session_create_requires_selection_before_allocating_or_building(
++    monkeypatch, params, rows
++):
++    configured = {str(row["slug"]) for row in rows}
++    _install_inventory(monkeypatch, rows=rows, configured=configured)
++    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
++    monkeypatch.setattr(
++        server,
++        "_schedule_agent_build",
++        lambda _sid: pytest.fail("an unresolved pair must not schedule a build"),
++    )
++    before = set(server._sessions)
++
++    response = server._methods["session.create"]("selection-required", params)
++
++    assert response["error"]["code"] == 4091
++    assert response["error"]["message"] == "model selection required"
++    assert response["error"]["data"]["type"] == "model_selection_required"
++    assert set(server._sessions) == before
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index e03d09d..9624e56 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -45,14 +45,45 @@ def _(rid, params: dict) -> dict:
+     # The desktop composer owns its model/effort/fast as plain UI state and ships
+     # it on every session.create. Honor each as a PER-SESSION override (built into
+     # the agent below) — never a global config write, so picking a model/effort
+-    # for a new chat can't mutate the profile default. provider is optional
+-    # (resolved at build).
+-    create_model = str(params.get("model") or "").strip()
+-    session_model_override = (
+-        {"model": create_model, "provider": str(params.get("provider") or "").strip() or None}
+-        if create_model
+-        else None
+-    )
++    # for a new chat can't mutate the profile default. Before allocating a live
++    # session or scheduling its deferred build, bind a complete pair against the
++    # same authenticated inventory used by model.options. This prevents a
++    # provider-independent model fallback from being combined with whichever
++    # credential provider auto-detection happens to find later.
++    requested_model = str(params.get("model") or "").strip()
++    requested_provider = str(params.get("provider") or "").strip()
++    provider_request = requested_provider or None
++    model_request = requested_model or None
++    if requested_provider and not requested_model:
++        model_request = ""
++    try:
++        create_model, create_provider = _resolve_session_create_model_pair(
++            requested_provider=provider_request,
++            requested_model=model_request,
++            profile_home=profile_home,
++        )
++    except Exception as exc:
++        from hermes_cli.inventory import AuthenticatedModelPairError
++
++        if isinstance(exc, AuthenticatedModelPairError):
++            return _err(
++                rid,
++                4091,
++                "model selection required",
++                {
++                    "type": exc.code,
++                    "provider": exc.provider,
++                    "model": exc.model,
++                },
++            )
++        # Do not serialize an arbitrary credential backend exception into the
++        # process log; some third-party stores include secret-bearing details.
++        logger.warning("authenticated model inventory resolution failed")
++        return _err(rid, 5039, "model inventory is unavailable")
++    session_model_override = {
++        "model": create_model,
++        "provider": create_provider,
++    }
+     create_reasoning_override = None
+     if effort := str(params.get("reasoning_effort") or "").strip():
+         try:
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 3545472..de4ae7c 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -4405,6 +4405,77 @@ def _resolve_model() -> str:
+         return "z-ai/glm-5.2"
+ 
+ 
++def _resolve_authenticated_runtime_pair(
++    *,
++    requested_provider: str | None = None,
++    requested_model: str | None = None,
++    profile_home: str | Path | None = None,
++) -> tuple[str, str]:
++    """Resolve one exact pair from this profile's authenticated inventory.
++
++    This is the non-interactive counterpart of ``model.options``. It shares
++    the same catalog substrate but never substitutes a provider-independent
++    silent model after credentials select a different provider. ``None`` means
++    inherit the configured field; an explicit empty string means the caller
++    supplied only the other field and needs that provider's own default.
++    """
++    home_token = None
++    secret_token = None
++    try:
++        if profile_home:
++            home = Path(profile_home)
++            home_token = set_hermes_home_override(home)
++            from agent.secret_scope import build_profile_secret_scope, set_secret_scope
++
++            secret_token = set_secret_scope(build_profile_secret_scope(home))
++
++        from hermes_cli.inventory import (
++            build_models_payload,
++            load_picker_context,
++            require_authenticated_model_pair,
++        )
++
++        ctx = load_picker_context()
++        payload = build_models_payload(
++            ctx,
++            explicit_only=True,
++            include_unconfigured=False,
++            picker_hints=True,
++            probe_custom_providers=False,
++            probe_current_custom_provider=True,
++        )
++        provider, model = require_authenticated_model_pair(
++            payload.get("providers") or [],
++            ctx,
++            requested_provider=requested_provider,
++            requested_model=requested_model,
++        )
++        return model, provider
++    finally:
++        try:
++            if secret_token is not None:
++                from agent.secret_scope import reset_secret_scope
++
++                reset_secret_scope(secret_token)
++        finally:
++            if home_token is not None:
++                reset_hermes_home_override(home_token)
++
++
++def _resolve_session_create_model_pair(
++    *,
++    requested_provider: str | None = None,
++    requested_model: str | None = None,
++    profile_home: str | Path | None = None,
++) -> tuple[str, str]:
++    """Session-create seam for exact-pair preflight and isolated tests."""
++    return _resolve_authenticated_runtime_pair(
++        requested_provider=requested_provider,
++        requested_model=requested_model,
++        profile_home=profile_home,
++    )
++
++
+ def _resolve_session_platform() -> str:
+     """Resolve the platform tag for a tui_gateway-routed session.
+ 
+@@ -4481,40 +4552,49 @@ def _config_model_target() -> tuple[str, str]:
+ 
+ 
+ def _resolve_startup_runtime() -> tuple[str, str | None]:
+-    model = _resolve_model()
+     explicit_provider = os.environ.get("HERMES_TUI_PROVIDER", "").strip()
+-    if explicit_provider:
+-        return model, explicit_provider
+-
+     explicit_model = (
+         os.environ.get("HERMES_MODEL", "")
+         or os.environ.get("HERMES_INFERENCE_MODEL", "")
+     ).strip()
+-    if not explicit_model:
+-        return model, None
+-
+-    try:
+-        from hermes_cli.models import detect_static_provider_for_model
++    if explicit_model:
++        # A launch-scoped model is an explicit user/host choice, not a silent
++        # default. Preserve the existing static-alias behavior; session.create
++        # independently attests the resulting pair against authenticated rows.
++        if explicit_provider:
++            return explicit_model, explicit_provider
++        try:
++            from hermes_cli.models import detect_static_provider_for_model
+ 
+-        cfg = _load_cfg().get("model") or {}
+-        current_provider = (
+-            (
+-                str(cfg.get("provider") or "").strip().lower()
+-                if isinstance(cfg, dict)
+-                else ""
++            cfg = _load_cfg().get("model") or {}
++            current_provider = (
++                (
++                    str(cfg.get("provider") or "").strip().lower()
++                    if isinstance(cfg, dict)
++                    else ""
++                )
++                or os.environ.get("HERMES_INFERENCE_PROVIDER", "").strip().lower()
++                or "auto"
+             )
+-            or os.environ.get("HERMES_INFERENCE_PROVIDER", "").strip().lower()
+-            or "auto"
+-        )
+-        detected = detect_static_provider_for_model(explicit_model, current_provider)
+-        if detected:
+-            provider, detected_model = detected
+-            return detected_model, provider
+-    except ManagedConfigIntegrityError:
+-        raise
+-    except Exception:
+-        pass
+-    return model, None
++            detected = detect_static_provider_for_model(
++                explicit_model, current_provider
++            )
++            if detected:
++                provider, detected_model = detected
++                return detected_model, provider
++        except ManagedConfigIntegrityError:
++            raise
++        except Exception:
++            pass
++        return explicit_model, None
++
++    # With no explicit model, never call _resolve_model(): its global silent
++    # fallback is provider-independent. Resolve a complete authenticated pair,
++    # and let a provider-only override select only that provider's own default.
++    return _resolve_authenticated_runtime_pair(
++        requested_provider=explicit_provider or None,
++        requested_model="" if explicit_provider else None,
++    )
+ 
+ 
+ # Bare billing buckets are not routable provider identities; restoring one as a
+@@ -9757,7 +9837,9 @@ def _lazy_resume_info(
+         "cwd": cwd,
+         "branch": _git_branch_for_cwd(cwd),
+         "project": _project_info_for_cwd(cwd),
+-        "model": model or _resolve_model(),
++        # No global silent fallback here: a lazy projection may advertise only
++        # the exact stored/validated pair it was handed.
++        "model": model,
+         "tools": {},
+         "skills": {},
+         "lazy": True,
+@@ -9911,12 +9993,18 @@ def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
+         preview = inflight.get("assistant") or inflight.get("user") or preview
+         preview = " ".join(str(preview).split())[:160]
+     now = time.time()
++    model_override = session.get("model_override")
++    model_override = model_override if isinstance(model_override, dict) else {}
+     return {
+         "current": sid == current_sid,
+         "id": sid,
+         "last_active": float(session.get("last_active") or session.get("created_at") or now),
+         "message_count": len(history),
+-        "model": str(getattr(agent, "model", "") or _resolve_model()),
++        "model": str(
++            getattr(agent, "model", "")
++            or model_override.get("model")
++            or ""
++        ),
+         "preview": preview,
+         "session_key": key,
+         "started_at": float(session.get("created_at") or now),
+@@ -9956,12 +10044,14 @@ def _fallback_session_info(session: dict) -> dict:
+     # repo) so a client can clear a stale label instead of retaining it — the
+     # same contract `_lazy_session_info` above already follows.
+     cwd = _session_cwd(session)
+-    return {
++    model_override = session.get("model_override")
++    model_override = model_override if isinstance(model_override, dict) else {}
++    info = {
+         "cwd": cwd,
+         "branch": _git_branch_for_cwd(cwd),
+         "project": _project_info_for_cwd(cwd),
+         "lazy": True,
+-        "model": _resolve_model(),
++        "model": str(model_override.get("model") or ""),
+         "skills": {},
+         "tools": {},
+         # A lazy session (agent not built yet) is still served by *this* backend,
+@@ -9971,6 +10061,9 @@ def _fallback_session_info(session: dict) -> dict:
+         # session.create shape (_lazy_resume_info) already carries it (#36112).
+         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+     }
++    if provider := str(model_override.get("provider") or "").strip():
++        info["provider"] = provider
++    return info
+ 
+ 
+ def _reconcile_display_with_live(
+@@ -14709,8 +14802,11 @@ def _model_picker_context(agent):
+ 
+     return ctx.with_overrides(
+         current_provider=provider,
+-        current_model=(getattr(agent, "model", "") if agent else "")
+-        or _resolve_model(),
++        # A sessionless picker must retain the disk config's empty model so
++        # inventory can derive a provider-specific exact default. Injecting
++        # _resolve_model() here created an orphan global model before a
++        # credential provider had been selected.
++        current_model=(getattr(agent, "model", "") if agent else ""),
+         current_base_url=base_url,
+     )
+ 

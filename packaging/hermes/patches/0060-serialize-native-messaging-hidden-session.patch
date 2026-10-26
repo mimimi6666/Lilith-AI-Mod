@@ -1,0 +1,2517 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index 2449700..e8d8855 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -108,6 +108,7 @@ _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
+ _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
+ _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+ _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
++_LILITH_SHARED_SESSION_EVENT_ATTRIBUTE = "_lilith_shared_session_id"
+ 
+ 
+ def _public_actor_name(default: str = "Hermes") -> str:
+@@ -17857,7 +17858,103 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+ 
+         strict_session = bool(event_metadata.get("gateway_session_strict"))
+         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
+-        if strict_session:
++        # The Lilith bridge hook only marks the authorized Telegram event. It
++        # must not call SessionStore.switch_session itself: route mutation is
++        # part of the same profile-global critical section as transcript
++        # load/run/flush. Consume the private mark once, re-check its native
++        # authorization and canonical shape, then acquire the TARGET session's
++        # turn lease before looking up, creating, or rebinding the route.
++        lilith_shared_session_id = getattr(
++            event, _LILITH_SHARED_SESSION_EVENT_ATTRIBUTE, None
++        )
++        try:
++            delattr(event, _LILITH_SHARED_SESSION_EVENT_ATTRIBUTE)
++        except AttributeError:
++            pass
++        try:
++            lilith_shared_session_id_bytes = len(
++                lilith_shared_session_id.encode("utf-8", errors="strict")
++            )
++        except (AttributeError, UnicodeError):
++            lilith_shared_session_id_bytes = 257
++        if not (
++            type(lilith_shared_session_id) is str
++            and lilith_shared_session_id
++            and lilith_shared_session_id == lilith_shared_session_id.strip()
++            and lilith_shared_session_id_bytes <= 256
++            and not any(
++                ord(char) < 32 or 0x7F <= ord(char) <= 0x9F
++                for char in lilith_shared_session_id
++            )
++            and not bool(getattr(event, "internal", False))
++            and getattr(source, "platform", None) == Platform.TELEGRAM
++            and self._is_user_authorized(source) is True
++            and not strict_session
++        ):
++            lilith_shared_session_id = None
++
++        if lilith_shared_session_id is not None:
++            session_key = self._session_key_for_source(source)
++            _lease_registry = getattr(self, "_turn_leases", None)
++            if _lease_registry is None:
++                # A production runner always owns the registry. Fail closed for
++                # partial/bare runners instead of mutating the shared route
++                # without the cross-process serialization contract.
++                raise TurnLeaseTimeoutError(
++                    lilith_shared_session_id,
++                    owner_key=_quick_key,
++                    generation=run_generation,
++                    wait_seconds=0.0,
++                )
++            _lease_token = await _lease_registry.acquire(
++                lilith_shared_session_id,
++                owner_key=_quick_key,
++                generation=run_generation,
++                timeout=_float_env(
++                    "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
++                ),
++            )
++            if _lease_token is None:
++                raise TurnLeaseTimeoutError(
++                    lilith_shared_session_id,
++                    owner_key=_quick_key,
++                    generation=run_generation,
++                    wait_seconds=0.0,
++                )
++            _lease_state = self._session_state(_quick_key).turn
++            if _lease_state.lease_token is not None:
++                _lease_registry.release(_lease_token)
++                raise TurnLeaseTimeoutError(
++                    lilith_shared_session_id,
++                    owner_key=_quick_key,
++                    generation=run_generation,
++                    wait_seconds=0.0,
++                )
++            _lease_state.lease_token = _lease_token
++            _lease_state.lease_generation = run_generation
++
++            session_entry = await self.async_session_store.lookup_by_session_key(
++                session_key
++            )
++            if session_entry is None:
++                session_entry = await self.async_session_store.get_or_create_session(
++                    source,
++                    touch_activity=True,
++                )
++            if session_entry.session_id != lilith_shared_session_id:
++                session_entry = await self.async_session_store.switch_session(
++                    session_key,
++                    lilith_shared_session_id,
++                )
++            if (
++                session_entry is None
++                or session_entry.session_key != session_key
++                or session_entry.session_id != lilith_shared_session_id
++            ):
++                raise RuntimeError(
++                    "Lilith shared Telegram session binding was not exact"
++                )
++        elif strict_session:
+             session_entry = await self.async_session_store.lookup_by_session_key(
+                 expected_session_key
+             )
+@@ -17883,7 +17980,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 touch_activity=not bool(getattr(event, "internal", False)),
+             )
+         session_key = session_entry.session_key
+-        if not strict_session and pinned_session_id:
++        if (
++            lilith_shared_session_id is None
++            and not strict_session
++            and pinned_session_id
++        ):
+             resolved_entry = await self._resolve_async_delegation_session(
+                 session_entry,
+                 pinned_session_id,
+@@ -17892,7 +17993,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 return
+             session_entry = resolved_entry
+         self._cache_session_source(session_key, source)
+-        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
++        if (
++            lilith_shared_session_id is None
++            and await asyncio.to_thread(self._is_telegram_topic_lane, source)
++        ):
+             try:
+                 binding = (await self._session_db.get_telegram_topic_binding(
+                     chat_id=str(source.chat_id),
+@@ -18171,25 +18275,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         # stale unwind can't release a newer turn's lease.
+         _lease_registry = getattr(self, "_turn_leases", None)
+         if _lease_registry is not None:
+-            try:
+-                _lease_token = await _lease_registry.acquire(
++            _lease_state = self._session_state(_quick_key).turn
++            _lease_token = (
++                _lease_state.lease_token
++                if _lease_state.lease_generation == run_generation
++                else None
++            )
++            if _lease_token is None:
++                try:
++                    _lease_token = await _lease_registry.acquire(
++                        session_entry.session_id,
++                        owner_key=_quick_key,
++                        generation=run_generation,
++                        timeout=_float_env(
++                            "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
++                        ),
++                    )
++                except TurnLeaseTimeoutError:
++                    # The broad session-context cleanup finally starts later in this
++                    # method. Restore the tokens here before propagating the rejection
++                    # to outer dispatch, or this early exit leaks task-local identity.
++                    self._clear_session_env(_session_env_tokens)
++                    raise
++                if _lease_token is not None:
++                    _lease_state.lease_token = _lease_token
++                    _lease_state.lease_generation = run_generation
++            elif _lease_token.session_id != session_entry.session_id:
++                # A pre-route lease is only valid if every later resolver kept
++                # the exact target. Never reuse a token for a different durable
++                # transcript; fail closed before load/run/flush.
++                self._clear_session_env(_session_env_tokens)
++                raise TurnLeaseTimeoutError(
+                     session_entry.session_id,
+                     owner_key=_quick_key,
+                     generation=run_generation,
+-                    timeout=_float_env(
+-                        "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
+-                    ),
++                    wait_seconds=0.0,
+                 )
+-            except TurnLeaseTimeoutError:
+-                # The broad session-context cleanup finally starts later in this
+-                # method. Restore the tokens here before propagating the rejection
+-                # to outer dispatch, or this early exit leaks task-local identity.
+-                self._clear_session_env(_session_env_tokens)
+-                raise
+-            if _lease_token is not None:
+-                _lease_state = self._session_state(_quick_key).turn
+-                _lease_state.lease_token = _lease_token
+-                _lease_state.lease_generation = run_generation
+ 
+         # A turn only becomes durable recovery work after it owns (or has
+         # explicitly degraded past) the per-session lease.  Marking before the
+diff --git a/gateway/turn_lease.py b/gateway/turn_lease.py
+index a47ad65..1c9b0c4 100644
+--- a/gateway/turn_lease.py
++++ b/gateway/turn_lease.py
+@@ -1,4 +1,4 @@
+-"""Per-session turn lease — serializes the [load history → run → flush] region.
++"""Turn leases serialize the [load history → run → flush] region.
+ 
+ Why this exists (#64934): the gateway's busy guards are keyed by ROUTING KEY
+ (``_active_sessions`` in the adapter, ``_running_agents`` in the runner), but
+@@ -14,15 +14,16 @@ and the second turn runs on a history base that never saw the first turn's
+ exchange — leaving a permanent ``user;user`` alternation wedge that
+ ``repair_message_sequence`` re-repairs on every request forever.
+ 
+-The lease closes that route by serializing per RESOLVED session_id: it is
+-acquired after session resolution is final (post ``switch_session``/tip-walk),
+-immediately before the transcript load, and released in the dispatch layer's
+-``finally`` on every exit path. Same-key messages never reach the acquisition
+-point while a turn runs (both routing-key guards hold them), so the lock is
+-uncontended everywhere except the alias-key route — where the second turn now
+-waits for the first turn's flush and logs one WARNING naming the session and
+-both routing keys (pairing with the cross-agent tripwire in
+-``agent/agent_runtime_helpers.note_turn_start``).
++The lease closes that route in two layers. A process-local asyncio lock keeps
++the precise resolved-session diagnostics and rotation aliases, while one
++profile-global OS file lock serializes every durable turn that can touch the
++profile from another Hermes process (gateway, TUI, or CLI continuity). Normal
++routes acquire after session resolution is final; a Lilith shared-session
++route acquires the target lease *before* ``switch_session`` so route mutation
++is protected too. Both hold it through transcript load/run/flush and release
++from the dispatch layer's ``finally`` on every exit path. The OS owns the file
++lock, so process death releases it without stale-pid recovery or lock-file
++deletion.
+ 
+ Safety properties:
+ 
+@@ -37,21 +38,26 @@ Safety properties:
+   still-held lease and therefore cannot defeat the serialization invariant.
+ - **Bounded registry.** The per-session lease map is size-capped; eviction
+   only ever removes idle (unheld, uncontended) entries, never a live lease.
+-
+-Known limits (deliberate, flagged on #64934):
+-
+-- A CLI process sharing the session via CLI-continuity is outside any
+-  in-process lock — that pair needs a DB-level lease (separate design).
+-- Mid-turn compression rotation leaves a small alias window: the tip-walk can
+-  resolve a fresh child id while the parent-holding turn is still in flight.
+-  The mid-turn binding-sync sites are the right place to alias the lease in a
+-  follow-up.
++- **Cross-process and crash-safe.** Every held gateway token also owns the
++  profile-global kernel lock. The synchronous helper exported for the TUI
++  uses the exact same lock path and ownership-checked token.
++
++The profile-global layer deliberately serializes turns for distinct sessions
++too. This is conservative, but it is the smallest safe seam across the native
++gateway and TUI processes: both ultimately mutate profile-scoped session and
++projector state in addition to the selected transcript.
+ """
+ 
+ import asyncio
++import errno
+ import logging
++import os
++from pathlib import Path
++import threading
+ import time
+-from typing import Dict, Optional
++from typing import BinaryIO, Callable, Dict, Optional, Union
++
++from hermes_constants import get_hermes_home
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -68,6 +74,12 @@ DEFAULT_MAX_LEASES = 512
+ # run it concurrently with the holder.
+ DEFAULT_LEASE_WAIT = 1800.0
+ 
++# One kernel lock per HERMES_HOME/profile. The file is persistent; only the
++# kernel lock is state. Never delete it during release or recovery because
++# unlinking a live lock file creates a second inode and defeats serialization.
++PROFILE_TURN_LEASE_RELATIVE_PATH = Path("runtime") / "profile-turn-lease-v1.lock"
++PROFILE_TURN_LEASE_POLL_SECONDS = 0.025
++
+ 
+ class TurnLeaseTimeoutError(TimeoutError):
+     """The session lease stayed held for the caller's full wait budget.
+@@ -94,6 +106,293 @@ class TurnLeaseTimeoutError(TimeoutError):
+         )
+ 
+ 
++class ProfileTurnLeaseUnavailableError(TurnLeaseTimeoutError):
++    """The profile-global lock could not be opened or locked safely."""
++
++
++class TurnLeaseCancelledError(TurnLeaseTimeoutError):
++    """The caller cancelled while waiting for the profile-global lease."""
++
++    def __init__(
++        self,
++        session_id: str,
++        *,
++        owner_key: str,
++        generation: int,
++        wait_seconds: float,
++    ) -> None:
++        super().__init__(
++            session_id,
++            owner_key=owner_key,
++            generation=generation,
++            wait_seconds=wait_seconds,
++        )
++        self.args = (
++            f"turn lease wait cancelled on session {session_id} for routing "
++            f"key {owner_key} (gen {generation})",
++        )
++
++
++class ProfileTurnLeaseToken:
++    """Synchronous ownership token for the profile-global kernel lock.
++
++    ``release`` is idempotent and identity-checked. The lock-file descriptor
++    remains open for the token's full lifetime; closing it (including on
++    process death) is what lets the operating system release the lock.
++    """
++
++    __slots__ = (
++        "session_id",
++        "owner_key",
++        "profile_key",
++        "_handle",
++        "released",
++    )
++
++    def __init__(
++        self,
++        session_id: str,
++        owner_key: str,
++        profile_key: str,
++        handle: BinaryIO,
++    ) -> None:
++        self.session_id = session_id
++        self.owner_key = owner_key
++        self.profile_key = profile_key
++        self._handle = handle
++        self.released = False
++
++    def release(self) -> bool:
++        """Release this exact token. Safe to call more than once."""
++        return _release_profile_turn_lease(self)
++
++    def __enter__(self) -> "ProfileTurnLeaseToken":
++        return self
++
++    def __exit__(self, _exc_type, _exc, _tb) -> None:
++        self.release()
++
++
++_PROFILE_TURN_HOLDERS: Dict[str, ProfileTurnLeaseToken] = {}
++_PROFILE_TURN_HOLDERS_GUARD = threading.Lock()
++
++
++def _profile_turn_lock_path(
++    profile_home: Optional[Union[str, os.PathLike[str]]] = None,
++) -> Path:
++    home = Path(profile_home) if profile_home is not None else get_hermes_home()
++    return home.expanduser().resolve(strict=False) / PROFILE_TURN_LEASE_RELATIVE_PATH
++
++
++def _open_profile_turn_lock(path: Path) -> BinaryIO:
++    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
++    flags = os.O_RDWR | os.O_CREAT
++    if hasattr(os, "O_CLOEXEC"):
++        flags |= os.O_CLOEXEC
++    # POSIX can reject a swapped symlink atomically. Windows profile runtime
++    # directories are trusted installation state; msvcrt supplies the lock.
++    if os.name != "nt" and hasattr(os, "O_NOFOLLOW"):
++        flags |= os.O_NOFOLLOW
++    fd = os.open(path, flags, 0o600)
++    try:
++        if os.fstat(fd).st_size == 0:
++            os.write(fd, b"\0")
++        os.lseek(fd, 0, os.SEEK_SET)
++        return os.fdopen(fd, "r+b", buffering=0)
++    except BaseException:
++        os.close(fd)
++        raise
++
++
++def _lock_profile_turn_handle(handle: BinaryIO) -> None:
++    handle.seek(0)
++    if os.name == "nt":
++        import msvcrt
++
++        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
++    else:
++        import fcntl
++
++        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++
++
++def _unlock_profile_turn_handle(handle: BinaryIO) -> None:
++    handle.seek(0)
++    if os.name == "nt":
++        import msvcrt
++
++        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
++    else:
++        import fcntl
++
++        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
++
++
++def _is_profile_turn_lock_contention(exc: OSError) -> bool:
++    return exc.errno in {
++        errno.EACCES,
++        errno.EAGAIN,
++        getattr(errno, "EDEADLK", errno.EACCES),
++        getattr(errno, "EWOULDBLOCK", errno.EAGAIN),
++    }
++
++
++def _try_acquire_profile_turn_lease(
++    session_id: str,
++    *,
++    owner_key: str,
++    profile_home: Optional[Union[str, os.PathLike[str]]] = None,
++    generation: int = 0,
++) -> Optional[ProfileTurnLeaseToken]:
++    path = _profile_turn_lock_path(profile_home)
++    profile_key = os.path.normcase(str(path))
++    with _PROFILE_TURN_HOLDERS_GUARD:
++        if profile_key in _PROFILE_TURN_HOLDERS:
++            return None
++        try:
++            handle = _open_profile_turn_lock(path)
++        except OSError:
++            logger.exception("profile-global turn lease file is unavailable")
++            raise ProfileTurnLeaseUnavailableError(
++                session_id,
++                owner_key=owner_key,
++                generation=generation,
++                wait_seconds=0.0,
++            ) from None
++        try:
++            _lock_profile_turn_handle(handle)
++        except OSError as exc:
++            handle.close()
++            if _is_profile_turn_lock_contention(exc):
++                return None
++            logger.exception("profile-global turn lease lock failed")
++            raise ProfileTurnLeaseUnavailableError(
++                session_id,
++                owner_key=owner_key,
++                generation=generation,
++                wait_seconds=0.0,
++            ) from None
++        token = ProfileTurnLeaseToken(
++            session_id,
++            owner_key,
++            profile_key,
++            handle,
++        )
++        _PROFILE_TURN_HOLDERS[profile_key] = token
++        return token
++
++
++def _release_profile_turn_lease(token: ProfileTurnLeaseToken) -> bool:
++    if token.released:
++        return False
++    with _PROFILE_TURN_HOLDERS_GUARD:
++        if _PROFILE_TURN_HOLDERS.get(token.profile_key) is not token:
++            token.released = True
++            return False
++        _PROFILE_TURN_HOLDERS.pop(token.profile_key, None)
++        token.released = True
++        try:
++            _unlock_profile_turn_handle(token._handle)
++        except OSError:
++            # Closing the descriptor is the crash-safe release backstop.
++            logger.exception("profile-global turn lease unlock failed")
++        finally:
++            try:
++                token._handle.close()
++            except OSError:
++                # The token has already been removed from the exact-holder
++                # map. Never strand the process-local asyncio lease because a
++                # best-effort descriptor close itself reported an error.
++                logger.exception("profile-global turn lease close failed")
++        return True
++
++
++def acquire_profile_turn_lease(
++    session_id: str,
++    *,
++    owner_key: str,
++    timeout: Optional[float] = None,
++    deadline: Optional[float] = None,
++    cancelled: Optional[Callable[[], bool]] = None,
++    profile_home: Optional[Union[str, os.PathLike[str]]] = None,
++    generation: int = 0,
++) -> Optional[ProfileTurnLeaseToken]:
++    """Synchronously acquire the crash-safe profile-global turn lease.
++
++    This is the TUI/CLI seam. It polls a non-blocking OS lock so the wait is
++    bounded on every platform. ``deadline`` is an absolute
++    :func:`time.monotonic` deadline and is intersected with ``timeout`` so a
++    lease wait can never outlive its enclosing turn. ``cancelled`` is polled
++    before and after each non-blocking lock attempt; a cancellation that races
++    a successful attempt releases the token before failing closed. A falsy
++    ``session_id`` returns ``None``; timeout and cancellation both fail closed.
++    """
++    if not session_id:
++        return None
++    wait = float(timeout) if timeout and timeout > 0 else DEFAULT_LEASE_WAIT
++    started = time.monotonic()
++    wait_deadline = started + wait
++    if deadline is not None:
++        try:
++            wait_deadline = min(wait_deadline, float(deadline))
++        except (TypeError, ValueError):
++            wait_deadline = started
++    effective_wait = max(0.0, wait_deadline - started)
++
++    def cancellation_requested() -> bool:
++        if cancelled is None:
++            return False
++        try:
++            return cancelled() is True
++        except Exception:
++            # A broken cancellation probe must not authorize a turn whose
++            # owner can no longer prove it is live.
++            logger.exception("profile-global turn lease cancellation probe failed")
++            return True
++
++    while True:
++        if cancellation_requested():
++            raise TurnLeaseCancelledError(
++                session_id,
++                owner_key=owner_key,
++                generation=generation,
++                wait_seconds=effective_wait,
++            )
++        remaining = wait_deadline - time.monotonic()
++        if remaining <= 0:
++            raise TurnLeaseTimeoutError(
++                session_id,
++                owner_key=owner_key,
++                generation=generation,
++                wait_seconds=effective_wait,
++            )
++        token = _try_acquire_profile_turn_lease(
++            session_id,
++            owner_key=owner_key,
++            profile_home=profile_home,
++            generation=generation,
++        )
++        if token is not None:
++            if cancellation_requested():
++                token.release()
++                raise TurnLeaseCancelledError(
++                    session_id,
++                    owner_key=owner_key,
++                    generation=generation,
++                    wait_seconds=effective_wait,
++                )
++            if time.monotonic() >= wait_deadline:
++                token.release()
++                raise TurnLeaseTimeoutError(
++                    session_id,
++                    owner_key=owner_key,
++                    generation=generation,
++                    wait_seconds=effective_wait,
++                )
++            return token
++        time.sleep(min(PROFILE_TURN_LEASE_POLL_SECONDS, remaining))
++
++
+ class TurnLeaseToken:
+     """Handle returned by :meth:`SessionTurnLeaseRegistry.acquire`.
+ 
+@@ -102,7 +401,13 @@ class TurnLeaseToken:
+     release idempotent.
+     """
+ 
+-    __slots__ = ("session_id", "owner_key", "generation", "released")
++    __slots__ = (
++        "session_id",
++        "owner_key",
++        "generation",
++        "profile_lease",
++        "released",
++    )
+ 
+     def __init__(
+         self,
+@@ -113,6 +418,7 @@ class TurnLeaseToken:
+         self.session_id = session_id
+         self.owner_key = owner_key
+         self.generation = generation
++        self.profile_lease: Optional[ProfileTurnLeaseToken] = None
+         self.released = False
+ 
+     def __repr__(self) -> str:  # pragma: no cover - debug aid
+@@ -150,11 +456,10 @@ class _SessionLease:
+ 
+ 
+ class SessionTurnLeaseRegistry:
+-    """Asyncio lease per resolved session_id serializing transcript turns.
++    """Async gateway lease combining session-local and profile-global locks.
+ 
+-    Process-local and single-event-loop by design — the same visibility scope
+-    as the routing-key guards it extends. All methods must be called from the
+-    gateway's event loop.
++    The registry remains single-event-loop. Its kernel-lock layer coordinates
++    with other Hermes processes using the same resolved HERMES_HOME.
+     """
+ 
+     def __init__(self, max_entries: int = DEFAULT_MAX_LEASES) -> None:
+@@ -206,6 +511,7 @@ class SessionTurnLeaseRegistry:
+         if not session_id:
+             return None
+         wait = float(timeout) if timeout and timeout > 0 else DEFAULT_LEASE_WAIT
++        deadline = time.monotonic() + wait
+         token = TurnLeaseToken(session_id, owner_key, int(generation))
+         lease = self._get_or_create(session_id)
+ 
+@@ -256,8 +562,47 @@ class SessionTurnLeaseRegistry:
+         finally:
+             lease.pending_acquires -= 1
+ 
+-        # The lock is held and there is no await before holder publication, so
+-        # the lease cannot become evictable after the pending count is cleared.
++        # The local session lock is now held. Poll the non-blocking kernel lock
++        # without blocking the gateway event loop. Cancellation or any
++        # fail-closed error releases the local lock before propagating.
++        try:
++            while True:
++                profile_token = _try_acquire_profile_turn_lease(
++                    session_id,
++                    owner_key=owner_key,
++                    generation=generation,
++                )
++                if profile_token is not None:
++                    token.profile_lease = profile_token
++                    break
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    logger.error(
++                        "profile-global turn lease wait timed out after %.0fs "
++                        "on session %s (routing key %s gen %s) — failing "
++                        "closed instead of entering a cross-process turn",
++                        wait,
++                        session_id,
++                        owner_key,
++                        generation,
++                    )
++                    raise TurnLeaseTimeoutError(
++                        session_id,
++                        owner_key=owner_key,
++                        generation=generation,
++                        wait_seconds=wait,
++                    )
++                await asyncio.sleep(
++                    min(PROFILE_TURN_LEASE_POLL_SECONDS, remaining)
++                )
++        except BaseException:
++            if lease.lock.locked():
++                lease.lock.release()
++            lease.last_used = time.time()
++            raise
++
++        # Both locks are held and there is no await before holder publication,
++        # so the lease cannot become evictable after the pending count clears.
+         lease.holder = token
+         lease.acquired_at = time.time()
+         lease.last_used = lease.acquired_at
+@@ -333,6 +678,9 @@ class SessionTurnLeaseRegistry:
+             return False
+         token.released = True
+         lease = self._leases.get(token.session_id)
++        if token.profile_lease is not None:
++            token.profile_lease.release()
++            token.profile_lease = None
+         if lease is None:
+             return False
+         if lease.holder is not token:
+diff --git a/plugins/lilith_messaging_bridge/__init__.py b/plugins/lilith_messaging_bridge/__init__.py
+new file mode 100644
+index 0000000..e1407c4
+--- /dev/null
++++ b/plugins/lilith_messaging_bridge/__init__.py
+@@ -0,0 +1,155 @@
++"""Authorized Telegram routing bridge for the Lilith hidden game session.
++
++The Runtime owns ``runtime/game-session-v1.json``. This plugin only consumes
++that strict receipt and marks an authorized native Telegram event for deferred
++binding. The gateway performs the actual route mutation while holding the
++profile-global turn lease; the hook must never mutate SessionStore first. The
++plugin does not replace Telegram auth, pairing, adapters, delivery, or gateway
++lifecycle.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++from pathlib import Path
++import stat
++from typing import Any, Optional
++import unicodedata
++
++from gateway.config import Platform
++from hermes_constants import get_hermes_home
++
++logger = logging.getLogger(__name__)
++
++_HANDLE_RELATIVE_PATH = Path("runtime") / "game-session-v1.json"
++_HANDLE_MAX_BYTES = 4096
++_SESSION_ID_MAX_UTF8_BYTES = 256
++_HANDLE_KEYS = frozenset({"schemaVersion", "storedSessionId"})
++_SHARED_SESSION_EVENT_ATTRIBUTE = "_lilith_shared_session_id"
++
++
++def _is_reparse_point(path_stat: os.stat_result) -> bool:
++    attributes = int(getattr(path_stat, "st_file_attributes", 0) or 0)
++    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
++    return bool(attributes & reparse_flag)
++
++
++def _strict_json_object(pairs):
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise ValueError("duplicate JSON property")
++        result[key] = value
++    return result
++
++
++def _valid_stored_session_id(value: Any) -> Optional[str]:
++    if type(value) is not str or not value or value != value.strip():
++        return None
++    if any(unicodedata.category(char) == "Cc" for char in value):
++        return None
++    try:
++        encoded = value.encode("utf-8", errors="strict")
++    except UnicodeError:
++        return None
++    if not encoded or len(encoded) > _SESSION_ID_MAX_UTF8_BYTES:
++        return None
++    return value
++
++
++def _read_active_game_session_id() -> Optional[str]:
++    path = get_hermes_home() / _HANDLE_RELATIVE_PATH
++    try:
++        before = os.lstat(path)
++        if (
++            not stat.S_ISREG(before.st_mode)
++            or stat.S_ISLNK(before.st_mode)
++            or _is_reparse_point(before)
++            or before.st_size > _HANDLE_MAX_BYTES
++        ):
++            return None
++        with path.open("rb") as handle:
++            opened = os.fstat(handle.fileno())
++            if (
++                not stat.S_ISREG(opened.st_mode)
++                or _is_reparse_point(opened)
++                or opened.st_size > _HANDLE_MAX_BYTES
++                or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
++            ):
++                return None
++            raw = handle.read(_HANDLE_MAX_BYTES + 1)
++    except (OSError, ValueError):
++        return None
++    if not raw or len(raw) > _HANDLE_MAX_BYTES:
++        return None
++    try:
++        document = json.loads(
++            raw.decode("utf-8", errors="strict"),
++            object_pairs_hook=_strict_json_object,
++        )
++    except (UnicodeError, ValueError, TypeError):
++        return None
++    if type(document) is not dict or frozenset(document) != _HANDLE_KEYS:
++        return None
++    if type(document.get("schemaVersion")) is not int:
++        return None
++    if document["schemaVersion"] != 1:
++        return None
++    return _valid_stored_session_id(document.get("storedSessionId"))
++
++
++def _pre_gateway_dispatch(*, event, gateway, session_store=None, **_kwargs):
++    """Mark an authorized Telegram event for lease-protected native binding."""
++    if event is None:
++        return None
++    # Hooks can be re-invoked by test/replay infrastructure. Clear a prior
++    # private mark first so an event that is no longer eligible cannot retain
++    # route authority from an earlier invocation.
++    try:
++        delattr(event, _SHARED_SESSION_EVENT_ATTRIBUTE)
++    except AttributeError:
++        pass
++    if bool(getattr(event, "internal", False)):
++        return None
++    source = getattr(event, "source", None)
++    if source is None or getattr(source, "platform", None) != Platform.TELEGRAM:
++        return None
++    user_id = getattr(source, "user_id", None)
++    if (
++        type(user_id) is not str
++        or not user_id
++        or user_id != user_id.strip()
++        or len(user_id.encode("utf-8", errors="ignore")) > 128
++        or any(unicodedata.category(char) == "Cc" for char in user_id)
++    ):
++        return None
++    if gateway is None:
++        return None
++    authorize = getattr(gateway, "_is_user_authorized", None)
++    if not callable(authorize):
++        return None
++    try:
++        authorized = authorize(source)
++    except Exception:
++        logger.warning("Lilith Telegram bridge authorization check failed")
++        return None
++    # Exact True prevents truthy test doubles or malformed adapters from
++    # becoming an authorization bypass. Unauthorized traffic remains wholly
++    # untouched so the native DM pairing flow can run immediately afterward.
++    if authorized is not True:
++        return None
++
++    stored_session_id = _read_active_game_session_id()
++    if stored_session_id is None:
++        return None
++    try:
++        setattr(event, _SHARED_SESSION_EVENT_ATTRIBUTE, stored_session_id)
++    except Exception:
++        logger.warning("Lilith Telegram bridge could not mark the native event")
++    return None
++
++
++def register(ctx) -> None:
++    ctx.register_hook("pre_gateway_dispatch", _pre_gateway_dispatch)
+diff --git a/plugins/lilith_messaging_bridge/plugin.yaml b/plugins/lilith_messaging_bridge/plugin.yaml
+new file mode 100644
+index 0000000..5423682
+--- /dev/null
++++ b/plugins/lilith_messaging_bridge/plugin.yaml
+@@ -0,0 +1,6 @@
++name: lilith_messaging_bridge
++version: 1.0.0
++description: "Bind authorized native Telegram messages to Lilith's active hidden game session."
++author: "Lilith"
++hooks:
++  - pre_gateway_dispatch
+diff --git a/tests/gateway/test_turn_lease.py b/tests/gateway/test_turn_lease.py
+index 552fc98..198c19b 100644
+--- a/tests/gateway/test_turn_lease.py
++++ b/tests/gateway/test_turn_lease.py
+@@ -8,7 +8,8 @@ invisible to every routing-key guard.
+ Covers:
+ - alias-key turn waits until the first turn's flush, and flush order is
+   preserved (the second turn loads history AFTER the first turn's release)
+-- distinct sessions do not contend
++- distinct sessions share the conservative profile-global lease
++- synchronous TUI helper and cross-process kernel-lock behavior
+ - generation-scoped, idempotent release: a stale unwind can never free a
+   newer turn's lease; double-release is a no-op
+ - timeout fail-closed: a timed-out waiter never enters the transcript region,
+@@ -20,17 +21,42 @@ Covers:
+ """
+ 
+ import asyncio
++from pathlib import Path
++import subprocess
++import sys
++import threading
++import time
+ from unittest.mock import AsyncMock, MagicMock
+ 
+ import pytest
+ 
+-from gateway.turn_lease import SessionTurnLeaseRegistry, TurnLeaseTimeoutError
++from gateway.turn_lease import (
++    SessionTurnLeaseRegistry,
++    TurnLeaseCancelledError,
++    TurnLeaseTimeoutError,
++    acquire_profile_turn_lease,
++)
++import gateway.turn_lease as turn_lease_module
+ 
+ 
+ def _run(coro):
+     return asyncio.run(coro)
+ 
+ 
++class _NoopProfileLease:
++    def release(self):
++        return True
++
++
++def _isolate_process_local_registry_mechanics(monkeypatch):
++    """Keep legacy handoff tests focused on the asyncio registry layer."""
++    monkeypatch.setattr(
++        turn_lease_module,
++        "_try_acquire_profile_turn_lease",
++        lambda *_args, **_kwargs: _NoopProfileLease(),
++    )
++
++
+ # ---------------------------------------------------------------------------
+ # Serialization behavior
+ # ---------------------------------------------------------------------------
+@@ -64,7 +90,7 @@ def test_alias_key_turn_waits_and_order_is_preserved():
+     assert events == ["load:key-a", "flush:key-a", "load:key-b", "flush:key-b"]
+ 
+ 
+-def test_distinct_sessions_do_not_contend():
++def test_distinct_sessions_share_profile_global_lease():
+     async def scenario():
+         registry = SessionTurnLeaseRegistry()
+         order = []
+@@ -82,8 +108,178 @@ def test_distinct_sessions_do_not_contend():
+         return order
+ 
+     order = _run(scenario())
+-    # Both started before either finished — no serialization across sessions.
+-    assert order[:2] == ["start:sess-a", "start:sess-b"]
++    # Cross-process consumers also mutate profile-scoped projector/session
++    # state, so the conservative profile lease serializes distinct sessions.
++    assert order == [
++        "start:sess-a",
++        "end:sess-a",
++        "start:sess-b",
++        "end:sess-b",
++    ]
++
++
++def test_sync_profile_turn_lease_is_identity_checked_and_bounded(tmp_path):
++    first = acquire_profile_turn_lease(
++        "sess-a", owner_key="tui:a", profile_home=tmp_path, timeout=1
++    )
++    assert first is not None
++
++    with pytest.raises(TurnLeaseTimeoutError):
++        acquire_profile_turn_lease(
++            "sess-b", owner_key="tui:b", profile_home=tmp_path, timeout=0.03
++        )
++
++    assert first.release() is True
++    assert first.release() is False
++    second = acquire_profile_turn_lease(
++        "sess-b", owner_key="tui:b", profile_home=tmp_path, timeout=1
++    )
++    assert second is not None
++    assert second.release() is True
++
++
++def test_sync_profile_wait_honors_absolute_deadline_and_never_acquires_late(
++    monkeypatch, tmp_path
++):
++    holder = acquire_profile_turn_lease(
++        "sess-holder", owner_key="holder", profile_home=tmp_path, timeout=1
++    )
++    assert holder is not None
++    attempts = 0
++    original_try = turn_lease_module._try_acquire_profile_turn_lease
++
++    def observed_try(*args, **kwargs):
++        nonlocal attempts
++        attempts += 1
++        return original_try(*args, **kwargs)
++
++    monkeypatch.setattr(
++        turn_lease_module, "_try_acquire_profile_turn_lease", observed_try
++    )
++    started = time.monotonic()
++    with pytest.raises(TurnLeaseTimeoutError):
++        acquire_profile_turn_lease(
++            "sess-waiter",
++            owner_key="waiter",
++            profile_home=tmp_path,
++            timeout=5,
++            deadline=started + 0.04,
++        )
++    elapsed = time.monotonic() - started
++    assert elapsed < 0.5
++    assert attempts >= 1
++    assert holder.release() is True
++
++
++def test_sync_profile_wait_honors_cancellation_without_late_background_acquire(
++    monkeypatch, tmp_path
++):
++    holder = acquire_profile_turn_lease(
++        "sess-holder", owner_key="holder", profile_home=tmp_path, timeout=1
++    )
++    assert holder is not None
++    cancel = threading.Event()
++    attempts = 0
++    original_try = turn_lease_module._try_acquire_profile_turn_lease
++
++    def observed_try(*args, **kwargs):
++        nonlocal attempts
++        attempts += 1
++        if attempts == 1:
++            cancel.set()
++        return original_try(*args, **kwargs)
++
++    monkeypatch.setattr(
++        turn_lease_module, "_try_acquire_profile_turn_lease", observed_try
++    )
++    with pytest.raises(TurnLeaseCancelledError):
++        acquire_profile_turn_lease(
++            "sess-waiter",
++            owner_key="waiter",
++            profile_home=tmp_path,
++            timeout=5,
++            cancelled=cancel.is_set,
++        )
++    assert attempts == 1
++    assert holder.release() is True
++
++    # Cancellation returned synchronously; releasing the old holder cannot
++    # wake an abandoned worker and start a turn later.
++    successor = acquire_profile_turn_lease(
++        "sess-successor",
++        owner_key="successor",
++        profile_home=tmp_path,
++        timeout=1,
++    )
++    assert successor is not None
++    assert successor.release() is True
++
++
++def test_profile_turn_lease_serializes_another_process(tmp_path):
++    holder = acquire_profile_turn_lease(
++        "sess-parent",
++        owner_key="parent",
++        profile_home=tmp_path,
++        timeout=1,
++    )
++    assert holder is not None
++    script = (
++        "import sys\n"
++        "from gateway.turn_lease import (TurnLeaseTimeoutError, "
++        "acquire_profile_turn_lease)\n"
++        "try:\n"
++        "    token = acquire_profile_turn_lease('sess-child', owner_key='child', "
++        "profile_home=sys.argv[1], timeout=0.08)\n"
++        "except TurnLeaseTimeoutError:\n"
++        "    raise SystemExit(23)\n"
++        "else:\n"
++        "    token.release()\n"
++    )
++    source_root = str(Path(__file__).parents[2])
++    blocked = subprocess.run(
++        [sys.executable, "-c", script, str(tmp_path)],
++        cwd=source_root,
++        check=False,
++        timeout=5,
++    )
++    assert blocked.returncode == 23
++    assert holder.release() is True
++
++    acquired = subprocess.run(
++        [sys.executable, "-c", script, str(tmp_path)],
++        cwd=source_root,
++        check=False,
++        timeout=5,
++    )
++    assert acquired.returncode == 0
++
++
++def test_profile_turn_lease_is_released_when_holder_process_crashes(tmp_path):
++    script = (
++        "import os, sys\n"
++        "from gateway.turn_lease import acquire_profile_turn_lease\n"
++        "acquire_profile_turn_lease('sess-child', owner_key='child', "
++        "profile_home=sys.argv[1], timeout=1)\n"
++        "sys.stdout.write('held\\n'); sys.stdout.flush()\n"
++        "os._exit(0)\n"
++    )
++    source_root = str(Path(__file__).parents[2])
++    crashed = subprocess.run(
++        [sys.executable, "-c", script, str(tmp_path)],
++        cwd=source_root,
++        check=False,
++        capture_output=True,
++        text=True,
++        timeout=5,
++    )
++    assert crashed.returncode == 0
++    assert crashed.stdout == "held\n"
++
++    successor = acquire_profile_turn_lease(
++        "sess-parent", owner_key="parent", profile_home=tmp_path, timeout=1
++    )
++    assert successor is not None
++    assert successor.release() is True
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -96,6 +292,133 @@ def test_distinct_sessions_do_not_contend():
+ # ---------------------------------------------------------------------------
+ 
+ 
++@pytest.mark.asyncio
++async def test_lilith_shared_route_switch_occurs_inside_target_profile_lease(
++    monkeypatch, tmp_path
++):
++    """The plugin mark is consumed before any SessionStore route mutation."""
++    from datetime import datetime
++
++    from gateway.config import Platform
++    from gateway.session import SessionEntry
++    from tests.gateway.test_42039_duplicate_user_message import (
++        _bootstrap,
++        _event,
++        _source,
++    )
++
++    runner = _bootstrap(monkeypatch, tmp_path)
++    runner._turn_leases = SessionTurnLeaseRegistry()
++    events = []
++    original_acquire = runner._turn_leases.acquire
++
++    async def observed_acquire(session_id, **kwargs):
++        events.append(("acquire", session_id))
++        return await original_acquire(session_id, **kwargs)
++
++    runner._turn_leases.acquire = observed_acquire
++    quick_key = "agent:main:telegram:group:-1001:12345"
++    temporary = SessionEntry(
++        session_key=quick_key,
++        session_id="temporary-route",
++        created_at=datetime.now(),
++        updated_at=datetime.now(),
++        platform=Platform.TELEGRAM,
++        chat_type="group",
++    )
++    shared = SessionEntry(
++        session_key=quick_key,
++        session_id="stored-game-session",
++        created_at=datetime.now(),
++        updated_at=datetime.now(),
++        platform=Platform.TELEGRAM,
++        chat_type="group",
++    )
++    runner.session_store.lookup_by_session_key.side_effect = (
++        lambda key: events.append(("lookup", key)) or None
++    )
++    runner.session_store.get_or_create_session.side_effect = (
++        lambda _source, **_kwargs: events.append(("create", quick_key)) or temporary
++    )
++    runner.session_store.switch_session.side_effect = (
++        lambda key, target: events.append(("switch", key, target)) or shared
++    )
++
++    class TranscriptReached(RuntimeError):
++        pass
++
++    def stop_at_transcript(session_id):
++        events.append(("load", session_id))
++        raise TranscriptReached
++
++    runner.session_store.load_transcript.side_effect = stop_at_transcript
++    event = _event()
++    event._lilith_shared_session_id = "stored-game-session"
++
++    try:
++        with pytest.raises(TranscriptReached):
++            await runner._handle_message_with_agent(
++                event, _source(), quick_key, 1
++            )
++    finally:
++        assert runner._release_turn_lease(quick_key, 1) is True
++
++    assert events[:4] == [
++        ("acquire", "stored-game-session"),
++        ("lookup", quick_key),
++        ("create", quick_key),
++        ("switch", quick_key, "stored-game-session"),
++    ]
++    assert events[4] == ("load", "stored-game-session")
++
++
++@pytest.mark.asyncio
++async def test_lilith_shared_route_never_mutates_when_target_lease_is_busy(
++    monkeypatch, tmp_path
++):
++    from tests.gateway.test_42039_duplicate_user_message import (
++        _bootstrap,
++        _event,
++        _source,
++    )
++
++    runner = _bootstrap(monkeypatch, tmp_path)
++    runner._turn_leases = SessionTurnLeaseRegistry()
++    holder = await runner._turn_leases.acquire(
++        "stored-game-session",
++        owner_key="tui-holder",
++        generation=1,
++        timeout=1,
++    )
++    monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
++    runner.session_store.lookup_by_session_key.side_effect = AssertionError(
++        "busy target must reject before route lookup"
++    )
++    runner.session_store.get_or_create_session.side_effect = AssertionError(
++        "busy target must reject before route creation"
++    )
++    runner.session_store.switch_session.side_effect = AssertionError(
++        "busy target must reject before route switch"
++    )
++    event = _event()
++    event._lilith_shared_session_id = "stored-game-session"
++
++    try:
++        with pytest.raises(TurnLeaseTimeoutError):
++            await runner._handle_message_with_agent(
++                event,
++                _source(),
++                "agent:main:telegram:group:-1001:12345",
++                1,
++            )
++    finally:
++        assert runner._turn_leases.release(holder) is True
++
++    runner.session_store.lookup_by_session_key.assert_not_called()
++    runner.session_store.get_or_create_session.assert_not_called()
++    runner.session_store.switch_session.assert_not_called()
++
++
+ def test_timeout_fails_closed_instead_of_authorizing_an_unserialized_turn():
+     """A timed-out waiter must never run against the still-live holder.
+ 
+@@ -180,6 +503,7 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
+     promptly even while the normal agent inactivity timeout remains long.
+     """
+     from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
++    import gateway.run as gateway_run
+ 
+     runner = _bootstrap(monkeypatch, tmp_path)
+     runner._turn_leases = SessionTurnLeaseRegistry()
+@@ -188,7 +512,16 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
+     )
+     assert holder is not None
+     monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "5")
+-    monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
++    real_float_env = gateway_run._float_env
++    monkeypatch.setattr(
++        gateway_run,
++        "_float_env",
++        lambda name, default: (
++            0.02
++            if name == "HERMES_TURN_LEASE_TIMEOUT"
++            else real_float_env(name, default)
++        ),
++    )
+ 
+     runner.session_store.load_transcript.side_effect = AssertionError(
+         "transcript must not load after a turn-lease timeout"
+@@ -198,9 +531,20 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
+     runner._clear_session_env = MagicMock()
+     runner._run_agent = pytest.fail
+     runner._post_turn_goal_continuation = AsyncMock()
++    runner._is_telegram_topic_root_lobby = MagicMock(return_value=False)
++
++    # This is a lease/dispatch test, so keep unrelated routing lookups inline.
++    # A fresh Windows replay can still spend more than a second in cold plugin
++    # and database setup before reaching the deliberately tiny 20 ms lease
++    # budget. Give the full dispatch a separate five-second harness ceiling;
++    # the lease itself remains independently bounded at 20 ms above.
++    async def inline_to_thread(func, /, *args, **kwargs):
++        return func(*args, **kwargs)
++
++    monkeypatch.setattr(gateway_run.asyncio, "to_thread", inline_to_thread)
+ 
+     try:
+-        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=1)
++        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=5)
+     finally:
+         assert runner._turn_leases.release(holder) is True
+ 
+@@ -256,7 +600,7 @@ class _GatedLock:
+         self._lock.release()
+ 
+ 
+-def test_registry_does_not_evict_lease_during_waiter_handoff():
++def test_registry_does_not_evict_lease_during_waiter_handoff(monkeypatch):
+     """A woken waiter must stay in the original serialization domain.
+ 
+     ``asyncio.Lock.release()`` unlocks before the selected waiter resumes.
+@@ -264,6 +608,8 @@ def test_registry_does_not_evict_lease_during_waiter_handoff():
+     let a later acquire for the same session take a second lock concurrently.
+     """
+ 
++    _isolate_process_local_registry_mechanics(monkeypatch)
++
+     async def scenario():
+         registry = SessionTurnLeaseRegistry(max_entries=1)
+         first = await registry.acquire(
+@@ -302,9 +648,11 @@ def test_registry_does_not_evict_lease_during_waiter_handoff():
+     _run(scenario())
+ 
+ 
+-def test_registry_does_not_evict_an_uncontended_acquire_before_it_locks():
++def test_registry_does_not_evict_an_uncontended_acquire_before_it_locks(monkeypatch):
+     """Every pending acquire is protected, even if the lock looked free."""
+ 
++    _isolate_process_local_registry_mechanics(monkeypatch)
++
+     async def scenario():
+         registry = SessionTurnLeaseRegistry(max_entries=1)
+         seed = await registry.acquire(
+@@ -413,9 +761,11 @@ def test_rebind_moves_serialization_to_new_session_id():
+     _run(scenario())
+ 
+ 
+-def test_rebind_does_not_replace_target_during_waiter_handoff():
++def test_rebind_does_not_replace_target_during_waiter_handoff(monkeypatch):
+     """A target with a waking waiter is still a live lease domain."""
+ 
++    _isolate_process_local_registry_mechanics(monkeypatch)
++
+     async def scenario():
+         registry = SessionTurnLeaseRegistry()
+         target_holder = await registry.acquire(
+diff --git a/tests/plugins/test_lilith_messaging_bridge.py b/tests/plugins/test_lilith_messaging_bridge.py
+new file mode 100644
+index 0000000..ab88c71
+--- /dev/null
++++ b/tests/plugins/test_lilith_messaging_bridge.py
+@@ -0,0 +1,164 @@
++"""Focused authorization and strict-receipt tests for Lilith Telegram bridge."""
++
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.config import Platform
++from plugins.lilith_messaging_bridge import (
++    _pre_gateway_dispatch,
++    _read_active_game_session_id,
++    register,
++)
++import plugins.lilith_messaging_bridge as bridge
++
++
++def _event(*, platform=Platform.TELEGRAM, user_id="42", internal=False):
++    source = SimpleNamespace(platform=platform, user_id=user_id)
++    return SimpleNamespace(source=source, internal=internal)
++
++
++def _write_handle(home: Path, raw: bytes) -> None:
++    runtime = home / "runtime"
++    runtime.mkdir(parents=True, exist_ok=True)
++    (runtime / "game-session-v1.json").write_bytes(raw)
++
++
++def test_authorized_telegram_event_marks_deferred_binding_without_mutating_route(
++    monkeypatch, tmp_path
++):
++    _write_handle(
++        tmp_path,
++        b'{"schemaVersion":1,"storedSessionId":"stored-game-session"}',
++    )
++    monkeypatch.setattr(bridge, "get_hermes_home", lambda: tmp_path)
++    event = _event()
++    gateway = SimpleNamespace(
++        _is_user_authorized=lambda source: True,
++    )
++    store = SimpleNamespace(
++        lookup_by_session_key=lambda *_args: pytest.fail("hook looked up route"),
++        get_or_create_session=lambda *_args: pytest.fail("hook created route"),
++        switch_session=lambda *_args: pytest.fail("hook switched route"),
++    )
++
++    assert (
++        _pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
++        is None
++    )
++    assert event._lilith_shared_session_id == "stored-game-session"
++
++
++@pytest.mark.parametrize(
++    "authorized,platform,user_id,internal",
++    [
++        (False, Platform.TELEGRAM, "42", False),
++        (True, Platform.SLACK, "42", False),
++        (True, Platform.TELEGRAM, None, False),
++        (True, Platform.TELEGRAM, "42", True),
++        (True, Platform.TELEGRAM, "42", 1),
++        (True, Platform.TELEGRAM, " 42", False),
++        (True, Platform.TELEGRAM, "42\n", False),
++    ],
++)
++def test_ineligible_event_never_reads_handle_or_mutates_route(
++    monkeypatch, authorized, platform, user_id, internal
++):
++    event = _event(platform=platform, user_id=user_id, internal=internal)
++    route_calls = []
++    gateway = SimpleNamespace(
++        _is_user_authorized=lambda source: authorized,
++        _session_key_for_source=lambda source: route_calls.append(source),
++    )
++    monkeypatch.setattr(
++        bridge,
++        "_read_active_game_session_id",
++        lambda: pytest.fail("ineligible event read the Lilith handle"),
++    )
++    store = SimpleNamespace(
++        switch_session=lambda *_args: pytest.fail("ineligible event switched route")
++    )
++
++    assert (
++        _pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
++        is None
++    )
++    assert route_calls == []
++    assert not hasattr(event, "_lilith_shared_session_id")
++
++
++def test_reinvocation_clears_stale_authority_mark(monkeypatch, tmp_path):
++    _write_handle(
++        tmp_path,
++        b'{"schemaVersion":1,"storedSessionId":"stored-game-session"}',
++    )
++    monkeypatch.setattr(bridge, "get_hermes_home", lambda: tmp_path)
++    event = _event()
++    gateway = SimpleNamespace(_is_user_authorized=lambda _source: True)
++    _pre_gateway_dispatch(event=event, gateway=gateway)
++    assert event._lilith_shared_session_id == "stored-game-session"
++
++    gateway._is_user_authorized = lambda _source: False
++    _pre_gateway_dispatch(event=event, gateway=gateway)
++    assert not hasattr(event, "_lilith_shared_session_id")
++
++
++@pytest.mark.parametrize(
++    "raw",
++    [
++        b'{"schemaVersion":true,"storedSessionId":"stored"}',
++        b'{"schemaVersion":2,"storedSessionId":"stored"}',
++        b'{"schemaVersion":1,"storedSessionId":" stored"}',
++        b'{"schemaVersion":1,"storedSessionId":"stored\\u0000"}',
++        b'{"schemaVersion":1,"storedSessionId":"stored","extra":1}',
++        b'{"schemaVersion":1,"schemaVersion":1,"storedSessionId":"stored"}',
++        b'not-json',
++    ],
++)
++def test_strict_handle_rejects_malformed_or_noncanonical_documents(
++    monkeypatch, tmp_path, raw
++):
++    _write_handle(tmp_path, raw)
++    monkeypatch.setattr(bridge, "get_hermes_home", lambda: tmp_path)
++    assert _read_active_game_session_id() is None
++
++
++def test_strict_handle_rejects_oversized_session_id(monkeypatch, tmp_path):
++    session_id = "x" * 257
++    _write_handle(
++        tmp_path,
++        (
++            '{"schemaVersion":1,"storedSessionId":"'
++            + session_id
++            + '"}'
++        ).encode("utf-8"),
++    )
++    monkeypatch.setattr(bridge, "get_hermes_home", lambda: tmp_path)
++    assert _read_active_game_session_id() is None
++
++
++def test_strict_handle_rejects_symlink(monkeypatch, tmp_path):
++    target = tmp_path / "target.json"
++    target.write_text(
++        '{"schemaVersion":1,"storedSessionId":"stored"}',
++        encoding="utf-8",
++    )
++    runtime = tmp_path / "runtime"
++    runtime.mkdir()
++    link = runtime / "game-session-v1.json"
++    try:
++        link.symlink_to(target)
++    except (OSError, NotImplementedError):
++        pytest.skip("symlinks are unavailable for this test account")
++    monkeypatch.setattr(bridge, "get_hermes_home", lambda: tmp_path)
++    assert _read_active_game_session_id() is None
++
++
++def test_registers_only_pre_gateway_dispatch_hook():
++    calls = []
++    context = SimpleNamespace(
++        register_hook=lambda name, callback: calls.append((name, callback))
++    )
++    register(context)
++    assert calls == [("pre_gateway_dispatch", _pre_gateway_dispatch)]
+diff --git a/tests/tui_gateway/test_profile_turn_lease.py b/tests/tui_gateway/test_profile_turn_lease.py
+new file mode 100644
+index 0000000..2184a7e
+--- /dev/null
++++ b/tests/tui_gateway/test_profile_turn_lease.py
+@@ -0,0 +1,188 @@
++"""TUI full-turn boundary tests for the shared profile kernel lease."""
++
++import threading
++import time
++import types
++
++from tui_gateway import server
++
++
++class _InlineThread:
++    def __init__(self, target=None, args=(), kwargs=None, **_ignored):
++        self._target = target
++        self._args = args
++        self._kwargs = kwargs or {}
++
++    def start(self):
++        if self._target is not None:
++            self._target(*self._args, **self._kwargs)
++
++    def is_alive(self):
++        return False
++
++
++def test_tui_holds_profile_lease_through_turn_and_releases_before_followups(
++    monkeypatch, tmp_path
++):
++    import gateway.turn_lease as turn_lease
++    from tools.process_registry import process_registry
++
++    events = []
++
++    class Lease:
++        released = False
++
++        def release(self):
++            if self.released:
++                return False
++            self.released = True
++            events.append("release")
++            return True
++
++    lease = Lease()
++
++    lease_options = {}
++
++    def acquire(session_id, *, owner_key, profile_home=None, **kwargs):
++        events.append(("acquire", session_id, owner_key, profile_home))
++        lease_options.update(kwargs)
++        lease_options["cancelled_at_acquire"] = kwargs["cancelled"]()
++        return lease
++
++    monkeypatch.setattr(turn_lease, "acquire_profile_turn_lease", acquire)
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
++    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
++    monkeypatch.setattr(server, "_session_cwd", lambda _session: str(tmp_path))
++    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
++    monkeypatch.setattr(server, "_tts_stream_begin", lambda *_args: None)
++    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *_a, **_k: None)
++    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
++    monkeypatch.setattr(server, "_load_cfg", lambda: {})
++    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(
++        server,
++        "_schedule_queued_prompt_drain",
++        lambda *_args: events.append("followups") or False,
++    )
++    monkeypatch.setattr(process_registry, "drain_notifications", lambda **_kw: [])
++
++    def run_conversation(_message, **_kwargs):
++        assert lease.released is False
++        events.append("turn")
++        return {"final_response": "done"}
++
++    agent = types.SimpleNamespace(
++        session_id="stored-session",
++        run_conversation=run_conversation,
++        clear_interrupt=lambda: None,
++    )
++    session = {
++        "agent": agent,
++        "session_key": "stored-session",
++        "profile_home": str(tmp_path),
++        "history": [],
++        "history_lock": threading.Lock(),
++        "history_version": 0,
++        "running": True,
++        "attached_images": [],
++        "image_counter": 0,
++        "cols": 80,
++        "slash_worker": None,
++        "show_reasoning": False,
++        "tool_progress_mode": "all",
++        "inflight_turn": None,
++    }
++
++    server._run_prompt_submit("rid", "sid", session, "hello")
++
++    assert events[0] == (
++        "acquire",
++        "stored-session",
++        "tui:sid",
++        str(tmp_path),
++    )
++    assert events.count("release") == 1
++    assert events.index("turn") < events.index("release") < events.index("followups")
++    assert 0 < lease_options["timeout"] <= server._TUI_PROFILE_LEASE_WAIT_SECONDS
++    assert lease_options["deadline"] > time.monotonic()
++    assert lease_options["cancelled_at_acquire"] is False
++    assert lease_options["cancelled"]() is True
++    assert session["running"] is False
++
++
++def test_tui_cancel_during_profile_lease_wait_never_starts_background_turn(
++    monkeypatch, tmp_path
++):
++    import gateway.turn_lease as turn_lease
++
++    events = []
++    monkeypatch.setattr(server, "_TUI_TURN_ADMISSION_DEADLINE_SECONDS", 1.0)
++
++    def acquire(session_id, *, owner_key, timeout, deadline, cancelled, **_kwargs):
++        events.append(("acquire", session_id, owner_key, timeout, deadline))
++        assert timeout <= server._TUI_PROFILE_LEASE_WAIT_SECONDS
++        # The accepted receipt is already ~0.8s old, so only the remaining
++        # admission deadline (not a fresh full timeout) is available.
++        assert 0 < timeout < 0.4
++        assert deadline < time.monotonic() + 0.4
++        assert cancelled() is True
++        raise turn_lease.TurnLeaseCancelledError(
++            session_id,
++            owner_key=owner_key,
++            generation=0,
++            wait_seconds=timeout,
++        )
++
++    monkeypatch.setattr(turn_lease, "acquire_profile_turn_lease", acquire)
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    monkeypatch.setattr(server, "_bind_agent_turn_callbacks", lambda *_a: None)
++    monkeypatch.setattr(server, "_clear_agent_turn_callbacks", lambda *_a: None)
++    monkeypatch.setattr(
++        server,
++        "_emit_terminal_turn_error",
++        lambda _sid, _session, error: events.append(("terminal", str(error))),
++    )
++    monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_a: None)
++    monkeypatch.setattr(server, "_emit", lambda *_a, **_kw: None)
++
++    class Agent:
++        session_id = "stored-session"
++
++        def clear_interrupt(self):
++            return None
++
++        def run_conversation(self, *_args, **_kwargs):
++            events.append("turn")
++            raise AssertionError("cancelled lease waiter started a background turn")
++
++    session = {
++        "agent": Agent(),
++        "session_key": "stored-session",
++        "profile_home": str(tmp_path),
++        "history": [],
++        "history_lock": threading.Lock(),
++        "history_version": 0,
++        "running": True,
++        "_turn_cancel_requested": True,
++        "attached_images": [],
++        "image_counter": 0,
++        "cols": 80,
++        "slash_worker": None,
++        "show_reasoning": False,
++        "tool_progress_mode": "all",
++        "inflight_turn": None,
++    }
++    server._start_inflight_turn(session, "hello")
++    session["inflight_turn"]["started_at"] = time.time() - 0.8
++
++    server._run_prompt_submit("rid", "sid", session, "hello")
++
++    assert events[0][:3] == ("acquire", "stored-session", "tui:sid")
++    assert events[1] == (
++        "terminal",
++        "Turn cancelled before it entered the shared session.",
++    )
++    assert "turn" not in events
++    assert session["running"] is False
++    assert session["inflight_turn"] is None
+diff --git a/tests/tui_gateway/test_telegram_messaging_rpc.py b/tests/tui_gateway/test_telegram_messaging_rpc.py
+new file mode 100644
+index 0000000..a8cfd99
+--- /dev/null
++++ b/tests/tui_gateway/test_telegram_messaging_rpc.py
+@@ -0,0 +1,234 @@
++"""Strict schema and redaction tests for six Telegram Runtime RPCs."""
++
++from types import SimpleNamespace
++
++import pytest
++
++from tui_gateway import server
++from tui_gateway import telegram_messaging as messaging
++
++
++METHODS = {
++    "messaging.telegram.status",
++    "messaging.telegram.replace",
++    "messaging.telegram.remove",
++    "messaging.telegram.pairing.list",
++    "messaging.telegram.pairing.approve",
++    "messaging.telegram.pairing.revoke",
++}
++
++
++def _request(method, params):
++    return server.handle_request(
++        {"jsonrpc": "2.0", "id": "rpc-1", "method": method, "params": params}
++    )
++
++
++def test_six_methods_are_registered_and_reject_extra_params():
++    assert METHODS <= set(server._methods)
++    for name in METHODS:
++        result = _request(name, {"unexpected": True})
++        assert result["error"] == {"code": -32602, "message": "invalid params"}
++
++
++@pytest.mark.parametrize(
++    "configured,running,gateway_state,platform_state,expected_running,expected",
++    [
++        (False, True, "running", "connected", False, "unconfigured"),
++        (True, True, "running", "connected", True, "connected"),
++        (True, True, "running", "running", True, "connected"),
++        (True, True, "running", "ok", True, "connected"),
++        (True, True, "starting", "starting", True, "starting"),
++        (True, True, "running", "connecting", True, "starting"),
++        (True, True, "running", "initializing", True, "starting"),
++        (True, True, "running", "pending", True, "starting"),
++        (True, True, "running", "pending_restart", True, "starting"),
++        (True, True, "running", "reconnecting", True, "starting"),
++        (True, True, "running", "", True, "starting"),
++        (True, False, "startup_failed", "fatal", False, "attention"),
++        (True, True, "running", "fatal", True, "attention"),
++    ],
++)
++def test_status_redlines_native_state_without_error_or_token(
++    monkeypatch,
++    tmp_path,
++    configured,
++    running,
++    gateway_state,
++    platform_state,
++    expected_running,
++    expected,
++):
++    import gateway.status as gateway_status
++    import hermes_constants
++
++    monkeypatch.setattr(messaging, "_env_token", lambda: "secret" if configured else "")
++    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
++    runtime = {
++        "gateway_state": gateway_state,
++        "platforms": {"telegram": {"state": platform_state, "error_message": "secret"}},
++    }
++    monkeypatch.setattr(gateway_status, "read_runtime_status", lambda **_kw: runtime)
++    monkeypatch.setattr(
++        gateway_status,
++        "resolve_gateway_liveness",
++        lambda **_kw: SimpleNamespace(running=running),
++    )
++
++    result = messaging.telegram_status()
++    assert result == {
++        "configured": configured,
++        "gateway_running": expected_running,
++        "state": expected,
++    }
++    assert "secret" not in repr(result)
++
++
++def test_replace_and_remove_use_native_env_writers_without_returning_token(monkeypatch):
++    import hermes_cli.config as config
++
++    token = "123456789:" + "A" * 35
++    env = {}
++    writes = []
++
++    monkeypatch.setattr(config, "load_env", lambda: dict(env))
++
++    def save(key, value):
++        writes.append((key, value))
++        env[key] = value
++
++    def remove(key):
++        writes.append(("remove", key))
++        return env.pop(key, None) is not None
++
++    monkeypatch.setattr(config, "save_env_value", save)
++    monkeypatch.setattr(config, "remove_env_value", remove)
++
++    replaced = messaging.replace_bot_token(token, "operation-1")
++    assert replaced == {
++        "operation_id": "operation-1",
++        "configured": True,
++        "changed": True,
++    }
++    assert token not in repr(replaced)
++    assert writes == [("TELEGRAM_BOT_TOKEN", token)]
++
++    unchanged = messaging.replace_bot_token(token, "operation-2")
++    assert unchanged["changed"] is False
++    removed = messaging.remove_bot_token("operation-3")
++    assert removed == {
++        "operation_id": "operation-3",
++        "configured": False,
++        "changed": True,
++    }
++    assert env == {}
++
++
++@pytest.mark.parametrize(
++    "call",
++    [
++        lambda: messaging.replace_bot_token("not-a-token", "operation-1"),
++        lambda: messaging.replace_bot_token("123:" + "A" * 30, " bad-op"),
++        lambda: messaging.remove_bot_token("bad\noperation"),
++        lambda: messaging.approve_pairing_request("not-a-request"),
++        lambda: messaging.revoke_approved_user("not-numeric"),
++    ],
++)
++def test_all_mutation_inputs_are_bounded_and_reject_control_or_bad_shape(call):
++    with pytest.raises(messaging.TelegramMessagingRpcError) as exc_info:
++        call()
++    assert exc_info.value.rpc_code == -32602
++
++
++def test_pairing_list_is_telegram_only_and_has_exact_public_shape():
++    store = SimpleNamespace(
++        list_pending=lambda platform: [
++            {
++                "platform": platform,
++                "request_id": "0123456789abcdef",
++                "user_id": "42",
++                "user_name": "Alice",
++                "age_minutes": 3,
++                "hash": "must-not-leak",
++            },
++            {
++                "platform": "discord",
++                "request_id": "fedcba9876543210",
++                "user_id": "7",
++                "user_name": "Other",
++                "age_minutes": 1,
++            },
++        ],
++        list_approved=lambda platform: [
++            {"platform": platform, "user_id": "42", "user_name": "Alice"},
++            {"platform": "discord", "user_id": "7"},
++        ],
++    )
++
++    assert messaging.telegram_pairing_list(store) == {
++        "pending": [
++            {
++                "request_id": "0123456789abcdef",
++                "user_id": "42",
++                "user_name": "Alice",
++                "age_minutes": 3,
++            }
++        ],
++        "approved": [{"user_id": "42"}],
++    }
++
++
++def test_pairing_approve_and_revoke_return_strict_receipts_and_explicit_misses():
++    store = SimpleNamespace(
++        approve_request=lambda platform, request_id: {
++            "user_id": "42",
++            "user_name": "Alice",
++        },
++        revoke=lambda platform, user_id: True,
++    )
++    assert messaging.approve_pairing_request("0123456789abcdef", store) == {
++        "request_id": "0123456789abcdef",
++        "user_id": "42",
++        "approved": True,
++    }
++    assert messaging.revoke_approved_user("42", store) == {
++        "user_id": "42",
++        "revoked": True,
++    }
++
++    store.approve_request = lambda *_args: None
++    with pytest.raises(messaging.TelegramMessagingRpcError) as approve_error:
++        messaging.approve_pairing_request("0123456789abcdef", store)
++    assert approve_error.value.rpc_code == messaging.TELEGRAM_PAIRING_REQUEST_NOT_FOUND
++
++    store.revoke = lambda *_args: False
++    with pytest.raises(messaging.TelegramMessagingRpcError) as revoke_error:
++        messaging.revoke_approved_user("42", store)
++    assert revoke_error.value.rpc_code == messaging.TELEGRAM_APPROVED_USER_NOT_FOUND
++
++
++def test_rpc_envelopes_match_fixed_schema_and_never_echo_token(monkeypatch):
++    token = "123456789:" + "B" * 35
++    monkeypatch.setattr(
++        messaging,
++        "replace_bot_token",
++        lambda bot_token, operation_id: {
++            "operation_id": operation_id,
++            "configured": True,
++            "changed": True,
++        },
++    )
++    response = _request(
++        "messaging.telegram.replace",
++        {"bot_token": token, "operation_id": "operation-1"},
++    )
++    assert response == {
++        "jsonrpc": "2.0",
++        "id": "rpc-1",
++        "result": {
++            "operation_id": "operation-1",
++            "configured": True,
++            "changed": True,
++        },
++    }
++    assert token not in repr(response)
+diff --git a/tui_gateway/methods_messaging.py b/tui_gateway/methods_messaging.py
+new file mode 100644
+index 0000000..330af38
+--- /dev/null
++++ b/tui_gateway/methods_messaging.py
+@@ -0,0 +1,99 @@
++"""Strict Telegram messaging JSON-RPC handlers for the Lilith Runtime."""
++
++from .method_ctx import HandlerRegistry
++
++_registry = HandlerRegistry()
++method = _registry.method
++
++
++def _call(rid, params, expected_keys, operation):
++    # This helper is intentionally captured as a default argument by handlers
++    # below; HandlerRegistry rebinds their globals onto server.py at install.
++    if set(params) != set(expected_keys):
++        return {
++            "jsonrpc": "2.0",
++            "id": rid,
++            "error": {"code": -32602, "message": "invalid params"},
++        }
++    try:
++        return {"jsonrpc": "2.0", "id": rid, "result": operation()}
++    except Exception as exc:
++        from tui_gateway.telegram_messaging import TelegramMessagingRpcError
++
++        if isinstance(exc, TelegramMessagingRpcError):
++            code = exc.rpc_code
++            message = str(exc)
++        else:
++            code = -32603
++            message = "Telegram messaging operation failed"
++        return {
++            "jsonrpc": "2.0",
++            "id": rid,
++            "error": {"code": code, "message": message},
++        }
++
++
++@method("messaging.telegram.status")
++def _(rid, params: dict, _invoke=_call) -> dict:
++    from tui_gateway.telegram_messaging import telegram_status
++
++    return _invoke(rid, params, (), telegram_status)
++
++
++@method("messaging.telegram.replace")
++def _(rid, params: dict, _invoke=_call) -> dict:
++    from tui_gateway.telegram_messaging import replace_bot_token
++
++    return _invoke(
++        rid,
++        params,
++        ("bot_token", "operation_id"),
++        lambda: replace_bot_token(params.get("bot_token"), params.get("operation_id")),
++    )
++
++
++@method("messaging.telegram.remove")
++def _(rid, params: dict, _invoke=_call) -> dict:
++    from tui_gateway.telegram_messaging import remove_bot_token
++
++    return _invoke(
++        rid,
++        params,
++        ("operation_id",),
++        lambda: remove_bot_token(params.get("operation_id")),
++    )
++
++
++@method("messaging.telegram.pairing.list")
++def _(rid, params: dict, _invoke=_call) -> dict:
++    from tui_gateway.telegram_messaging import telegram_pairing_list
++
++    return _invoke(rid, params, (), telegram_pairing_list)
++
++
++@method("messaging.telegram.pairing.approve")
++def _(rid, params: dict, _invoke=_call) -> dict:
++    from tui_gateway.telegram_messaging import approve_pairing_request
++
++    return _invoke(
++        rid,
++        params,
++        ("request_id",),
++        lambda: approve_pairing_request(params.get("request_id")),
++    )
++
++
++@method("messaging.telegram.pairing.revoke")
++def _(rid, params: dict, _invoke=_call) -> dict:
++    from tui_gateway.telegram_messaging import revoke_approved_user
++
++    return _invoke(
++        rid,
++        params,
++        ("user_id",),
++        lambda: revoke_approved_user(params.get("user_id")),
++    )
++
++
++def register(server) -> None:
++    _registry.install(server)
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index c1f9300..22ca0dc 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -282,6 +282,12 @@ _LONG_HANDLERS = frozenset(
+         "pet.select",
+         "pet.thumb",
+         "learning.frames",
++        "messaging.telegram.status",
++        "messaging.telegram.replace",
++        "messaging.telegram.remove",
++        "messaging.telegram.pairing.list",
++        "messaging.telegram.pairing.approve",
++        "messaging.telegram.pairing.revoke",
+         "plugins.manage",
+         # reload.mcp shuts down and rediscovers every MCP server — with a
+         # flapping server (retry loops, connect timeouts up to 120s) that can
+@@ -370,6 +376,15 @@ _pool = concurrent.futures.ThreadPoolExecutor(
+ )
+ atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
+ 
++# A Lilith game request has a ten-minute outer deadline. Admission to the
++# shared Hermes profile must resolve well before that caller gives up, or the
++# abandoned worker could acquire the lease later and run a background turn the
++# game already reported as failed. The short contention budget is intersected
++# with a nine-minute absolute turn-admission deadline derived from the accepted
++# inflight receipt; both are cancellation-aware.
++_TUI_PROFILE_LEASE_WAIT_SECONDS = 60.0
++_TUI_TURN_ADMISSION_DEADLINE_SECONDS = 9.0 * 60.0
++
+ # Exact in-memory session generation executing on the current turn thread.
+ # Unlike a public session id, this object identity cannot be supplied by RPC.
+ _current_runtime_session_record: contextvars.ContextVar[dict | None] = (
+@@ -14921,7 +14936,7 @@ def _run_prompt_submit(
+         with _turn_event_scope(turn_id, assistant_message_id):
+             _emit("message.start", sid)
+ 
+-    def run():
++    def _run_with_profile_turn_lease(release_profile_turn_lease):
+         # The conversation runs on a fresh thread, so ContextVars from the RPC
+         # dispatcher do not follow automatically. Rebind the exact transport
+         # stored on this session generation before any tool can commission a
+@@ -15787,6 +15802,11 @@ def _run_prompt_submit(
+             _retire_turn_marker(session, marker_key)
+             session.pop("_auto_continue_scheduled", None)
+             _emit_settled_session_info(sid, session, agent)
++            # The durable turn is fully flushed and all per-turn context has
++            # been torn down. Release the shared profile lease BEFORE queued,
++            # goal, and completion follow-ups recursively submit their own
++            # turns; keeping it through those calls would self-deadlock.
++            release_profile_turn_lease()
+ 
+         # A user prompt that arrived mid-turn (interrupt + queue) wins over
+         # every auto follow-up below — drain it first and skip them this cycle;
+@@ -15901,6 +15921,82 @@ def _run_prompt_submit(
+                 file=sys.stderr,
+             )
+ 
++    def run():
++        # TUI and native messaging gateway are separate processes that can
++        # resolve the same durable session. Hold the same profile-global
++        # kernel lock as gateway.turn_lease across the entire durable turn.
++        from gateway.turn_lease import (
++            TurnLeaseCancelledError,
++            TurnLeaseTimeoutError,
++            acquire_profile_turn_lease,
++        )
++
++        with session["history_lock"]:
++            inflight = session.get("inflight_turn")
++            accepted_at = (
++                float(inflight.get("started_at") or time.time())
++                if isinstance(inflight, dict)
++                else time.time()
++            )
++        accepted_elapsed = max(0.0, time.time() - accepted_at)
++        turn_remaining = max(
++            0.0,
++            _TUI_TURN_ADMISSION_DEADLINE_SECONDS - accepted_elapsed,
++        )
++        lease_wait = min(_TUI_PROFILE_LEASE_WAIT_SECONDS, turn_remaining)
++        turn_deadline = time.monotonic() + turn_remaining
++
++        def lease_wait_cancelled() -> bool:
++            with session["history_lock"]:
++                return (
++                    session.get("_turn_cancel_requested") is True
++                    or not bool(session.get("running"))
++                )
++
++        try:
++            profile_lease = acquire_profile_turn_lease(
++                str(session.get("session_key") or sid),
++                owner_key=f"tui:{sid}",
++                timeout=lease_wait,
++                deadline=turn_deadline,
++                cancelled=lease_wait_cancelled,
++                profile_home=session.get("profile_home") or _session_home(session),
++            )
++        except (TurnLeaseCancelledError, TurnLeaseTimeoutError) as lease_error:
++            # Fail closed without exposing the lock path, routing key, stored
++            # session id, or another process's details to the UI. Timeout is a
++            # retryable non-start; cancellation is terminal for this receipt.
++            visible_error = RuntimeError(
++                "Turn cancelled before it entered the shared session."
++                if isinstance(lease_error, TurnLeaseCancelledError)
++                else (
++                    "Another Hermes entry is still running a turn. This turn "
++                    "did not start; please resend after it finishes."
++                )
++            )
++            try:
++                _emit_terminal_turn_error(sid, session, visible_error)
++            except Exception:
++                _emit("error", sid, {"message": str(visible_error)})
++            with session["history_lock"]:
++                session["running"] = False
++                session["last_active"] = time.time()
++                _clear_inflight_turn(session)
++                _arm_next_queued_prompt_gate_locked(session)
++            _clear_agent_turn_callbacks(agent, sid, turn_id)
++            _emit_settled_session_info(sid, session, agent)
++            return
++
++        if profile_lease is None:  # defensive; session key above is non-empty
++            with session["history_lock"]:
++                session["running"] = False
++            return
++        try:
++            _run_with_profile_turn_lease(profile_lease.release)
++        finally:
++            # Covers exceptions before the normal post-flush release boundary.
++            profile_lease.release()
++
+     run_thread = threading.Thread(target=run, daemon=True)
+     session["_run_thread"] = run_thread
+     run_thread.start()
+@@ -21347,6 +21443,7 @@ from . import (  # noqa: E402
+     methods_complete as _methods_complete,
+     methods_config as _methods_config,
+     methods_images as _methods_images,
++    methods_messaging as _methods_messaging,
+     methods_profiles as _methods_profiles,
+     methods_prompt as _methods_prompt,
+     methods_session as _methods_session,
+@@ -21359,6 +21456,7 @@ for _m in (
+     _methods_config,
+     _methods_complete,
+     _methods_tools,
++    _methods_messaging,
+     _methods_profiles,
+     _methods_images,
+ ):
+diff --git a/tui_gateway/telegram_messaging.py b/tui_gateway/telegram_messaging.py
+new file mode 100644
+index 0000000..202935a
+--- /dev/null
++++ b/tui_gateway/telegram_messaging.py
+@@ -0,0 +1,316 @@
++"""Strict native Telegram control surface for the Lilith Runtime.
++
++Only bounded receipts and pairing identities cross this module boundary.
++The bot token is accepted write-only and is never returned or logged.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++import re
++import threading
++from typing import Any, Optional
++import unicodedata
++
++TELEGRAM_PAIRING_REQUEST_NOT_FOUND = 5071
++TELEGRAM_APPROVED_USER_NOT_FOUND = 5072
++TELEGRAM_CONFIG_WRITE_FAILED = 5073
++
++_BOT_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{30,}$")
++_REQUEST_ID_RE = re.compile(r"^[0-9a-fA-F]{16}$")
++_USER_ID_RE = re.compile(r"^[0-9]{1,32}$")
++_MUTATION_LOCK = threading.RLock()
++
++
++class TelegramMessagingRpcError(ValueError):
++    def __init__(self, rpc_code: int, message: str) -> None:
++        self.rpc_code = int(rpc_code)
++        super().__init__(message)
++
++
++def _has_control(value: str) -> bool:
++    return any(unicodedata.category(char) == "Cc" for char in value)
++
++
++def _bounded_text(
++    value: Any,
++    *,
++    field: str,
++    max_utf8_bytes: int,
++    pattern: Optional[re.Pattern[str]] = None,
++) -> str:
++    if type(value) is not str or not value or value != value.strip():
++        raise TelegramMessagingRpcError(-32602, f"invalid params: {field}")
++    if _has_control(value):
++        raise TelegramMessagingRpcError(-32602, f"invalid params: {field}")
++    try:
++        encoded = value.encode("utf-8", errors="strict")
++    except UnicodeError:
++        raise TelegramMessagingRpcError(
++            -32602, f"invalid params: {field}"
++        ) from None
++    if len(encoded) > max_utf8_bytes or (pattern is not None and not pattern.fullmatch(value)):
++        raise TelegramMessagingRpcError(-32602, f"invalid params: {field}")
++    return value
++
++
++def validate_operation_id(value: Any) -> str:
++    return _bounded_text(
++        value,
++        field="operation_id",
++        max_utf8_bytes=128,
++    )
++
++
++def validate_bot_token(value: Any) -> str:
++    # The regex is the native hermes_cli.setup Telegram token grammar. Keep a
++    # hard byte bound as a defense before any credential writer sees input.
++    return _bounded_text(
++        value,
++        field="bot_token",
++        max_utf8_bytes=512,
++        pattern=_BOT_TOKEN_RE,
++    )
++
++
++def validate_request_id(value: Any) -> str:
++    return _bounded_text(
++        value,
++        field="request_id",
++        max_utf8_bytes=16,
++        pattern=_REQUEST_ID_RE,
++    ).lower()
++
++
++def validate_user_id(value: Any) -> str:
++    return _bounded_text(
++        value,
++        field="user_id",
++        max_utf8_bytes=32,
++        pattern=_USER_ID_RE,
++    )
++
++
++def _env_token() -> str:
++    from hermes_cli.config import load_env
++
++    value = load_env().get("TELEGRAM_BOT_TOKEN", "")
++    return value if isinstance(value, str) else ""
++
++
++def telegram_status() -> dict[str, Any]:
++    """Return a redacted four-state Telegram health projection."""
++    from gateway.status import read_runtime_status, resolve_gateway_liveness
++    from hermes_constants import get_hermes_home
++
++    home = Path(get_hermes_home())
++    try:
++        configured = bool(_env_token())
++    except Exception:
++        configured = False
++    try:
++        runtime = read_runtime_status(path=home / "gateway_state.json")
++    except Exception:
++        runtime = None
++    try:
++        liveness = resolve_gateway_liveness(
++            profile_dir=home,
++            runtime=runtime,
++        )
++        profile_gateway_running = bool(liveness.running)
++    except Exception:
++        profile_gateway_running = False
++
++    runtime = runtime if isinstance(runtime, dict) else {}
++    platforms = runtime.get("platforms")
++    telegram = platforms.get("telegram") if isinstance(platforms, dict) else None
++    telegram = telegram if isinstance(telegram, dict) else {}
++    platform_state = str(
++        telegram.get("state") or telegram.get("status") or ""
++    ).strip().lower()
++    connected_states = {"connected", "running", "ok"}
++    starting_states = {
++        "starting",
++        "connecting",
++        "initializing",
++        "pending",
++        "pending_restart",
++        "reconnecting",
++    }
++    # Once Telegram is configured, a live profile gateway owns its lifecycle.
++    # The Telegram adapter may still be starting/reconnecting, may not have
++    # written its platform entry yet, or may be reporting an error that needs
++    # attention. None of those states authorizes Runtime to spawn a second
++    # gateway process for the same profile.
++    gateway_running = bool(configured and profile_gateway_running)
++
++    if not configured:
++        state = "unconfigured"
++    elif gateway_running and platform_state in connected_states:
++        state = "connected"
++    elif gateway_running and (
++        not platform_state or platform_state in starting_states
++    ):
++        state = "starting"
++    else:
++        state = "attention"
++    return {
++        "configured": configured,
++        "gateway_running": gateway_running,
++        "state": state,
++    }
++
++
++def replace_bot_token(bot_token: Any, operation_id: Any) -> dict[str, Any]:
++    token = validate_bot_token(bot_token)
++    operation = validate_operation_id(operation_id)
++    from hermes_cli.config import load_env, save_env_value
++
++    with _MUTATION_LOCK:
++        before = load_env().get("TELEGRAM_BOT_TOKEN", "")
++        changed = before != token
++        if changed:
++            try:
++                save_env_value("TELEGRAM_BOT_TOKEN", token)
++            except Exception:
++                raise TelegramMessagingRpcError(
++                    TELEGRAM_CONFIG_WRITE_FAILED,
++                    "Telegram credential could not be saved",
++                ) from None
++        try:
++            persisted = load_env().get("TELEGRAM_BOT_TOKEN", "")
++        except Exception:
++            persisted = ""
++        if persisted != token:
++            raise TelegramMessagingRpcError(
++                TELEGRAM_CONFIG_WRITE_FAILED,
++                "Telegram credential could not be saved",
++            )
++    return {
++        "operation_id": operation,
++        "configured": True,
++        "changed": bool(changed),
++    }
++
++
++def remove_bot_token(operation_id: Any) -> dict[str, Any]:
++    operation = validate_operation_id(operation_id)
++    from hermes_cli.config import load_env, remove_env_value
++
++    with _MUTATION_LOCK:
++        before = load_env().get("TELEGRAM_BOT_TOKEN", "")
++        changed = bool(before)
++        if changed:
++            try:
++                remove_env_value("TELEGRAM_BOT_TOKEN")
++            except Exception:
++                raise TelegramMessagingRpcError(
++                    TELEGRAM_CONFIG_WRITE_FAILED,
++                    "Telegram credential could not be removed",
++                ) from None
++        try:
++            persisted = load_env().get("TELEGRAM_BOT_TOKEN", "")
++        except Exception:
++            persisted = before
++        if persisted:
++            raise TelegramMessagingRpcError(
++                TELEGRAM_CONFIG_WRITE_FAILED,
++                "Telegram credential could not be removed",
++            )
++    return {
++        "operation_id": operation,
++        "configured": False,
++        "changed": bool(changed),
++    }
++
++
++def _safe_output_text(value: Any, max_utf8_bytes: int) -> Optional[str]:
++    if type(value) is not str or not value or _has_control(value):
++        return None
++    try:
++        encoded = value.encode("utf-8", errors="strict")
++    except UnicodeError:
++        return None
++    if len(encoded) > max_utf8_bytes:
++        return None
++    return value
++
++
++def telegram_pairing_list(store=None) -> dict[str, list[dict[str, Any]]]:
++    if store is None:
++        from gateway.pairing import PairingStore
++
++        store = PairingStore()
++
++    pending = []
++    for item in store.list_pending("telegram"):
++        if not isinstance(item, dict) or item.get("platform") != "telegram":
++            continue
++        request_id = _safe_output_text(item.get("request_id"), 16)
++        user_id = _safe_output_text(item.get("user_id"), 128)
++        user_name = item.get("user_name")
++        if type(user_name) is not str:
++            user_name = ""
++        if _has_control(user_name) or len(user_name.encode("utf-8", errors="ignore")) > 256:
++            user_name = ""
++        age = item.get("age_minutes")
++        if (
++            request_id is None
++            or not _REQUEST_ID_RE.fullmatch(request_id)
++            or user_id is None
++            or type(age) is not int
++            or age < 0
++        ):
++            continue
++        pending.append(
++            {
++                "request_id": request_id.lower(),
++                "user_id": user_id,
++                "user_name": user_name,
++                "age_minutes": min(age, 2_147_483_647),
++            }
++        )
++
++    approved = []
++    for item in store.list_approved("telegram"):
++        if not isinstance(item, dict) or item.get("platform") != "telegram":
++            continue
++        user_id = _safe_output_text(item.get("user_id"), 128)
++        if user_id is not None:
++            approved.append({"user_id": user_id})
++    return {"pending": pending, "approved": approved}
++
++
++def approve_pairing_request(request_id: Any, store=None) -> dict[str, Any]:
++    request = validate_request_id(request_id)
++    if store is None:
++        from gateway.pairing import PairingStore
++
++        store = PairingStore()
++    result = store.approve_request("telegram", request)
++    if not isinstance(result, dict):
++        raise TelegramMessagingRpcError(
++            TELEGRAM_PAIRING_REQUEST_NOT_FOUND,
++            "Telegram pairing request was not found or has expired",
++        )
++    user_id = _safe_output_text(result.get("user_id"), 128)
++    if user_id is None:
++        raise TelegramMessagingRpcError(
++            TELEGRAM_PAIRING_REQUEST_NOT_FOUND,
++            "Telegram pairing request was not found or has expired",
++        )
++    return {"request_id": request, "user_id": user_id, "approved": True}
++
++
++def revoke_approved_user(user_id: Any, store=None) -> dict[str, Any]:
++    user = validate_user_id(user_id)
++    if store is None:
++        from gateway.pairing import PairingStore
++
++        store = PairingStore()
++    if store.revoke("telegram", user) is not True:
++        raise TelegramMessagingRpcError(
++            TELEGRAM_APPROVED_USER_NOT_FOUND,
++            "Telegram approved user was not found",
++        )
++    return {"user_id": user, "revoked": True}

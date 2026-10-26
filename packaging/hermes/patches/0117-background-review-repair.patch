@@ -1,0 +1,474 @@
+diff --git a/agent/background_context.py b/agent/background_context.py
+index c1b908f..9ec897a 100644
+--- a/agent/background_context.py
++++ b/agent/background_context.py
+@@ -1,8 +1,79 @@
+ """Data-only summary handoff; no parent agent, compressor or write authority."""
+ from dataclasses import dataclass
++import hashlib
++import json
+ from agent.history_context import summary_scope
+ 
+ 
++@dataclass(frozen=True)
++class HistoryProjectionSnapshot:
++    """Data only: ordinal metadata belongs to one exact captured history."""
++    session_id: str
++    identity_enabled: bool
++    fingerprint: str
++    source_key: str
++    migration: tuple[int, str] | None
++
++
++def _source_key(rows):
++    return hashlib.sha256(json.dumps(rows, sort_keys=True, ensure_ascii=True,
++        separators=(",", ":"), allow_nan=False).encode()).hexdigest()
++
++
++def freeze_history_projection(agent, rows):
++    """Freeze before the next foreground turn; never read storage or an LLM."""
++    from agent.identity_policy import policy_for_agent
++    policy = policy_for_agent(agent)
++    migration = None
++    value = getattr(agent, "_identity_legacy_history_v1", None)
++    if policy.enabled and value is not None:
++        if (type(value) is not dict or type(value.get("cutoff")) is not int
++                or value["cutoff"] <= 0 or value.get("migrated_to") != policy.fingerprint):
++            return None
++        migration = (value["cutoff"], value["migrated_to"])
++    try:
++        return HistoryProjectionSnapshot(agent.session_id, policy.enabled,
++            policy.fingerprint, _source_key(rows), migration)
++    except (TypeError, ValueError):
++        return None
++
++
++def attach_history_projection(agent, snapshot, rows):
++    """Apply only to unchanged full history, never to a routed digest.
++
++    Identity attestation and summary scope/coverage are still independently
++    checked by their native owners. A child receives its own migration dict,
++    not a parent agent, database handle or shared mutable authority.
++    """
++    from agent.identity_policy import policy_for_agent
++    policy = policy_for_agent(agent)
++    if (type(snapshot) is not HistoryProjectionSnapshot
++            or snapshot.session_id != agent.session_id
++            or snapshot.identity_enabled != policy.enabled
++            or snapshot.fingerprint != policy.fingerprint):
++        return False
++    try:
++        if snapshot.source_key != _source_key(rows):
++            return False
++    except (TypeError, ValueError):
++        return False
++    migration = snapshot.migration
++    if migration is not None and (not policy.enabled or type(migration) is not tuple
++            or len(migration) != 2 or type(migration[0]) is not int
++            or migration[0] <= 0 or migration[1] != policy.fingerprint):
++        return False
++    value = None if migration is None else {"cutoff": migration[0], "migrated_to": migration[1]}
++    current = getattr(agent, "_identity_legacy_history_v1", None)
++    if current is not None and current != value:
++        return False
++    if value is not None:
++        agent._identity_legacy_history_v1 = dict(value)
++        config = getattr(agent, "_session_init_model_config", None)
++        if isinstance(config, dict):
++            config["_identity_legacy_history_v1"] = dict(value)
++    return True
++
++
+ @dataclass(frozen=True)
+ class SummarySnapshot:
+     key: tuple
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 50c95b4..0e4f70e 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -673,6 +673,7 @@ def _run_review_in_thread(
+     completion_callback: Any = ...,
+     origin_turn_id: str = "",
+     summary_snapshot: Any = None,
++    history_projection_snapshot: Any = None,
+ ) -> None:
+     """Worker function executed in the background-review daemon thread.
+ 
+@@ -919,6 +920,9 @@ def _run_review_in_thread(
+             # the review must not kill the parent's processes or discard its
+             # browser/computer-use target state between foreground turns.
+             review_agent._owns_session_tool_resources = False
++            # Establish close isolation before any fallible metadata handoff:
++            # even a rejected snapshot must not finalize the parent's session.
++            review_agent._end_session_on_close = False
+             # Suppress all status/warning emits from the fork so the
+             # user only sees the final successful-action summary.
+             # Without this, mid-review "Iteration budget exhausted",
+@@ -952,15 +956,23 @@ def _run_review_in_thread(
+                 # if a future code path bypasses the cache.
+                 review_agent.session_start = agent.session_start
+             review_agent.session_id = agent.session_id
++            # Full replay must use the same request-only legacy boundary as
++            # the captured foreground history, even when cached system text
++            # bypasses the normal DB restore path. Routed digests use different
++            # ordinals and must not inherit this boundary or its summary.
++            from agent.background_context import attach_history_projection
++            if not _routed and not attach_history_projection(
++                review_agent, history_projection_snapshot, messages_snapshot
++            ):
++                raise RuntimeError("background_history_projection_mismatch")
+             from agent.background_context import attach_summary
+             attach_summary(review_agent, summary_snapshot)
+-            # The fork shares the parent's live session_id (pinned above for
+-            # prefix-cache parity). It is single-lifecycle and calls close()
+-            # right after this run_conversation(); without opting out, close()
+-            # would finalize the parent's still-active session row mid
+-            # conversation (the review fires every ~10 turns). Leave session
+-            # finalization to the real owner (CLI close / gateway reset / cron).
+-            review_agent._end_session_on_close = False
++            from agent.background_review_policy import (
++                BackgroundReviewGuardrails, review_capability_guidance,
++            )
++            review_agent._tool_guardrails = BackgroundReviewGuardrails(
++                review_agent, getattr(getattr(review_agent, "_tool_guardrails", None), "config", None)
++            )
+             # Never let the review fork compress. It shares the parent's
+             # session_id, so if it won a compression race it would rotate the
+             # parent into a NEW child that the gateway never adopts (the fork
+@@ -1042,6 +1054,7 @@ def _run_review_in_thread(
+                 review_agent.run_conversation(
+                     user_message=(
+                         prompt
++                        + "\n\n" + review_capability_guidance(review_agent)
+                         + "\n\nYou can only call memory and skill "
+                         "management tools. Other tools will be denied "
+                         "at runtime — do not attempt them."
+@@ -1223,8 +1236,9 @@ def spawn_background_review_thread(
+     completion_callback = getattr(agent, "background_review_callback", None)
+     # Freeze before a later foreground turn can replace the parent's checkpoint.
+     # The child rechecks route/identity and full source coverage independently.
+-    from agent.background_context import freeze_summary
++    from agent.background_context import freeze_summary, freeze_history_projection
+     summary_snapshot = freeze_summary(agent)
++    history_projection_snapshot = freeze_history_projection(agent, messages_snapshot)
+     origin_turn_id = str(
+         getattr(completion_callback, "_hermes_turn_id", "")
+         or getattr(agent, "_current_turn_id", "")
+@@ -1239,6 +1253,7 @@ def spawn_background_review_thread(
+             completion_callback=completion_callback,
+             origin_turn_id=origin_turn_id,
+             summary_snapshot=summary_snapshot,
++            history_projection_snapshot=history_projection_snapshot,
+         )
+ 
+     return _target, prompt
+diff --git a/agent/background_review_policy.py b/agent/background_review_policy.py
+new file mode 100644
+--- /dev/null
++++ b/agent/background_review_policy.py
+@@ -0,0 +1,109 @@
++"""Background-only capability guidance and native loop convergence.
++
++No writer, extra provider, preference change or approval bypass. Foreground
++guardrails are untouched. Native tool results remain the outcome authority.
++"""
++import json
++from collections.abc import Mapping
++
++from agent.tool_guardrails import ToolCallGuardrailController, ToolGuardrailDecision
++
++
++def _target_available(agent, target):
++    if target not in ("memory", "user"):
++        return True  # native schema/target validation owns malformed requests
++    enabled = "_memory_enabled" if target == "memory" else "_user_profile_enabled"
++    if not getattr(agent, enabled, False):
++        return False
++    if target == "user" and getattr(agent, "_authoritative_user_profile_writes", False):
++        return getattr(agent, "_memory_manager", None) is not None
++    return getattr(agent, "_memory_store", None) is not None
++
++
++def review_capability_guidance(agent):
++    """Numeric advisory snapshot, not permission or a capacity reservation."""
++    lines = ["Background maintenance constraints (not new write authority):"]
++    for target in ("memory", "user"):
++        available = _target_available(agent, target)
++        lines.append(f"memory target={target}: {'available under native policy' if available else 'unavailable; skip this target'}.")
++        store = getattr(agent, "_memory_store", None)
++        if available and store is not None:
++            try:
++                used, limit = store._char_count(target), store._char_limit(target)
++                if type(used) is int and type(limit) is int and 0 <= used and 0 <= limit:
++                    lines.append(f"Built-in {target} snapshot: {used}/{limit} characters; {max(0, limit-used)} remaining. The native store rechecks the actual current state.")
++            except Exception:
++                pass  # unknown capacity is not an empty store
++    lines += [
++        "Do not copy user-profile facts into environmental memory or a skill as a workaround. The separate authoritative profile-review flow remains responsible for those facts.",
++        "No-op is complete. Do not delete unrelated knowledge merely to fit a new entry. If capacity is insufficient, skip or propose one safe atomic consolidation using exact existing entries; never repeatedly guess a shorter batch.",
++        "Protected/bundled/hub/user-owned/pinned skills remain protected. Skip a refused target; do not try another tool or path to change it.",
++        "An unavailable provider, denied write, pending approval or terminal result is not an invitation to retry. Only committed tool receipts mean saved; staged or skipped is not saved.",
++    ]
++    return "\n".join(lines)
++
++
++class BackgroundReviewGuardrails(ToolCallGuardrailController):
++    """Converge optional maintenance, using the existing controlled-halt seam."""
++    def __init__(self, agent, config=None):
++        self._review_agent = agent
++        super().__init__(config)
++
++    def reset_for_turn(self):
++        super().reset_for_turn()
++        self._review_failures = {}
++        self._review_stop = None
++
++    def _stop(self, tool_name, code, *, before=False, count=1):
++        decision = ToolGuardrailDecision(action="block" if before else "halt",
++            code=code, tool_name=tool_name, count=count,
++            message="Background maintenance stopped at an unavailable, uncommitted or repeatedly failing operation. Do not retry or bypass it. Earlier committed receipts remain valid; this operation was not reported as saved.")
++        self._review_stop = decision
++        self._halt_decision = decision
++        return decision
++
++    def before_call(self, tool_name, args):
++        if self._review_stop is not None:
++            return self._stop(tool_name, self._review_stop.code, before=True,
++                              count=self._review_stop.count)
++        native = super().before_call(tool_name, args)
++        if not native.allows_execution:
++            return native
++        if tool_name == "memory" and isinstance(args, Mapping):
++            if not _target_available(self._review_agent, args.get("target", "memory")):
++                return self._stop(tool_name, "background_memory_target_unavailable", before=True)
++        return native
++
++    def after_call(self, tool_name, args, result, *, failed=None):
++        if tool_name not in ("memory", "skill_manage"):
++            return super().after_call(tool_name, args, result, failed=failed)
++        try:
++            data = json.loads(result) if isinstance(result, str) else None
++        except (TypeError, ValueError):
++            data = None
++        data = data if isinstance(data, dict) else {}
++        if data.get("staged") is True or (data.get("success") is True and data.get("committed") is False):
++            return self._stop(tool_name, "background_write_pending")
++        is_failure = failed is True or data.get("success") is False or bool(data.get("error"))
++        if not is_failure:
++            self._review_failures.pop(tool_name, None)
++            return super().after_call(tool_name, args, result, failed=failed)
++        count = self._review_failures.get(tool_name, 0) + 1
++        self._review_failures[tool_name] = count
++        error = data.get("error")
++        protected = (tool_name == "skill_manage" and isinstance(error, str)
++                     and error.startswith("Refusing background curator "))
++        unavailable = data.get("code") in (
++            "memory.authoritative_provider_unavailable", "memory.authoritative_user_profile_required")
++        if data.get("done") is True or unavailable or protected:
++            return self._stop(tool_name, "background_write_terminal", count=count)
++        if count >= 2:
++            return self._stop(tool_name, "background_write_no_progress", count=count)
++        # One diagnostic/correction, never the foreground 'keep using tools'
++        # recovery instruction. Native stricter limits must still take effect.
++        native = super().after_call(tool_name, args, result, failed=True)
++        if native.should_halt:
++            return native
++        return ToolGuardrailDecision(action="warn", code="background_write_correction",
++            tool_name=tool_name, count=count,
++            message="This optional maintenance write failed. Skip it unless one safe correction is evident from the exact tool result. At most one corrective attempt; do not remove unrelated facts, change permissions or redirect user facts to another store.")
+diff --git a/tests/test_background_review_repair.py b/tests/test_background_review_repair.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_background_review_repair.py
+@@ -0,0 +1,191 @@
++"""Synthetic data only; full-host harness separately verifies real identity."""
++from copy import deepcopy
++from dataclasses import FrozenInstanceError, replace
++import json
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++from agent.background_context import freeze_history_projection, attach_history_projection
++from agent.background_review_policy import BackgroundReviewGuardrails, review_capability_guidance
++from agent.tool_guardrails import ToolCallGuardrailController, ToolCallGuardrailConfig
++
++
++def agent():
++    return SimpleNamespace(session_id="synthetic", _session_init_model_config={},
++        _identity_policy=SimpleNamespace(enabled=True, fingerprint="a"*64),
++        _identity_legacy_history_v1={"cutoff":12,"migrated_to":"a"*64},
++        _memory_enabled=True, _user_profile_enabled=True,
++        _authoritative_user_profile_writes=True, _memory_manager=None,
++        _memory_store=SimpleNamespace(_char_count=lambda target:2186,
++                                      _char_limit=lambda target:2200))
++
++
++class HistoryHandoffTests(unittest.TestCase):
++    def setUp(self):
++        self.policy = patch("agent.identity_policy.policy_for_agent", lambda a:a._identity_policy)
++        self.policy.start()
++        self.addCleanup(self.policy.stop)
++        self.parent = agent()
++        self.rows = [{"role":"user", "content":"synthetic", "api_content":"synthetic sidecar"},
++                     {"role":"assistant", "content":"answer", "reasoning_content":"old reasoning"}]
++        self.original = deepcopy(self.rows)
++        self.snapshot = freeze_history_projection(self.parent, self.rows)
++        self.child = agent()
++        del self.child._identity_legacy_history_v1
++
++    def test_frozen_metadata_independent_of_parent_and_child(self):
++        self.parent._identity_legacy_history_v1["cutoff"] = 99
++        self.assertTrue(attach_history_projection(self.child, self.snapshot, self.rows))
++        self.assertEqual(self.child._identity_legacy_history_v1["cutoff"], 12)
++        self.child._identity_legacy_history_v1["cutoff"] = 8
++        self.assertEqual(self.snapshot.migration[0], 12)
++        self.assertEqual(self.child._session_init_model_config["_identity_legacy_history_v1"]["cutoff"], 12)
++        self.assertEqual(self.rows, self.original)
++        with self.assertRaises(FrozenInstanceError):
++            self.snapshot.session_id = "other"
++
++    def test_no_migration_preserves_native_shape(self):
++        del self.parent._identity_legacy_history_v1
++        snapshot = freeze_history_projection(self.parent, self.rows)
++        self.assertTrue(attach_history_projection(self.child, snapshot, self.rows))
++        self.assertFalse(hasattr(self.child, "_identity_legacy_history_v1"))
++
++    def test_generic_identity_preserved(self):
++        for owner in (self.parent, self.child):
++            owner._identity_policy = SimpleNamespace(enabled=False, fingerprint="")
++        snapshot = freeze_history_projection(self.parent, self.rows)
++        self.assertTrue(attach_history_projection(self.child, snapshot, self.rows))
++        self.assertIsNone(snapshot.migration)
++
++    def test_malformed_boundary_rejected(self):
++        for boundary in ({"cutoff":True,"migrated_to":"a"*64}, {"cutoff":0,"migrated_to":"a"*64},
++                         {"cutoff":12,"migrated_to":"b"*64}, "not metadata"):
++            with self.subTest(boundary=boundary):
++                self.parent._identity_legacy_history_v1 = boundary
++                self.assertIsNone(freeze_history_projection(self.parent, self.rows))
++
++    def test_forged_snapshot_shape_rejected(self):
++        for snapshot in (None, {}, replace(self.snapshot, migration=(True,"a"*64)),
++                         replace(self.snapshot, migration=(0,"a"*64)),
++                         replace(self.snapshot, migration=(12,"b"*64))):
++            self.assertFalse(attach_history_projection(self.child, snapshot, self.rows))
++        self.assertFalse(hasattr(self.child, "_identity_legacy_history_v1"))
++
++    def test_scope_mismatch_never_mutates_child(self):
++        for snapshot in (replace(self.snapshot, session_id="other"),
++                         replace(self.snapshot, fingerprint="b"*64),
++                         replace(self.snapshot, identity_enabled=False)):
++            self.assertFalse(attach_history_projection(self.child, snapshot, self.rows))
++        self.assertEqual(self.child._session_init_model_config, {})
++
++    def test_every_history_field_and_order_are_bound(self):
++        for field in ("content", "api_content", "reasoning_content", "tool_calls"):
++            changed = deepcopy(self.rows)
++            changed[0][field] = "changed"
++            self.assertFalse(attach_history_projection(self.child, self.snapshot, changed))
++        self.assertFalse(attach_history_projection(self.child, self.snapshot, self.rows[::-1]))
++        self.assertFalse(attach_history_projection(self.child, self.snapshot, self.rows[1:]))
++
++    def test_existing_conflicting_boundary_rejected(self):
++        self.child._identity_legacy_history_v1 = {"cutoff":24,"migrated_to":"a"*64}
++        self.assertFalse(attach_history_projection(self.child, self.snapshot, self.rows))
++        self.assertEqual(self.child._identity_legacy_history_v1["cutoff"],24)
++
++    def test_unknown_nonserializable_history_rejected(self):
++        self.assertIsNone(freeze_history_projection(self.parent, [{"content":object()}]))
++        self.assertFalse(attach_history_projection(self.child, self.snapshot, [{"content":float("nan")}]))
++
++
++class ReviewPolicyTests(unittest.TestCase):
++    def setUp(self):
++        self.agent = agent()
++        self.guard = BackgroundReviewGuardrails(self.agent)
++
++    def result(self, data, tool="memory", args=None, failed=None):
++        return self.guard.after_call(tool, args or {"target":"memory"}, json.dumps(data), failed=failed)
++
++    def test_capabilities_explain_unavailable_profile_and_capacity(self):
++        text = review_capability_guidance(self.agent)
++        self.assertIn("target=user: unavailable", text)
++        self.assertIn("2186/2200", text)
++        self.assertIn("14 remaining", text)
++        self.assertIn("Do not copy user-profile facts", text)
++        self.assertEqual(self.agent._memory_store._char_count("memory"),2186)
++
++    def test_unknown_capacity_does_not_invent_zero(self):
++        self.agent._memory_store = SimpleNamespace()
++        self.assertNotIn("characters;", review_capability_guidance(self.agent))
++
++    def test_unavailable_user_target_blocked_before_writer(self):
++        self.assertFalse(self.guard.before_call("memory", {"target":"user"}).allows_execution)
++        self.assertIsNone(self.agent._memory_manager)
++
++    def test_builtin_user_allowed_when_no_external_owner(self):
++        self.agent._authoritative_user_profile_writes = False
++        self.assertTrue(self.guard.before_call("memory", {"target":"user"}).allows_execution)
++
++    def test_disabled_targets_blocked(self):
++        self.agent._memory_enabled = False
++        self.assertFalse(self.guard.before_call("memory", {}).allows_execution)
++
++    def test_missing_store_is_unavailable(self):
++        self.agent._memory_store = None
++        self.assertFalse(self.guard.before_call("memory", {}).allows_execution)
++
++    def test_terminal_provider_failure_stops_immediately(self):
++        result = self.result({"success":False,"done":True,"committed":False,
++                             "code":"memory.authoritative_provider_unavailable"})
++        self.assertTrue(result.should_halt)
++        self.assertFalse(self.guard.before_call("skill_manage", {}).allows_execution)
++
++    def test_one_capacity_correction_not_repeated_guessing(self):
++        error = {"success":False,"error":"After applying operations, memory would be over the limit.",
++                 "usage":"2,186/2,200","current_entries":["synthetic"]}
++        first = self.result(error)
++        self.assertEqual(first.action,"warn")
++        self.assertNotIn("keep using tools",first.message)
++        self.assertTrue(self.guard.before_call("memory", {"action":"batch"}).allows_execution)
++        self.assertTrue(self.result(error, args={"action":"batch"}).should_halt)
++
++    def test_corrected_success_can_continue(self):
++        self.result({"success":False,"error":"over capacity"})
++        decision = self.result({"success":True,"committed":True,"message":"Entry replaced"})
++        self.assertFalse(decision.should_halt)
++        self.assertTrue(self.guard.before_call("skill_manage", {"action":"create"}).allows_execution)
++
++    def test_protected_skill_denial_stops(self):
++        for kind in ("bundled", "pinned", "hub-installed", "protected"):
++            self.guard.reset_for_turn()
++            result = self.result({"success":False,"error":f"Refusing background curator patch for {kind} skill 'synthetic'."},tool="skill_manage")
++            self.assertTrue(result.should_halt)
++
++    def test_staged_is_not_committed_and_not_retried(self):
++        for receipt in ({"success":True,"staged":True,"committed":False},
++                        {"success":True,"committed":False}):
++            self.guard.reset_for_turn()
++            self.assertEqual(self.result(receipt).code,"background_write_pending")
++
++    def test_malformed_result_only_native_reported_failure_counts(self):
++        self.assertFalse(self.guard.after_call("memory", {}, "invalid", failed=False).should_halt)
++        self.assertEqual(self.guard.after_call("memory", {}, "invalid", failed=True).action,"warn")
++        self.assertTrue(self.guard.after_call("memory", {}, "invalid", failed=True).should_halt)
++
++    def test_native_stricter_guard_stays_effective(self):
++        config = ToolCallGuardrailConfig(hard_stop_enabled=True,same_tool_failure_halt_after=1)
++        self.guard = BackgroundReviewGuardrails(self.agent,config)
++        self.assertTrue(self.result({"success":False,"error":"synthetic"}).should_halt)
++
++    def test_foreground_defaults_and_other_tools_unchanged(self):
++        native = ToolCallGuardrailController()
++        for i in range(4):
++            decision = native.after_call("memory", {"content":str(i)}, '{"success":false,"error":"synthetic"}', failed=True)
++            self.assertFalse(decision.should_halt)
++        self.assertIn("keep using tools",decision.message)
++        self.assertEqual(self.guard.before_call("read_file", {}).action,native.before_call("read_file", {}).action)
++
++    def test_reset_starts_new_child_turn_only(self):
++        self.result({"success":False,"done":True})
++        self.guard.reset_for_turn()
++        self.assertTrue(self.guard.before_call("memory", {}).allows_execution)
++

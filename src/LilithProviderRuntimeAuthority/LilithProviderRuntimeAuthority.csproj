@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>LilithProviderRuntimeAuthority</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.cs" />
+    <Compile Include="..\LilithProviderControlPlane\DeepSeekControlPlane.cs"
+             Link="ProviderControl\DeepSeekControlPlane.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderProfiles.cs"
+             Link="ProviderControl\UnifiedProviderProfiles.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderEndpointAdmission.cs"
+             Link="ProviderControl\UnifiedProviderEndpointAdmission.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderCatalogAdapters.cs"
+             Link="ProviderControl\UnifiedProviderCatalogAdapters.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderConnectedAddressTransport.cs"
+             Link="ProviderControl\UnifiedProviderConnectedAddressTransport.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderCatalogNetworkClient.cs"
+             Link="ProviderControl\UnifiedProviderCatalogNetworkClient.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderControlPlaneCanonicalSnapshotCodec.cs"
+             Link="ProviderControl\UnifiedProviderControlPlaneCanonicalSnapshotCodec.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderControlPlaneStore.cs"
+             Link="ProviderControl\UnifiedProviderControlPlaneStore.cs" />
+    <Compile Include="..\LilithProviderControlPlane\D045AiFunctionRoutingStore.cs"
+             Link="ProviderControl\D045AiFunctionRoutingStore.cs" />
+    <Compile Include="..\LilithProviderControlPlane\D045WorkbenchModelCatalogRules.cs"
+             Link="ProviderControl\D045WorkbenchModelCatalogRules.cs" />
+  </ItemGroup>
+</Project>

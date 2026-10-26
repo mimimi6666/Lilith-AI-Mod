@@ -1,0 +1,60 @@
+Subject: [lilith-core-seam] Preserve explicit empty CLI toolsets
+
+Hermes' gateway currently adds coding/project/desktop toolsets even when
+`platform_toolsets.cli: []` is explicitly saved. Preserve that operator choice
+as AIAgent's existing `[]` no-tools representation. Environment pins and every
+non-empty/default configuration retain their upstream behavior.
+
+Upstream base: 3c5fd918e3e2537cd74f4f88c990c5de5cbd9f63
+
+diff --git a/tests/tui_gateway/test_gui_surface_toolsets.py b/tests/tui_gateway/test_gui_surface_toolsets.py
+index 366c393..804ebaa 100644
+--- a/tests/tui_gateway/test_gui_surface_toolsets.py
++++ b/tests/tui_gateway/test_gui_surface_toolsets.py
+@@ -79,6 +79,22 @@ class TestSurfaceResolution:
+ 
+ 
+ class TestResolverPlumbing:
++    def test_explicit_empty_cli_toolsets_disable_all_surface_tools(
++        self, no_desktop_env
++    ):
++        import agent.coding_context as cc
++        import hermes_cli.config as config_mod
++
++        no_desktop_env.setattr(cc, "coding_selection", lambda **_: ["coding"])
++        no_desktop_env.setattr(
++            config_mod,
++            "load_config",
++            lambda: {"platform_toolsets": {"cli": []}},
++        )
++
++        assert server._load_enabled_toolsets("desktop") == []
++        assert server._load_enabled_toolsets("tui") == []
++
+     def test_posture_path_folds_in_the_session_surface(self, no_desktop_env):
+         """Focus-mode returns early — the surface toolsets must survive it."""
+         import agent.coding_context as cc
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 04b3c95..df612a6 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -4274,6 +4274,19 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
+     cfg = None
+     fallback_notice = None
+ 
++    # A saved empty CLI list is an explicit no-tools selection. Preserve it
++    # before coding and GUI surface recovery can add toolsets back.
++    if not explicit:
++        try:
++            from hermes_cli.config import load_config
++
++            cfg = load_config()
++            configured = (cfg.get("platform_toolsets") or {}).get("cli")
++            if isinstance(configured, list) and not configured:
++                return []
++        except Exception:
++            cfg = None
++
+     # Coding posture (base Hermes): with no explicit pin, collapse to the
+     # coding toolset (+ enabled MCP servers) when sitting in a code workspace.
+     # The desktop app and `hermes --tui` both land here. See

@@ -1,0 +1,1515 @@
+diff --git a/agent/identity_policy.py b/agent/identity_policy.py
+index 4f2e6e37d61b483598c9343c548bef51c256572e..2ec5ba8d78c63b829e4c34fc1f5f19e3e4685982 100644
+--- a/agent/identity_policy.py
++++ b/agent/identity_policy.py
+@@ -19,6 +19,8 @@ import json
+ import os
+ from pathlib import Path
+ import re
++import stat
++import tempfile
+ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+ 
+ 
+@@ -516,6 +518,233 @@ def preflight_aia_agent_identity(
+     )
+ 
+ 
++def prepare_host_config_digest_rotation() -> Optional[str]:
++    """Attest the current strict config before an authorized native rewrite.
++
++    Generic Hermes profiles return ``None``.  A host-locked profile must prove
++    its complete pinned identity snapshot before the caller is allowed to
++    mutate even an unrelated config section.  The returned digest is the
++    compare-and-swap token consumed by
++    :func:`commit_host_config_digest_rotation` after the atomic write.
++    """
++
++    if not identity_lock_required_by_host():
++        return None
++    receipt = preflight_aia_agent_identity(request_overrides={})
++    from hermes_cli.env_loader import assert_trusted_identity_config_digest
++
++    assert_trusted_identity_config_digest(receipt.config_sha256)
++    return receipt.config_sha256
++
++
++def _host_config_path_for_digest_rotation(*, strict: bool) -> Path:
++    if strict:
++        raw_home = str(os.environ.get("HERMES_HOME") or "").strip()
++        profile_home = Path(raw_home)
++        if not raw_home or not profile_home.is_absolute():
++            raise IdentityPolicyError(
++                "HERMES_HOME must be absolute for strict config digest rotation"
++            )
++        return profile_home / "config.yaml"
++
++    from hermes_cli.config import get_config_path
++
++    return get_config_path()
++
++
++def _atomic_restore_exact_config_bytes(config_path: Path, raw: bytes) -> None:
++    """Replace ``config_path`` with the exact captured bytes and metadata."""
++
++    try:
++        original_stat = config_path.stat()
++    except Exception as exc:
++        raise IdentityPolicyError(
++            f"identity config rollback target could not be inspected: {config_path}"
++        ) from exc
++
++    fd, temporary = tempfile.mkstemp(
++        dir=str(config_path.parent),
++        prefix=f".{config_path.stem}_rollback_",
++        suffix=".tmp",
++    )
++    try:
++        mode = stat.S_IMODE(original_stat.st_mode)
++        with os.fdopen(fd, "wb") as handle:
++            if hasattr(os, "fchmod"):
++                os.fchmod(handle.fileno(), mode)
++            handle.write(raw)
++            handle.flush()
++            os.fsync(handle.fileno())
++
++        from utils import atomic_replace
++
++        restored_path = Path(atomic_replace(temporary, config_path))
++        try:
++            os.chmod(restored_path, mode)
++        except OSError:
++            pass
++        if os.name == "posix" and hasattr(os, "chown"):
++            try:
++                os.chown(restored_path, original_stat.st_uid, original_stat.st_gid)
++            except OSError:
++                pass
++    except BaseException:
++        try:
++            os.unlink(temporary)
++        except OSError:
++            pass
++        raise
++
++
++def restore_host_config_snapshot(
++    raw: bytes,
++    expected_sha256: str,
++    *,
++    strict_required: bool = False,
++) -> str:
++    """Atomically restore and re-attest an exact pre-mutation config snapshot.
++
++    This is the compensating half of an authorized native config mutation.  A
++    caller may continue serving turns only when both the exact old bytes and,
++    for a strict profile, the old host pin still prove the original identity.
++    """
++
++    if not isinstance(raw, bytes):
++        raise IdentityPolicyError("identity config rollback requires raw bytes")
++    expected = str(expected_sha256 or "").strip().lower()
++    if not _FINGERPRINT_RE.fullmatch(expected):
++        raise IdentityPolicyError(
++            "identity config rollback requires a lowercase SHA-256 digest"
++        )
++    captured_sha256 = hashlib.sha256(raw).hexdigest()
++    if not hmac.compare_digest(captured_sha256, expected):
++        raise IdentityPolicyError(
++            "identity config rollback bytes do not match their captured digest"
++        )
++
++    strict = identity_lock_required_by_host()
++    if strict_required and not strict:
++        raise IdentityPolicyError(
++            "strict host identity requirement was lost before config rollback"
++        )
++    config_path = _host_config_path_for_digest_rotation(strict=strict)
++    if strict:
++        current_expected = _required_digest(
++            os.environ, _EXPECTED_CONFIG_SHA256_ENV
++        )
++        if not hmac.compare_digest(current_expected, expected):
++            raise IdentityPolicyError(
++                "strict host pin changed before identity config rollback"
++            )
++
++    _atomic_restore_exact_config_bytes(config_path, raw)
++    try:
++        restored = config_path.read_bytes()
++    except Exception as exc:
++        raise IdentityPolicyError(
++            f"restored identity config could not be read: {config_path}"
++        ) from exc
++    if not hmac.compare_digest(restored, raw):
++        raise IdentityPolicyError(
++            "restored identity config does not exactly match captured bytes"
++        )
++
++    # Native save_config maintains process caches.  A byte-exact compensating
++    # write must invalidate those same caches before the process can continue.
++    from hermes_cli import config as config_module
++
++    config_module._RAW_CONFIG_CACHE.pop(str(config_path), None)
++    config_module._LAST_EXPANDED_CONFIG_BY_PATH.pop(str(config_path), None)
++
++    if strict:
++        from hermes_cli.env_loader import assert_trusted_identity_config_digest
++
++        assert_trusted_identity_config_digest(expected)
++        receipt = preflight_aia_agent_identity(request_overrides={})
++        if not hmac.compare_digest(receipt.config_sha256, expected):
++            raise IdentityPolicyError(
++                "restored strict identity config returned a different digest"
++            )
++    return expected
++
++
++def commit_host_config_digest_rotation(
++    previous_sha256: Optional[str],
++) -> str:
++    """Verify one completed config write, then rotate the strict host pin.
++
++    The process-global expected digest is updated only after a candidate
++    preflight proves that the rewritten bytes still carry the exact pinned
++    identity, SOUL, and personality.  Existing agents intentionally retain
++    their old snapshot digest and therefore cannot continue under the new
++    config; callers must report that a new session is required.
++    """
++
++    strict = identity_lock_required_by_host()
++    if strict:
++        if previous_sha256 is None or not _FINGERPRINT_RE.fullmatch(
++            str(previous_sha256)
++        ):
++            raise IdentityPolicyError(
++                "strict config digest rotation requires a preflight token"
++            )
++        previous = str(previous_sha256).lower()
++        current_expected = _required_digest(
++            os.environ, _EXPECTED_CONFIG_SHA256_ENV
++        )
++        if not hmac.compare_digest(current_expected, previous):
++            raise IdentityPolicyError(
++                "strict config digest changed during the authorized mutation"
++            )
++    config_path = _host_config_path_for_digest_rotation(strict=strict)
++
++    try:
++        raw = config_path.read_bytes()
++    except Exception as exc:
++        raise IdentityPolicyError(
++            f"rewritten identity config could not be read: {config_path}"
++        ) from exc
++    candidate_sha256 = hashlib.sha256(raw).hexdigest()
++
++    if strict:
++        candidate_env = dict(os.environ)
++        candidate_env[_EXPECTED_CONFIG_SHA256_ENV] = candidate_sha256
++        receipt = preflight_aia_agent_identity(
++            environ=candidate_env,
++            request_overrides={},
++        )
++        if not hmac.compare_digest(receipt.config_sha256, candidate_sha256):
++            raise IdentityPolicyError(
++                "strict config candidate preflight returned a different digest"
++            )
++
++        # Re-read immediately before committing the process pin.  A concurrent
++        # writer cannot be blessed merely because it raced the candidate
++        # preflight; any later drift is still caught by the next strict turn.
++        try:
++            verified_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
++        except Exception as exc:
++            raise IdentityPolicyError(
++                f"rewritten identity config could not be re-read: {config_path}"
++            ) from exc
++        if not hmac.compare_digest(verified_sha256, candidate_sha256):
++            raise IdentityPolicyError(
++                "strict config bytes changed during candidate verification"
++            )
++        current_expected = _required_digest(
++            os.environ, _EXPECTED_CONFIG_SHA256_ENV
++        )
++        if not hmac.compare_digest(current_expected, previous):
++            raise IdentityPolicyError(
++                "strict config digest changed before candidate commit"
++            )
++        from hermes_cli.env_loader import rotate_trusted_identity_config_digest
++
++        rotate_trusted_identity_config_digest(previous, candidate_sha256)
++
++    return candidate_sha256
++
++
+ def _required_bool(section: Mapping[str, Any], key: str) -> bool:
+     if key not in section or not isinstance(section[key], bool):
+         raise IdentityPolicyError(
+diff --git a/hermes_cli/env_loader.py b/hermes_cli/env_loader.py
+index f0c22382b0d9d8d93c1921858489bd90d0cc8b1c..5cfb744998d489295e893e53d8a52b76353ccab6 100644
+--- a/hermes_cli/env_loader.py
++++ b/hermes_cli/env_loader.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import codecs
++import hmac
+ import io
+ import os
+ import sys
+@@ -69,35 +70,119 @@ _STRICT_FORBIDDEN_PROMPT_ENV_KEYS: tuple[str, ...] = (
+     "HERMES_ENVIRONMENT_HINT",
+ )
+ _TRUSTED_IDENTITY_ENV_SNAPSHOT: dict[str, str | None] | None = None
++_TRUSTED_IDENTITY_ENV_LOCK = threading.RLock()
+ 
+ 
+ class TrustedIdentityEnvironmentError(RuntimeError):
+     """Raised when dotenv attempts to mutate Runtime identity authority."""
+ 
+ 
++def _normalized_config_digest(value: str, *, label: str) -> str:
++    digest = str(value or "").strip().lower()
++    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
++        raise TrustedIdentityEnvironmentError(
++            f"{label} must be a lowercase SHA-256 value"
++        )
++    return digest
++
++
+ def _capture_trusted_identity_environment() -> dict[str, str | None] | None:
+     global _TRUSTED_IDENTITY_ENV_SNAPSHOT
+-    if _TRUSTED_IDENTITY_ENV_SNAPSHOT is not None:
++    with _TRUSTED_IDENTITY_ENV_LOCK:
++        if _TRUSTED_IDENTITY_ENV_SNAPSHOT is not None:
++            return _TRUSTED_IDENTITY_ENV_SNAPSHOT
++        if "HERMES_IDENTITY_REQUIRED" not in os.environ:
++            return None
++        _TRUSTED_IDENTITY_ENV_SNAPSHOT = {
++            key: os.environ.get(key) for key in _TRUSTED_IDENTITY_ENV_KEYS
++        }
+         return _TRUSTED_IDENTITY_ENV_SNAPSHOT
+-    if "HERMES_IDENTITY_REQUIRED" not in os.environ:
+-        return None
+-    _TRUSTED_IDENTITY_ENV_SNAPSHOT = {
+-        key: os.environ.get(key) for key in _TRUSTED_IDENTITY_ENV_KEYS
+-    }
+-    return _TRUSTED_IDENTITY_ENV_SNAPSHOT
+ 
+ 
+ def _restore_trusted_identity_environment() -> None:
+-    snapshot = _capture_trusted_identity_environment()
+-    if snapshot is None:
+-        return
+-    for key, value in snapshot.items():
+-        if value is None:
++    with _TRUSTED_IDENTITY_ENV_LOCK:
++        snapshot = _capture_trusted_identity_environment()
++        if snapshot is None:
++            return
++        for key, value in snapshot.items():
++            if value is None:
++                os.environ.pop(key, None)
++            else:
++                os.environ[key] = value
++        for key in _STRICT_FORBIDDEN_PROMPT_ENV_KEYS:
+             os.environ.pop(key, None)
+-        else:
+-            os.environ[key] = value
+-    for key in _STRICT_FORBIDDEN_PROMPT_ENV_KEYS:
+-        os.environ.pop(key, None)
++
++
++def rotate_trusted_identity_config_digest(
++    previous_sha256: str,
++    candidate_sha256: str,
++) -> None:
++    """CAS-rotate the Runtime config digest in both trusted env authorities.
++
++    ``load_hermes_dotenv`` restores values from an immutable startup snapshot,
++    not merely from ``os.environ``.  An authorized native config mutation must
++    therefore replace that snapshot and the live environment under one lock;
++    otherwise the next dotenv reload silently resurrects the old digest.
++    """
++
++    global _TRUSTED_IDENTITY_ENV_SNAPSHOT
++    previous = _normalized_config_digest(
++        previous_sha256,
++        label="previous trusted identity config digest",
++    )
++    candidate = _normalized_config_digest(
++        candidate_sha256,
++        label="candidate trusted identity config digest",
++    )
++
++    key = "HERMES_IDENTITY_EXPECTED_CONFIG_SHA256"
++    with _TRUSTED_IDENTITY_ENV_LOCK:
++        snapshot = _capture_trusted_identity_environment()
++        if snapshot is None:
++            raise TrustedIdentityEnvironmentError(
++                "trusted identity environment was not captured"
++            )
++        snapshot_value = str(snapshot.get(key) or "").strip().lower()
++        environ_value = str(os.environ.get(key) or "").strip().lower()
++        if not hmac.compare_digest(snapshot_value, previous) or not hmac.compare_digest(
++            environ_value, previous
++        ):
++            raise TrustedIdentityEnvironmentError(
++                "trusted identity config digest changed before rotation"
++            )
++
++        replacement = dict(snapshot)
++        replacement[key] = candidate
++        # ``os.environ`` is the only assignment here that can invoke an OS
++        # operation and fail.  Perform it first while the snapshot is still the
++        # proven previous authority; the following in-memory reference swap
++        # cannot leave a half-rotated pair.
++        os.environ[key] = candidate
++        _TRUSTED_IDENTITY_ENV_SNAPSHOT = replacement
++
++
++def assert_trusted_identity_config_digest(expected_sha256: str) -> None:
++    """Prove the immutable snapshot and live environment carry one digest."""
++
++    expected = _normalized_config_digest(
++        expected_sha256,
++        label="expected trusted identity config digest",
++    )
++    key = "HERMES_IDENTITY_EXPECTED_CONFIG_SHA256"
++    with _TRUSTED_IDENTITY_ENV_LOCK:
++        snapshot = _capture_trusted_identity_environment()
++        if snapshot is None:
++            raise TrustedIdentityEnvironmentError(
++                "trusted identity environment was not captured"
++            )
++        snapshot_value = str(snapshot.get(key) or "").strip().lower()
++        environ_value = str(os.environ.get(key) or "").strip().lower()
++        if not hmac.compare_digest(snapshot_value, expected) or not hmac.compare_digest(
++            environ_value, expected
++        ):
++            raise TrustedIdentityEnvironmentError(
++                "trusted identity config digest authorities do not match"
++            )
+ 
+ 
+ def _reject_reserved_identity_dotenv_keys(path: Path) -> None:
+diff --git a/hermes_cli/tools_config.py b/hermes_cli/tools_config.py
+index 69fa685138b6284c189a2bd986000f7dec863c8f..bad1e6f0b1a315b5bf0e1837910e3c3679831f35 100644
+--- a/hermes_cli/tools_config.py
++++ b/hermes_cli/tools_config.py
+@@ -197,6 +197,22 @@ def _xai_credentials_present() -> bool:
+     return bool(str(get_secret("XAI_API_KEY") or "").strip())
+ 
+ 
++def _spotify_credentials_present() -> bool:
++    """Cheap, side-effect-free check for a completed Spotify login.
++
++    Spotify is a bundled backend plugin with no API-key fields, so the generic
++    "keyless provider" heuristic cannot distinguish a usable integration from
++    one whose PKCE flow has never run.  Keep readiness aligned with the
++    plugin's runtime ``check_fn`` by consulting the same local auth status.
++    """
++    try:
++        from hermes_cli.auth import get_auth_status
++
++        return bool(get_auth_status("spotify").get("logged_in"))
++    except Exception:
++        return False
++
++
+ def _homeassistant_credentials_present() -> bool:
+     """Return whether the active profile has a Home Assistant token."""
+     try:
+@@ -3396,13 +3412,17 @@ def provider_readiness_status(
+     if post_setup:
+         if post_setup == "xai_grok":
+             return "ready" if _xai_credentials_present() else "needs_auth"
++        if post_setup == "spotify":
++            return "ready" if _spotify_credentials_present() else "needs_auth"
+         predicate = _POST_SETUP_READY.get(post_setup)
+         if predicate is not None:
+             try:
+                 return "ready" if predicate() else "needs_setup"
+             except Exception:
+-                # Flaky detection must not manufacture a warning state.
+-                return "ready"
++                # A failed installed-check cannot prove that a keyless
++                # provider is usable.  Fail closed so catalogs never
++                # manufacture a Ready state from detector failure.
++                return "needs_setup"
+         # No reliable installed-check registered → treat the active-provider
+         # signal as "setup completed" (selecting the row runs the hook).
+         if is_active is None:
+@@ -3653,8 +3673,17 @@ def _is_provider_active(
+             current = cfg_get(config, "browser", "cloud_provider")
+             return feature.managed_by_nous and provider["browser_provider"] == current
+         if provider.get("web_backend"):
+-            current = cfg_get(config, "web", "backend")
+-            return feature.managed_by_nous and current == provider["web_backend"]
++            web_cfg = config.get("web", {})
++            if not isinstance(web_cfg, dict):
++                web_cfg = {}
++            selected = {
++                str(web_cfg.get(key) or "").strip().lower()
++                for key in ("backend", "search_backend", "extract_backend")
++            }
++            return (
++                feature.managed_by_nous
++                and str(provider["web_backend"]).strip().lower() in selected
++            )
+         return feature.managed_by_nous
+ 
+     if provider.get("tts_provider"):
+@@ -3701,8 +3730,14 @@ def _is_provider_active(
+         except Exception:
+             return False
+     if provider.get("web_backend"):
+-        current = cfg_get(config, "web", "backend")
+-        return current == provider["web_backend"]
++        web_cfg = config.get("web", {})
++        if not isinstance(web_cfg, dict):
++            web_cfg = {}
++        selected = {
++            str(web_cfg.get(key) or "").strip().lower()
++            for key in ("backend", "search_backend", "extract_backend")
++        }
++        return str(provider["web_backend"]).strip().lower() in selected
+     if provider.get("imagegen_backend"):
+         image_cfg = config.get("image_gen", {})
+         if not isinstance(image_cfg, dict):
+@@ -3713,6 +3748,25 @@ def _is_provider_active(
+             and configured_provider in {None, "", "fal"}
+             and not is_truthy_value(image_cfg.get("use_gateway"), default=False)
+         )
++    post_setup = provider.get("post_setup")
++    if post_setup == "xai_grok":
++        return _xai_credentials_present()
++    if post_setup == "spotify":
++        return _spotify_credentials_present()
++    predicate = _POST_SETUP_READY.get(post_setup)
++    if predicate is not None:
++        try:
++            return bool(predicate())
++        except Exception:
++            return False
++
++    # Provider rows without a selector key (for example Home Assistant) are
++    # active when all of their declared credentials are present.  This is the
++    # same fallback used by ``_detect_active_provider_index`` and prevents the
++    # JSON/HTTP catalogs from disagreeing about a single-provider category.
++    env_vars = provider.get("env_vars", [])
++    if env_vars:
++        return all(get_env_value(item["key"]) for item in env_vars)
+     return False
+ 
+ 
+diff --git a/tests/tui_gateway/test_tools_policy_rpc.py b/tests/tui_gateway/test_tools_policy_rpc.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..eae89823799a5a0171e552cc0b78bae29663cb56
+--- /dev/null
++++ b/tests/tui_gateway/test_tools_policy_rpc.py
+@@ -0,0 +1,564 @@
++"""Behavior contracts for the native tools policy JSON-RPC surface."""
++
++from __future__ import annotations
++
++import hashlib
++import os
++import threading
++from unittest.mock import patch
++
++import pytest
++import yaml
++
++from hermes_cli.nous_account import NousPortalAccountInfo
++from hermes_cli.nous_subscription import NousSubscriptionFeatures
++import tui_gateway.server as server
++
++
++@pytest.fixture(autouse=True)
++def _clean_gateway_sessions(monkeypatch):
++    import hermes_cli.env_loader as env_loader
++
++    server._sessions.clear()
++    monkeypatch.setattr(server, "_tool_policy_terminal_error", None)
++    monkeypatch.setattr(env_loader, "_TRUSTED_IDENTITY_ENV_SNAPSHOT", None)
++    yield
++    server._sessions.clear()
++
++
++def _home():
++    from pathlib import Path
++
++    return Path(os.environ["HERMES_HOME"])
++
++
++def _write_config(config: dict) -> bytes:
++    raw = yaml.safe_dump(
++        config,
++        allow_unicode=True,
++        sort_keys=False,
++    ).encode("utf-8")
++    (_home() / "config.yaml").write_bytes(raw)
++    return raw
++
++
++def _logged_out_features() -> NousSubscriptionFeatures:
++    return NousSubscriptionFeatures(
++        subscribed=False,
++        nous_auth_present=False,
++        provider_is_nous=False,
++        features={},
++        account_info=NousPortalAccountInfo(
++            logged_in=False,
++            source="none",
++            fresh=False,
++        ),
++    )
++
++
++def _catalog_rows(monkeypatch) -> dict[str, dict]:
++    import hermes_cli.tools_config as tools_config
++
++    features = _logged_out_features()
++    monkeypatch.setattr(
++        tools_config,
++        "get_nous_subscription_features",
++        lambda *args, **kwargs: features,
++    )
++    response = server._methods["tools.catalog"]("catalog", {})
++    assert "error" not in response, response
++    result = response["result"]
++    assert result["platform"] == "cli"
++    assert result["new_session_required"] is False
++    return {row["name"]: row for row in result["toolsets"]}
++
++
++def test_catalog_never_calls_keyless_unready_providers_configured(monkeypatch):
++    import hermes_cli.tools_config as tools_config
++
++    _write_config(
++        {
++            "platform_toolsets": {
++                "cli": ["browser", "spotify", "web"],
++            },
++            "approvals": {"mode": "manual"},
++            "browser": {
++                "cloud_provider": "local",
++                "backend": "off",
++            },
++            "web": {"search_backend": "ddgs"},
++        }
++    )
++    monkeypatch.setitem(
++        tools_config._POST_SETUP_READY,
++        "agent_browser",
++        lambda: False,
++    )
++    monkeypatch.setitem(
++        tools_config._POST_SETUP_READY,
++        "ddgs",
++        lambda: False,
++    )
++    monkeypatch.setattr(
++        tools_config,
++        "_spotify_credentials_present",
++        lambda: False,
++    )
++
++    rows = _catalog_rows(monkeypatch)
++
++    assert rows["spotify"]["enabled"] is True
++    assert rows["spotify"]["configured"] is False
++    assert rows["spotify"]["readiness"] == "needs_auth"
++    assert rows["browser"]["enabled"] is True
++    assert rows["browser"]["configured"] is False
++    assert rows["browser"]["readiness"] == "needs_setup"
++    assert rows["web"]["enabled"] is True
++    assert rows["web"]["configured"] is False
++    assert rows["web"]["readiness"] == "needs_setup"
++    assert all(
++        row["configured"] is (row["readiness"] == "ready")
++        for row in rows.values()
++    )
++
++
++def test_catalog_reports_seeded_local_browser_ready_after_native_setup(monkeypatch):
++    import hermes_cli.tools_config as tools_config
++
++    _write_config(
++        {
++            "platform_toolsets": {"cli": ["browser", "web"]},
++            "approvals": {"mode": "manual"},
++            "browser": {
++                "cloud_provider": "local",
++                "backend": "off",
++            },
++            "web": {"search_backend": "ddgs"},
++        }
++    )
++    monkeypatch.setitem(
++        tools_config._POST_SETUP_READY,
++        "agent_browser",
++        lambda: True,
++    )
++    monkeypatch.setitem(
++        tools_config._POST_SETUP_READY,
++        "ddgs",
++        lambda: True,
++    )
++
++    rows = _catalog_rows(monkeypatch)
++
++    assert rows["browser"]["enabled"] is True
++    assert rows["browser"]["configured"] is True
++    assert rows["browser"]["readiness"] == "ready"
++    assert rows["web"]["configured"] is True
++    assert rows["web"]["readiness"] == "ready"
++
++
++def test_catalog_does_not_report_ready_when_native_setup_probe_fails(monkeypatch):
++    import hermes_cli.tools_config as tools_config
++
++    _write_config(
++        {
++            "platform_toolsets": {"cli": ["browser"]},
++            "browser": {
++                "cloud_provider": "local",
++                "backend": "off",
++            },
++        }
++    )
++
++    def broken_probe():
++        raise RuntimeError("probe unavailable")
++
++    monkeypatch.setitem(
++        tools_config._POST_SETUP_READY,
++        "agent_browser",
++        broken_probe,
++    )
++
++    browser = _catalog_rows(monkeypatch)["browser"]
++    assert browser["configured"] is False
++    assert browser["readiness"] == "needs_setup"
++
++
++def test_tools_set_persists_toolsets_and_approval_in_one_native_save(monkeypatch):
++    import hermes_cli.tools_config as tools_config
++    from tools.approval import _normalize_approval_mode
++
++    _write_config(
++        {
++            "platform_toolsets": {"cli": ["memory"]},
++            "approvals": {"mode": "manual"},
++        }
++    )
++    history = [{"role": "user", "content": "keep me"}]
++    server._sessions["idle"] = {
++        "history_lock": threading.RLock(),
++        "history": history,
++        "running": False,
++        "tool_started_at": {},
++    }
++    original_save = tools_config.save_config
++    saves = []
++
++    def counted_save(config):
++        saves.append(config)
++        return original_save(config)
++
++    monkeypatch.setattr(tools_config, "save_config", counted_save)
++    response = server._methods["tools.set"](
++        "set",
++        {
++            "enabled_toolsets": ["file", "terminal"],
++            "approval_mode": "off",
++        },
++    )
++
++    assert "error" not in response, response
++    result = response["result"]
++    assert result == {
++        "platform": "cli",
++        "approval_mode": "off",
++        "enabled_toolsets": ["file", "terminal"],
++        "config_sha256": hashlib.sha256(
++            (_home() / "config.yaml").read_bytes()
++        ).hexdigest(),
++        "new_session_required": True,
++    }
++    assert len(saves) == 1
++    saved = yaml.safe_load((_home() / "config.yaml").read_text(encoding="utf-8"))
++    assert set(saved["platform_toolsets"]["cli"]) == {"file", "terminal"}
++    assert _normalize_approval_mode(saved["approvals"]["mode"]) == "off"
++    assert server._sessions["idle"]["history"] is history
++
++
++@pytest.mark.parametrize(
++    "busy_state",
++    [
++        {"running": True, "tool_started_at": {}},
++        {"running": False, "tool_started_at": {"call-1": 1.0}},
++    ],
++)
++def test_tools_set_rejects_active_turn_or_tool_without_writing(busy_state):
++    before = _write_config(
++        {
++            "platform_toolsets": {"cli": ["memory"]},
++            "approvals": {"mode": "manual"},
++        }
++    )
++    server._sessions["busy"] = {
++        "history_lock": threading.RLock(),
++        **busy_state,
++    }
++
++    response = server._methods["tools.set"](
++        "busy",
++        {
++            "enabled_toolsets": ["file"],
++            "approval_mode": "smart",
++        },
++    )
++
++    assert response["error"]["code"] == 4090
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++@pytest.mark.parametrize(
++    "params",
++    [
++        {"enabled_toolsets": ["file"], "approval_mode": "auto"},
++        {"enabled_toolsets": ["not-a-native-toolset"], "approval_mode": "manual"},
++        {
++            "enabled_toolsets": ["file"],
++            "approval_mode": "manual",
++            "platform": "cli",
++        },
++    ],
++)
++def test_tools_set_rejects_non_native_policy_shapes(params):
++    response = server._methods["tools.set"]("invalid", params)
++    assert response["error"]["code"] == -32602
++
++
++def _strict_config(personality: str) -> dict:
++    from hermes_cli.config_defaults import DEFAULT_CONFIG
++
++    return {
++        "_config_version": DEFAULT_CONFIG["_config_version"],
++        "identity": {
++            "require_soul": True,
++            "suppress_kernel_help": True,
++            "personality_allowlist": ["lilith"],
++            "locked_personality": "lilith",
++            "force_soul_for_children": True,
++            "fingerprint": "a" * 64,
++        },
++        "display": {"personality": "lilith"},
++        "agent": {
++            "personalities": {
++                "lilith": {"system_prompt": personality},
++            },
++        },
++        "platform_toolsets": {"cli": ["memory"]},
++        "approvals": {"mode": "manual"},
++    }
++
++
++def _attest_strict_host(monkeypatch, raw: bytes, soul: str, personality: str):
++    monkeypatch.setenv("HERMES_IDENTITY_REQUIRED", "1")
++    monkeypatch.setenv("HERMES_IDENTITY_EXPECTED_FINGERPRINT", "a" * 64)
++    monkeypatch.setenv(
++        "HERMES_IDENTITY_EXPECTED_CONFIG_SHA256",
++        hashlib.sha256(raw).hexdigest(),
++    )
++    monkeypatch.setenv(
++        "HERMES_IDENTITY_EXPECTED_SOUL_SHA256",
++        hashlib.sha256(soul.encode("utf-8")).hexdigest(),
++    )
++    monkeypatch.setenv(
++        "HERMES_IDENTITY_EXPECTED_PERSONALITY_SHA256",
++        hashlib.sha256(personality.encode("utf-8")).hexdigest(),
++    )
++
++
++def _new_strict_agent():
++    from run_agent import AIAgent
++
++    with (
++        patch("run_agent.get_tool_definitions", return_value=[]),
++        patch("run_agent.check_toolset_requirements", return_value={}),
++        patch("run_agent.OpenAI"),
++    ):
++        return AIAgent(
++            model="test-model",
++            provider="openrouter",
++            api_mode="chat_completions",
++            base_url="https://example.test/v1",
++            api_key="test-key",
++            enabled_toolsets=[],
++            quiet_mode=True,
++            skip_context_files=True,
++            skip_memory=True,
++        )
++
++
++def test_tools_set_rotates_strict_config_pin_only_after_verified_native_save(
++    monkeypatch,
++):
++    from agent.identity_policy import (
++        IdentityPolicyError,
++        enforce_scoped_turn_identity,
++        preflight_aia_agent_identity,
++    )
++    from hermes_cli.config import reload_env
++    from hermes_cli.env_loader import load_hermes_dotenv
++
++    soul = "Lilith soul.\n"
++    personality = "You are Lilith.\n"
++    raw = _write_config(_strict_config(personality))
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, raw, soul, personality)
++    old_digest = hashlib.sha256(raw).hexdigest()
++    # Capture the immutable startup snapshot before the mutation.  The bug
++    # guarded here only appears when a later dotenv reload can resurrect it.
++    load_hermes_dotenv(hermes_home=_home())
++    old_agent = _new_strict_agent()
++    assert old_agent._identity_config_sha256 == old_digest
++
++    response = server._methods["tools.set"](
++        "strict",
++        {
++            "enabled_toolsets": ["file", "terminal"],
++            "approval_mode": "smart",
++        },
++    )
++
++    assert "error" not in response, response
++    digest = hashlib.sha256((_home() / "config.yaml").read_bytes()).hexdigest()
++    assert response["result"]["config_sha256"] == digest
++    assert os.environ["HERMES_IDENTITY_EXPECTED_CONFIG_SHA256"] == digest
++    load_hermes_dotenv(hermes_home=_home())
++    reload_env()
++    assert os.environ["HERMES_IDENTITY_EXPECTED_CONFIG_SHA256"] == digest
++    assert preflight_aia_agent_identity(request_overrides={}).config_sha256 == digest
++    new_agent = _new_strict_agent()
++    assert new_agent._identity_config_sha256 == digest
++    with pytest.raises(IdentityPolicyError, match="config snapshot"):
++        enforce_scoped_turn_identity(old_agent)
++
++
++def test_failed_strict_candidate_does_not_rotate_expected_digest(monkeypatch):
++    from agent.identity_policy import (
++        IdentityPolicyError,
++        commit_host_config_digest_rotation,
++        prepare_host_config_digest_rotation,
++    )
++
++    soul = "Lilith soul.\n"
++    personality = "You are Lilith.\n"
++    raw = _write_config(_strict_config(personality))
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, raw, soul, personality)
++    previous = prepare_host_config_digest_rotation()
++
++    changed = _strict_config("You are somebody else.\n")
++    _write_config(changed)
++    with pytest.raises(IdentityPolicyError, match="personality"):
++        commit_host_config_digest_rotation(previous)
++
++    assert os.environ["HERMES_IDENTITY_EXPECTED_CONFIG_SHA256"] == previous
++
++
++def test_tools_set_candidate_failure_restores_exact_old_bytes_and_pin(monkeypatch):
++    import agent.identity_policy as identity_policy
++    import hermes_cli.env_loader as env_loader
++
++    soul = "Lilith soul.\n"
++    personality = "You are Lilith.\n"
++    old_raw = _write_config(_strict_config(personality))
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, old_raw, soul, personality)
++    old_digest = hashlib.sha256(old_raw).hexdigest()
++    original_preflight = identity_policy.preflight_aia_agent_identity
++    calls = 0
++
++    def hostile_candidate(*args, **kwargs):
++        nonlocal calls
++        calls += 1
++        if calls == 2:
++            raise identity_policy.IdentityPolicyError("hostile candidate")
++        return original_preflight(*args, **kwargs)
++
++    monkeypatch.setattr(
++        identity_policy,
++        "preflight_aia_agent_identity",
++        hostile_candidate,
++    )
++
++    response = server._methods["tools.set"](
++        "hostile",
++        {
++            "enabled_toolsets": ["file", "terminal"],
++            "approval_mode": "smart",
++        },
++    )
++
++    assert response["error"]["code"] == 5035
++    assert calls >= 3
++    assert (_home() / "config.yaml").read_bytes() == old_raw
++    assert os.environ["HERMES_IDENTITY_EXPECTED_CONFIG_SHA256"] == old_digest
++    assert (
++        env_loader._TRUSTED_IDENTITY_ENV_SNAPSHOT[
++            "HERMES_IDENTITY_EXPECTED_CONFIG_SHA256"
++        ]
++        == old_digest
++    )
++    assert server._tool_policy_terminal_error is None
++    assert original_preflight(request_overrides={}).config_sha256 == old_digest
++    usable_prompt = server._methods["prompt.submit"](
++        "still-usable",
++        {"session_id": "missing", "text": "ordinary validation continues"},
++    )
++    assert usable_prompt["error"]["code"] != 5035
++
++
++def test_tools_set_recovery_failure_latches_terminal_and_blocks_future_turns(
++    monkeypatch,
++):
++    import agent.identity_policy as identity_policy
++
++    _write_config(
++        {
++            "platform_toolsets": {"cli": ["memory"]},
++            "approvals": {"mode": "manual"},
++        }
++    )
++    monkeypatch.setattr(
++        identity_policy,
++        "commit_host_config_digest_rotation",
++        lambda previous: (_ for _ in ()).throw(RuntimeError("candidate rejected")),
++    )
++    monkeypatch.setattr(
++        identity_policy,
++        "restore_host_config_snapshot",
++        lambda raw, digest, **kwargs: (_ for _ in ()).throw(
++            RuntimeError("restore failed")
++        ),
++    )
++
++    first = server._methods["tools.set"](
++        "terminal",
++        {
++            "enabled_toolsets": ["file"],
++            "approval_mode": "off",
++        },
++    )
++    failed_bytes = (_home() / "config.yaml").read_bytes()
++
++    assert first["error"] == {
++        "code": 5035,
++        "message": server._TOOL_POLICY_TERMINAL_MESSAGE,
++    }
++    assert server._tool_policy_terminal_error is not None
++
++    dispatched = []
++    monkeypatch.setattr(
++        server,
++        "_start_agent_build",
++        lambda *args, **kwargs: dispatched.append("build"),
++    )
++    monkeypatch.setattr(
++        server,
++        "_run_prompt_submit",
++        lambda *args, **kwargs: dispatched.append("turn"),
++    )
++    second = server._methods["tools.set"](
++        "terminal-again",
++        {
++            "enabled_toolsets": ["terminal"],
++            "approval_mode": "manual",
++        },
++    )
++    prompt = server._methods["prompt.submit"](
++        "blocked-turn",
++        {"session_id": "missing", "text": "must not run"},
++    )
++
++    assert second["error"]["code"] == 5035
++    assert prompt["error"]["code"] == 5035
++    assert dispatched == []
++    assert (_home() / "config.yaml").read_bytes() == failed_bytes
++
++
++def test_approval_request_always_emits_native_choices(monkeypatch):
++    emitted = []
++    monkeypatch.setattr(
++        server,
++        "_emit",
++        lambda event, sid, payload: emitted.append((event, sid, payload)),
++    )
++
++    server._emit_approval_request(
++        "session-1",
++        {
++            "pattern_key": "mcp_elicitation",
++            "pattern_keys": ["mcp_elicitation"],
++        },
++    )
++    server._emit_approval_request(
++        "session-1",
++        {
++            "allow_permanent": False,
++            "choices": ["once", "always", "once", "invalid"],
++        },
++    )
++
++    assert emitted[0][2]["choices"] == ["once", "deny"]
++    assert emitted[1][2]["choices"] == ["once"]
++    for _, _, payload in emitted:
++        choices = payload["choices"]
++        assert choices
++        assert len(choices) == len(set(choices))
++        assert set(choices) <= {"once", "session", "always", "deny"}
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 0e13b4cb2451f72cc8745b8796cb4a2adc3ba9fd..ad04cd5b2c66738af1f65efa09702db102d1d4fa 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -291,6 +291,8 @@ def _(rid, params: dict) -> dict:
+             _voice_emit("voice.transcript", {"stop_phrase": True, "typed": True})
+             logger.info("prompt.submit: typed stop phrase — voice chat ended")
+             return _ok(rid, {"voice_stopped": True})
++    if _tool_policy_terminal_error is not None:
++        return _err(rid, 5035, _TOOL_POLICY_TERMINAL_MESSAGE)
+     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
+     if params.get("interrupted"):
+         # Client-side barge-in (desktop VAD / typing over playback) — latch it
+@@ -354,6 +356,11 @@ def _(rid, params: dict) -> dict:
+     # rowId rebinding (see comment at the assignment site).
+     survivor_user_row_ids = None
+     with session["history_lock"]:
++        # Re-check under the same lock held by tools.set.  A submit that read
++        # the process latch just before a failed mutation must not claim a turn
++        # after the compensating write itself failed.
++        if _tool_policy_terminal_error is not None:
++            return _err(rid, 5035, _TOOL_POLICY_TERMINAL_MESSAGE)
+         # A watch session's run lives in the PARENT turn, so its own running
+         # flag is False — without this, typing mid-run builds a second agent
+         # racing the in-flight child on the same stored session (interleaved
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 5b55fe971a51c257728a5e7f04b036b56e8eb629..5f4d154548fc8f0fe6d7a76d1dada7861c316d30 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -1702,6 +1702,331 @@ def _(rid, params: dict) -> dict:
+         return _err(rid, 5031, str(e))
+ 
+ 
++@method("tools.catalog")
++def _(rid, params: dict) -> dict:
++    """Return the native CLI toolset catalog and effective approval policy."""
++    if not isinstance(params, dict) or params:
++        return _err(rid, -32602, "tools.catalog params must be an empty object")
++
++    try:
++        from hermes_cli.config import load_config
++        from hermes_cli.tools_config import (
++            TOOL_CATEGORIES,
++            _CONFIG_ONLY_TOOLSETS,
++            _get_effective_configurable_toolsets,
++            _get_platform_tools,
++            _is_provider_active,
++            _toolset_allowed_for_platform,
++            _toolset_has_keys,
++            _visible_providers,
++            get_nous_subscription_features,
++            gui_toolset_label,
++            provider_readiness_status,
++        )
++        from toolsets import resolve_toolset
++        from tools.approval import _get_approval_mode
++
++        platform = "cli"
++        config = load_config()
++        catalog = [
++            row
++            for row in _get_effective_configurable_toolsets()
++            if row[0] not in _CONFIG_ONLY_TOOLSETS
++            and _toolset_allowed_for_platform(row[0], platform)
++        ]
++        catalog_names = {name for name, _, _ in catalog}
++        enabled = {
++            name
++            for name in _get_platform_tools(
++                config,
++                platform,
++                include_default_mcp_servers=False,
++            )
++            if name in catalog_names
++        }
++        features = get_nous_subscription_features(config)
++
++        def category_readiness(toolset_name: str) -> str:
++            category = TOOL_CATEGORIES.get(toolset_name)
++            if not category:
++                return (
++                    "ready"
++                    if _toolset_has_keys(
++                        toolset_name,
++                        config,
++                        features=features,
++                    )
++                    else "needs_keys"
++                )
++
++            providers = _visible_providers(
++                category,
++                config,
++                features=features,
++            )
++            active_statuses = []
++            for provider in providers:
++                try:
++                    is_active = _is_provider_active(provider, config)
++                except Exception:
++                    is_active = False
++                if not is_active:
++                    continue
++                status = provider_readiness_status(
++                    provider,
++                    config,
++                    features=features,
++                    is_active=True,
++                )
++                if status in {"ready", "needs_setup", "needs_auth", "needs_keys"}:
++                    active_statuses.append(status)
++
++            if "ready" in active_statuses:
++                return "ready"
++            for status in ("needs_auth", "needs_keys", "needs_setup"):
++                if status in active_statuses:
++                    return status
++
++            # A sole unselected provider can still explain the exact missing
++            # prerequisite (Spotify authentication, a required key, etc.), but
++            # it can never make the category look ready while inactive.
++            if len(providers) == 1:
++                status = provider_readiness_status(
++                    providers[0],
++                    config,
++                    features=features,
++                    is_active=False,
++                )
++                if status in {"needs_setup", "needs_auth", "needs_keys"}:
++                    return status
++            return "needs_setup"
++
++        rows = []
++        for name, label, description in catalog:
++            readiness = category_readiness(name)
++            try:
++                tools = sorted(set(resolve_toolset(name)))
++            except Exception:
++                tools = []
++            rows.append(
++                {
++                    "name": name,
++                    "label": gui_toolset_label(label),
++                    "description": description,
++                    "enabled": name in enabled,
++                    "configured": readiness == "ready",
++                    "readiness": readiness,
++                    "tools": tools,
++                }
++            )
++
++        return _ok(
++            rid,
++            {
++                "platform": platform,
++                "approval_mode": _get_approval_mode(),
++                "enabled_toolsets": sorted(enabled),
++                "toolsets": rows,
++                "new_session_required": False,
++            },
++        )
++    except Exception as e:
++        return _err(rid, 5031, str(e))
++
++
++@method("tools.set")
++def _(rid, params: dict) -> dict:
++    """Atomically replace native CLI toolsets and the approval mode."""
++    global _tool_policy_terminal_error
++
++    required = {"enabled_toolsets", "approval_mode"}
++    if not isinstance(params, dict) or set(params) != required:
++        return _err(
++            rid,
++            -32602,
++            "tools.set requires exactly enabled_toolsets and approval_mode",
++        )
++
++    requested_raw = params.get("enabled_toolsets")
++    if not isinstance(requested_raw, list) or any(
++        not isinstance(name, str) or not name.strip() for name in requested_raw
++    ):
++        return _err(
++            rid,
++            -32602,
++            "enabled_toolsets must be an array of non-empty strings",
++        )
++    requested = {name.strip() for name in requested_raw}
++    if len(requested) != len(requested_raw):
++        return _err(rid, -32602, "enabled_toolsets must not contain duplicates")
++
++    approval_mode = params.get("approval_mode")
++    if approval_mode not in {"manual", "smart", "off"}:
++        return _err(
++            rid,
++            -32602,
++            "approval_mode must be manual, smart, or off",
++        )
++    if _tool_policy_terminal_error is not None:
++        return _err(rid, 5035, _TOOL_POLICY_TERMINAL_MESSAGE)
++
++    try:
++        from agent.identity_policy import (
++            commit_host_config_digest_rotation,
++            prepare_host_config_digest_rotation,
++            restore_host_config_snapshot,
++        )
++        from hermes_cli.config import _CONFIG_LOCK, get_config_path, load_config
++        from hermes_cli.tools_config import (
++            _CONFIG_ONLY_TOOLSETS,
++            _get_effective_configurable_toolsets,
++            _get_platform_tools,
++            _save_platform_tools,
++            _toolset_allowed_for_platform,
++        )
++        from tools.approval import _normalize_approval_mode
++
++        platform = "cli"
++        valid = {
++            name
++            for name, _, _ in _get_effective_configurable_toolsets()
++            if name not in _CONFIG_ONLY_TOOLSETS
++            and _toolset_allowed_for_platform(name, platform)
++        }
++        unknown = sorted(requested - valid)
++        if unknown:
++            return _err(
++                rid,
++                -32602,
++                f"unknown cli toolset(s): {', '.join(unknown)}",
++            )
++
++        acquired_history_locks = []
++        _tool_policy_mutation_lock.acquire()
++        _sessions_lock.acquire()
++        try:
++            if _tool_policy_terminal_error is not None:
++                return _err(rid, 5035, _TOOL_POLICY_TERMINAL_MESSAGE)
++            seen_locks = set()
++            for session in list(_sessions.values()):
++                history_lock = session.get("history_lock")
++                if history_lock is not None and id(history_lock) not in seen_locks:
++                    seen_locks.add(id(history_lock))
++                    if not history_lock.acquire(blocking=False):
++                        return _err(
++                            rid,
++                            4090,
++                            "tool policy cannot change while a session is active",
++                        )
++                    acquired_history_locks.append(history_lock)
++
++            if any(
++                session.get("running") or bool(session.get("tool_started_at"))
++                for session in _sessions.values()
++            ):
++                return _err(
++                    rid,
++                    4090,
++                    "tool policy cannot change while a turn or tool call is running",
++                )
++
++            with _CONFIG_LOCK:
++                config_path = get_config_path()
++                try:
++                    old_raw = config_path.read_bytes()
++                except Exception as exc:
++                    raise RuntimeError(
++                        "native config must exist and be readable before tools.set"
++                    ) from exc
++                old_sha256 = hashlib.sha256(old_raw).hexdigest()
++                previous_sha256 = prepare_host_config_digest_rotation()
++                if (
++                    previous_sha256 is not None
++                    and old_sha256 != previous_sha256
++                ):
++                    raise RuntimeError(
++                        "strict config snapshot changed before native mutation"
++                    )
++
++                config = load_config()
++                approvals = config.get("approvals")
++                if not isinstance(approvals, dict):
++                    approvals = {}
++                    config["approvals"] = approvals
++                approvals["mode"] = approval_mode
++
++                mutation_attempted = True
++                try:
++                    # The native helper performs the one fail-closed atomic
++                    # config save. Approval mode is already in this same
++                    # mapping, so both authorities commit in one replacement.
++                    _save_platform_tools(config, platform, requested)
++
++                    saved = load_config()
++                    actual_enabled = {
++                        name
++                        for name in _get_platform_tools(
++                            saved,
++                            platform,
++                            include_default_mcp_servers=False,
++                        )
++                        if name in valid
++                    }
++                    saved_approvals = saved.get("approvals")
++                    saved_mode = _normalize_approval_mode(
++                        saved_approvals.get("mode", "manual")
++                        if isinstance(saved_approvals, dict)
++                        else "manual"
++                    )
++                    if actual_enabled != requested or saved_mode != approval_mode:
++                        raise RuntimeError(
++                            "native config verification did not reproduce the requested policy"
++                        )
++
++                    config_sha256 = commit_host_config_digest_rotation(
++                        previous_sha256
++                    )
++                    mutation_attempted = False
++                except BaseException as mutation_error:
++                    if mutation_attempted:
++                        try:
++                            restored_sha256 = restore_host_config_snapshot(
++                                old_raw,
++                                old_sha256,
++                                strict_required=previous_sha256 is not None,
++                            )
++                            if restored_sha256 != old_sha256:
++                                raise RuntimeError(
++                                    "native config rollback returned a different digest"
++                                )
++                        except BaseException as recovery_error:
++                            _tool_policy_terminal_error = (
++                                _TOOL_POLICY_TERMINAL_MESSAGE
++                            )
++                            raise RuntimeError(
++                                _TOOL_POLICY_TERMINAL_MESSAGE
++                            ) from recovery_error
++                    raise mutation_error
++
++            return _ok(
++                rid,
++                {
++                    "platform": platform,
++                    "approval_mode": saved_mode,
++                    "enabled_toolsets": sorted(actual_enabled),
++                    "config_sha256": config_sha256,
++                    "new_session_required": True,
++                },
++            )
++        finally:
++            for history_lock in reversed(acquired_history_locks):
++                history_lock.release()
++            _sessions_lock.release()
++            _tool_policy_mutation_lock.release()
++    except Exception as e:
++        return _err(rid, 5035, str(e))
++
++
+ @method("tools.show")
+ def _(rid, params: dict) -> dict:
+     try:
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 78ba12739bf49d647c10d5a2e6ca931eb214ccdd..1914bafb9916fb04dfa7e2e23dce2130e32d3cca 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -151,6 +151,17 @@ _stdout_lock = threading.Lock()
+ _cfg_lock = threading.Lock()
+ _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
+ _prompt_lock = threading.Lock()
++# Serializes native toolset + approval-mode config replacements.  The handler
++# also holds every live session's history lock while writing, so a new turn
++# cannot claim an old tool snapshot halfway through the mutation.
++_tool_policy_mutation_lock = threading.Lock()
++# A failed compensating write leaves native config authority uncertain.  Once
++# latched, this process must not accept another turn or policy mutation; only a
++# restart can reconstruct a trustworthy config/session snapshot.
++_tool_policy_terminal_error: str | None = None
++_TOOL_POLICY_TERMINAL_MESSAGE = (
++    "tool policy mutation recovery failed; restart required"
++)
+ _cfg_cache: dict | None = None
+ _cfg_mtime: float | None = None
+ _cfg_path = None
+@@ -1864,13 +1875,32 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
+     platforms and the SSE/API stream fixed in #50767). Reuse the shared gateway
+     seam so all approval transports redact consistently."""
+     payload = dict(data or {})
+-    if "choices" not in payload:
+-        if payload.get("smart_denied"):
+-            payload["choices"] = ["once", "deny"]
+-        elif payload.get("allow_permanent") is False:
+-            payload["choices"] = ["once", "session", "deny"]
+-        elif "allow_permanent" in payload:
+-            payload["choices"] = ["once", "session", "always", "deny"]
++    canonical_choices = ("once", "session", "always", "deny")
++    supplied = payload.get("choices")
++    choices = []
++    if isinstance(supplied, (list, tuple)):
++        for value in supplied:
++            if value in canonical_choices and value not in choices:
++                choices.append(value)
++
++    if payload.get("smart_denied"):
++        choices = [choice for choice in choices if choice in {"once", "deny"}]
++        if not choices:
++            choices = ["once", "deny"]
++    elif payload.get("allow_permanent") is False:
++        choices = [choice for choice in choices if choice != "always"]
++        if not choices:
++            choices = ["once", "session", "deny"]
++    elif not choices:
++        if "allow_permanent" in payload:
++            choices = ["once", "session", "always", "deny"]
++        else:
++            # MCP elicitation and any legacy request without policy metadata
++            # are per-operation consent prompts.  Never make a client invent
++            # persistence semantics when the native producer did not offer
++            # them.
++            choices = ["once", "deny"]
++    payload["choices"] = choices
+     if "command" in payload:
+         from gateway.run import _redact_approval_command
+ 
+@@ -10124,6 +10154,16 @@ def _run_prompt_submit(
+     image_paths: list[str] | None = None,
+     queued_prompt_generation: int | None = None,
+ ) -> None:
++    if _tool_policy_terminal_error is not None:
++        with session["history_lock"]:
++            session["running"] = False
++            _clear_inflight_turn(session)
++        _emit(
++            "error",
++            sid,
++            {"message": _TOOL_POLICY_TERMINAL_MESSAGE},
++        )
++        return
+     with session["history_lock"]:
+         if (
+             queued_prompt_generation is not None

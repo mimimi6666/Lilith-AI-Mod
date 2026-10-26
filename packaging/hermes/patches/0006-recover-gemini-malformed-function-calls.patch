@@ -1,0 +1,448 @@
+diff --git a/agent/gemini_native_adapter.py b/agent/gemini_native_adapter.py
+index 0fb31b7..974d3ec 100644
+--- a/agent/gemini_native_adapter.py
++++ b/agent/gemini_native_adapter.py
+@@ -29,6 +29,7 @@ import httpx
+ 
+ from agent.bounded_response import read_streaming_error_body
+ from agent.gemini_schema import sanitize_gemini_tool_parameters
++from agent.redact import redact_sensitive_text
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -48,6 +49,12 @@ DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+ # an omitted limit means full budget).
+ GEMINI_DEFAULT_MAX_OUTPUT_TOKENS = 65535
+ 
++# Provider finish messages may echo generated arguments or other request
++# context.  Keep enough detail to diagnose malformed tool calls, but never
++# expose the raw provider string or allow an unbounded log/response field.
++_GEMINI_FINISH_DIAGNOSTIC_INPUT_LIMIT = 4096
++_GEMINI_FINISH_DIAGNOSTIC_OUTPUT_LIMIT = 512
++
+ 
+ def bare_gemini_model_id(model: str) -> str:
+     """Strip Gemini's own provider prefix from an aggregator-style model id."""
+@@ -575,11 +582,54 @@ def _map_gemini_finish_reason(reason: str) -> str:
+         "MAX_TOKENS": "length",
+         "SAFETY": "content_filter",
+         "RECITATION": "content_filter",
++        # Gemini can reject a generated function call before returning a
++        # functionCall part.  Preserve that as the existing dropped-tool-call
++        # recovery signal instead of silently converting it to a clean stop.
++        "MALFORMED_FUNCTION_CALL": "tool_calls",
+         "OTHER": "stop",
+     }
+     return mapping.get(str(reason or "").upper(), "stop")
+ 
+ 
++def _bounded_finish_diagnostic(value: Any) -> str:
++    """Return a single-line, force-redacted provider diagnostic."""
++    raw = str(value or "")
++    try:
++        safe = redact_sensitive_text(
++            raw[:_GEMINI_FINISH_DIAGNOSTIC_INPUT_LIMIT],
++            force=True,
++            redact_url_credentials=True,
++        )
++    except Exception:
++        # Diagnostics must never make an otherwise parseable response fail,
++        # and falling back to the raw provider value would cross the redaction
++        # boundary this helper exists to enforce.
++        safe = "[provider diagnostic unavailable]"
++    safe = "".join(
++        char if char.isprintable() else f"\\u{ord(char):04x}"
++        for char in safe
++    )
++    if len(safe) > _GEMINI_FINISH_DIAGNOSTIC_OUTPUT_LIMIT:
++        safe = safe[: _GEMINI_FINISH_DIAGNOSTIC_OUTPUT_LIMIT - 3] + "..."
++    return safe
++
++
++def _attach_finish_diagnostic(choice: SimpleNamespace, candidate: Dict[str, Any]) -> None:
++    """Attach bounded provider finish metadata and log malformed calls safely."""
++    reason_raw = str(candidate.get("finishReason") or "")
++    reason = _bounded_finish_diagnostic(reason_raw)
++    message = _bounded_finish_diagnostic(candidate.get("finishMessage"))
++    choice.provider_finish_reason = reason or None
++    choice.provider_finish_message = message or None
++    if reason_raw.upper() == "MALFORMED_FUNCTION_CALL":
++        logger.warning(
++            "Gemini candidate reported a malformed function call "
++            "(finish_reason=%s finish_message=%s)",
++            reason or "[missing]",
++            message or "[missing]",
++        )
++
++
+ def _tool_call_extra_from_part(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+     sig = part.get("thoughtSignature")
+     if isinstance(sig, str) and sig:
+@@ -672,6 +722,7 @@ def translate_gemini_response(resp: Dict[str, Any], model: str) -> SimpleNamespa
+         reasoning_details=None,
+     )
+     choice = SimpleNamespace(index=0, message=message, finish_reason=finish_reason)
++    _attach_finish_diagnostic(choice, cand)
+     return SimpleNamespace(
+         id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+         object="chat.completion",
+@@ -822,6 +873,7 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
+     if finish_reason_raw:
+         mapped = "tool_calls" if tool_call_indices else _map_gemini_finish_reason(finish_reason_raw)
+         finish_chunk = _make_stream_chunk(model=model, finish_reason=mapped)
++        _attach_finish_diagnostic(finish_chunk.choices[0], cand)
+         # Attach usage from this event's usageMetadata so the streaming
+         # loop in run_agent.py can record token counts (mirrors the
+         # non-streaming path in translate_gemini_response).
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 3dded88..51e7bdb 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -7390,10 +7390,6 @@ def run_conversation(
+             
+             else:
+                 # No tool calls - this is the final response.
+-                # (Dropped tool-call recovery — finish_reason=="tool_calls" with
+-                # an empty tool_calls array — is handled at the finalization
+-                # chokepoint below, after final_msg is built, so it catches
+-                # every path that reaches turn finalization, not just this one.)
+                 final_response = assistant_message.content or ""
+                 
+                 # Fix: unmute output when entering the no-tool-call branch
+@@ -7402,6 +7398,55 @@ def run_conversation(
+                 # prior housekeeping tool turn and should not silence the
+                 # final response path.
+                 agent._mute_post_response = False
++
++                # Some providers report finish_reason="tool_calls" while the
++                # parsed tool_calls array is empty. Handle that contract
++                # mismatch before any generic empty-response recovery so the
++                # next request contains the existing corrective nudge instead
++                # of repeating the same empty request. The consecutive budget
++                # is shared with narration-only mismatches and resets after a
++                # successful tool round.
++                _dropped_toolcall_mismatch = (
++                    finish_reason == "tool_calls"
++                    and not getattr(assistant_message, "tool_calls", None)
++                )
++                if (
++                    _dropped_toolcall_mismatch
++                    and getattr(agent, "_dropped_toolcall_retries", 0) < 3
++                ):
++                    agent._dropped_toolcall_retries = (
++                        getattr(agent, "_dropped_toolcall_retries", 0) + 1
++                    )
++                    logger.warning(
++                        "finish_reason=tool_calls with empty tool_calls array "
++                        "— re-prompting to emit the call "
++                        "(retry %d/3, model=%s provider=%s)",
++                        agent._dropped_toolcall_retries,
++                        agent.model,
++                        agent.provider,
++                    )
++                    agent._emit_status(
++                        "↻ Model signaled a tool call but sent none — "
++                        f"re-prompting ({agent._dropped_toolcall_retries}/3)"
++                    )
++                    # Both halves are ephemeral recovery scaffolding. The
++                    # placeholder keeps role alternation valid when the
++                    # provider returned no assistant content at all.
++                    final_msg = agent._build_assistant_message(
++                        assistant_message, finish_reason
++                    )
++                    if not final_msg.get("content"):
++                        final_msg["content"] = "(empty)"
++                    final_msg["_dropped_toolcall_nudge"] = True
++                    messages.append(final_msg)
++                    messages.append({
++                        "role": "user",
++                        "content": _DROPPED_TOOLCALL_NUDGE_CONTENT,
++                        "_dropped_toolcall_nudge": True,
++                    })
++                    agent._session_messages = messages
++                    final_response = None
++                    continue
+                 
+                 # Check if response only has think block with no actual content after it
+                 if not agent._has_content_after_think_block(final_response):
+@@ -7490,6 +7535,7 @@ def run_conversation(
+                     )
+                     if (
+                         _prior_was_tool
++                        and not _dropped_toolcall_mismatch
+                         and not getattr(agent, "_post_tool_empty_retried", False)
+                         and not _has_inline_thinking  # thinking model still working — let prefill handle
+                     ):
+@@ -7537,7 +7583,11 @@ def run_conversation(
+                         or getattr(assistant_message, "reasoning_details", None)
+                         or _has_inline_thinking
+                     )
+-                    if _has_structured and agent._thinking_prefill_retries < 2:
++                    if (
++                        _has_structured
++                        and not _dropped_toolcall_mismatch
++                        and agent._thinking_prefill_retries < 2
++                    ):
+                         agent._thinking_prefill_retries += 1
+                         logger.info(
+                             "Thinking-only response (no visible content) — "
+@@ -7572,7 +7622,12 @@ def run_conversation(
+                         _has_structured
+                         and agent._thinking_prefill_retries >= 2
+                     )
+-                    if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3:
++                    if (
++                        _truly_empty
++                        and not _dropped_toolcall_mismatch
++                        and (not _has_structured or _prefill_exhausted)
++                        and agent._empty_content_retries < 3
++                    ):
+                         agent._empty_content_retries += 1
+                         wait_time = jittered_backoff(
+                             agent._empty_content_retries,
+@@ -7782,61 +7837,11 @@ def run_conversation(
+                             _frag.pop("_length_continuation_nudge", None)
+                 
+                 final_response = agent._strip_think_blocks(final_response).strip()
+-                
++                 
+                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+ 
+-                # ── Dropped tool-call recovery (copilot/Claude) ────────
+-                # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5
+-                # on GitHub Copilot, ~2026-07) return finish_reason="tool_calls"
+-                # while the parsed tool_calls array is empty — the model
+-                # signalled it wanted to act but the payload shipped no call.
+-                # Reaching finalization with that mismatch means the turn is
+-                # about to end with the task unstarted (the narration, which may
+-                # be in content or only in the reasoning field, gets treated as
+-                # the final answer). Re-prompt (bounded to 3 CONSECUTIVE stalls;
+-                # the budget resets after any successful tool round) to make the
+-                # model emit the call instead of exiting. finish_reason="stop"
+-                # text finishes never enter this guard.
+-                if (
+-                    finish_reason == "tool_calls"
+-                    and not assistant_message.tool_calls
+-                    and getattr(agent, "_dropped_toolcall_retries", 0) < 3
+-                ):
+-                    agent._dropped_toolcall_retries = getattr(agent, "_dropped_toolcall_retries", 0) + 1
+-                    logger.warning(
+-                        "finish_reason=tool_calls with empty tool_calls array "
+-                        "(narration only) — re-prompting to emit the call "
+-                        "(retry %d/3, model=%s provider=%s)",
+-                        agent._dropped_toolcall_retries, agent.model, agent.provider,
+-                    )
+-                    agent._emit_status(
+-                        "↻ Model signaled a tool call but sent none — "
+-                        f"re-prompting ({agent._dropped_toolcall_retries}/3)"
+-                    )
+-                    # Both halves of the re-prompt pair are ephemeral recovery
+-                    # scaffolding (mirrors the empty-response nudge pattern):
+-                    # the interim narration-only assistant turn exists solely to
+-                    # keep role alternation valid for the nudge, and the nudge
+-                    # exists solely to drive the retry. Flag both so the
+-                    # persistence layer never writes them to the durable
+-                    # transcript and the finalization pop below can strip an
+-                    # unanswered tail pair. A recovered (answered) pair stays
+-                    # buried mid-list in live memory but is skipped by the
+-                    # flush regardless of position.
+-                    final_msg["_dropped_toolcall_nudge"] = True
+-                    messages.append(final_msg)
+-                    messages.append({
+-                        "role": "user",
+-                        "content": _DROPPED_TOOLCALL_NUDGE_CONTENT,
+-                        "_dropped_toolcall_nudge": True,
+-                    })
+-                    agent._session_messages = messages
+-                    final_response = None
+-                    continue
+-
+-                # Reached finalization without the dropped-tool-call mismatch —
+-                # a genuine turn end. Clear the consecutive-stall budget so the
+-                # next turn starts fresh.
++                # Reached finalization. Clear the consecutive-stall budget so
++                # the next turn starts fresh.
+                 agent._dropped_toolcall_retries = 0
+ 
+                 # Pop thinking-only prefill and empty-response retry
+diff --git a/tests/agent/test_gemini_native_adapter.py b/tests/agent/test_gemini_native_adapter.py
+index ab98fed..3650e8d 100644
+--- a/tests/agent/test_gemini_native_adapter.py
++++ b/tests/agent/test_gemini_native_adapter.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import json
++import logging
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -163,6 +164,36 @@ def test_translate_native_response_surfaces_reasoning_and_tool_calls():
+     assert json.loads(choice.message.tool_calls[0].function.arguments) == {"q": "hermes"}
+ 
+ 
++def test_malformed_function_call_nonstream_preserves_recovery_signal_and_safe_diagnostic(
++    caplog,
++):
++    from agent.gemini_native_adapter import translate_gemini_response
++
++    secret = "sk-malformedsecret1234567890"
++    payload = {
++        "candidates": [{
++            "content": {"parts": []},
++            "finishReason": "MALFORMED_FUNCTION_CALL",
++            "finishMessage": f"invalid arguments {secret}\n" + ("x" * 900),
++        }],
++    }
++
++    with caplog.at_level(logging.WARNING, logger="agent.gemini_native_adapter"):
++        response = translate_gemini_response(payload, model="gemini-2.5-flash")
++
++    choice = response.choices[0]
++    assert choice.finish_reason == "tool_calls"
++    assert choice.message.content is None
++    assert choice.message.tool_calls is None
++    assert choice.provider_finish_reason == "MALFORMED_FUNCTION_CALL"
++    assert choice.provider_finish_message
++    assert len(choice.provider_finish_message) <= 512
++    assert "\n" not in choice.provider_finish_message
++    assert secret not in choice.provider_finish_message
++    assert secret not in caplog.text
++    assert "malformed function call" in caplog.text.lower()
++
++
+ def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatch):
+     from agent.gemini_native_adapter import GeminiNativeClient
+ 
+@@ -290,6 +321,40 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
+     assert first[-1].choices[0].finish_reason == "tool_calls"
+ 
+ 
++def test_malformed_function_call_stream_preserves_recovery_signal_and_safe_diagnostic(
++    caplog,
++):
++    from agent.gemini_native_adapter import translate_stream_event
++
++    secret = "sk-streamsecret1234567890"
++    event = {
++        "candidates": [{
++            "content": {"parts": []},
++            "finishReason": "MALFORMED_FUNCTION_CALL",
++            "finishMessage": f"unable to parse {secret}\r\n" + ("y" * 900),
++        }],
++    }
++
++    with caplog.at_level(logging.WARNING, logger="agent.gemini_native_adapter"):
++        chunks = translate_stream_event(
++            event,
++            model="gemini-2.5-flash",
++            tool_call_indices={},
++        )
++
++    assert len(chunks) == 1
++    choice = chunks[0].choices[0]
++    assert choice.finish_reason == "tool_calls"
++    assert choice.delta.tool_calls is None
++    assert choice.provider_finish_reason == "MALFORMED_FUNCTION_CALL"
++    assert choice.provider_finish_message
++    assert len(choice.provider_finish_message) <= 512
++    assert "\n" not in choice.provider_finish_message
++    assert "\r" not in choice.provider_finish_message
++    assert secret not in choice.provider_finish_message
++    assert secret not in caplog.text
++
++
+ 
+ 
+ 
+@@ -308,4 +373,3 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
+ 
+ 
+ 
+-
+diff --git a/tests/run_agent/test_dropped_tool_call_recovery.py b/tests/run_agent/test_dropped_tool_call_recovery.py
+index d7816a1..2045d36 100644
+--- a/tests/run_agent/test_dropped_tool_call_recovery.py
++++ b/tests/run_agent/test_dropped_tool_call_recovery.py
+@@ -125,6 +125,46 @@ class TestDroppedToolCallRecovery:
+         )
+         assert "Here is your answer." in result["final_response"]
+ 
++
++    def test_empty_mismatch_uses_tool_call_nudge_before_generic_empty_retry(
++        self, loop_agent,
++    ):
++        """An empty malformed-call signal must change the very next request.
++
++        It must not spend the generic empty-response retry budget sending the
++        same request again, and recovery must not force a provider tool mode.
++        """
++        from tests.run_agent.test_run_agent import _mock_response
++
++        loop_agent.client.chat.completions.create.side_effect = [
++            _dropped_tool_call_response(""),
++            _mock_response(content="Recovered normally.", finish_reason="stop"),
++        ]
++
++        with (
++            patch.object(loop_agent, "_persist_session"),
++            patch.object(loop_agent, "_save_trajectory"),
++            patch.object(loop_agent, "_cleanup_task_resources"),
++            patch("agent.conversation_loop.time.sleep") as sleep_mock,
++        ):
++            result = loop_agent.run_conversation("inspect the repository")
++
++        assert loop_agent.client.chat.completions.create.call_count == 2
++        second_call = loop_agent.client.chat.completions.create.call_args_list[1]
++        messages = second_call.kwargs.get("messages") or second_call.args[0].get(
++            "messages"
++        )
++        assert messages[-2]["role"] == "assistant"
++        assert messages[-2]["content"] == "(empty)"
++        assert messages[-1]["role"] == "user"
++        assert "actual tool call" in messages[-1]["content"].lower()
++        assert second_call.kwargs.get("tool_choice") not in {
++            "required", "any", "ANY",
++        }
++        assert loop_agent._empty_content_retries == 0
++        sleep_mock.assert_not_called()
++        assert result["final_response"] == "Recovered normally."
++
+     def test_persistent_dropped_tool_calls_are_bounded(self, loop_agent):
+         """If the model never emits a call, the recovery must give up after a
+         bounded number of consecutive stalls instead of looping forever."""
+@@ -151,6 +191,28 @@ class TestDroppedToolCallRecovery:
+         )
+         assert result is not None
+ 
++
++    def test_persistent_empty_malformed_calls_do_not_fall_into_generic_retries(
++        self, loop_agent,
++    ):
++        """The one recovery budget remains the bound for an empty mismatch."""
++        loop_agent.client.chat.completions.create.side_effect = [
++            _dropped_tool_call_response("") for _ in range(9)
++        ]
++
++        with (
++            patch.object(loop_agent, "_persist_session"),
++            patch.object(loop_agent, "_save_trajectory"),
++            patch.object(loop_agent, "_cleanup_task_resources"),
++            patch("agent.conversation_loop.time.sleep") as sleep_mock,
++        ):
++            result = loop_agent.run_conversation("inspect the repository")
++
++        assert loop_agent.client.chat.completions.create.call_count == 4
++        assert loop_agent._empty_content_retries == 0
++        sleep_mock.assert_not_called()
++        assert "no reply" in result["final_response"].lower()
++
+     def test_nudge_pair_is_ephemeral_scaffolding(self, loop_agent):
+         """The re-prompt pair (interim assistant turn + synthetic user nudge)
+         must be flagged as ephemeral scaffolding so persistence never writes
+@@ -191,4 +253,3 @@ class TestDroppedToolCallRecovery:
+             "_dropped_toolcall_nudge messages must be classified as "
+             "ephemeral scaffolding so they are never persisted."
+         )
+-
+

@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "component": "cua-driver",
+  "upstream": {
+    "remote": "https://github.com/trycua/cua.git",
+    "tag": "cua-driver-rs-v0.21.0",
+    "version": "0.21.0",
+    "releaseUrl": "https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.21.0",
+    "publishedUtc": "2026-08-19T21:37:21Z"
+  },
+  "artifact": {
+    "platform": "windows-x86_64",
+    "name": "cua-driver-rs-0.21.0-windows-x86_64-binary.zip",
+    "url": "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.21.0/cua-driver-rs-0.21.0-windows-x86_64-binary.zip",
+    "size": 27572733,
+    "sha256": "D63F6A78E65AFC06524048F5557FED36CDF01F0A8A680236E93C9A2FB3587F44"
+  },
+  "extractedFiles": {
+    "cua-driver.exe": "94216FD10A101A165EFB94E1C30E6ED05E3947AE7140F096B3545B8BDAE580DA",
+    "cua-driver-uia.exe": "FB8E15264973FC61F66F821A49290EF9E7303D203D12FCA027D92226387FFF37",
+    "cua-cursor-theme.exe": "A5246BE025C48BAE0354B848631E7FE4DB43E5921CCC2593833D7B6739E3912B",
+    "cua_driver_sdk.dll": "5BB7432E44EBF5474A4E655E7B447E06F8B3FAA4B69FDA4FBB12B6D37E117EBA",
+    "cua_driver_node_runtime.node": "F98D2370B2A16065860E72624A59C6DAB26ADE7B5CC2EA688CE756DE36BE31EC",
+    "cua_driver_abi.h": "C17169F41DA321BAA5E7E953323C3AD660B00790176BA381E93189FBA3506587"
+  },
+  "license": {
+    "spdx": "MIT",
+    "url": "https://github.com/trycua/cua/blob/cua-driver-rs-v0.21.0/LICENSE.md",
+    "sha256": "C0779290C1D4783169AA3DBFB55FEB505E563EF8A004BBF55298CEFFCFBDA8D9"
+  },
+  "productLayout": {
+    "relativeExecutablePath": "Components/cua-driver/0.21.0/cua-driver.exe",
+    "inheritProviderSecrets": false,
+    "telemetryEnabled": false,
+    "autoUpdate": false
+  }
+}

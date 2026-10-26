@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <LilithWorkspaceRoot>$(MSBuildThisFileDirectory)</LilithWorkspaceRoot>
+    <LilithLocalPathsFile Condition="'$(LILITH_LOCAL_PATHS_FILE)' != ''">$(LILITH_LOCAL_PATHS_FILE)</LilithLocalPathsFile>
+    <LilithLocalPathsFile Condition="'$(LilithLocalPathsFile)' == ''">$(MSBuildThisFileDirectory)local.paths.props</LilithLocalPathsFile>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <PathMap>$(MSBuildThisFileDirectory)=/_/</PathMap>
+  </PropertyGroup>
+  <Import Project="$(LilithLocalPathsFile)" Condition="Exists('$(LilithLocalPathsFile)')" />
+</Project>

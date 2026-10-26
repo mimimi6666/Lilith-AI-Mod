@@ -1,0 +1,186 @@
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 3853c6d..d8968db 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -2396,7 +2396,17 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
+     from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
+ 
+     summary_request = MAX_ITERATIONS_SUMMARY_REQUEST
+-    messages.append({"role": "user", "content": summary_request})
++    messages.append(
++        {
++            "role": "user",
++            "content": summary_request,
++            # This is provider-facing control scaffolding, not a second user
++            # turn.  The persistence layer recognizes this structural marker
++            # and keeps it out of durable history while the wire sanitizer
++            # removes the private field before dispatch.
++            "_max_iterations_summary_synthetic": True,
++        }
++    )
+ 
+     try:
+         # Build API messages, stripping internal-only fields
+diff --git a/run_agent.py b/run_agent.py
+index 742a938..228bbea 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -252,6 +252,11 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
+     # drive the bounded retry. Persisting them would replay the internal
+     # retry instruction as user-authored context on resume.
+     "_dropped_toolcall_nudge",
++    # Max-iteration finalization asks the provider for one last summary by
++    # appending a synthetic user-shaped instruction. It belongs on that one
++    # provider request only; persisting it would create a second user row in
++    # the active canonical turn.
++    "_max_iterations_summary_synthetic",
+ )
+ 
+ 
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index aecbe8d..2a76edc 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -8418,7 +8418,37 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
+     messages = []
+     scoped_tool_call_args = {}
+     legacy_tool_call_args = {}
+-    from agent.turn_identity import message_turn_id
++    from agent.turn_identity import (
++        MESSAGE_ID_METADATA_KEY,
++        MESSAGE_KIND_METADATA_KEY,
++        USER_MESSAGE_ID_METADATA_KEY,
++        canonical_id,
++        message_turn_id,
++    )
++
++    # A pre-fix max-iteration summary nudge could be stamped as another
++    # user-shaped row in the initiating user's turn.  It carries a turn and
++    # message id, but it has no canonical user claim.  Preserve the strict
++    # one-user-per-turn invariant while keeping old transcripts loadable: if a
++    # turn already contains a fully attested user row, suppress only another
++    # user row whose newer identity fields are both absent.  This is based on
++    # durable provenance, never message text, language, provider, or adjacency.
++    canonical_user_turns = set()
++    for source in history:
++        if not isinstance(source, dict) or source.get("role") != "user":
++            continue
++        metadata = source.get("display_metadata")
++        metadata = metadata if isinstance(metadata, dict) else {}
++        turn_id = message_turn_id(source)
++        user_message_id = canonical_id(metadata.get(USER_MESSAGE_ID_METADATA_KEY))
++        message_id = canonical_id(metadata.get(MESSAGE_ID_METADATA_KEY))
++        if (
++            turn_id
++            and metadata.get(MESSAGE_KIND_METADATA_KEY) == "user"
++            and user_message_id
++            and user_message_id == message_id
++        ):
++            canonical_user_turns.add(turn_id)
+     reasoning_keys = (
+         "reasoning",
+         "reasoning_content",
+@@ -8501,6 +8531,17 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
+         role = m.get("role")
+         if role not in {"user", "assistant", "tool", "system"}:
+             continue
++        if role == "user":
++            metadata = m.get("display_metadata")
++            metadata = metadata if isinstance(metadata, dict) else {}
++            turn_id = message_turn_id(m)
++            if (
++                turn_id in canonical_user_turns
++                and canonical_id(metadata.get(MESSAGE_ID_METADATA_KEY))
++                and USER_MESSAGE_ID_METADATA_KEY not in metadata
++                and MESSAGE_KIND_METADATA_KEY not in metadata
++            ):
++                continue
+         # An explicit display_kind="hidden" row is model-facing scaffolding
+         # (compaction references, interrupted-turn checkpoints). The string
+         # sniff below only catches the "[System:" convention; honor the
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+index b21b793..21b9791 100644
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -2476,6 +2476,13 @@ class TestHandleMaxIterations:
+         assert isinstance(result, str)
+         assert len(result) > 0
+         assert "summary" in result.lower()
++        summary_nudge = messages[-2]
++        assert summary_nudge["role"] == "user"
++        assert summary_nudge["_max_iterations_summary_synthetic"] is True
++
++        from run_agent import _is_ephemeral_scaffolding
++
++        assert _is_ephemeral_scaffolding(summary_nudge)
+ 
+     def test_summary_retries_share_relay_identity(self, agent):
+         agent.client.chat.completions.create.side_effect = [
+diff --git a/tests/tui_gateway/test_turn_scope_protocol.py b/tests/tui_gateway/test_turn_scope_protocol.py
+index 65338a1..ccdd283 100644
+--- a/tests/tui_gateway/test_turn_scope_protocol.py
++++ b/tests/tui_gateway/test_turn_scope_protocol.py
+@@ -498,6 +498,63 @@ def test_legacy_turn_only_row_gets_one_reproducible_message_identity():
+     assert legacy_turn_message_id(different_role) != expected
+ 
+ 
++def test_history_hides_only_unattested_duplicate_user_in_canonical_turn():
++    synthetic_message = "7" * 32
++    malformed_message = "8" * 32
++    other_turn = "9" * 32
++    other_legacy_message = "a" * 32
++    history = [
++        {
++            "role": "user",
++            "content": "real user",
++            "display_metadata": _metadata(
++                TURN_1,
++                USER_MESSAGE,
++                user=True,
++                kind="user",
++            ),
++        },
++        {
++            "role": "user",
++            "content": "internal provider nudge",
++            "display_metadata": {
++                "hermes_turn_id": TURN_1,
++                "hermes_message_id": synthetic_message,
++            },
++        },
++        # A partially claimed newer row must remain visible so strict
++        # downstream validation can reject it instead of silently repairing it.
++        {
++            "role": "user",
++            "content": "malformed claimed user",
++            "display_metadata": {
++                "hermes_turn_id": TURN_1,
++                "hermes_message_id": malformed_message,
++                "hermes_message_kind": "user",
++            },
++        },
++        # A standalone legacy-correlated user in another turn is still a real
++        # visible history row; compatibility filtering is duplicate-scoped.
++        {
++            "role": "user",
++            "content": "other legacy user",
++            "display_metadata": {
++                "hermes_turn_id": other_turn,
++                "hermes_message_id": other_legacy_message,
++            },
++        },
++    ]
++
++    projected = server._history_to_messages(history)
++
++    assert [item["text"] for item in projected] == [
++        "real user",
++        "malformed claimed user",
++        "other legacy user",
++    ]
++    assert all(item["text"] != "internal provider nudge" for item in projected)
++
++
+ def test_persisted_legacy_turn_only_row_keeps_identity_after_db_reopen(tmp_path):
+     db_path = tmp_path / "state.db"
+     db = SessionDB(db_path=db_path)

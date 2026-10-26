@@ -1,0 +1,154 @@
+diff --git a/agent/minigame_answer_repair.py b/agent/minigame_answer_repair.py
+index 3a1c511..a1900e7 100644
+--- a/agent/minigame_answer_repair.py
++++ b/agent/minigame_answer_repair.py
+@@ -98,7 +98,7 @@ def _has(text, *phrases):
+ def _has_turn_question(question):
+     # The complete clause must match a current-turn question. A turn keyword
+     # inside cooking, schedules or another verb phrase is ordinary chat.
+-    zh = r"^(?:(?:請|请)?(?:告訴我|告诉我|問一下|问一下)|請問|请问|你知道|你知不知道)?(?:(?:現在|现在|目前|這局|这局|這一局|这一局|棋局中|牌局中|抽牌時|抽牌时|那|所以|是))*(?:輪到誰|轮到谁|誰的回合|谁的回合|輪到你|轮到你|輪到我|轮到我)(?:抽牌|出牌|走棋|下棋)?(?:了)?(?:嗎|吗|呢)?$"
++    zh = r"^(?:(?:請|请)?(?:告訴我|告诉我|問一下|问一下)|請問|请问|你知道|你知不知道)?(?:(?:我們|我们|的|在|現在|现在|目前|當前|当前|這局|这局|這一局|这一局|這盤|这盘|西洋棋局|西洋棋|棋局中|棋局|牌局中|牌局|抽鬼牌|抽牌時|抽牌时|那|所以|是)){0,6}(?:輪到誰|轮到谁|誰的回合|谁的回合|輪到你|轮到你|輪到我|轮到我)(?:抽牌|出牌|走棋|下棋|走)?(?:了)?(?:嗎|吗|呢)?$"
+     en = r"^(?:(?:please )?(?:tell me )?)?(?:(?:right now|now|currently) )?(?:whose turn(?: is it)?|is it (?:my|your) turn|(?:my|your) turn)(?: (?:now|right now|to (?:draw(?: a card)?|move|play chess)|in (?:this|the) (?:game|chess game|card game)))?$"
+     ja = r"^(?:(?:今|現在)(?:は|の)?|この対局では)?(?:誰の番|どちらの番)(?:ですか|なの|か|を教えて)?$"
+     for part in re.split(r"[,，;；。?!？！\r\n]", question):
+@@ -572,12 +572,15 @@ def _question_actors(text):
+ 
+ def _requested_check_actors(question, current):
+     actors = []
+-    for clause in re.split(r"[。.!！?？;；\n]", question):
+-        marker = re.search(r"被將軍|被将军|將軍了|将军了|in check|チェックされ|王手され|王手です", clause, re.I)
+-        if marker:
+-            for actor in _question_actors(clause[:marker.start()]) or (current,):
++    for clause in re.split(r"[,，。.!！?？;；\n]", question):
++        start = 0
++        for marker in re.finditer(r"被將軍|被将军|將軍了|将军了|in check|チェックされ|王手され|王手です", clause, re.I):
++            # Repeated predicates have independent subjects. Do not let the
++            # first comma clause (or an earlier predicate) consume the second.
++            for actor in _question_actors(clause[start:marker.start()]) or (current,):
+                 if actor not in actors:
+                     actors.append(actor)
++            start = marker.end()
+     return actors or [current]
+ 
+ 
+@@ -933,8 +936,12 @@ def _data_denial(assertions, items=None):
+                 limitation = _assertions(_chess_item_text(key, value, locale))
+                 if _canonical_asserted(assertions, limitation):
+                     assertions = assertions.replace(limitation.rstrip("。.!！"), "")
+-    return any(_EXPLICIT_ABSENCE.search(part) or _DENIAL.search(part)
++    return (any(_EXPLICIT_ABSENCE.search(part) or _DENIAL.search(part)
+         for part in re.split(r"[。.!！?？;；\n]", assertions))
++        # Every finite, safely replaceable denial is also a diagnostic denial.
++        # Otherwise a newly recognized phrasing could survive beside correct
++        # canonical facts and incorrectly take the already-complete fast path.
++        or any(_pure_data_denial(atom) for _, _, atom in _merge_atoms(assertions)))
+ 
+ 
+ def _unresolved_claim_families(plan, assertions):
+@@ -1223,19 +1230,66 @@ def _render(plan, values, kind):
+     return text
+ 
+ 
++def _list_denial_families(text):
++    """An explicit finite game-field list and its immediately linked denial.
++
++    A bare 'these items are missing' is not authority to delete anything. The
++    complete list, link and denial must match together; an unrelated item,
++    assertion, quotation or modifier makes the entire construct ineligible.
++    """
++    who = r"(?:我|你|妳|誰|谁)"
++    by_family = {
++        "turn": r"(?:輪到誰|轮到谁)(?:抽牌|走棋|下棋|走)?|(?:誰|谁)的回合",
++        "hand-counts": r"各剩(?:幾|几)張(?:牌)?|各剩几张(?:牌)?",
++        "self-hand": r"我的手牌",
++        "pieces": r"棋子位置",
++        "last-move": r"上一手(?:是誰|是谁)?(?:(?:用)?哪(?:個|个)棋子(?:從|从)哪(?:一)?格(?:走)?到哪(?:一)?格)?",
++        "check": who + r"(?:有沒有|有没有|是否)?被(?:將軍|将军)",
++    }
++    field = "|".join(by_family.values())
++    fields = r"(?:" + field + r")(?:\s*[,，、]\s*(?:" + field + r")){0,8}"
++    link = r"(?:這幾項|这几项|這些項目|这些项目|上述項目|上述项目|以上幾項|以上几项|這些|这些)?"
++    denial = r"(?:我)?(?:全部|全都|都)?(?:沒有|没有|沒收到|没收到|未收到)(?:資料|资料|資訊|信息|數據|数据)"
++    # The inherited shorthand ('...——全部都沒有') has the same scope
++    # obligation as the explicit-data form; it is not a family-guard bypass.
++    short_denial = r"(?:全部|全都|都)(?:都)?(?:沒有|没有)"
++    match = re.fullmatch("(" + fields + r")\s*(?:[,，：:]|——|—)\s*(?:" + link + denial + "|" + short_denial + ")", text.strip())
++    if not match:
++        return None
++    return {family for part in re.split(r"[,，、]", match.group(1))
++        for family, pattern in by_family.items() if re.fullmatch(pattern, part.strip())}
++
++
++def _pure_list_denial(text):
++    return _list_denial_families(text) is not None
++
++
++def _foreign_game_denial(plan, text):
++    """Foreign-only availability statements are not contradicted by this game.
++
++    This is a deletion exclusion, not a claim that the foreign facts exist or
++    are absent. Ambiguous/unverified prose remains original on refusal.
++    """
++    card = re.search(r"抽鬼牌|牌局|手牌|\b(?:card|cards|hand)\b|手札|カード", text, re.I)
++    chess = re.search(r"西洋棋|棋局|棋盤|棋盘|棋子|\b(?:chess|board)\b|盤面|駒", text, re.I)
++    kind = json.loads(plan.context.wire)["gameKind"]
++    return bool(card and not chess) if kind == "chess" else bool(chess and not card)
++
++
+ def _pure_data_denial(text):
+     """Whole finite clauses only. The broad diagnostic regex never deletes prose."""
+     s = text.strip()
+-    subject = r"(?:(?:這次|这次|本次)?(?:訊息|消息)|我(?:這邊|这边)?|目前|現在|现在|這邊|这边)?"
+-    verb = r"(?:沒帶|没带|沒有帶|没有带|沒有收到|没收到|未收到|沒有取得|沒得到|没有取得|没得到|沒有|没有|缺少|看不到|不知道|無法得知|无法得知)"
+-    data = r"(?:(?:最新|新的|當前|当前|目前|這次|这次|完整)(?:的)?){0,2}(?:對局資料|对局资料|牌局資訊|牌局信息|牌局資料|牌局资料|棋局資料|棋局资料|遊戲資料|游戏资料|局面|棋盤|棋盘|自己的手牌|我的手牌|手牌)"
++    subject = r"(?:(?:這次|这次|本次|目前|現在|现在)?(?:訊息|消息|信息|請求|请求)(?:裡|里|內|内|中)?|我(?:這邊|这边)?|目前|現在|现在|這邊|这边)?"
++    action = r"(?:帶|带|帶上|带上|附上|附帶|附带|提供|收到|取得|得到)"
++    verb = r"(?:(?:還|还|仍|也|都)?(?:沒有|没有|沒|没|未)(?:" + action + r")?|缺少|看不到|不知道|無法得知|无法得知)"
++    data = r"(?:(?:最新|新的|當前|当前|目前|這次|这次|完整)(?:的)?){0,2}(?:(?:對局|对局|牌局|棋局|遊戲|游戏)(?:資料|资料|資訊|信息|數據|数据)|局面|棋盤|棋盘|自己的手牌|我的手牌|手牌)"
+     zh = subject + r"\s*" + verb + r"\s*" + data + r"(?:呢|喔|哦|呀|啊)?"
++    reverse = data + r"(?:尚未|還未|还未|沒有|没有|未)(?:被)?" + action
+     games = r"(?:抽鬼牌|西洋棋)(?:(?:和|與|与|、)(?:抽鬼牌|西洋棋))?(?:都)?(?:沒有|没有|沒提供|没提供)"
+-    fields = r"(?:輪到誰|轮到谁|各剩幾張|各剩几张|我的手牌|上一手|棋子位置|誰被將軍|谁被将军)"
+-    listed = fields + r"(?:、" + fields + r"){0,8}(?:——|—|：|:)(?:全部|全都|都)(?:都)?(?:沒有|没有)"
+-    en = r"(?:I (?:cannot|can't) see|I (?:did not|didn't) receive|I (?:do not|don't) have|there is no|no)(?: (?:the|any|current|new|latest)){0,3} (?:game|card|board|chess|hand)(?: (?:data|information|state))?"
++    en = r"(?:I (?:cannot|can't) see|I (?:did not|didn't) receive|I (?:do not|don't) have|there is no|no|(?:this|the current) (?:message|request) (?:does not|doesn't) (?:include|contain|provide))(?: (?:the|any|current|new|latest)){0,3} (?:game|card|board|chess|hand)(?: (?:data|information|state))?"
+     ja = r"(?:私は|こちらは)?(?:現在の|今の)?(?:対局|手札|盤面|ゲーム)(?:の)?(?:情報|データ)(?:が|を|は)?(?:ない|ありません|届いていない|受け取っていません|受け取っていない)"
+-    return re.fullmatch(zh + "|" + games + "|" + listed + "|" + en + "|" + ja, s, re.I) is not None
++    return (_pure_list_denial(s)
++        or re.fullmatch(zh + "|" + reverse + "|" + games + "|" + en + "|" + ja, s, re.I) is not None)
+ 
+ 
+ def _pure_fact_atom(text):
+@@ -1268,6 +1322,19 @@ def _merge_atoms(text):
+             parts = [(0, end)]
+         else:
+             parts = [(m.start(), m.end()) for m in re.finditer(r"[^,，]+", body)]
++            # Commas normally preserve unrelated prose. They are owned as one
++            # denial atom ONLY for a completely recognized field enumeration
++            # followed immediately by its finite anaphoric denial. Never join
++            # across sentence boundaries or remove an unbound anaphor.
++            grouped, index = [], 0
++            while index < len(parts):
++                match = index
++                for candidate in range(index+1, min(index+10, len(parts))):
++                    if _pure_list_denial(body[parts[index][0]:parts[candidate][1]]):
++                        match = candidate
++                grouped.append((parts[index][0], parts[match][1]))
++                index = match+1
++            parts = grouped
+         for left, right in parts:
+             atom = body[left:right]
+             leading = len(atom) - len(atom.lstrip())
+@@ -1307,6 +1374,12 @@ def natural_merge(plan, original_text, confirmed):
+             # recognized wrong number somewhere in the sentence.
+             _fail()
+         if pure_denial:
++            families = _list_denial_families(atom)
++            if _foreign_game_denial(plan, atom) or families is not None and families - set(plan.ids):
++                # An active chess snapshot cannot refute unavailable hand
++                # information (or vice versa), and a linked list cannot confer
++                # authority to remove unrequested or foreign-game assertions.
++                _fail()
+             affected = dict(confirmed)
+         remaining = {key: value for key, value in affected.items() if key not in consumed}
+         replacement = _render_items(plan, remaining, "correction").rstrip("。.!！") if remaining else ""

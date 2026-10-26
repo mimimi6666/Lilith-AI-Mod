@@ -1,0 +1,39 @@
+diff --git a/tests/tui_gateway/test_speech_projection.py b/tests/tui_gateway/test_speech_projection.py
+--- a/tests/tui_gateway/test_speech_projection.py
++++ b/tests/tui_gateway/test_speech_projection.py
+@@ -193,13 +193,12 @@ def test_project_speech_is_one_memory_isolated_structured_main_route_call(
+     assert "speech locale is ja" in messages[1]["content"][0]["text"]
+     assert messages[1]["content"][1] == {"type": "text", "text": original_text}
+ 
+-    schema = captured["extra_body"]["response_format"]["json_schema"]["schema"]
+-    assert schema == {
+-        "type": "object",
+-        "properties": {"speech_text": {"type": "string", "minLength": 1}},
+-        "required": ["speech_text"],
+-        "additionalProperties": False,
+-    }
++    # The hidden session can use an OpenAI-compatible endpoint that does not
++    # implement provider-native json_schema response formats.  The schema stays
++    # in the prompt and is validated locally, without a wire-level hint.
++    assert captured["extra_body"] is None
++    assert "speech_text" in messages[1]["content"][0]["text"]
++    assert "additionalProperties" in messages[1]["content"][0]["text"]
+     assert session["history"] == original_history
+     attestation.assert_called_once_with(session)
+     agent.run_conversation.assert_not_called()
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -1416,7 +1416,11 @@ def _(rid, params: dict) -> dict:
+             input=[PluginLlmTextInput(text=text)],
+             json_schema=schema,
+             json_mode=True,
+-            send_response_format=True,
++            # The active main route can be DeepSeek or another OpenAI-compatible
++            # endpoint that rejects provider-native json_schema response formats.
++            # Keep the schema in the prompt and retain local parse/validation so
++            # this remains one portable, fail-closed projection call.
++            send_response_format=False,
+             schema_name="speech_projection",
+             system_prompt=system_prompt,
+             temperature=0.0,

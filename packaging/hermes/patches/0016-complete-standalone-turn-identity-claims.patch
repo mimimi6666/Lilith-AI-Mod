@@ -1,0 +1,168 @@
+diff --git a/run_agent.py b/run_agent.py
+index a2b014191f53d69a0c59b58c6d0993d8202a4675..3a46832028aca4d16b152bf329944a720dc956a5 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -8146,12 +8146,42 @@ class AIAgent:
+             "task_id": effective_task_id,
+             "platform": getattr(self, "platform", None) or "",
+         }
++        from agent.turn_identity import canonical_id, new_message_id, new_turn_claim
++
+         relay_turn_id = str(getattr(self, "_relay_pending_turn_id", "") or "")
+-        if not relay_turn_id:
+-            relay_turn_id = (
+-                f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
++        relay_user_message_id = str(
++            getattr(self, "_relay_pending_user_message_id", "") or ""
++        )
++        relay_assistant_message_id = str(
++            getattr(self, "_relay_pending_assistant_message_id", "") or ""
++        )
++        had_relay_claim = any(
++            (relay_turn_id, relay_user_message_id, relay_assistant_message_id)
++        )
++        if not had_relay_claim:
++            relay_turn_id, relay_user_message_id = new_turn_claim()
++            relay_assistant_message_id = new_message_id(
++                excluding=(relay_turn_id, relay_user_message_id)
++            )
++        elif (
++            not canonical_id(relay_turn_id)
++            or not canonical_id(relay_user_message_id)
++            or not canonical_id(relay_assistant_message_id)
++            or len(
++                {
++                    relay_turn_id,
++                    relay_user_message_id,
++                    relay_assistant_message_id,
++                }
++            )
++            != 3
++        ):
++            raise ValueError(
++                "canonical turn claim requires three pairwise-distinct identities"
+             )
+         self._relay_pending_turn_id = relay_turn_id
++        self._relay_pending_user_message_id = relay_user_message_id
++        self._relay_pending_assistant_message_id = relay_assistant_message_id
+         relay_parent_session_id = (
+             str(getattr(self, "_parent_session_id", None) or "")
+             if task_context["platform"] == "subagent"
+@@ -8272,6 +8302,16 @@ class AIAgent:
+                         pass
+                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
+                         self._relay_pending_turn_id = None
++                    if (
++                        getattr(self, "_relay_pending_user_message_id", None)
++                        == relay_user_message_id
++                    ):
++                        self._relay_pending_user_message_id = None
++                    if (
++                        getattr(self, "_relay_pending_assistant_message_id", None)
++                        == relay_assistant_message_id
++                    ):
++                        self._relay_pending_assistant_message_id = None
+                     if acct_token is not None:
+                         reset_accounting_context(acct_token)
+                     if token is not None:
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+index a0b0ff1bf95d3fa1491518d9947be2edfe4f4ea2..b21b793ad88f69d6652f3788455914a9269818ca 100644
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -2769,6 +2769,96 @@ class TestRunConversation:
+         )
+         coordinator.release_conversation.assert_called_once_with(relay_lease)
+         assert agent._relay_pending_turn_id is None
++        assert agent._relay_pending_user_message_id is None
++        assert agent._relay_pending_assistant_message_id is None
++
++    def test_standalone_turn_claim_is_complete_distinct_and_cleared(self, agent):
++        """Non-gateway callers must create the same complete identity claim.
++
++        Background review, CLI, and other internal callers enter through this
++        wrapper without a transport-owned claim.  The wrapper must not publish
++        only a synthetic turn id because ``build_turn_context`` correctly
++        rejects every partial correlation claim.
++        """
++        relay_lease = SimpleNamespace(
++            parent_session_id="",
++            profile_key="/profile",
++            session_id=agent.session_id or "",
++        )
++        relay_turn = object()
++        coordinator = MagicMock()
++        coordinator.acquire_conversation.return_value = relay_lease
++        coordinator.begin_turn.return_value = relay_turn
++        observed = {}
++
++        def _capture_claim(*_args, **_kwargs):
++            observed["turn_id"] = agent._relay_pending_turn_id
++            observed["user_message_id"] = agent._relay_pending_user_message_id
++            observed["assistant_message_id"] = (
++                agent._relay_pending_assistant_message_id
++            )
++            return {"final_response": "ok", "completed": True}
++
++        with (
++            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
++            patch(
++                "agent.relay_runtime.current_profile_key",
++                return_value="/profile",
++            ),
++            patch(
++                "hermes_cli.observability.relay_shared_metrics.start_task_run"
++            ),
++            patch(
++                "hermes_cli.observability.relay_shared_metrics.finish_task_run"
++            ),
++            patch(
++                "agent.conversation_loop.run_conversation",
++                side_effect=_capture_claim,
++            ),
++        ):
++            result = agent.run_conversation("hello", task_id="task-identity")
++
++        assert result["completed"] is True
++        assert all(
++            isinstance(value, str)
++            and len(value) == 32
++            and value == value.lower()
++            for value in observed.values()
++        )
++        assert len(set(observed.values())) == 3
++        coordinator.begin_turn.assert_called_once_with(
++            relay_lease,
++            turn_id=observed["turn_id"],
++            task_id="task-identity",
++        )
++        assert agent._relay_pending_turn_id is None
++        assert agent._relay_pending_user_message_id is None
++        assert agent._relay_pending_assistant_message_id is None
++
++    @pytest.mark.parametrize(
++        "turn_id,user_message_id,assistant_message_id",
++        [
++            ("a" * 32, "", "b" * 32),
++            ("a" * 32, "a" * 32, "b" * 32),
++            ("gateway-owned-turn-id", "b" * 32, "c" * 32),
++        ],
++    )
++    def test_partial_or_noncanonical_external_turn_claim_is_rejected(
++        self,
++        agent,
++        turn_id,
++        user_message_id,
++        assistant_message_id,
++    ):
++        agent._relay_pending_turn_id = turn_id
++        agent._relay_pending_user_message_id = user_message_id
++        agent._relay_pending_assistant_message_id = assistant_message_id
++
++        with pytest.raises(
++            ValueError,
++            match="canonical turn claim requires three pairwise-distinct identities",
++        ):
++            agent.run_conversation("hello", task_id="task-invalid-identity")
+ 
+     def test_stop_finish_reason_returns_response(self, agent):
+         self._setup_agent(agent)

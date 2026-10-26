@@ -1,0 +1,195 @@
+diff --git a/agent/minigame_context.py b/agent/minigame_context.py
+index 8c4330d..4b5d28f 100644
+--- a/agent/minigame_context.py
++++ b/agent/minigame_context.py
+@@ -12,12 +12,19 @@ import re
+ import time
+ 
+ SCHEMA = "lilith.minigame.public.v1"
++VIEW_SCHEMA = "lilith.minigame.lilith-view.v2"
+ MAX_BYTES = 4096
+ _ROOT = {"schema", "gameEpoch", "matchId", "capturedAtUnixTimeMilliseconds",
+          "publicRevision", "gameKind", "phase", "actor", "winner", "resultReason"}
+ _CHESS = {"board", "playerSide", "sideToMove", "ply", "lastMoveUci", "inCheck",
+           "mode", "playerRemainingMilliseconds", "lilithRemainingMilliseconds"}
+ _CARDS = {"playerHandCount", "lilithHandCount", "drawCount", "publicPairCount"}
++_RANKS = {"A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"}
++_HAND = {"order", "cards"}
++_CARD = {"rank", "suit"}
++_AWARENESS = {"scope", "turnActor", "checkingMoveAvailable", "captureTargetSquares", "lastMove"}
++_LAST_MOVE = {"actor", "piece", "capturedPiece", "capturedSquare", "gaveCheck"}
++_SQUARE = re.compile(r"[a-h][1-8]\Z", re.ASCII)
+ _DRAWS = {"stalemate", "dead-position", "claimed-draw", "fivefold", "seventy-five-move"}
+ _REASONS = _DRAWS | {"none", "all-pairs", "checkmate", "timeout", "resignation"}
+ _GUID = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
+@@ -35,6 +42,34 @@ _REFERENCE = (
+     "lowercase are pink, and board cells run a1 through h8. Remaining clock values "
+     "are milliseconds at capture (-1 means untimed), never a live countdown.\n"
+ )
++_VIEW_REFERENCE = (
++    "\n\n" + _REFERENCE_START + "\n"
++    "These are actual host-provided game facts known to Lilith when the player "
++    "submitted this message. Use them to answer relevant game questions; do not "
++    "claim you cannot know these facts merely because you cannot see the screen. "
++    "The game may have progressed since capture. Do not invent prior moves, "
++    "engine evaluations, player intentions or missing facts. You do not control "
++    "random draws, card selection, moves or outcomes; narration is not an "
++    "action or a result.\n"
++)
++_OWN_HAND_REFERENCE = (
++    "Your own hand is provided in "
++    "screen-left-to-right order, including rank and suit; JOKER has suit none. "
++    "You may describe your own cards or positions when asked, but do not "
++    "automatically reveal your hand. The player\'s hidden cards and their "
++    "positions are not provided: do not pretend to have directly observed them.\n"
++)
++_CHESS_VIEW_REFERENCE = (
++    "Pink represents the standard black side; uppercase board letters are white, "
++    "lowercase are pink, and board cells run a1 through h8. Remaining clock values "
++    "are milliseconds at capture (-1 means untimed), never a live countdown. "
++    "Awareness concerns only legal moves available to the current side to move. "
++    "Capture targets are the occupied victim squares, including en-passant victims. "
++    "Being in check is not checkmate. A legal checking move exists does not mean "
++    "it is best, intended or a forced win. The lastMove facts describe the last "
++    "committed move, not what the player will do next. Use this awareness to "
++    "participate naturally; do not automatically recite move recommendations.\n"
++)
+ 
+ 
+ def _reject():
+@@ -56,6 +91,68 @@ def _token(value, choices):
+         _reject()
+ 
+ 
++def _square_piece(board, square):
++    return board[(ord(square[1]) - ord("1")) * 8 + ord(square[0]) - ord("a")]
++
++
++def _chess_awareness(data, active, actor):
++    awareness = data["awareness"]
++    _exact(awareness, _AWARENESS)
++    _token(awareness["scope"], {"side-to-move-legal"})
++    _token(awareness["turnActor"], {"player", "lilith", "none"})
++    if awareness["turnActor"] != (actor if active else "none") or type(awareness["checkingMoveAvailable"]) is not bool:
++        _reject()
++    targets = awareness["captureTargetSquares"]
++    if type(targets) is not list or len(targets) > 32:
++        _reject()
++    previous = ""
++    for square in targets:
++        if type(square) is not str or not _SQUARE.fullmatch(square) or square <= previous:
++            _reject()
++        victim = _square_piece(data["board"], square)
++        enemies = "prnbq" if data["sideToMove"] == "white" else "PRNBQ"
++        if victim not in enemies:
++            _reject()
++        previous = square
++    if not active and (awareness["checkingMoveAvailable"] or targets):
++        _reject()
++    last = awareness["lastMove"]
++    if last is None:
++        return
++    _exact(last, _LAST_MOVE)
++    _token(last["actor"], {"player", "lilith"})
++    _token(last["piece"], set("PRNBQKprnbqk"))
++    _token(last["capturedPiece"], set(".PRNBQprnbq"))
++    if data["ply"] == 0 or type(last["gaveCheck"]) is not bool or last["gaveCheck"] != data["inCheck"]:
++        _reject()
++    white = last["piece"].isupper()
++    side = "white" if white else "pink"
++    if side == data["sideToMove"] or last["actor"] != ("player" if side == data["playerSide"] else "lilith"):
++        _reject()
++    move = data["lastMoveUci"]
++    destination = move[2:4]
++    moved = last["piece"]
++    if len(move) == 5:
++        if moved not in {"P", "p"} or move[1] != ("7" if white else "2") or move[3] != ("8" if white else "1"):
++            _reject()
++        moved = move[4].upper() if white else move[4]
++    if _square_piece(data["board"], destination) != moved:
++        _reject()
++    captured, square = last["capturedPiece"], last["capturedSquare"]
++    if type(square) is not str or (square and not _SQUARE.fullmatch(square)) or (captured == ".") != (square == ""):
++        _reject()
++    if captured == ".":
++        return
++    if captured.isupper() == white:
++        _reject()
++    if square != destination:
++        if (last["piece"] != ("P" if white else "p") or captured != ("p" if white else "P")
++                or move[1] != ("5" if white else "4") or move[3] != ("6" if white else "3")
++                or abs(ord(move[0]) - ord(move[2])) != 1 or square != move[2] + move[1]
++                or _square_piece(data["board"], square) != "."):
++            _reject()
++
++
+ @dataclass(frozen=True, slots=True)
+ class PublicGameContext:
+     """Private validated carrier; JSON strings cannot alias caller dictionaries."""
+@@ -77,8 +174,8 @@ def parse_public_context(value):
+     _token(kind, {"chess", "old-maid"})
+     payload_key = "chess" if kind == "chess" else "oldMaid"
+     _exact(value, _ROOT | {payload_key})
+-    if value["schema"] != SCHEMA:
+-        _reject()
++    _token(value["schema"], {SCHEMA, VIEW_SCHEMA})
++    view = value["schema"] == VIEW_SCHEMA
+     for key in ("gameEpoch", "matchId"):
+         text = value[key]
+         if type(text) is not str or not _GUID.fullmatch(text) or text == "0" * 32:
+@@ -97,7 +194,7 @@ def parse_public_context(value):
+         _reject()
+     data = value[payload_key]
+     if kind == "chess":
+-        _exact(data, _CHESS)
++        _exact(data, _CHESS | ({"awareness"} if view else set()))
+         board = data["board"]
+         if (type(board) is not str or len(board) != 64 or set(board) - set(".prnbqkPRNBQK")
+                 or board.count("K") != 1 or board.count("k") != 1 or 64 - board.count(".") > 32):
+@@ -120,8 +217,10 @@ def parse_public_context(value):
+         if ((active and value["actor"] != actor) or value["resultReason"] == "all-pairs"
+                 or ((value["winner"] == "draw") != (value["resultReason"] in _DRAWS))):
+             _reject()
++        if view:
++            _chess_awareness(data, active, actor)
+     else:
+-        _exact(data, _CARDS)
++        _exact(data, _CARDS | ({"lilithHand"} if view else set()))
+         for key in ("playerHandCount", "lilithHandCount"):
+             _int(data[key], 0, 27)
+         _int(data["drawCount"], 0, 100000)
+@@ -133,12 +232,33 @@ def parse_public_context(value):
+                 or (value["winner"] == "player" and (player != 0 or lilith != 1))
+                 or (value["winner"] == "lilith" and (lilith != 0 or player != 1))):
+             _reject()
++        if view:
++            hand = data["lilithHand"]
++            _exact(hand, _HAND)
++            _token(hand["order"], {"screen-left-to-right"})
++            cards = hand["cards"]
++            if type(cards) is not list or len(cards) != lilith:
++                _reject()
++            seen = set()
++            for card in cards:
++                _exact(card, _CARD)
++                _token(card["rank"], _RANKS | {"JOKER"})
++                _token(card["suit"], {"hearts", "spades", "none"})
++                if (card["rank"] == "JOKER") != (card["suit"] == "none"):
++                    _reject()
++                identity = (card["rank"], card["suit"])
++                if identity in seen:
++                    _reject()
++                seen.add(identity)
++            if not active and value["winner"] == "player" and cards != [{"rank": "JOKER", "suit": "none"}]:
++                _reject()
+     wire = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+     if len(wire.encode("utf-8")) > MAX_BYTES:
+         _reject()
+     # Correlation identities and hidden-change counters do not enter model text.
+     public = {key: value[key] for key in ("gameKind", "phase", "actor", "winner", "resultReason", payload_key)}
+-    reference = _REFERENCE + json.dumps(public, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n" + _REFERENCE_END
++    introduction = (_VIEW_REFERENCE + (_OWN_HAND_REFERENCE if kind == "old-maid" else _CHESS_VIEW_REFERENCE)) if view else _REFERENCE
++    reference = introduction + json.dumps(public, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n" + _REFERENCE_END
+     return PublicGameContext(wire, reference, value["capturedAtUnixTimeMilliseconds"])
+ 
+ 

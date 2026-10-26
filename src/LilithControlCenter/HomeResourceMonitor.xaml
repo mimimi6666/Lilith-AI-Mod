@@ -1,0 +1,136 @@
+<UserControl x:Class="LilithControlCenter.HomeResourceMonitor"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:LilithControlCenter"
+             Foreground="{DynamicResource TextBrush}"
+             AutomationProperties.AutomationId="HomeResourceMonitor">
+    <UserControl.Resources>
+        <Style x:Key="ResourceCard" TargetType="Border">
+            <Setter Property="Background" Value="{DynamicResource PanelBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius" Value="14"/>
+            <Setter Property="Padding" Value="18"/>
+        </Style>
+        <Style x:Key="ResourceCaption" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Foreground" Value="{DynamicResource MutedBrush}"/>
+            <Setter Property="TextWrapping" Value="Wrap"/>
+        </Style>
+    </UserControl.Resources>
+    <StackPanel x:Name="ResourceContent">
+        <Grid Grid.IsSharedSizeScope="True">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="12"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="12"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="12"/>
+                <ColumnDefinition Width="1.4*"/>
+            </Grid.ColumnDefinitions>
+            <Border x:Name="ResourceCpuCard" Style="{StaticResource ResourceCard}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" SharedSizeGroup="ResourceGaugeHeader"/>
+                        <RowDefinition Height="Auto" SharedSizeGroup="ResourceGaugeBody"/>
+                    </Grid.RowDefinitions>
+                    <StackPanel>
+                        <TextBlock Text="{Binding CpuPercentText}" FontSize="32" FontWeight="SemiBold"
+                                   AutomationProperties.AutomationId="ResourceCpuPercent"/>
+                        <TextBlock Text="{local:UiText resources.cpu}" Style="{StaticResource ResourceCaption}"/>
+                    </StackPanel>
+                    <Viewbox x:Name="ResourceCpuGauge" Grid.Row="1" Stretch="Uniform" Margin="0,18,0,12" MaxHeight="94"
+                             ToolTip="{Binding CpuStateText}" AutomationProperties.Name="{Binding CpuStateText}">
+                        <Canvas Width="164" Height="90">
+                            <Path Data="M 7,82 A 75,75 0 0 1 157,82" Stroke="{DynamicResource PanelHoverBrush}"
+                                  StrokeThickness="6" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                            <Path Data="{Binding CpuArc}" Stroke="{DynamicResource AccentBrush}" StrokeThickness="6"
+                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                            <Path Data="{Binding CpuNeedle}" Fill="{DynamicResource AccentBrush}"/>
+                        </Canvas>
+                    </Viewbox>
+                </Grid>
+            </Border>
+            <Border x:Name="ResourceGpuCard" Grid.Column="2" Style="{StaticResource ResourceCard}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" SharedSizeGroup="ResourceGaugeHeader"/>
+                        <RowDefinition Height="Auto" SharedSizeGroup="ResourceGaugeBody"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    <StackPanel>
+                        <TextBlock Text="{Binding GpuPercentText}" FontSize="32" FontWeight="SemiBold"
+                                   AutomationProperties.AutomationId="ResourceGpuPercent"/>
+                        <TextBlock Text="{local:UiText resources.gpu}" Style="{StaticResource ResourceCaption}"
+                                   ToolTip="{local:UiText resources.gpuHelp}"/>
+                    </StackPanel>
+                    <Viewbox x:Name="ResourceGpuGauge" Grid.Row="1" Stretch="Uniform" Margin="0,18,0,12" MaxHeight="94"
+                             ToolTip="{Binding GpuStateText}" AutomationProperties.Name="{Binding GpuStateText}">
+                        <Canvas Width="164" Height="90">
+                            <Path Data="M 7,82 A 75,75 0 0 1 157,82" Stroke="{DynamicResource PanelHoverBrush}"
+                                  StrokeThickness="6" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                            <Path Data="{Binding GpuArc}" Stroke="{DynamicResource AccentStrongBrush}" StrokeThickness="6"
+                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                            <Path Data="{Binding GpuNeedle}" Fill="{DynamicResource AccentStrongBrush}"/>
+                        </Canvas>
+                    </Viewbox>
+                    <TextBlock Grid.Row="2" Text="{Binding GpuTemperatureText}" Style="{StaticResource ResourceCaption}"
+                               VerticalAlignment="Bottom" AutomationProperties.AutomationId="ResourceGpuTemperature"
+                               ToolTip="{local:UiText resources.temperatureHelp}"/>
+                </Grid>
+            </Border>
+            <Border Grid.Column="4" Style="{StaticResource ResourceCard}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <StackPanel>
+                        <TextBlock Text="{Binding MemoryPercentText}" FontSize="32" FontWeight="SemiBold"
+                                   AutomationProperties.AutomationId="ResourceMemoryPercent"/>
+                        <TextBlock Text="{local:UiText resources.memory}" Style="{StaticResource ResourceCaption}"/>
+                    </StackPanel>
+                    <Viewbox Grid.Row="1" Stretch="Fill" Height="22" Margin="0,18,0,12" VerticalAlignment="Center"
+                             ToolTip="{Binding MemoryStateText}">
+                        <Canvas Width="100" Height="22">
+                            <Rectangle Width="100" Height="22" RadiusX="3" RadiusY="3" Fill="{DynamicResource PanelHoverBrush}"/>
+                            <Rectangle Width="{Binding MemoryBarWidth}" Height="22" RadiusX="3" RadiusY="3"
+                                       Fill="{DynamicResource AccentBrush}"/>
+                        </Canvas>
+                    </Viewbox>
+                    <TextBlock Grid.Row="2" Text="{Binding MemoryBytesText}" Style="{StaticResource ResourceCaption}"
+                               ToolTip="{local:UiText resources.memoryHelp}"/>
+                </Grid>
+            </Border>
+            <Border Grid.Column="6" Style="{StaticResource ResourceCard}" ToolTip="{local:UiText resources.networkHelp}">
+                <StackPanel>
+                    <TextBlock Text="{local:UiText resources.network}" FontSize="14" FontWeight="SemiBold"/>
+                    <Grid Margin="0,12,0,0">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                        <TextBlock Text="{local:UiText resources.download}" Style="{StaticResource ResourceCaption}"/>
+                        <TextBlock Grid.Column="1" Text="{Binding DownloadText}" FontSize="13" Foreground="{DynamicResource GoodBrush}"/>
+                    </Grid>
+                    <Viewbox Height="46" Stretch="Fill" Margin="0,6,0,8" ClipToBounds="True">
+                        <Canvas Width="200" Height="46">
+                            <Path Data="{Binding DownloadArea}" Fill="{DynamicResource GoodBrush}" Opacity="0.12"/>
+                            <Path Data="{Binding DownloadLine}" Stroke="{DynamicResource GoodBrush}" StrokeThickness="1.6"/>
+                        </Canvas>
+                    </Viewbox>
+                    <Grid>
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                        <TextBlock Text="{local:UiText resources.upload}" Style="{StaticResource ResourceCaption}"/>
+                        <TextBlock Grid.Column="1" Text="{Binding UploadText}" FontSize="13" Foreground="{DynamicResource AccentBrush}"/>
+                    </Grid>
+                    <Viewbox Height="46" Stretch="Fill" Margin="0,6,0,0" ClipToBounds="True">
+                        <Canvas Width="200" Height="46">
+                            <Path Data="{Binding UploadArea}" Fill="{DynamicResource AccentBrush}" Opacity="0.12"/>
+                            <Path Data="{Binding UploadLine}" Stroke="{DynamicResource AccentBrush}" StrokeThickness="1.6"/>
+                        </Canvas>
+                    </Viewbox>
+                </StackPanel>
+            </Border>
+        </Grid>
+    </StackPanel>
+</UserControl>

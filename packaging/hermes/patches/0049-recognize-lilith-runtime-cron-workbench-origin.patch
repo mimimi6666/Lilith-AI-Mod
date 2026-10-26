@@ -1,0 +1,127 @@
+diff --git a/tests/cron/test_local_workbench_completion.py b/tests/cron/test_local_workbench_completion.py
+index 8e41f868..008953d3 100644
+--- a/tests/cron/test_local_workbench_completion.py
++++ b/tests/cron/test_local_workbench_completion.py
+@@ -73,6 +73,66 @@ def test_capture_is_disabled_without_dedicated_runtime_flag(monkeypatch):
+         assert _local_workbench_origin_from_env(None) is None
+ 
+ 
++def test_capture_accepts_lilith_runtime_formal_session(monkeypatch):
++    from tools.cronjob_tools import _local_workbench_origin_from_env
++
++    monkeypatch.setenv("HERMES_CRON_TICKER", "1")
++    env = {
++        "HERMES_SESSION_SOURCE": "lilith-runtime",
++        "HERMES_SESSION_KEY": "durable-formal-a",
++        "HERMES_SESSION_ID": "durable-formal-a",
++        "HERMES_UI_SESSION_ID": "formal-tab-a",
++    }
++
++    with _session_env(env):
++        captured = _local_workbench_origin_from_env(None)
++
++    assert captured == {
++        "kind": "local_workbench",
++        "source": "lilith-runtime",
++        "session_key": "durable-formal-a",
++        "session_id": "durable-formal-a",
++        "ui_session_id": "formal-tab-a",
++    }
++
++
++@pytest.mark.parametrize("updated_deliver", ["local", "all"])
++def test_delivery_update_preserves_lilith_runtime_return_address(
++    isolated_cron_home,
++    monkeypatch,
++    updated_deliver,
++):
++    from cron.jobs import create_job, update_job
++    from tools.cronjob_tools import _local_workbench_origin_from_env
++
++    monkeypatch.setenv("HERMES_CRON_TICKER", "1")
++    env = {
++        "HERMES_SESSION_SOURCE": "lilith-runtime",
++        "HERMES_SESSION_KEY": "durable-formal-a",
++        "HERMES_SESSION_ID": "durable-formal-a",
++        "HERMES_UI_SESSION_ID": "formal-tab-a",
++    }
++    with _session_env(env):
++        local_origin = _local_workbench_origin_from_env(None)
++
++    job = create_job(
++        prompt="say the timer is done",
++        schedule="1m",
++        local_workbench_origin=local_origin,
++    )
++    updated = update_job(job["id"], {"deliver": updated_deliver})
++
++    assert updated is not None
++    assert updated["deliver"] == updated_deliver
++    assert updated["local_workbench_origin"] == {
++        "kind": "local_workbench",
++        "source": "lilith-runtime",
++        "session_key": "durable-formal-a",
++        "session_id": "durable-formal-a",
++        "ui_session_id": "formal-tab-a",
++    }
++
++
+ def test_create_job_persists_local_origin_only_for_one_shot(isolated_cron_home):
+     from cron.jobs import create_job
+ 
+@@ -140,7 +200,18 @@ def test_cron_tool_create_plumbs_exact_workbench_origin(monkeypatch):
+     assert captured["local_workbench_origin"]["session_key"] == "durable-a"
+ 
+ 
+-def test_run_one_job_queues_one_exact_live_only_completion(monkeypatch):
++@pytest.mark.parametrize(
++    ("deliver", "delivery_error"),
++    [
++        ("local", None),
++        ("all", "no delivery target resolved for deliver=all"),
++    ],
++)
++def test_run_one_job_queues_one_exact_live_only_completion(
++    monkeypatch,
++    deliver,
++    delivery_error,
++):
+     import cron.scheduler as scheduler
+     from tools.process_registry import process_registry
+ 
+@@ -159,7 +230,11 @@ def test_run_one_job_queues_one_exact_live_only_completion(monkeypatch):
+         ),
+     )
+     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "saved.txt")
+-    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(
++        scheduler,
++        "_deliver_result",
++        lambda *_args, **_kwargs: delivery_error,
++    )
+     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+     monkeypatch.setattr(scheduler, "finish_execution", lambda *_args, **_kwargs: None)
+ 
+@@ -167,7 +242,7 @@ def test_run_one_job_queues_one_exact_live_only_completion(monkeypatch):
+         "id": "timer-job",
+         "name": "一分鐘計時",
+         "execution_id": "exec-timer-1",
+-        "deliver": "local",
++        "deliver": deliver,
+         "schedule": {"kind": "once"},
+         "local_workbench_origin": {
+             "kind": "local_workbench",
+diff --git a/tools/cronjob_tools.py b/tools/cronjob_tools.py
+index 71e21e9e..6f1c6cfc 100644
+--- a/tools/cronjob_tools.py
++++ b/tools/cronjob_tools.py
+@@ -380,7 +380,7 @@ def _local_workbench_origin_from_env(
+         return None
+ 
+     source = str(get_session_env("HERMES_SESSION_SOURCE", "") or "").strip().lower()
+-    if source not in {"desktop", "local", "tui"}:
++    if source not in {"desktop", "lilith-runtime", "local", "tui"}:
+         return None
+     session_key = str(get_session_env("HERMES_SESSION_KEY", "") or "").strip()
+     session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
+

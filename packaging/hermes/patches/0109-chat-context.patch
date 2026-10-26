@@ -1,0 +1,529 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index cd8f162..0755fed 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -2498,6 +2498,10 @@ def run_conversation(
+             agent, api_messages, messages, _budget_history_selection,
+             history_offset=len(api_messages) - len(messages),
+             estimate_input=estimate_request_tokens_rough,
++            normalize_tool_calls=(
++                (lambda row, model=_sanitize_model: agent._sanitize_tool_calls_for_strict_api(row, model=model))
++                if agent._should_sanitize_tool_calls() else None
++            ),
+         )
+ 
+         # Per-turn context selection hook (additive, no-op by default).
+diff --git a/agent/history_context.py b/agent/history_context.py
+new file mode 100644
+--- /dev/null
++++ b/agent/history_context.py
+@@ -0,0 +1,96 @@
++"""Pure request-side history helpers. No storage, recall, model call or authority.
++
++Only identical host-appended plugin envelopes may be deduplicated. Unknown or
++changed sidecars stay intact; literal player text is never parsed as a sidecar.
++"""
++from copy import deepcopy
++import hashlib
++import json
++
++_START = "[Subordinate operational context: pre_llm_call plugin context]\n"
++_END = "[End subordinate operational context: pre_llm_call plugin context]"
++_REMOVED = "\n\n[Identical historical host context omitted; retained on a later message.]"
++_CONTENT_FIELDS = ("role", "content", "tool_calls", "tool_call_id", "function_call")
++
++
++def semantic_key(rows):
++    """Transport bookkeeping/reasoning echo is not a new conversation exchange.
++
++    The caller separately checks immutable full source digests and exact native
++    send transformations. Every visible argument, result and multimodal block
++    remains in this coverage key; it is not a fuzzy-text similarity test.
++    """
++    data = [{k: row[k] for k in _CONTENT_FIELDS if k in row} for row in rows]
++    return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=True,
++                                    separators=(",", ":"), allow_nan=False).encode()).hexdigest()
++
++
++def summary_scope(agent, origin, spec):
++    from agent.identity_policy import policy_for_agent
++    policy = policy_for_agent(agent)
++    route = tuple(str(getattr(agent, key, ""))
++                  for key in ("model", "provider", "api_mode", "base_url"))
++    return (agent.session_id, origin.ledger.policy.level, origin.ledger.policy.version,
++            route, policy.enabled, policy.fingerprint, repr(spec))
++
++
++def _plugin_suffix(source, actual):
++    if (not isinstance(source, dict) or not isinstance(actual, dict)
++            or source.get("role") != "user" or actual.get("role") != "user"
++            or source.get("display_kind") not in (None, "", "user")):
++        return None
++    clean, sidecar, content = source.get("content"), source.get("api_content"), actual.get("content")
++    if (not all(isinstance(text, str) for text in (clean, sidecar, content))
++            or not clean or not sidecar.startswith(clean + "\n\n")
++            or not content.startswith(clean + "\n\n")):
++        return None
++    suffix = sidecar[len(clean) + 2:]
++    if (not suffix.startswith(_START) or not suffix.endswith(_END)
++            or suffix.count(_START) != 1 or suffix.count(_END) != 1
++            or not content.endswith("\n\n" + suffix)):
++        return None
++    return suffix
++
++
++def dedupe_sidecars(projected, source, offset, allowed, visible=None):
++    """Return replacements only; the latest surviving copy always stays full.
++
++    `allowed` consists exclusively of verified historical projection units.
++    Fresh current memory may precede the current plugin block, but that row is
++    never eligible for replacement. The scan is restricted to surviving rows,
++    so we cannot point at a later copy that was itself removed by a summary.
++    """
++    if source is None or len(projected) != len(source) + offset:
++        return {}, 0
++    visible = range(len(projected)) if visible is None else visible
++    replacements, seen, saved = {}, set(), 0
++    for index in sorted(visible, reverse=True):
++        original_index = index - offset
++        if not 0 <= original_index < len(source):
++            continue
++        suffix = _plugin_suffix(source[original_index], projected[index])
++        if suffix is None:
++            continue
++        key = hashlib.sha256(suffix.encode("utf-8")).digest()
++        # Exact equality is retained as a second check, not hash-only deletion.
++        identity = (key, suffix)
++        if identity in seen and index in allowed and len(suffix) > len(_REMOVED):
++            row = deepcopy(projected[index])
++            row["content"] = row["content"][:-(len(suffix) + 2)] + _REMOVED
++            replacements[index] = row
++            saved += len(projected[index]["content"]) - len(row["content"])
++        seen.add(identity)
++    return replacements, saved
++
++
++def content_counts(rows):
++    """Character counts only; deliberately not labelled provider token usage."""
++    counts = {"chat_chars": 0, "tool_chars": 0, "system_chars": 0}
++    for row in rows:
++        content = row.get("content")
++        if not isinstance(content, str):
++            continue  # images/structured payloads are not estimated as text
++        role = row.get("role")
++        key = "tool_chars" if role == "tool" else "system_chars" if role in ("system", "developer") else "chat_chars"
++        counts[key] += len(content)
++    return counts
+diff --git a/agent/usage_budget_context.py b/agent/usage_budget_context.py
+index 50533ef..d14ff1e 100644
+--- a/agent/usage_budget_context.py
++++ b/agent/usage_budget_context.py
+@@ -339,7 +339,7 @@ def select_working_context(projected, source, history, *, history_offset,
+ 
+ 
+ def prepare_budget_context(agent, projected, source, history, *, history_offset,
+-                           estimate_input=None):
++                           estimate_input=None, normalize_tool_calls=None):
+     """Actual conversation-loop seam, before request selection/sanitization."""
+     ledger = current_turn_budget()
+     if ledger is not None and ledger.policy.information_strategy.history_turns is not None:
+@@ -348,8 +348,10 @@ def prepare_budget_context(agent, projected, source, history, *, history_offset,
+         origin = capture_origin()
+         if origin is not None:
+             try:
+-                units = _strategy_projection_units(agent, history, source, projected, history_offset)
+-                return project_context(agent, projected, units, ledger.policy.information_strategy, origin)
++                units = _strategy_projection_units(agent, history, source, projected, history_offset,
++                                                   normalize_tool_calls=normalize_tool_calls)
++                return project_context(agent, projected, units, ledger.policy.information_strategy, origin,
++                                       source=source, history_offset=history_offset)
+             except Exception:
+                 agent._usage_budget_context_status = {"strategy": "projection_unavailable_originals_retained"}
+                 return projected
+@@ -371,7 +373,7 @@ def prepare_budget_context(agent, projected, source, history, *, history_offset,
+     return result.messages
+ 
+ 
+-def _strategy_projection_units(agent, history, source, projected, offset):
++def _strategy_projection_units(agent, history, source, projected, offset, *, normalize_tool_calls=None):
+     """Reproduce owned sidecar/quarantine transforms, not arbitrary text guesses.
+ 
+     Old normal-unit matcher required pristine content and therefore never
+@@ -400,6 +402,12 @@ def _strategy_projection_units(agent, history, source, projected, offset):
+                 expected["content"] = deepcopy(source[index].get("content"))
+             elif kind is not None:
+                 quarantine_scoped_legacy_assistant_message(agent, expected, record_type=kind)
++            # Use the exact host-owned transformation already applied by this
++            # provider pass, including the resolved MoA aggregator model. Do not
++            # merely ignore metadata names: retained signatures and unknown
++            # fields must still match, as must arguments and call/result IDs.
++            if normalize_tool_calls is not None:
++                normalize_tool_calls(expected)
+             # Native reasoning transport fields are not needed to certify the
+             # visible exchange. Tool arguments/linkage remain byte-exact.
+             fields = ("role", "content", "tool_calls", "tool_call_id", "function_call")
+diff --git a/agent/usage_strategy_context.py b/agent/usage_strategy_context.py
+index aada6ae..2db19da 100644
+--- a/agent/usage_strategy_context.py
++++ b/agent/usage_strategy_context.py
+@@ -7,6 +7,11 @@ The native summarizer supplies identity/redaction/provenance/usage boundaries.
+ from copy import copy, deepcopy
+ import hashlib
+ import json
++import logging
++
++from agent.history_context import semantic_key, summary_scope, dedupe_sidecars, content_counts
++
++logger = logging.getLogger(__name__)
+ 
+ 
+ def compact_results(rows, chars):
+@@ -33,21 +38,27 @@ def compact_results(rows, chars):
+ 
+ 
+ def _key(rows):
+-    return hashlib.sha256(json.dumps(rows, sort_keys=True, ensure_ascii=True,
+-                                    separators=(",", ":")).encode()).hexdigest()
++    return semantic_key(rows)
+ 
+ 
+-def project_context(agent, projected, units, spec, origin):
++def project_context(agent, projected, units, spec, origin, *, source=None, history_offset=0):
+     if spec.history_turns is None or not units:
+         return projected
+     tool_indices = tuple(i for unit in units[:-1] for i in unit)
+     excerpts = compact_results([projected[i] for i in tool_indices], spec.old_tool_chars)
+     replacements = dict(zip(tool_indices, excerpts))
++    allowed = {i for unit in units for i in unit}
++    summary_added_turns = 0
++    summary_attempted = False
+     # capture_completed_history already protects the latest completed exchange.
+     old = units[:max(0, len(units) - (spec.history_turns - 1))]
+     if not old:
+-        return [replacements.get(i, row) for i, row in enumerate(projected)]
+-    state_key = (agent.session_id, origin.ledger.policy.level, origin.ledger.policy.version)
++        sidecars, saved = dedupe_sidecars(projected, source, history_offset, allowed)
++        replacements.update(sidecars)
++        result = [replacements.get(i, row) for i, row in enumerate(projected)]
++        _record_projection(agent, projected, result, spec, 0, 0, len(sidecars), saved, False, 0)
++        return result
++    state_key = summary_scope(agent, origin, spec)
+     state = getattr(agent, "_information_summary", None)
+     if not isinstance(state, dict) or state["key"] != state_key:
+         state = {"key": state_key, "covered": (), "summary": "", "last": None, "attempt_count": None}
+@@ -78,7 +89,11 @@ def project_context(agent, projected, units, spec, origin):
+                 checkpoint._record_aux_compression_call = recorder
+             checkpoint._previous_summary = state["summary"] or None
+             checkpoint._compute_summary_budget = lambda _rows: spec.summary_target_tokens
+-            rows = [projected[i] for unit in old[len(covered):] for i in unit]
++            indices = [i for unit in old[len(covered):] for i in unit]
++            sidecars, _ = dedupe_sidecars(projected, source, history_offset, allowed, indices)
++            rows = [sidecars.get(i, projected[i]) for i in indices]
++            summary_attempted = True
++            summary_added_turns = len(old) - len(covered)
+             try:
+                 summary = checkpoint._generate_summary(compact_results(rows, spec.old_tool_chars))
+             except Exception:
+@@ -87,6 +102,9 @@ def project_context(agent, projected, units, spec, origin):
+                 state.update(covered=keys, summary=summary)
+                 covered = keys
+     removed = {i for unit in old[:len(covered)] for i in unit}
++    sidecars, saved = dedupe_sidecars(projected, source, history_offset, allowed,
++                                    set(range(len(projected))) - removed)
++    replacements.update(sidecars)
+     # Uncovered exchanges are still sent (with old-result excerpts). Current
+     # input, latest history, non-eligible rows and tool payloads are untouched.
+     result = []
+@@ -95,8 +113,18 @@ def project_context(agent, projected, units, spec, origin):
+             result.append({"role": "user", "content": state["summary"]})
+         if i not in removed:
+             result.append(replacements.get(i, row))
++    _record_projection(agent, projected, result, spec, len(covered), len(old)-len(covered),
++                       len(sidecars), saved, summary_attempted, summary_added_turns)
++    return result
++
++
++def _record_projection(agent, before, after, spec, covered, uncovered, deduped, saved, attempted, added):
+     agent._usage_budget_context_status = {
+         "strategy": "information_v1", "history_target_turns": spec.history_turns,
+-        "summarized_turns": len(covered), "uncovered_turns_retained": len(old)-len(covered),
++        "summarized_turns": covered, "uncovered_turns_retained": uncovered,
++        "measurement": "projection_text_characters_not_final_wire_tokens",
++        "before": content_counts(before), "after": content_counts(after),
++        "deduplicated_sidecars": deduped, "sidecar_chars_saved": saved,
++        "summary_attempted": attempted, "summary_new_turns": added,
+     }
+-    return result
++    logger.info("[context_projection] %s", json.dumps(agent._usage_budget_context_status, sort_keys=True))
+diff --git a/tests/test_chat_context.py b/tests/test_chat_context.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_chat_context.py
+@@ -0,0 +1,267 @@
++from copy import deepcopy
++import json
++from types import SimpleNamespace
++import unittest
++
++from agent.usage_budget import NormalBudget, VerifiedModelLimits, resolve_policy, TurnBudgetLedger
++from agent.usage_budget_context import capture_completed_history, _strategy_projection_units
++from agent.usage_strategy import strategy_for_level
++from agent.usage_strategy_context import project_context, compact_results
++from agent.history_context import semantic_key, dedupe_sidecars
++
++
++SUFFIX = ("[Subordinate operational context: pre_llm_call plugin context]\n"
++          + "Fixture operational context; not identity or permission. " * 16
++          + "\n[End subordinate operational context: pre_llm_call plugin context]")
++
++
++def origin(key="one", level=4, revision=1):
++    policy = resolve_policy(level, NormalBudget(max_iterations=90), VerifiedModelLimits(), version=revision)
++    return SimpleNamespace(origin_id=key, ledger=TurnBudgetLedger(key, policy))
++
++
++def transcript(turns=36, tools=True, sidecar=False):
++    source = []
++    for i in range(turns):
++        user = {"role": "user", "content": f"question {i}"}
++        if sidecar:
++            user["api_content"] = user["content"] + "\n\n" + SUFFIX
++        source.append(user)
++        if tools:
++            source.extend([
++                {"role": "assistant", "content": "", "tool_calls": [{"id": f"call-{i}", "type": "function",
++                 "call_id": f"call-{i}", "response_item_id": f"response-{i}",
++                 "extra_content": {"signature": "fixture"},
++                 "function": {"name": "fixture_read", "arguments": json.dumps({"number": i})}}]},
++                {"role": "tool", "tool_call_id": f"call-{i}", "content": f"result {i}"}])
++        source.append({"role": "assistant", "content": f"answer {i}", "reasoning_content": "fixture echo"})
++    source.append({"role": "user", "content": "current request"})
++    return source
++
++
++def normalize(row, keep_signature=False):
++    if isinstance(row.get("tool_calls"), list):
++        row["tool_calls"] = [{k: v for k, v in call.items()
++                              if k not in {"call_id", "response_item_id"}
++                              and (keep_signature or k != "extra_content")} for call in row["tool_calls"]]
++
++
++def project(source, normalizer=normalize):
++    rows = [{"role": "system", "content": "protected identity"}] + deepcopy(source)
++    from agent.turn_context import substitute_api_content
++    for row in rows[1:]:
++        substitute_api_content(row)
++        normalizer(row)
++    return rows
++
++
++def units(agent, source, rows, normalizer=normalize):
++    history = capture_completed_history(source, len(source)-1)
++    return _strategy_projection_units(agent, history, source, rows, 1, normalize_tool_calls=normalizer)
++
++
++class Compressor:
++    def __init__(self):
++        self.calls = []
++        self._previous_summary = "native compressor state must not change"
++
++    def _generate_summary(self, rows):
++        self.calls.append((deepcopy(rows), self._previous_summary))
++        return "Historical context: fixture facts and unfinished work retained."
++
++
++class ChatContextTests(unittest.TestCase):
++    def setUp(self):
++        self.agent = SimpleNamespace(session_id="fixture", model="model", provider="provider",
++                                     api_mode="chat_completions", context_compressor=Compressor())
++
++    def run_projection(self, source, handle=None):
++        rows = project(source)
++        handle = handle or origin()
++        return project_context(self.agent, rows, units(self.agent, source, rows),
++                               strategy_for_level(handle.ledger.policy.level), handle,
++                               source=source, history_offset=1)
++
++    def test_actual_sanitizer_parity_recovers_completed_tool_exchanges(self):
++        source = transcript(52)
++        rows = project(source)
++        history = capture_completed_history(source, len(source)-1)
++        self.assertEqual(_strategy_projection_units(self.agent, history, source, rows, 1), ())
++        self.assertEqual(len(units(self.agent, source, rows)), 51)
++
++    def test_changed_arguments_results_ids_and_unknown_metadata_are_not_accepted(self):
++        for location, field, value in [(2, "content", "not original"), (3, "content", "changed result"),
++                                        (3, "tool_call_id", "wrong")]:
++            source = transcript(3)
++            rows = project(source)
++            rows[location][field] = value
++            self.assertNotIn(tuple(range(1, 5)), units(self.agent, source, rows))
++        for field, value in [("id", "wrong"), ("unknown", "new"),
++                             ("function", {"name": "fixture_read", "arguments": "{\"number\":9}"})]:
++            source = transcript(3)
++            rows = project(source)
++            rows[2]["tool_calls"][0][field] = value
++            self.assertEqual(len(units(self.agent, source, rows)), 1)
++
++    def test_retained_signature_must_match_the_resolved_route(self):
++        normalizer = lambda row: normalize(row, keep_signature=True)
++        source = transcript(3)
++        rows = project(source, normalizer)
++        self.assertEqual(len(units(self.agent, source, rows, normalizer)), 2)
++        rows[2]["tool_calls"][0]["extra_content"] = {"signature": "wrong"}
++        self.assertEqual(len(units(self.agent, source, rows, normalizer)), 1)
++
++    def test_source_mutation_after_capture_fails_closed(self):
++        source = transcript(3)
++        history = capture_completed_history(source, len(source)-1)
++        source[0]["content"] = "modified after capture"
++        self.assertEqual(len(_strategy_projection_units(self.agent, history, source, project(source), 1,
++                                                       normalize_tool_calls=normalize)), 1)
++
++    def test_incomplete_tool_chain_is_never_captured(self):
++        source = transcript(4)
++        source[2]["tool_call_id"] = "unmatched"
++        source[5]["tool_calls"].append({"id": "missing", "function": {"name": "x", "arguments": "{}"}})
++        self.assertEqual(len(units(self.agent, source, project(source))), 1)
++
++    def test_source_and_current_input_remain_unchanged_and_recent_24_retained(self):
++        source = transcript(60)
++        before = deepcopy(source)
++        output = self.run_projection(source)
++        self.assertEqual(source, before)
++        self.assertEqual(output[-1], before[-1])
++        self.assertEqual(output[0]["content"], "protected identity")
++        users = [r["content"] for r in output if r["role"] == "user" and r["content"].startswith("question ")]
++        self.assertEqual(users, [f"question {i}" for i in range(36, 60)])
++        for row in output:
++            if row["role"] == "tool":
++                self.assertIn(row["tool_call_id"], {c["id"] for r in output for c in r.get("tool_calls", [])})
++
++    def test_incremental_updates_receive_only_new_exchanges_and_previous_summary(self):
++        self.run_projection(transcript(36, tools=False))
++        self.run_projection(transcript(37, tools=False), origin("two"))
++        self.run_projection(transcript(38, tools=False), origin("three"))
++        calls = self.agent.context_compressor.calls
++        self.assertEqual([len(c[0]) for c in calls], [24, 4])
++        self.assertIsNone(calls[0][1])
++        self.assertEqual(calls[1][1], "Historical context: fixture facts and unfinished work retained.")
++        self.assertEqual(self.agent.context_compressor._previous_summary, "native compressor state must not change")
++
++    def test_transport_only_metadata_and_reasoning_echo_do_not_rebuild_summary(self):
++        source = transcript(36, tools=False)
++        self.run_projection(source)
++        for row in source:
++            row["_db_persisted"] = True
++            row["reasoning_content"] = "changed transport echo"
++        self.run_projection(source, origin("two"))
++        self.assertEqual(len(self.agent.context_compressor.calls), 1)
++
++    def test_real_old_text_edit_invalidates_coverage(self):
++        source = transcript(36, tools=False)
++        self.run_projection(source)
++        source[0]["content"] = "corrected prior question"
++        self.run_projection(source, origin("two"))
++        self.assertEqual(len(self.agent.context_compressor.calls), 2)
++        self.assertIsNone(self.agent.context_compressor.calls[-1][1])
++
++    def test_model_session_identity_and_strategy_revision_invalidate_summary(self):
++        for attribute in ("model", "provider", "api_mode", "base_url", "session_id", "fingerprint"):
++            with self.subTest(attribute=attribute):
++                self.setUp()
++                source = transcript(36, tools=False)
++                self.run_projection(source)
++                setattr(self.agent, attribute, "new")
++                self.run_projection(source, origin("two"))
++                self.assertEqual(len(self.agent.context_compressor.calls), 2)
++        self.setUp()
++        self.run_projection(transcript())
++        self.run_projection(transcript(), origin("two", revision=2))
++        self.assertEqual(len(self.agent.context_compressor.calls), 2)
++
++    def test_tool_passes_do_not_repeat_summary(self):
++        handle, source = origin(), transcript()
++        for _ in range(10):
++            self.run_projection(source, handle)
++        self.assertEqual(len(self.agent.context_compressor.calls), 1)
++
++    def test_failure_keeps_uncovered_originals(self):
++        def fail(_rows):
++            raise RuntimeError("fixture failure")
++        self.agent.context_compressor._generate_summary = fail
++        source = transcript()
++        self.assertEqual(self.run_projection(source), project(source))
++
++    def test_stop_during_summary_never_accepts_coverage(self):
++        handle, source = origin(), transcript()
++        def stopped(_rows):
++            handle.ledger.stop()
++            return "must not become coverage"
++        self.agent.context_compressor._generate_summary = stopped
++        self.assertEqual(self.run_projection(source, handle), project(source))
++        self.assertEqual(self.agent._information_summary["covered"], ())
++
++    def test_only_identical_proven_historical_sidecar_suffix_is_deduped(self):
++        source = transcript(4, tools=False, sidecar=True)
++        rows = project(source)
++        before = deepcopy(rows)
++        changes, saved = dedupe_sidecars(rows, source, 1, {1, 3, 5})
++        self.assertEqual(set(changes), {1, 3, 5})
++        self.assertGreater(saved, 0)
++        self.assertEqual(rows, before)
++        self.assertTrue(rows[7]["content"].endswith(SUFFIX))
++        self.assertTrue(changes[1]["content"].startswith("question 0\n\n"))
++
++    def test_sidecar_different_unknown_memory_multimodal_and_literal_text_are_preserved(self):
++        for change in ("different", "unknown", "memory", "multimodal", "literal", "mismatch"):
++            source = transcript(3, tools=False, sidecar=True)
++            if change == "different": source[0]["api_content"] += " changed"
++            if change == "unknown": source[0]["api_content"] = "question 0\n\nunknown context"
++            if change == "memory": source[0]["api_content"] = "question 0\n\n<memory-context>\nold value"
++            if change == "multimodal": source[0]["content"] = [{"type": "text", "text": "question 0"}]
++            if change == "literal": source[0]["content"] += "\n\n" + SUFFIX
++            rows = project(source)
++            if change == "mismatch": rows[1]["content"] = "transformed message"
++            changes, _ = dedupe_sidecars(rows, source, 1, {1})
++            self.assertNotIn(1, changes, change)
++
++    def test_dedupe_only_points_at_surviving_later_copy(self):
++        source = transcript(3, tools=False, sidecar=True)
++        rows = project(source)
++        changes, _ = dedupe_sidecars(rows, source, 1, {1, 3}, visible={0, 1, 2, 3, 4, 7})
++        self.assertEqual(set(changes), {1})
++
++    def test_current_ephemeral_memory_is_not_deduped_or_persisted(self):
++        source = transcript(3, tools=False, sidecar=True)
++        source[-1]["api_content"] = source[-1]["content"] + "\n\n" + SUFFIX
++        rows = project(source)
++        rows[-1]["content"] = source[-1]["content"] + "\n\n<memory-context>fresh only</memory-context>\n\n" + SUFFIX
++        before = deepcopy(rows[-1])
++        changes, _ = dedupe_sidecars(rows, source, 1, {1, 3})
++        self.assertNotIn(len(rows)-1, changes)
++        self.assertEqual(rows[-1], before)
++
++    def test_status_contains_counts_not_prompt_text_or_fake_token_savings(self):
++        self.run_projection(transcript(36, sidecar=True))
++        status = json.dumps(self.agent._usage_budget_context_status)
++        self.assertNotIn("question 0", status)
++        self.assertNotIn(SUFFIX, status)
++        self.assertIn("not_final_wire_tokens", status)
++        self.assertEqual(self.agent._usage_budget_context_status["history_target_turns"], 24)
++
++    def test_normal_and_unleashed_preserve_projection_identity(self):
++        rows = project(transcript())
++        for level in (5, 6):
++            self.assertIs(project_context(self.agent, rows, (), strategy_for_level(level), origin(level=level)), rows)
++
++    def test_parameters_and_tool_excerpt_algorithm_are_not_retuned(self):
++        fourth = strategy_for_level(4)
++        self.assertEqual((fourth.history_turns, fourth.relationship_every, fourth.summary_every,
++                          fourth.old_tool_chars, fourth.background_every), (24, 6, 2, 6000, 3))
++        tool = {"role": "tool", "tool_call_id": "exact", "content": "x"*6500+"ERROR retained"}
++        excerpt = compact_results([tool], fourth.old_tool_chars)[0]
++        self.assertTrue(excerpt["content"].endswith("ERROR retained"))
++        self.assertEqual(excerpt["tool_call_id"], "exact")
++
++
++if __name__ == "__main__":
++    unittest.main()

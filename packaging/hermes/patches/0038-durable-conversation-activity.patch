@@ -1,0 +1,683 @@
+diff --git a/hermes_state.py b/hermes_state.py
+index 53fedcd6..1c42a624 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -7555,6 +7555,54 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+ 
+         return {"tokens": int(row[0] or 0), "cost_usd": float(row[1] or 0.0)}
+ 
++    def _last_conversation_at_for_lineages(
++        self, root_session_ids
++    ) -> Dict[str, float]:
++        """Return true authored-turn recency for many compression lineages.
++
++        ``sessions.last_conversation_at`` is maintained transactionally by the
++        message writers.  One bounded recursive query folds it across every
++        surfaced root's compression continuations; no session resume/history
++        load and no per-row database round trip is required.  Empty lineages
++        fall back to the surfaced root's original ``started_at``.
++        """
++        roots = list(dict.fromkeys(sid for sid in root_session_ids if sid))
++        if not roots:
++            return {}
++        result: Dict[str, float] = {}
++        # Keep well below SQLite's legacy 999 bind-variable cap.
++        for start in range(0, len(roots), 400):
++            chunk = roots[start:start + 400]
++            placeholders = ",".join("?" for _ in chunk)
++            query = f"""
++                WITH RECURSIVE chain(root_id, cur_id) AS (
++                    SELECT id, id FROM sessions WHERE id IN ({placeholders})
++                    UNION
++                    SELECT c.root_id, child.id
++                    FROM chain c
++                    JOIN sessions parent ON parent.id = c.cur_id
++                    JOIN sessions child ON child.parent_session_id = c.cur_id
++                    WHERE parent.end_reason = 'compression'
++                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
++                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
++                      AND COALESCE(child.source, '') != 'tool'
++                )
++                SELECT c.root_id,
++                       COALESCE(MAX(s.last_conversation_at), root.started_at)
++                           AS last_conversation_at
++                FROM chain c
++                JOIN sessions s ON s.id = c.cur_id
++                JOIN sessions root ON root.id = c.root_id
++                GROUP BY c.root_id, root.started_at
++            """
++            with self._read_ctx() as conn:
++                rows = conn.execute(query, chunk).fetchall()
++            for row in rows:
++                result[str(row["root_id"])] = float(
++                    row["last_conversation_at"] or 0
++                )
++        return result
++
+     def list_sessions_rich(
+         self,
+         source: str = None,
+@@ -7567,6 +7615,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         min_message_count: int = 0,
+         project_compression_tips: bool = True,
+         order_by_last_active: bool = False,
++        order_by_last_conversation: bool = False,
+         include_archived: bool = False,
+         archived_only: bool = False,
+         id_query: str = None,
+@@ -7580,7 +7629,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         Returns dicts with keys: id, source, model, title, started_at, ended_at,
+         message_count, preview (first 60 chars of first user message),
+         last_active (freshest of last_activity_at heartbeat and latest
+-        message timestamp, else started_at).
++        message timestamp, else started_at), and last_conversation_at (latest
++        true user-originated durable turn across the compression lineage, else
++        the root started_at).
+ 
+         Uses a single query with correlated subqueries instead of N+2 queries.
+ 
+@@ -7597,7 +7648,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         delegate subagents and branches hidden. Pass ``False`` to return the
+         raw root rows (useful for admin/debug UIs).
+ 
+-        Pass ``order_by_last_active=True`` to sort by most-recent activity
++        Pass ``order_by_last_active=True`` to sort by most-recent operational activity
+         instead of original conversation start time. For compression chains,
+         the "most-recent activity" is taken from the live tip (not the root),
+         so an old conversation that was compressed and continued recently
+@@ -7605,6 +7656,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         a recursive CTE that walks compression-continuation edges, so LIMIT
+         and OFFSET still apply efficiently.
+ 
++        Pass ``order_by_last_conversation=True`` to select and sort the bounded
++        page by durable user-authored conversation activity instead.  This is
++        the desktop chat-list contract: compression, resume and heartbeat may
++        make ``last_active`` newer, but cannot displace a genuinely newer
++        conversation before LIMIT/OFFSET is applied.
++
+         ``search_query`` matches case-insensitive substrings against each
+         surfaced row's title and id (and, like ``id_query``, every title/id in
+         its forward compression chain). A punctuation-stripped variant is also
+@@ -7700,7 +7757,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         # pass id_query=None.
+         id_needle = (id_query or "").strip().lower()
+         search_needle = (search_query or "").strip().lower()
+-        if order_by_last_active:
++        if order_by_last_active or order_by_last_conversation:
+             # Compute effective_last_active by walking each surfaced session's
+             # compression-continuation chain forward in SQL and taking the MAX
+             # timestamp across the chain. This lets us ORDER BY + LIMIT at SQL
+@@ -7777,10 +7834,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 ),
+                 chain_max AS (
+                     SELECT
+-                        root_id,
+-                        MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
+-                    FROM chain
+-                    GROUP BY root_id
++                        c.root_id,
++                        MAX({_sql_session_last_active_by_id("c.cur_id")}) AS effective_last_active,
++                        MAX(member.last_conversation_at) AS effective_last_conversation_at
++                    FROM chain c
++                    JOIN sessions member ON member.id = c.cur_id
++                    GROUP BY c.root_id
+                 )
+                 SELECT {_sel}{prompt_select},
+                     COALESCE(
+@@ -7791,12 +7850,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                         ''
+                     ) AS _preview_raw,
+                     {_sql_session_last_active("s")} AS last_active,
+-                    COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
++                    COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active,
++                    COALESCE(cm.effective_last_conversation_at, s.started_at)
++                        AS _effective_last_conversation_at
+                 FROM sessions s
+                 LEFT JOIN chain_max cm ON cm.root_id = s.id
+                 {prompt_join}
+                 {outer_where}
+-                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
++                ORDER BY {"_effective_last_conversation_at" if order_by_last_conversation else "_effective_last_active"} DESC,
++                         s.started_at DESC, s.id DESC
+                 LIMIT ? OFFSET ?
+             """
+             # WHERE params apply twice (CTE seed + outer select); the id filter
+@@ -7830,6 +7892,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+             # Drop the internal ordering column so callers see a clean dict.
+             s.pop("_effective_last_active", None)
++            s.pop("_effective_last_conversation_at", None)
+             sessions.append(s)
+ 
+         # Back-fill pinned conversations the page missed. A pin outlives
+@@ -7872,6 +7935,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 seen_ids.add(s["id"])
+                 sessions.append(s)
+ 
++        # Conversation recency is intentionally independent of the operational
++        # last_active projection above.  Fold the persisted authored-turn
++        # watermark across every selected compression lineage in one bounded
++        # query, before root rows are projected to their current tips.
++        conversation_activity = self._last_conversation_at_for_lineages(
++            s.get("id") for s in sessions
++        )
++        for s in sessions:
++            s["last_conversation_at"] = conversation_activity.get(
++                s.get("id"), float(s.get("started_at") or 0)
++            )
++
+         # Project compression roots forward to their tips. Each row whose
+         # end_reason is 'compression' has a continuation child; replace the
+         # surfaced fields (id, message_count, title, last_active, ended_at,
+@@ -8170,6 +8245,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             except (TypeError, ValueError):
+                 logger.debug("Ignoring invalid explicit message timestamp: %r", timestamp)
+ 
++        # Conversation recency is authored-turn recency, not operational DB
++        # activity.  Reuse the compressor/undo truth so display-only user rows,
++        # reasoning/tool scaffolding, and compaction handoffs can never move a
++        # conversation in the sidebar.
++        try:
++            from agent.context_compressor import is_user_originated_turn
++
++            advances_conversation = is_user_originated_turn(
++                {
++                    "role": role,
++                    "content": content,
++                    "display_kind": display_kind,
++                }
++            )
++        except Exception:
++            advances_conversation = False
++
+         # Pre-compute tool call count
+         num_tool_calls = 0
+         if tool_calls is not None:
+@@ -8223,6 +8315,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                     (session_id,),
+                 )
++            if advances_conversation:
++                conn.execute(
++                    """UPDATE sessions
++                       SET last_conversation_at = CASE
++                           WHEN last_conversation_at IS NULL
++                                OR last_conversation_at < ? THEN ?
++                           ELSE last_conversation_at
++                       END
++                       WHERE id = ?""",
++                    (message_timestamp, message_timestamp, session_id),
++                )
+             return msg_id
+ 
+         # Transcript append is THE critical write: its failure aborts the
+@@ -8561,6 +8664,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         now_ts = time.time()
+         inserted = 0
+         tool_calls_total = 0
++        last_conversation_at = None
++        from agent.context_compressor import is_user_originated_turn
++
+         for msg in messages:
+             role = msg.get("role", "unknown")
+             tool_calls = msg.get("tool_calls")
+@@ -8639,7 +8745,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 tool_calls_total += (
+                     len(tool_calls) if isinstance(tool_calls, list) else 1
+                 )
++            try:
++                if is_user_originated_turn(msg):
++                    last_conversation_at = max(
++                        float(last_conversation_at or message_timestamp),
++                        message_timestamp,
++                    )
++            except Exception:
++                pass
+             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
++        if last_conversation_at is not None:
++            conn.execute(
++                """UPDATE sessions
++                   SET last_conversation_at = CASE
++                       WHEN last_conversation_at IS NULL
++                            OR last_conversation_at < ? THEN ?
++                       ELSE last_conversation_at
++                   END
++                   WHERE id = ?""",
++                (last_conversation_at, last_conversation_at, session_id),
++            )
+         return inserted, tool_calls_total
+ 
+     def replace_messages(
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index a6f29dbe..4d81be25 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -216,7 +216,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
+     )
+ 
+ 
+-SCHEMA_VERSION = 25
++SCHEMA_VERSION = 26
+ 
+ 
+ # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
+@@ -296,6 +296,7 @@ CREATE TABLE IF NOT EXISTS sessions (
+     title TEXT,
+     title_source TEXT,
+     last_activity_at REAL,
++    last_conversation_at REAL,
+     last_activity_description TEXT,
+     last_activity_provenance TEXT,
+     api_call_count INTEGER DEFAULT 0,
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index 77d6db87..05ed4cac 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -870,6 +870,58 @@ class SessionSchemaMixin:
+             # backfills, index changes tied to a specific version step) stay
+             # in a version-gated chain. Column additions are handled by
+             # _reconcile_columns() above and no longer need entries here.
++            if current_version < 26:
++                # v26: operational last_activity_at and true conversation
++                # recency diverge.  Backfill the newest durable human turn once
++                # using the same semantic predicate as rewind/compression;
++                # content-prefix SQL heuristics would misclassify legacy
++                # compaction handoffs that lack display_kind.
++                try:
++                    from agent.context_compressor import is_user_originated_turn
++
++                    candidates = cursor.execute(
++                        """SELECT m.session_id, m.timestamp, m.content,
++                                  m.display_kind
++                           FROM messages m
++                           JOIN sessions s ON s.id = m.session_id
++                           WHERE s.last_conversation_at IS NULL
++                             AND m.role = 'user'
++                             AND (m.display_kind IS NULL OR m.display_kind = '')
++                           ORDER BY m.session_id, m.timestamp DESC, m.id DESC"""
++                    ).fetchall()
++                    resolved = set()
++                    updates = []
++                    for message in candidates:
++                        session_id = message["session_id"]
++                        if session_id in resolved:
++                            continue
++                        decoded = self._decode_content(message["content"])
++                        if not is_user_originated_turn(
++                            {
++                                "role": "user",
++                                "content": decoded,
++                                "display_kind": message["display_kind"],
++                            }
++                        ):
++                            continue
++                        resolved.add(session_id)
++                        updates.append((float(message["timestamp"]), session_id))
++                    if updates:
++                        cursor.executemany(
++                            "UPDATE sessions SET last_conversation_at = ? "
++                            "WHERE id = ? AND last_conversation_at IS NULL",
++                            updates,
++                        )
++                except Exception:
++                    # Never mark the schema upgraded when the semantic
++                    # watermark could not be reconstructed.  Propagating rolls
++                    # back this schema transaction, so the next open retries
++                    # instead of permanently falling back to polluted
++                    # operational activity.
++                    logger.exception(
++                        "last_conversation_at backfill failed", exc_info=True
++                    )
++                    raise
+             if current_version < 10 and SCHEMA_VERSION == 10:
+                 # v10: trigram FTS5 table for CJK/substring search. The
+                 # virtual table + triggers are created unconditionally via
+diff --git a/tests/test_session_conversation_activity.py b/tests/test_session_conversation_activity.py
+new file mode 100644
+index 00000000..2ce432b6
+--- /dev/null
++++ b/tests/test_session_conversation_activity.py
+@@ -0,0 +1,267 @@
++"""True conversation recency stays independent from operational activity."""
++
++import sqlite3
++
++import pytest
++
++from agent.context_compressor import (
++    HISTORICAL_TASK_HEADING,
++    SUMMARY_PREFIX,
++    _SUMMARY_END_MARKER,
++)
++from hermes_state import SessionDB
++
++
++HANDOFF = (
++    f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\n"
++    f"User asked: 'historical task'\n\n{_SUMMARY_END_MARKER}"
++)
++
++
++def _listed(db: SessionDB, session_id: str) -> dict:
++    rows = db.list_sessions_rich(
++        limit=20,
++        order_by_last_conversation=True,
++        compact_rows=True,
++    )
++    return next(
++        row
++        for row in rows
++        if row["id"] == session_id or row.get("_lineage_root_id") == session_id
++    )
++
++
++def test_in_place_compression_and_heartbeat_do_not_advance_conversation(tmp_path):
++    path = tmp_path / "state.db"
++    db = SessionDB(path)
++    db.create_session("chat", source="cli", model="m")
++    db.append_message("chat", "user", "real request", timestamp=10.0)
++    db.append_message("chat", "assistant", "answer", timestamp=11.0)
++
++    before = _listed(db, "chat")
++    assert before["last_conversation_at"] == 10.0
++
++    # A successful in-place compression persists a synthetic role=user
++    # handoff at a newer timestamp.  It is durable, but not human-authored.
++    db.archive_and_compact(
++        "chat",
++        [{"role": "user", "content": HANDOFF, "timestamp": 50.0}],
++    )
++    db.touch_session_activity("chat", 60.0, description="compressing")
++    after = _listed(db, "chat")
++    assert after["last_active"] == 60.0
++    assert after["last_conversation_at"] == 10.0
++
++    # Reload/restart reads the durable watermark; it does not reconstruct it
++    # from the now-newer compressed handoff or heartbeat.
++    db.close()
++    reopened = SessionDB(path)
++    try:
++        reloaded = _listed(reopened, "chat")
++        assert reloaded["last_active"] == 60.0
++        assert reloaded["last_conversation_at"] == 10.0
++    finally:
++        reopened.close()
++
++
++def test_rotated_compression_lineage_uses_latest_real_user_turn(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        db.create_session("root", source="cli", model="m")
++        db.append_message("root", "user", "root request", timestamp=20.0)
++        db.publish_compression_child(
++            parent_session_id="root",
++            child_session_id="tip",
++            source="cli",
++            messages=[{"role": "user", "content": HANDOFF, "timestamp": 40.0}],
++            require_compression_lease=False,
++        )
++        db.touch_session_activity("tip", 50.0, description="heartbeat")
++
++        compressed = _listed(db, "root")
++        assert compressed["id"] == "tip"
++        assert compressed["last_active"] == 50.0
++        assert compressed["last_conversation_at"] == 20.0
++
++        db.append_message("tip", "user", "new request", timestamp=70.0)
++        db.append_message(
++            "tip",
++            "user",
++            "internal timeline marker",
++            timestamp=90.0,
++            display_kind="internal",
++        )
++        advanced = _listed(db, "root")
++        assert advanced["last_active"] == 90.0
++        assert advanced["last_conversation_at"] == 70.0
++    finally:
++        db.close()
++
++
++def test_empty_session_falls_back_to_original_start_time(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        db.create_session("empty", source="cli", model="m")
++        row = _listed(db, "empty")
++        assert row["last_conversation_at"] == row["started_at"]
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize("compression_outcome", ["noop", "aborted"])
++def test_nonmutating_compression_outcomes_and_heartbeat_do_not_advance(
++    tmp_path,
++    compression_outcome,
++):
++    db = SessionDB(tmp_path / f"{compression_outcome}.db")
++    try:
++        db.create_session("chat", source="cli", model="m")
++        db.append_message("chat", "user", "real request", timestamp=10.0)
++
++        # No-op and aborted compression persist no replacement transcript.
++        # Their only durable side effect may be operational status/heartbeat.
++        db.touch_session_activity(
++            "chat",
++            80.0,
++            description=f"compression-{compression_outcome}",
++        )
++
++        row = _listed(db, "chat")
++        assert row["last_active"] == 80.0
++        assert row["last_conversation_at"] == 10.0
++    finally:
++        db.close()
++
++
++def test_nonconversation_durable_rows_and_metadata_never_advance(tmp_path):
++    path = tmp_path / "state.db"
++    db = SessionDB(path)
++    db.create_session("chat", source="cli", model="m")
++    db.append_message("chat", "user", "real request", timestamp=10.0)
++    db.append_message(
++        "chat",
++        "assistant",
++        "internal reasoning",
++        reasoning_content="reasoning sidecar",
++        timestamp=20.0,
++    )
++    db.append_message(
++        "chat",
++        "tool",
++        "tool output",
++        tool_name="terminal",
++        timestamp=30.0,
++    )
++    db.append_message("chat", "user", HANDOFF, timestamp=40.0)
++    db.append_message(
++        "chat",
++        "user",
++        "display-only status",
++        display_kind="internal",
++        timestamp=50.0,
++    )
++    db.set_session_title("chat", "renamed")
++    db.touch_session_activity("chat", 60.0, description="resume-open-heartbeat")
++
++    assert _listed(db, "chat")["last_conversation_at"] == 10.0
++    db.close()
++
++    reopened = SessionDB(path)
++    try:
++        assert _listed(reopened, "chat")["last_conversation_at"] == 10.0
++    finally:
++        reopened.close()
++
++
++def test_v25_upgrade_backfills_from_real_durable_user_turns(tmp_path):
++    path = tmp_path / "legacy.db"
++    db = SessionDB(path)
++    db.create_session("legacy", source="cli", model="m")
++    db.append_message("legacy", "user", "real request", timestamp=10.0)
++    db.append_message("legacy", "user", HANDOFF, timestamp=90.0)
++    db.append_message(
++        "legacy",
++        "user",
++        "display-only status",
++        display_kind="internal",
++        timestamp=95.0,
++    )
++    db.touch_session_activity("legacy", 100.0, description="heartbeat")
++    db.close()
++
++    # Simulate a real pre-v26 database after its column has been reconciled:
++    # it has operational activity but no authored-turn watermark.
++    with sqlite3.connect(path) as conn:
++        conn.execute("UPDATE sessions SET last_conversation_at = NULL")
++        conn.execute("UPDATE schema_version SET version = 25")
++
++    upgraded = SessionDB(path)
++    try:
++        row = _listed(upgraded, "legacy")
++        assert row["last_active"] == 100.0
++        assert row["last_conversation_at"] == 10.0
++        version = upgraded._conn.execute(
++            "SELECT version FROM schema_version LIMIT 1"
++        ).fetchone()[0]
++        assert version == 26
++    finally:
++        upgraded.close()
++
++
++def test_bounded_page_is_selected_by_conversation_not_heartbeat(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        for session_id, authored_at in (
++            ("newest", 300.0),
++            ("middle", 200.0),
++            ("old-heartbeat", 100.0),
++        ):
++            db.create_session(session_id, source="cli", model="m")
++            db.append_message(
++                session_id,
++                "user",
++                f"request from {session_id}",
++                timestamp=authored_at,
++            )
++        db.touch_session_activity(
++            "old-heartbeat",
++            1_000.0,
++            description="compression-heartbeat",
++        )
++
++        rows = db.list_sessions_rich(
++            limit=2,
++            order_by_last_conversation=True,
++            compact_rows=True,
++        )
++
++        assert [row["id"] for row in rows] == ["newest", "middle"]
++        assert all(row["last_conversation_at"] >= 200.0 for row in rows)
++    finally:
++        db.close()
++
++
++def test_v25_backfill_failure_never_marks_schema_upgraded(tmp_path, monkeypatch):
++    path = tmp_path / "retryable-upgrade.db"
++    db = SessionDB(path)
++    db.create_session("legacy", source="cli", model="m")
++    db.append_message("legacy", "user", "real request", timestamp=10.0)
++    db.close()
++    with sqlite3.connect(path) as conn:
++        conn.execute("UPDATE sessions SET last_conversation_at = NULL")
++        conn.execute("UPDATE schema_version SET version = 25")
++
++    monkeypatch.setattr(
++        "agent.context_compressor.is_user_originated_turn",
++        lambda _message: (_ for _ in ()).throw(RuntimeError("predicate failed")),
++    )
++    with pytest.raises(RuntimeError, match="predicate failed"):
++        SessionDB(path)
++
++    with sqlite3.connect(path) as conn:
++        assert conn.execute(
++            "SELECT version FROM schema_version LIMIT 1"
++        ).fetchone()[0] == 25
++        assert conn.execute(
++            "SELECT last_conversation_at FROM sessions WHERE id = 'legacy'"
++        ).fetchone()[0] is None
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index b38712a5..27d8e42c 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -12813,6 +12813,7 @@ def test_session_list_honors_params_profile_opens_profile_db(monkeypatch, tmp_pa
+ 
+         def list_sessions_rich(self, **kwargs):
+             seen["profile"] = True
++            seen["list_kwargs"] = kwargs
+             return [
+                 {
+                     "id": "ml-1",
+@@ -12842,6 +12843,8 @@ def test_session_list_honors_params_profile_opens_profile_db(monkeypatch, tmp_pa
+     assert resp["result"]["sessions"][0]["id"] == "ml-1"
+     assert seen.get("profile") is True
+     assert seen.get("launch") is None
++    assert seen["list_kwargs"]["order_by_last_conversation"] is True
++    assert "order_by_last_active" not in seen["list_kwargs"]
+     assert str(seen.get("db_path")).endswith("state.db")
+     assert seen.get("closed") is True
+ 
+diff --git a/tests/tui_gateway/test_turn_scope_protocol.py b/tests/tui_gateway/test_turn_scope_protocol.py
+index ccdd283b..39850b68 100644
+--- a/tests/tui_gateway/test_turn_scope_protocol.py
++++ b/tests/tui_gateway/test_turn_scope_protocol.py
+@@ -804,6 +804,7 @@ def test_session_list_surfaces_authoritative_last_active_at(monkeypatch):
+                     "id": "older-start-newer-activity",
+                     "started_at": 10.0,
+                     "last_active": 50.0,
++                    "last_conversation_at": 30.0,
+                     "message_count": 2,
+                     "source": "tui",
+                 },
+@@ -811,6 +812,7 @@ def test_session_list_surfaces_authoritative_last_active_at(monkeypatch):
+                     "id": "newer-start-older-activity",
+                     "started_at": 20.0,
+                     "last_active": 40.0,
++                    "last_conversation_at": 20.0,
+                     "message_count": 1,
+                     "source": "tui",
+                 },
+@@ -830,3 +832,4 @@ def test_session_list_surfaces_authoritative_last_active_at(monkeypatch):
+         "newer-start-older-activity",
+     ]
+     assert [item["last_active_at"] for item in sessions] == [50.0, 40.0]
++    assert [item["last_conversation_at"] for item in sessions] == [30.0, 20.0]
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index e753f591..f22f6ad2 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -252,7 +252,7 @@ def _(rid, params: dict) -> dict:
+                 for s in db.list_sessions_rich(
+                     source=None,
+                     limit=fetch_limit,
+-                    order_by_last_active=True,
++                    order_by_last_conversation=True,
+                     compact_rows=True,
+                 )
+                 if (s.get("source") or "").strip().lower() not in deny
+@@ -275,6 +275,15 @@ def _(rid, params: dict) -> dict:
+                                 if s.get("last_active") is not None
+                                 else s.get("started_at") or 0
+                             ),
++                            # Required authored-turn watermark. Operational
++                            # heartbeats, compression and resume activity never
++                            # enter this value; empty conversations use their
++                            # original start time.
++                            "last_conversation_at": (
++                                s.get("last_conversation_at")
++                                if s.get("last_conversation_at") is not None
++                                else s.get("started_at") or 0
++                            ),
+                             "message_count": s.get("message_count") or 0,
+                             "source": s.get("source") or "",
+                         }
+

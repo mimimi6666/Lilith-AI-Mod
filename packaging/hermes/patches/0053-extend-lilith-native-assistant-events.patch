@@ -1,0 +1,3635 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index f17816a80f479fb3bd4ddb6597aa1ca87f12b575..b270039c213473bacbf71450c7d7ecac22bae982 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -3152,6 +3152,7 @@ def create_anthropic_message(
+     *,
+     log_prefix: str = "",
+     prefer_stream: bool = True,
++    allow_create_fallback: bool = True,
+     on_stream_event=None,
+     on_response=None,
+ ) -> Any:
+@@ -3209,7 +3210,10 @@ def create_anthropic_message(
+                             )
+                 return stream.get_final_message()
+         except Exception as exc:
+-            if not _is_stream_unavailable_error(exc):
++            if (
++                not _is_stream_unavailable_error(exc)
++                or not allow_create_fallback
++            ):
+                 raise
+             logger.debug(
+                 "%sAnthropic Messages stream unavailable; falling back to "
+diff --git a/agent/bedrock_adapter.py b/agent/bedrock_adapter.py
+index 62923fd2d2e069e8c18b75aa5985d3f7e034221f..9244dfb5324ca96b1c978ece6910a5a35c274801 100644
+--- a/agent/bedrock_adapter.py
++++ b/agent/bedrock_adapter.py
+@@ -88,11 +88,29 @@ def _require_boto3():
+     return boto3
+ 
+ 
+-def _get_bedrock_runtime_client(region: str):
++def _get_bedrock_runtime_client(
++    region: str,
++    *,
++    single_attempt: bool = False,
++):
+     """Get or create a cached ``bedrock-runtime`` client for the given region.
+ 
+     Uses the default AWS credential chain (env vars → profile → instance role).
+     """
++    if single_attempt:
++        # This client is intentionally request-local and is closed by the
++        # caller. botocore's default retry policy can otherwise turn one
++        # durable extension right into multiple physical provider requests.
++        boto3 = _require_boto3()
++        from botocore.config import Config
++
++        return boto3.client(
++            "bedrock-runtime",
++            region_name=region,
++            config=Config(
++                retries={"total_max_attempts": 1, "mode": "standard"}
++            ),
++        )
+     if region not in _bedrock_runtime_client_cache:
+         boto3 = _require_boto3()
+         _bedrock_runtime_client_cache[region] = boto3.client(
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index d8968db235a6802d617ec74de0351308bc36ebe2..aee2be4e6ef70671364ac11b28085e9650ff22ce 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -494,7 +494,13 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
+     return None
+ 
+ 
+-def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
++def _dispatch_nonstreaming_api_request(
++    agent,
++    api_kwargs: dict,
++    *,
++    make_client,
++    physical_attempt_limit: int | None = None,
++):
+     """Run one non-streaming LLM request for the active api_mode and return it.
+ 
+     Shared by the interrupt-worker path (``interruptible_api_call``) and the
+@@ -510,13 +516,18 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+     interrupt, abort, cancellation, and close semantics stay in the callers —
+     this helper only issues the request.
+     """
++    if physical_attempt_limit not in {None, 1}:
++        raise ValueError("physical_attempt_limit must be None or 1")
++    single_attempt = physical_attempt_limit == 1
+     if agent.api_mode == "codex_responses":
+         request_client = make_client("codex_stream_request")
+-        return agent._run_codex_stream(
+-            api_kwargs,
+-            client=request_client,
+-            on_first_delta=getattr(agent, "_codex_on_first_delta", None),
+-        )
++        codex_kwargs = {
++            "client": request_client,
++            "on_first_delta": getattr(agent, "_codex_on_first_delta", None),
++        }
++        if single_attempt:
++            codex_kwargs["max_stream_retries"] = 0
++        return agent._run_codex_stream(api_kwargs, **codex_kwargs)
+     if agent.api_mode == "anthropic_messages":
+         # #67142: use a request-local Anthropic client so the stale/interrupt
+         # watchdog aborts sockets from the stranger thread while the worker
+@@ -524,7 +535,16 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+         request_client = make_client(
+             "anthropic_messages_request", kind="anthropic_messages"
+         )
+-        return agent._anthropic_messages_create(api_kwargs, client=request_client)
++        if single_attempt:
++            return agent._anthropic_messages_create(
++                api_kwargs,
++                client=request_client,
++                allow_create_fallback=False,
++            )
++        return agent._anthropic_messages_create(
++            api_kwargs,
++            client=request_client,
++        )
+     if agent.api_mode == "bedrock_converse":
+         # Bedrock uses boto3 directly — no OpenAI client needed.
+         # normalize_converse_response produces an OpenAI-compatible
+@@ -538,15 +558,27 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+         )
+         region = api_kwargs.pop("__bedrock_region__", "us-east-1")
+         api_kwargs.pop("__bedrock_converse__", None)
+-        client = _get_bedrock_runtime_client(region)
++        client = _get_bedrock_runtime_client(
++            region,
++            single_attempt=single_attempt,
++        )
+         try:
+             raw_response = client.converse(**api_kwargs)
+         except Exception as _bedrock_exc:
+             # Evict the cached client on stale-connection failures
+             # so the outer retry loop builds a fresh client/pool.
+-            if is_stale_connection_error(_bedrock_exc):
++            if not single_attempt and is_stale_connection_error(_bedrock_exc):
+                 invalidate_runtime_client(region)
+             raise
++        finally:
++            if single_attempt:
++                try:
++                    client.close()
++                except Exception:
++                    logger.debug(
++                        "Bedrock single-attempt client close failed",
++                        exc_info=True,
++                    )
+         return normalize_converse_response(raw_response)
+     if agent.provider == "moa":
+         # MoA is a virtual chat-completions provider backed by the
+@@ -634,7 +666,12 @@ def _resolve_direct_stale_timeout(agent, api_kwargs: dict) -> float:
+     return float(value)
+ 
+ 
+-def direct_api_call(agent, api_kwargs: dict):
++def direct_api_call(
++    agent,
++    api_kwargs: dict,
++    *,
++    physical_attempt_limit: int | None = None,
++):
+     """Run a non-streaming LLM call inline on the conversation thread.
+ 
+     Used when ``should_use_direct_api_call`` is True (cron turns and
+@@ -799,7 +836,10 @@ def direct_api_call(agent, api_kwargs: dict):
+     succeeded = False
+     try:
+         response = _dispatch_nonstreaming_api_request(
+-            agent, api_kwargs, make_client=_make_client
++            agent,
++            api_kwargs,
++            make_client=_make_client,
++            physical_attempt_limit=physical_attempt_limit,
+         )
+     except Exception:
+         if getattr(agent, "_interrupt_requested", False):
+@@ -851,7 +891,12 @@ def direct_api_call(agent, api_kwargs: dict):
+             )
+ 
+ 
+-def interruptible_api_call(agent, api_kwargs: dict):
++def interruptible_api_call(
++    agent,
++    api_kwargs: dict,
++    *,
++    physical_attempt_limit: int | None = None,
++):
+     """
+     Run the API call in a background thread so the main conversation loop
+     can detect interrupts without waiting for the full HTTP round-trip.
+@@ -869,7 +914,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
+     # interrupt worker — it wedges before the socket opens on the 2nd+ call
+     # (#62151). Run inline instead. See should_use_direct_api_call.
+     if should_use_direct_api_call(agent):
+-        return direct_api_call(agent, api_kwargs)
++        return direct_api_call(
++            agent,
++            api_kwargs,
++            physical_attempt_limit=physical_attempt_limit,
++        )
+ 
+     result = {"response": None, "error": None}
+ 
+@@ -969,6 +1018,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
+                     ),
+                     kind=kind,
+                 ),
++                physical_attempt_limit=physical_attempt_limit,
+             )
+         except Exception as e:
+             # If the request was cancelled by the main thread's interrupt
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+index e098751d9802d02bef98d1669895ed286e6a786c..626d13326f849661f37c9036ea8ceb6cf0bac34d 100644
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -1302,7 +1302,14 @@ def _consume_codex_event_stream(
+     return final
+ 
+ 
+-def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
++def run_codex_stream(
++    agent,
++    api_kwargs: dict,
++    client: Any = None,
++    on_first_delta=None,
++    *,
++    max_stream_retries: int | None = None,
++):
+     """Execute one streaming Responses API request and return the final response.
+ 
+     Uses ``responses.create(stream=True)`` (low-level raw event iteration)
+@@ -1317,7 +1324,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+     from agent import relay_llm
+ 
+     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
+-    max_stream_retries = 1
++    if max_stream_retries is None:
++        max_stream_retries = 1
++    elif type(max_stream_retries) is not int or max_stream_retries < 0:
++        raise ValueError("max_stream_retries must be a non-negative integer")
+     # Accumulate streamed text so callers / compat shims can read it.
+     agent._codex_streamed_text_parts: list = []
+ 
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 200baba5912384e45129cdfdee4485757733f806..5203b71f6f0866ff759b33bebaf1fa15dbc99437 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -7485,7 +7485,12 @@ def is_conversation_activity_message(message: Any) -> bool:
+     # display tags them so native/model speech remain distinguishable.  Every
+     # other display kind retains the historical synthetic-marker exclusion.
+     display_kind = message.get("display_kind")
+-    if display_kind and display_kind != "native_assistant_event":
++    if display_kind not in {
++        None,
++        "",
++        "native_assistant_event",
++        "native_assistant_extension",
++    }:
+         return False
+ 
+     role = message.get("role")
+@@ -7504,10 +7509,16 @@ def is_conversation_activity_message(message: Any) -> bool:
+     # for legacy final rows written before the field existed; an explicit
+     # synthetic/internal origin is never guessed back into a user turn.
+     origin = metadata.get("hermes_turn_origin")
+-    native_assistant_origin = (
+-        display_kind == "native_assistant_event"
+-        and origin == "synthetic"
+-        and metadata.get("hermes_turn_origin_kind") == "lilith-native"
++    native_assistant_origin = origin == "synthetic" and (
++        (
++            display_kind == "native_assistant_event"
++            and metadata.get("hermes_turn_origin_kind") == "lilith-native"
++        )
++        or (
++            display_kind == "native_assistant_extension"
++            and metadata.get("hermes_turn_origin_kind")
++            == "lilith-native-extension"
++        )
+     )
+     if origin not in {None, "", "user"} and not native_assistant_origin:
+         return False
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 74405ae50aec4ac4c1a89922d1c8d2dd21d899ea..36f64276bd390c4fe8392e1b30ce3fa96d0208e6 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -2520,8 +2520,20 @@ def compress_context(
+                     _complete_compaction_lifecycle()
+                     return messages, _existing_sp
+             try:
++                _lock_kwargs: Dict[str, Any] = {"ttl_seconds": _lock_ttl}
++                _native_owner_probe = getattr(
++                    agent,
++                    "_native_assistant_extension_owner_is_provably_orphaned",
++                    None,
++                )
++                if callable(_native_owner_probe):
++                    _lock_kwargs[
++                        "native_assistant_extension_owner_is_provably_orphaned"
++                    ] = _native_owner_probe
+                 _lock_acquired = _try_acquire_lock(
+-                    _lock_sid, _lock_holder, ttl_seconds=_lock_ttl
++                    _lock_sid,
++                    _lock_holder,
++                    **_lock_kwargs,
+                 )
+             except Exception as _lock_err:
+                 # The method exists and entered its implementation but failed.
+diff --git a/hermes_state.py b/hermes_state.py
+index 1eb59e187cefd5845b60e0ec2c381840e120e714..95aa465c6bb3967378afe324507a95528c76ebca 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -215,6 +215,38 @@ def _compression_lock_holder_process_is_dead(holder: str) -> bool:
+         return True
+     except (PermissionError, OSError, OverflowError):
+         return False
++
++
++def _native_assistant_extension_owner_process_is_dead(row: Any) -> bool:
++    """Return True only when a durable extension process is provably gone.
++
++    Unlike the compression-lock holder string, a native extension persists a
++    PID and process-start fingerprint in dedicated columns.  Both checks are
++    conservative: probe failures keep the claim streaming, while a missing PID
++    or a start-time mismatch proves that no model worker can still own it.
++    Same-process thread liveness is supplied separately by the gateway because
++    only its owner-token registry can distinguish a live worker from an orphan.
++    """
++    try:
++        owner_pid = int(row["owner_pid"])
++        owner_started_at = int(row["owner_started_at"])
++    except (KeyError, TypeError, ValueError, IndexError):
++        return False
++    if owner_pid <= 0:
++        return False
++    try:
++        from gateway.status import _pid_exists, get_process_start_time
++
++        if not _pid_exists(owner_pid):
++            return True
++        live_started_at = get_process_start_time(owner_pid)
++    except Exception:
++        return False
++    return bool(
++        owner_started_at
++        and live_started_at is not None
++        and owner_started_at != int(live_started_at)
++    )
+     return False
+ 
+ 
+@@ -2301,6 +2333,10 @@ class NativeAssistantEventConflictError(RuntimeError):
+     """One native event id was already committed with different content."""
+ 
+ 
++class NativeAssistantExtensionConflictError(RuntimeError):
++    """One native event extension was claimed with different perception."""
++
++
+ def build_native_assistant_event_message(
+     *,
+     event_id: str,
+@@ -2343,6 +2379,33 @@ def build_native_assistant_event_message(
+     }
+ 
+ 
++def build_native_assistant_extension_message(
++    *,
++    event_id: str,
++    turn_id: str,
++    assistant_message_id: str,
++    text: str,
++    timestamp: float,
++) -> Dict[str, Any]:
++    """Build one model-authored continuation without inventing a user row."""
++    return {
++        "role": "assistant",
++        "content": text,
++        "message_id": assistant_message_id,
++        "timestamp": timestamp,
++        "finish_reason": "stop",
++        "display_kind": "native_assistant_extension",
++        "display_metadata": {
++            "lilith_native_extension_event_id": event_id,
++            "hermes_turn_id": turn_id,
++            "hermes_message_id": assistant_message_id,
++            "hermes_message_kind": "primary",
++            "hermes_turn_origin": "synthetic",
++            "hermes_turn_origin_kind": "lilith-native-extension",
++        },
++    }
++
++
+ class SessionCompressionInProgressError(CompressionSessionBusyError):
+     """A concurrent writer collided with a *live* compression lock.
+ 
+@@ -5685,6 +5748,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         session_id: str,
+         holder: str,
+         ttl_seconds: float = 300.0,
++        *,
++        native_assistant_extension_owner_is_provably_orphaned: Optional[
++            Callable[[Dict[str, Any]], bool]
++        ] = None,
+     ) -> bool:
+         """Try to atomically acquire the compression lock for ``session_id``.
+ 
+@@ -5732,6 +5799,79 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                         (session_id, current_holder),
+                     )
+                     reclaimed_holder = current_holder
++            # A proactive native continuation holds a durable, single-use
++            # model-attempt right against this session lineage. Compression
++            # rotates that lineage, so its lock acquisition must be mutually
++            # exclusive with the claim in this same SQLite transaction. The
++            # claim path already checks compression_locks; this reverse check
++            # closes the whichever-commits-first race.
++            streaming_extensions = conn.execute(
++                """WITH RECURSIVE ancestors(id, parent_session_id) AS (
++                       SELECT id, parent_session_id
++                       FROM sessions
++                       WHERE id = ?
++                       UNION ALL
++                       SELECT parent.id, parent.parent_session_id
++                       FROM sessions AS parent
++                       JOIN ancestors AS child
++                         ON child.parent_session_id = parent.id
++                   )
++                   SELECT extension.event_id, extension.owner_pid,
++                          extension.owner_started_at, extension.owner_token
++                   FROM native_assistant_extensions AS extension
++                   WHERE extension.state = 'streaming'
++                     AND (
++                         extension.session_id = ?
++                         OR extension.lineage_root IN (
++                             SELECT id FROM ancestors
++                         )
++                     )
++                   """,
++                (session_id, session_id),
++            ).fetchall()
++            for extension in streaming_extensions:
++                extension_owner = {
++                    "event_id": extension["event_id"],
++                    "owner_pid": extension["owner_pid"],
++                    "owner_started_at": extension["owner_started_at"],
++                    "owner_token": extension["owner_token"],
++                }
++                orphaned = _native_assistant_extension_owner_process_is_dead(
++                    extension_owner
++                )
++                if (
++                    not orphaned
++                    and callable(
++                        native_assistant_extension_owner_is_provably_orphaned
++                    )
++                ):
++                    try:
++                        orphaned = (
++                            native_assistant_extension_owner_is_provably_orphaned(
++                                extension_owner
++                            )
++                            is True
++                        )
++                    except Exception:
++                        orphaned = False
++                if not orphaned:
++                    return False, reclaimed_holder
++                conn.execute(
++                    """UPDATE native_assistant_extensions
++                       SET state = 'abandoned', updated_at = ?
++                       WHERE event_id = ?
++                         AND state = 'streaming'
++                         AND owner_pid = ?
++                         AND owner_started_at = ?
++                         AND owner_token = ?""",
++                    (
++                        now,
++                        extension_owner["event_id"],
++                        extension_owner["owner_pid"],
++                        extension_owner["owner_started_at"],
++                        extension_owner["owner_token"],
++                    ),
++                )
+             # Then: try to insert. INSERT OR IGNORE returns no rowcount
+             # difference — verify ownership via SELECT.
+             conn.execute(
+@@ -8599,6 +8739,327 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+         )
+ 
++    @staticmethod
++    def _native_assistant_extension_receipt(
++        row,
++        *,
++        already_processed: bool,
++    ) -> Dict[str, Any]:
++        return {
++            "status": str(row["state"]),
++            "event_id": str(row["event_id"]),
++            "turn_id": str(row["turn_id"]),
++            "assistant_message_id": str(row["assistant_message_id"]),
++            "attempted": bool(row["attempted"]),
++            "already_processed": already_processed,
++            "session_id": str(row["session_id"]),
++            "perception_sha256": str(row["perception_sha256"]),
++            "owner_pid": int(row["owner_pid"]),
++            "owner_started_at": int(row["owner_started_at"]),
++            "owner_token": str(row["owner_token"]),
++            "assistant_row_id": (
++                int(row["assistant_row_id"])
++                if row["assistant_row_id"] is not None
++                else None
++            ),
++        }
++
++    def claim_native_assistant_extension(
++        self,
++        session_id: str,
++        *,
++        lineage_root: str,
++        lineage_session_ids: List[str],
++        event_id: str,
++        perception: Dict[str, Any],
++        perception_sha256: str,
++        turn_id: str,
++        assistant_message_id: str,
++        owner_pid: int,
++        owner_started_at: int,
++        owner_token: str,
++        abandon: bool,
++    ) -> Dict[str, Any]:
++        """Durably claim one native event before any model request.
++
++        The claim and its preallocated turn/message identities survive process
++        death.  A later caller can only observe or terminalize the claim; it
++        can never turn the same event into a second model attempt.
++        """
++        perception_fields = {
++            "schema_version",
++            "source",
++            "text",
++            "occurred_at_unix_ms",
++            "node_id",
++            "line_id",
++            "trigger",
++            "locale",
++        }
++        canonical_perception = json.dumps(
++            perception,
++            ensure_ascii=False,
++            sort_keys=True,
++            separators=(",", ":"),
++        )
++        if (
++            not isinstance(session_id, str)
++            or not session_id
++            or not isinstance(lineage_root, str)
++            or not lineage_root
++            or not isinstance(lineage_session_ids, list)
++            or not lineage_session_ids
++            or lineage_session_ids[0] != lineage_root
++            or lineage_session_ids[-1] != session_id
++            or len(lineage_session_ids) != len(set(lineage_session_ids))
++            or any(not isinstance(value, str) or not value for value in lineage_session_ids)
++            or re.fullmatch(r"[0-9a-f]{32}", event_id or "") is None
++            or not isinstance(perception, dict)
++            or set(perception) != perception_fields
++            or type(perception.get("schema_version")) is not int
++            or perception.get("schema_version") != 1
++            or perception.get("source") != "official-native-dialogue"
++            or not isinstance(perception.get("text"), str)
++            or not perception["text"].strip()
++            or type(perception.get("occurred_at_unix_ms")) is not int
++            or not all(
++                isinstance(perception.get(key), str)
++                for key in ("node_id", "line_id", "trigger", "locale")
++            )
++            or re.fullmatch(r"[0-9a-f]{64}", perception_sha256 or "") is None
++            or hashlib.sha256(canonical_perception.encode("utf-8")).hexdigest()
++            != perception_sha256
++            or re.fullmatch(r"[0-9a-f]{32}", turn_id or "") is None
++            or re.fullmatch(r"[0-9a-f]{32}", assistant_message_id or "") is None
++            or turn_id == assistant_message_id
++            or type(owner_pid) is not int
++            or owner_pid <= 0
++            or type(owner_started_at) is not int
++            or owner_started_at < 0
++            or re.fullmatch(r"[0-9a-f]{32}", owner_token or "") is None
++            or owner_token in {event_id, turn_id, assistant_message_id}
++            or type(abandon) is not bool
++        ):
++            raise ValueError("native assistant extension claim was rejected")
++
++        expected_metadata = {
++            "lilith_native_event_id": event_id,
++            "lilith_native_source": "lilith-native",
++            "lilith_native_occurred_at_unix_ms": perception[
++                "occurred_at_unix_ms"
++            ],
++            "lilith_native_node_id": perception["node_id"],
++            "lilith_native_line_id": perception["line_id"],
++            "lilith_native_trigger": perception["trigger"],
++            "lilith_native_locale": perception["locale"],
++        }
++
++        def _do(conn):
++            # Idempotent reconciliation is independent of mutable admission
++            # state. The first claim already proved the native assistant row,
++            # lineage, and transcript guards; a later compression lease or
++            # closed ancestor must not turn its exact receipt into a retryable
++            # 4009 after Runtime has already accepted the native append.
++            existing = conn.execute(
++                """SELECT lineage_root, event_id, perception_sha256,
++                          session_id, turn_id, assistant_message_id, state,
++                          owner_pid, owner_started_at, owner_token, attempted,
++                          assistant_row_id
++                   FROM native_assistant_extensions
++                   WHERE event_id = ?""",
++                (event_id,),
++            ).fetchone()
++            if existing is not None:
++                if (
++                    existing["lineage_root"] != lineage_root
++                    or existing["perception_sha256"] != perception_sha256
++                ):
++                    raise NativeAssistantExtensionConflictError(
++                        "native assistant extension perception conflicted"
++                    )
++                return self._native_assistant_extension_receipt(
++                    existing,
++                    already_processed=True,
++                )
++
++            self._check_transcript_write_guards(conn, session_id, None)
++            placeholders = ",".join("?" for _ in lineage_session_ids)
++            native_rows = conn.execute(
++                f"""SELECT role, content, display_kind, display_metadata
++                    FROM messages
++                    WHERE session_id IN ({placeholders})
++                      AND platform_message_id = ?
++                    ORDER BY id ASC""",
++                (*lineage_session_ids, event_id),
++            ).fetchall()
++            if len(native_rows) != 1:
++                raise NativeAssistantExtensionConflictError(
++                    "native assistant event prerequisite was missing or duplicated"
++                )
++            native_row = native_rows[0]
++            metadata = self._decode_display_metadata(native_row["display_metadata"])
++            if (
++                native_row["role"] != "assistant"
++                or self._decode_content(native_row["content"])
++                != perception["text"]
++                or native_row["display_kind"] != "native_assistant_event"
++                or not isinstance(metadata, dict)
++                or any(metadata.get(key) != value for key, value in expected_metadata.items())
++            ):
++                raise NativeAssistantExtensionConflictError(
++                    "native assistant event prerequisite conflicted"
++                )
++
++            now = time.time()
++            state = "abandoned" if abandon else "streaming"
++            attempted = 0 if abandon else 1
++            conn.execute(
++                """INSERT INTO native_assistant_extensions (
++                       lineage_root, event_id, perception_sha256, session_id,
++                       turn_id, assistant_message_id, owner_pid,
++                       owner_started_at, owner_token, state, attempted,
++                       assistant_row_id, created_at, updated_at
++                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
++                (
++                    lineage_root,
++                    event_id,
++                    perception_sha256,
++                    session_id,
++                    turn_id,
++                    assistant_message_id,
++                    owner_pid,
++                    owner_started_at,
++                    owner_token,
++                    state,
++                    attempted,
++                    now,
++                    now,
++                ),
++            )
++            created = conn.execute(
++                """SELECT lineage_root, event_id, perception_sha256,
++                          session_id, turn_id, assistant_message_id, state,
++                          owner_pid, owner_started_at, owner_token, attempted,
++                          assistant_row_id
++                   FROM native_assistant_extensions
++                   WHERE event_id = ?""",
++                (event_id,),
++            ).fetchone()
++            return self._native_assistant_extension_receipt(
++                created,
++                already_processed=state != "streaming",
++            )
++
++        return self._execute_write(
++            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
++        )
++
++    def finish_native_assistant_extension(
++        self,
++        session_id: str,
++        *,
++        lineage_root: str,
++        event_id: str,
++        perception_sha256: str,
++        turn_id: str,
++        assistant_message_id: str,
++        status: str,
++        text: Optional[str] = None,
++    ) -> Dict[str, Any]:
++        """Atomically terminalize a claim and optionally append its reply."""
++        if (
++            status not in {"completed", "silent", "abandoned"}
++            or (status == "completed" and (not isinstance(text, str) or not text.strip()))
++            or (status != "completed" and text is not None)
++        ):
++            raise ValueError("native assistant extension terminal state was rejected")
++
++        def _do(conn):
++            row = conn.execute(
++                """SELECT lineage_root, event_id, perception_sha256,
++                          session_id, turn_id, assistant_message_id, state,
++                          owner_pid, owner_started_at, owner_token, attempted,
++                          assistant_row_id
++                   FROM native_assistant_extensions
++                   WHERE event_id = ?""",
++                (event_id,),
++            ).fetchone()
++            if row is None:
++                raise ValueError("native assistant extension claim was not found")
++            if (
++                row["lineage_root"] != lineage_root
++                or row["perception_sha256"] != perception_sha256
++                or row["session_id"] != session_id
++                or row["turn_id"] != turn_id
++                or row["assistant_message_id"] != assistant_message_id
++            ):
++                raise NativeAssistantExtensionConflictError(
++                    "native assistant extension identity conflicted"
++                )
++            if row["state"] != "streaming":
++                return {
++                    **self._native_assistant_extension_receipt(
++                        row,
++                        already_processed=True,
++                    ),
++                    "message": None,
++                }
++
++            message = None
++            assistant_row_id = None
++            if status == "completed":
++                self._check_transcript_write_guards(conn, session_id, None)
++                message = build_native_assistant_extension_message(
++                    event_id=event_id,
++                    turn_id=turn_id,
++                    assistant_message_id=assistant_message_id,
++                    text=text,
++                    timestamp=time.time(),
++                )
++                self._insert_message_rows(
++                    conn,
++                    session_id,
++                    [message],
++                    require_activity_timestamps=True,
++                )
++                assistant_row_id = int(message["_row_id"])
++                conn.execute(
++                    "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
++                    (session_id,),
++                )
++
++            conn.execute(
++                """UPDATE native_assistant_extensions
++                   SET state = ?, assistant_row_id = ?, updated_at = ?
++                   WHERE event_id = ? AND state = 'streaming'""",
++                (
++                    status,
++                    assistant_row_id,
++                    time.time(),
++                    event_id,
++                ),
++            )
++            terminal = conn.execute(
++                """SELECT lineage_root, event_id, perception_sha256,
++                          session_id, turn_id, assistant_message_id, state,
++                          owner_pid, owner_started_at, owner_token, attempted,
++                          assistant_row_id
++                   FROM native_assistant_extensions
++                   WHERE event_id = ?""",
++                (event_id,),
++            ).fetchone()
++            return {
++                **self._native_assistant_extension_receipt(
++                    terminal,
++                    already_processed=True,
++                ),
++                "message": message,
++            }
++
++        return self._execute_write(
++            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
++        )
++
+     def append_messages_batch(
+         self,
+         session_id: str,
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index c9d8a6fc8ee32cecb2c42430041fb230e1511e9a..3d8429874aeecdbe3ff0ab447f8285e71c6c1c83 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -216,7 +216,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
+     )
+ 
+ 
+-SCHEMA_VERSION = 27
++SCHEMA_VERSION = 28
+ 
+ 
+ # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
+@@ -405,6 +405,25 @@ CREATE TABLE IF NOT EXISTS async_delegations (
+     delivery_claimed_at REAL
+ );
+ 
++CREATE TABLE IF NOT EXISTS native_assistant_extensions (
++    lineage_root TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
++    event_id TEXT PRIMARY KEY,
++    perception_sha256 TEXT NOT NULL,
++    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
++    turn_id TEXT NOT NULL UNIQUE,
++    assistant_message_id TEXT NOT NULL UNIQUE,
++    owner_pid INTEGER NOT NULL CHECK (owner_pid > 0),
++    owner_started_at INTEGER NOT NULL CHECK (owner_started_at >= 0),
++    owner_token TEXT NOT NULL UNIQUE,
++    state TEXT NOT NULL CHECK (
++        state IN ('streaming', 'completed', 'silent', 'abandoned')
++    ),
++    attempted INTEGER NOT NULL CHECK (attempted IN (0, 1)),
++    assistant_row_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
++    created_at REAL NOT NULL,
++    updated_at REAL NOT NULL
++);
++
+ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+ CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
+ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
+@@ -424,6 +443,8 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
+ CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+ CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
+     ON async_delegations(delivery_state, completed_at);
++CREATE INDEX IF NOT EXISTS idx_native_assistant_extensions_session
++    ON native_assistant_extensions(session_id, updated_at);
+ """
+ 
+ 
+diff --git a/run_agent.py b/run_agent.py
+index 09be3181da5e706289414997a567d529373caa09..214b9f25e965bed97ec73622fa9a24cac12a27a9 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -5590,10 +5590,22 @@ class AIAgent:
+                 exc,
+             )
+ 
+-    def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
++    def _run_codex_stream(
++        self,
++        api_kwargs: dict,
++        client: Any = None,
++        on_first_delta: callable = None,
++        max_stream_retries: int | None = None,
++    ):
+         """Forwarder — see ``agent.codex_runtime.run_codex_stream``."""
+         from agent.codex_runtime import run_codex_stream
+-        return run_codex_stream(self, api_kwargs, client, on_first_delta)
++        return run_codex_stream(
++            self,
++            api_kwargs,
++            client,
++            on_first_delta,
++            max_stream_retries=max_stream_retries,
++        )
+ 
+     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
+         """Forwarder — see ``agent.codex_runtime.run_codex_create_stream_fallback``."""
+@@ -6478,7 +6490,13 @@ class AIAgent:
+             return False
+         return pool.has_available()
+ 
+-    def _anthropic_messages_create(self, api_kwargs: dict, *, client: Any = None):
++    def _anthropic_messages_create(
++        self,
++        api_kwargs: dict,
++        *,
++        client: Any = None,
++        allow_create_fallback: bool = True,
++    ):
+         # When a request-local client is supplied it was already credential-
+         # refreshed in ``_create_request_anthropic_client``; only the shared
+         # fallback path refreshes here.
+@@ -6498,6 +6516,7 @@ class AIAgent:
+             api_kwargs,
+             log_prefix=getattr(self, "log_prefix", ""),
+             prefer_stream=not bool(getattr(self, "_disable_streaming", False)),
++            allow_create_fallback=allow_create_fallback,
+             # Rate-limit + credits state live in response headers, which the
+             # parsed Message drops. No-ops on providers that don't send the
+             # matching header families (x-ratelimit-* / x-nous-credits-*).
+@@ -6530,10 +6549,19 @@ class AIAgent:
+                 drop_context_1m_beta=_drop_1m,
+             )
+ 
+-    def _interruptible_api_call(self, api_kwargs: dict):
++    def _interruptible_api_call(
++        self,
++        api_kwargs: dict,
++        *,
++        physical_attempt_limit: int | None = None,
++    ):
+         """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""
+         from agent.chat_completion_helpers import interruptible_api_call
+-        return interruptible_api_call(self, api_kwargs)
++        return interruptible_api_call(
++            self,
++            api_kwargs,
++            physical_attempt_limit=physical_attempt_limit,
++        )
+ 
+     # ── Unified streaming API call ─────────────────────────────────────────
+ 
+diff --git a/tests/test_session_conversation_activity.py b/tests/test_session_conversation_activity.py
+index def16703339fc0b59b1cfd34bc5cde7aa7cea1f4..7079340d9231a18b8e195ba38b71a99b04bc8f4b 100644
+--- a/tests/test_session_conversation_activity.py
++++ b/tests/test_session_conversation_activity.py
+@@ -204,7 +204,7 @@ def test_v25_upgrade_backfills_from_real_durable_user_turns(tmp_path):
+         version = upgraded._conn.execute(
+             "SELECT version FROM schema_version LIMIT 1"
+         ).fetchone()[0]
+-        assert version == 27
++        assert version == 28
+     finally:
+         upgraded.close()
+ 
+@@ -431,6 +431,6 @@ def test_v26_upgrade_rebuilds_existing_user_watermark_with_assistant(tmp_path):
+         assert _listed(upgraded, "legacy")["last_conversation_at"] == 20.0
+         assert upgraded._conn.execute(
+             "SELECT version FROM schema_version"
+-        ).fetchone()[0] == 27
++        ).fetchone()[0] == 28
+     finally:
+         upgraded.close()
+diff --git a/tests/tui_gateway/test_native_assistant_extension.py b/tests/tui_gateway/test_native_assistant_extension.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..624ee8180929b860a7f0e1eef3ed2db5e6c202a7
+--- /dev/null
++++ b/tests/tui_gateway/test_native_assistant_extension.py
+@@ -0,0 +1,1444 @@
++"""Durable proactive continuations for official Lilith native dialogue."""
++
++from __future__ import annotations
++
++import json
++import hashlib
++import os
++import sys
++import threading
++import types
++
++import pytest
++
++from hermes_state import SessionDB
++from tui_gateway import server
++
++
++EVENT_ID = "0123456789abcdef0123456789abcdef"
++
++
++def _append_params(**overrides):
++    value = {
++        "session_id": "game-live",
++        "event_id": EVENT_ID,
++        "text": "又在寫代碼呀……",
++        "occurred_at_unix_ms": 1787932800123,
++        "node_id": "700324",
++        "line_id": "2200001",
++        "trigger": "native.dialogue.complete",
++        "locale": "zh-Hant",
++        "source": "lilith-native",
++        "require_durable_lineage": True,
++    }
++    value.update(overrides)
++    return value
++
++
++def _extend_params(**overrides):
++    perception = {
++        "schema_version": 1,
++        "source": "official-native-dialogue",
++        "text": "又在寫代碼呀……",
++        "occurred_at_unix_ms": 1787932800123,
++        "node_id": "700324",
++        "line_id": "2200001",
++        "trigger": "native.dialogue.complete",
++        "locale": "zh-Hant",
++    }
++    value = {
++        "session_id": "game-live",
++        "event_id": EVENT_ID,
++        "proactive_dialogue_enabled": True,
++        "perception": perception,
++        "source": "lilith-native",
++        "require_durable_lineage": True,
++    }
++    value.update(overrides)
++    return value
++
++
++class _FakeAgent:
++    def __init__(self, output: str):
++        self._cached_system_prompt = "You are Lilith."
++        self.ephemeral_system_prompt = None
++        self._ephemeral_max_output_tokens = None
++        self._interrupt_requested = False
++        self._session_messages = []
++        self._session_db = None
++        self.provider = "test"
++        self.model = "test-model"
++        self.api_mode = "chat_completions"
++        self.output = output
++        self.calls = 0
++        self.interrupt_calls = 0
++        self.requests = []
++        self.entered = threading.Event()
++        self.release = None
++
++    def clear_interrupt(self):
++        self._interrupt_requested = False
++
++    def interrupt(self):
++        self.interrupt_calls += 1
++        self._interrupt_requested = True
++
++    def _copy_reasoning_content_for_api(self, _source, _projected):
++        return None
++
++    def _build_system_prompt(self, _system_message):
++        return "You are Lilith."
++
++    def _sanitize_api_messages(self, messages):
++        return messages
++
++    def _drop_thinking_only_and_merge_users(self, messages):
++        return messages
++
++    def _build_api_kwargs(self, messages, tools_for_api=None):
++        assert tools_for_api == []
++        return {"model": self.model, "messages": messages}
++
++    def _interruptible_api_call(
++        self,
++        kwargs,
++        *,
++        physical_attempt_limit=None,
++    ):
++        assert physical_attempt_limit == 1
++        self.calls += 1
++        self.requests.append(kwargs)
++        self.entered.set()
++        if self.release is not None:
++            self.release.wait(timeout=5)
++        return types.SimpleNamespace(output=self.output)
++
++    def _get_transport(self):
++        return types.SimpleNamespace(
++            normalize_response=lambda response: types.SimpleNamespace(
++                content=response.output
++            )
++        )
++
++
++@pytest.fixture
++def extension_session(tmp_path, monkeypatch):
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("game-root", source="lilith-game", archived=True)
++    agent = _FakeAgent('{"decision":"reply","text":"嗯，別忘了休息。"}')
++    session = {
++        "agent": agent,
++        "archived": True,
++        "cols": 80,
++        "history": [],
++        "history_lock": threading.Lock(),
++        "history_version": 0,
++        "inflight_turn": None,
++        "profile_home": None,
++        "queued_prompt": None,
++        "running": False,
++        "session_key": "game-root",
++        "source": "lilith-game",
++        "transport": None,
++        "_durable_lineage_root": "game-root",
++    }
++    emitted = []
++    terminal_event = threading.Event()
++    existing = set(server._sessions)
++    server._sessions["game-live"] = session
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
++    def emit(event, sid, payload=None):
++        emitted.append((event, sid, payload))
++        if event == "message.complete":
++            terminal_event.set()
++
++    monkeypatch.setattr(server, "_emit", emit)
++    append = server._methods["session.append_assistant_event"](
++        "append-native",
++        _append_params(),
++    )
++    assert "error" not in append
++    emitted.clear()
++    session["_test_native_extension_terminal"] = terminal_event
++    try:
++        yield db, session, agent, emitted
++    finally:
++        thread = session.get("_run_thread")
++        if thread is not None and thread.is_alive():
++            if agent.release is not None:
++                agent.release.set()
++            thread.join(timeout=5)
++        for sid in set(server._sessions) - existing:
++            server._sessions.pop(sid, None)
++        db.close()
++
++
++def _extend(params=None):
++    return server._methods["session.extend_native_assistant_event"](
++        "extend-native",
++        params or _extend_params(),
++    )
++
++
++def _join(session):
++    terminal = session["_test_native_extension_terminal"]
++    assert terminal.wait(timeout=5)
++    thread = session.get("_run_thread")
++    if thread is not None:
++        thread.join(timeout=5)
++        assert not thread.is_alive()
++    assert "_run_thread" not in session
++
++
++def test_reply_is_one_model_attempt_one_primary_assistant_and_no_user_row(
++    extension_session,
++):
++    db, session, agent, emitted = extension_session
++
++    response = _extend()
++    assert "error" not in response
++    receipt = response["result"]
++    assert set(receipt) == {
++        "status",
++        "event_id",
++        "turn_id",
++        "assistant_message_id",
++        "already_processed",
++        "attempted",
++    }
++    assert receipt["status"] == "streaming"
++    assert receipt["already_processed"] is False
++    assert receipt["attempted"] is True
++    assert len(receipt["turn_id"]) == 32
++    assert len(receipt["assistant_message_id"]) == 32
++    assert receipt["turn_id"] != receipt["assistant_message_id"]
++
++    _join(session)
++
++    assert agent.calls == 1
++    sent = agent.requests[0]["messages"]
++    assert sent[-1]["role"] == "user"
++    assert "NOT a player/user utterance" in sent[-1]["content"]
++    assert "official-native-dialogue" in sent[-1]["content"]
++    # Provider-facing control context never enters the durable transcript.
++    rows = db._conn.execute(
++        "SELECT role, display_kind, display_metadata FROM messages ORDER BY id"
++    ).fetchall()
++    assert [row["role"] for row in rows] == ["assistant", "assistant"]
++    assert rows[1]["display_kind"] == "native_assistant_extension"
++    metadata = json.loads(rows[1]["display_metadata"])
++    assert metadata == {
++        "lilith_native_extension_event_id": EVENT_ID,
++        "hermes_turn_id": receipt["turn_id"],
++        "hermes_message_id": receipt["assistant_message_id"],
++        "hermes_message_kind": "primary",
++        "hermes_turn_origin": "synthetic",
++        "hermes_turn_origin_kind": "lilith-native-extension",
++    }
++
++    history = server._methods["session.history"](
++        "history",
++        {"session_id": "game-live"},
++    )["result"]["messages"]
++    assert [message["role"] for message in history] == ["assistant", "assistant"]
++    assert history[-1]["text"] == "嗯，別忘了休息。"
++    assert history[-1]["message_id"] == receipt["assistant_message_id"]
++    assert history[-1]["turn_id"] == receipt["turn_id"]
++    assert history[-1]["message_kind"] == "primary"
++
++    message_events = [item for item in emitted if item[0].startswith("message.")]
++    assert [item[0] for item in message_events] == [
++        "message.start",
++        "message.complete",
++    ]
++    complete = message_events[-1][2]
++    assert complete["text"] == "嗯，別忘了休息。"
++    assert complete["status"] == "complete"
++    assert complete["native_assistant_extension_status"] == "completed"
++    assert complete["durable"]["turn_origin"] == "synthetic"
++    assert not any(item[0] == "message.user" for item in emitted)
++
++
++def test_fresh_agent_builds_identity_prompt_before_extension_dispatch(
++    extension_session,
++):
++    db, session, agent, _ = extension_session
++    agent._cached_system_prompt = None
++
++    assert _extend()["result"]["status"] == "streaming"
++    _join(session)
++
++    assert agent.calls == 1
++    assert agent._cached_system_prompt == "You are Lilith."
++    assert agent.requests[0]["messages"][0]["role"] == "system"
++    assert agent.requests[0]["messages"][0]["content"].startswith(
++        "You are Lilith."
++    )
++    assert db._conn.execute(
++        "SELECT COUNT(*) FROM messages WHERE role = 'user'"
++    ).fetchone()[0] == 0
++
++
++def test_silence_is_terminal_idempotent_and_never_adds_a_row(extension_session):
++    db, session, agent, emitted = extension_session
++    agent.output = '{"decision":"silent","text":""}'
++
++    first = _extend()["result"]
++    _join(session)
++    second = _extend()["result"]
++
++    assert first["status"] == "streaming"
++    assert second == {
++        "status": "silent",
++        "event_id": EVENT_ID,
++        "turn_id": first["turn_id"],
++        "assistant_message_id": first["assistant_message_id"],
++        "already_processed": True,
++        "attempted": True,
++    }
++    assert agent.calls == 1
++    assert db.message_count("game-root") == 1
++    completes = [item for item in emitted if item[0] == "message.complete"]
++    assert len(completes) == 1
++    assert completes[0][2]["text"] == ""
++    assert completes[0][2]["status"] == "complete"
++    assert "durable" not in completes[0][2]
++
++
++@pytest.mark.parametrize(
++    "output, expected_status",
++    [
++        ('{"decision":"reply","text":"再一句。"}', "completed"),
++        ('{"decision":"silent","text":""}', "silent"),
++    ],
++)
++def test_terminal_claim_never_blocks_session_deletion(
++    extension_session,
++    output,
++    expected_status,
++):
++    db, session, agent, _ = extension_session
++    agent.output = output
++
++    assert _extend()["result"]["status"] == "streaming"
++    _join(session)
++    assert _extend()["result"]["status"] == expected_status
++
++    assert db.delete_session("game-root")
++    assert db._conn.execute(
++        "SELECT COUNT(*) FROM native_assistant_extensions"
++    ).fetchone()[0] == 0
++    assert db._conn.execute(
++        "SELECT COUNT(*) FROM messages WHERE session_id = 'game-root'"
++    ).fetchone()[0] == 0
++
++
++def test_abandoned_child_claim_cascades_when_child_is_deleted(extension_session):
++    db, session, agent, _ = extension_session
++    db.end_session("game-root", end_reason="compression")
++    db.create_session(
++        "game-child",
++        source="lilith-game",
++        parent_session_id="game-root",
++        archived=True,
++    )
++    session["session_key"] = "game-child"
++    session["running"] = True
++
++    response = _extend()
++    assert "error" not in response, response
++    receipt = response["result"]
++    session["running"] = False
++
++    assert receipt["status"] == "abandoned"
++    assert agent.calls == 0
++    assert db.delete_session("game-child")
++    assert db.get_session("game-root") is not None
++    assert db._conn.execute(
++        "SELECT COUNT(*) FROM native_assistant_extensions"
++    ).fetchone()[0] == 0
++
++
++def test_active_duplicate_reuses_claim_and_never_dispatches_twice(extension_session):
++    _, session, agent, _ = extension_session
++    agent.release = threading.Event()
++
++    first = _extend()["result"]
++    assert agent.entered.wait(timeout=5)
++    duplicate = _extend()["result"]
++
++    assert duplicate == {
++        **first,
++        "already_processed": True,
++    }
++    assert agent.calls == 1
++    agent.release.set()
++    _join(session)
++    assert agent.calls == 1
++
++
++def test_streaming_claim_blocks_compression_until_terminal(extension_session):
++    db, session, agent, _ = extension_session
++    agent.release = threading.Event()
++
++    assert _extend()["result"]["status"] == "streaming"
++    assert agent.entered.wait(timeout=5)
++    assert not db.try_acquire_compression_lock(
++        "game-root",
++        "compressor",
++        ttl_seconds=60,
++    )
++
++    agent.release.set()
++    _join(session)
++    assert db.try_acquire_compression_lock(
++        "game-root",
++        "compressor",
++        ttl_seconds=60,
++    )
++    db.release_compression_lock("game-root", "compressor")
++
++
++def test_compression_lock_first_refuses_extension_without_claim(extension_session):
++    db, _, agent, emitted = extension_session
++    assert db.try_acquire_compression_lock(
++        "game-root",
++        "compressor",
++        ttl_seconds=60,
++    )
++    try:
++        response = _extend()
++    finally:
++        db.release_compression_lock("game-root", "compressor")
++
++    assert response["error"]["code"] == 4009
++    assert agent.calls == 0
++    assert db._conn.execute(
++        "SELECT COUNT(*) FROM native_assistant_extensions"
++    ).fetchone()[0] == 0
++    assert not [item for item in emitted if item[0].startswith("message.")]
++
++
++def test_terminal_duplicate_returns_exact_receipt_during_compression_lock(
++    extension_session,
++):
++    db, session, agent, _ = extension_session
++
++    _extend()
++    _join(session)
++    terminal = _extend()["result"]
++    assert db.try_acquire_compression_lock(
++        "game-root",
++        "compressor",
++        ttl_seconds=60,
++    )
++    try:
++        duplicate = _extend()
++    finally:
++        db.release_compression_lock("game-root", "compressor")
++
++    assert duplicate["result"] == terminal
++    assert agent.calls == 1
++
++
++def test_dead_streaming_owner_is_atomically_abandoned_before_compression(
++    extension_session,
++    monkeypatch,
++):
++    from gateway import status as gateway_status
++
++    db, _, agent, _ = extension_session
++    perception = _extend_params()["perception"]
++    digest = hashlib.sha256(
++        json.dumps(
++            perception,
++            ensure_ascii=False,
++            sort_keys=True,
++            separators=(",", ":"),
++        ).encode("utf-8")
++    ).hexdigest()
++    proof = db.attest_resume_session_lineage(
++        "game-root",
++        "game-root",
++        expected_source="lilith-game",
++        expected_archived=True,
++    )
++    db.claim_native_assistant_extension(
++        "game-root",
++        lineage_root="game-root",
++        lineage_session_ids=proof["session_ids"],
++        event_id=EVENT_ID,
++        perception=perception,
++        perception_sha256=digest,
++        turn_id="1" * 32,
++        assistant_message_id="2" * 32,
++        owner_pid=424242,
++        owner_started_at=987654,
++        owner_token="3" * 32,
++        abandon=False,
++    )
++    monkeypatch.setattr(gateway_status, "_pid_exists", lambda _pid: False)
++
++    assert db.try_acquire_compression_lock(
++        "game-root",
++        "compressor",
++        ttl_seconds=60,
++    )
++    db.release_compression_lock("game-root", "compressor")
++
++    row = db._conn.execute(
++        "SELECT state, attempted FROM native_assistant_extensions"
++    ).fetchone()
++    assert (row["state"], row["attempted"]) == ("abandoned", 1)
++    assert agent.calls == 0
++
++
++def test_same_process_no_thread_owner_is_abandoned_before_compression(
++    extension_session,
++):
++    db, _, agent, _ = extension_session
++    perception = _extend_params()["perception"]
++    digest = hashlib.sha256(
++        json.dumps(
++            perception,
++            ensure_ascii=False,
++            sort_keys=True,
++            separators=(",", ":"),
++        ).encode("utf-8")
++    ).hexdigest()
++    proof = db.attest_resume_session_lineage(
++        "game-root",
++        "game-root",
++        expected_source="lilith-game",
++        expected_archived=True,
++    )
++    db.claim_native_assistant_extension(
++        "game-root",
++        lineage_root="game-root",
++        lineage_session_ids=proof["session_ids"],
++        event_id=EVENT_ID,
++        perception=perception,
++        perception_sha256=digest,
++        turn_id="1" * 32,
++        assistant_message_id="2" * 32,
++        owner_pid=os.getpid(),
++        owner_started_at=server._native_assistant_extension_process_identity()[1],
++        owner_token="3" * 32,
++        abandon=False,
++    )
++
++    assert db.try_acquire_compression_lock(
++        "game-root",
++        "compressor",
++        ttl_seconds=60,
++        native_assistant_extension_owner_is_provably_orphaned=(
++            server._native_assistant_extension_owner_is_provably_orphaned
++        ),
++    )
++    db.release_compression_lock("game-root", "compressor")
++
++    row = db._conn.execute(
++        "SELECT state, attempted FROM native_assistant_extensions"
++    ).fetchone()
++    assert (row["state"], row["attempted"]) == ("abandoned", 1)
++    assert agent.calls == 0
++
++
++@pytest.mark.parametrize("failure_point", ["constructor", "start"])
++def test_worker_launch_failure_terminalizes_claim_and_clears_owner(
++    extension_session,
++    monkeypatch,
++    failure_point,
++):
++    db, session, agent, emitted = extension_session
++
++    class FailingThread:
++        ident = None
++
++        def __init__(self, *args, **kwargs):
++            if failure_point == "constructor":
++                raise RuntimeError("thread constructor failed")
++
++        def start(self):
++            raise RuntimeError("thread start failed")
++
++        def is_alive(self):
++            return False
++
++    monkeypatch.setattr(
++        server,
++        "threading",
++        types.SimpleNamespace(
++            Event=threading.Event,
++            Thread=FailingThread,
++            current_thread=threading.current_thread,
++        ),
++    )
++
++    receipt = _extend()["result"]
++
++    assert receipt["status"] == "abandoned"
++    assert receipt["already_processed"] is True
++    assert receipt["attempted"] is True
++    assert agent.calls == 0
++    assert session["running"] is False
++    assert "_native_assistant_extension" not in session
++    assert "_run_thread" not in session
++    assert not [item for item in emitted if item[0].startswith("message.")]
++    row = db._conn.execute(
++        "SELECT state, attempted FROM native_assistant_extensions"
++    ).fetchone()
++    assert (row["state"], row["attempted"]) == ("abandoned", 1)
++
++
++def test_profile_db_launch_failure_reopens_handle_to_terminalize(
++    extension_session,
++    monkeypatch,
++):
++    db, session, agent, _ = extension_session
++    session["profile_home"] = str(db.db_path.parent)
++
++    class FailingThread:
++        def __init__(self, *args, **kwargs):
++            raise RuntimeError("thread constructor failed")
++
++    monkeypatch.setattr(
++        server,
++        "threading",
++        types.SimpleNamespace(
++            Event=threading.Event,
++            Thread=FailingThread,
++            current_thread=threading.current_thread,
++        ),
++    )
++
++    receipt = _extend()["result"]
++
++    assert receipt["status"] == "abandoned"
++    assert receipt["attempted"] is True
++    assert agent.calls == 0
++    assert session["running"] is False
++    assert "_native_assistant_extension" not in session
++    row = db._conn.execute(
++        "SELECT state, attempted FROM native_assistant_extensions"
++    ).fetchone()
++    assert (row["state"], row["attempted"]) == ("abandoned", 1)
++
++
++def test_interrupt_during_message_start_prevents_provider_dispatch(
++    extension_session,
++    monkeypatch,
++):
++    db, session, agent, emitted = extension_session
++    terminal = session["_test_native_extension_terminal"]
++
++    def emit(event, sid, payload=None):
++        emitted.append((event, sid, payload))
++        if event == "message.start":
++            interrupted = server._methods["session.interrupt"](
++                "interrupt-native",
++                {"session_id": sid},
++            )
++            assert "error" not in interrupted
++        if event == "message.complete":
++            terminal.set()
++
++    monkeypatch.setattr(server, "_emit", emit)
++
++    first = _extend()["result"]
++    _join(session)
++    terminal_receipt = _extend()["result"]
++
++    assert first["status"] == "streaming"
++    assert terminal_receipt["status"] == "silent"
++    assert terminal_receipt["attempted"] is True
++    assert agent.calls == 0
++    assert session["running"] is False
++    assert "_native_assistant_extension" not in session
++    assert "_run_thread" not in session
++    assert db.message_count("game-root") == 1
++    assert [item[0] for item in emitted if item[0].startswith("message.")] == [
++        "message.start",
++        "message.complete",
++    ]
++
++
++def test_player_prompt_cancels_extension_and_drains_as_next_turn(
++    extension_session,
++    monkeypatch,
++):
++    _, session, agent, _ = extension_session
++    agent.release = threading.Event()
++    drained = threading.Event()
++    dispatched = []
++
++    def run_queued(
++        rid,
++        sid,
++        target_session,
++        text,
++        **_kwargs,
++    ):
++        dispatched.append((rid, sid, text))
++        with target_session["history_lock"]:
++            target_session["running"] = False
++            target_session["inflight_turn"] = None
++        drained.set()
++
++    monkeypatch.setattr(server, "_run_prompt_submit", run_queued)
++    monkeypatch.setattr(
++        server,
++        "_emit_accepted_user_message",
++        lambda *_args, **_kwargs: None,
++    )
++
++    assert _extend()["result"]["status"] == "streaming"
++    assert agent.entered.wait(timeout=5)
++    queued = server._methods["prompt.submit"](
++        "player-prompt",
++        {"session_id": "game-live", "text": "先回我這句"},
++    )
++    assert queued == {
++        "jsonrpc": "2.0",
++        "id": "player-prompt",
++        "result": {"status": "queued"},
++    }
++    agent.release.set()
++    _join(session)
++    assert drained.wait(timeout=5)
++
++    assert dispatched == [
++        ("extend-native", "game-live", "先回我這句")
++    ]
++    assert agent.calls == 1
++    assert session.get("queued_prompt") is None
++    assert not session.get("queued_prompts")
++    assert not session.get("_pending_steer")
++
++
++def test_player_prompt_interrupt_fence_blocks_cleanup_and_queue_drain(
++    extension_session,
++    monkeypatch,
++):
++    from agent import interrupt_compat
++
++    _, session, agent, _ = extension_session
++    agent.release = threading.Event()
++    interrupt_entered = threading.Event()
++    release_interrupt = threading.Event()
++    drained = threading.Event()
++    response = {}
++
++    def hard_interrupt(target_agent):
++        target_agent.interrupt()
++        interrupt_entered.set()
++        assert release_interrupt.wait(timeout=5)
++
++    def run_queued(_rid, _sid, target_session, _text, **_kwargs):
++        with target_session["history_lock"]:
++            target_session["running"] = False
++            target_session["inflight_turn"] = None
++        drained.set()
++
++    monkeypatch.setattr(interrupt_compat, "request_hard_interrupt", hard_interrupt)
++    monkeypatch.setattr(server, "_run_prompt_submit", run_queued)
++    monkeypatch.setattr(
++        server,
++        "_emit_accepted_user_message",
++        lambda *_args, **_kwargs: None,
++    )
++
++    assert _extend()["result"]["status"] == "streaming"
++    assert agent.entered.wait(timeout=5)
++
++    def submit():
++        response["value"] = server._methods["prompt.submit"](
++            "player-prompt",
++            {"session_id": "game-live", "text": "這句優先"},
++        )
++
++    submit_thread = threading.Thread(target=submit)
++    submit_thread.start()
++    assert interrupt_entered.wait(timeout=5)
++    agent.release.set()
++    assert session["_test_native_extension_terminal"].wait(timeout=5)
++
++    # message.complete may publish, but ownership and the queued player turn
++    # stay fenced until the exact hard interrupt admitted for this owner ends.
++    assert session["running"] is True
++    assert "_native_assistant_extension" in session
++    assert not drained.is_set()
++
++    release_interrupt.set()
++    submit_thread.join(timeout=5)
++    assert not submit_thread.is_alive()
++    _join(session)
++    assert drained.wait(timeout=5)
++    assert response["value"]["result"]["status"] == "queued"
++    assert agent.interrupt_calls == 1
++
++
++def test_stop_interrupt_fence_blocks_native_owner_cleanup(
++    extension_session,
++    monkeypatch,
++):
++    from agent import interrupt_compat
++
++    _, session, agent, _ = extension_session
++    agent.release = threading.Event()
++    interrupt_entered = threading.Event()
++    release_interrupt = threading.Event()
++    response = {}
++    hard_interrupt_calls = []
++
++    def hard_interrupt(target_agent):
++        hard_interrupt_calls.append(target_agent)
++        target_agent.interrupt()
++        interrupt_entered.set()
++        assert release_interrupt.wait(timeout=5)
++
++    monkeypatch.setattr(interrupt_compat, "request_hard_interrupt", hard_interrupt)
++
++    assert _extend()["result"]["status"] == "streaming"
++    assert agent.entered.wait(timeout=5)
++
++    def stop():
++        response["value"] = server._methods["session.interrupt"](
++            "stop-native",
++            {"session_id": "game-live"},
++        )
++
++    stop_thread = threading.Thread(target=stop)
++    stop_thread.start()
++    assert interrupt_entered.wait(timeout=5)
++
++    def second_stop():
++        response["second"] = server._methods["session.interrupt"](
++            "stop-native-again",
++            {"session_id": "game-live"},
++        )
++
++    second_stop_thread = threading.Thread(target=second_stop)
++    second_stop_thread.start()
++    second_stop_thread.join(timeout=1)
++    assert not second_stop_thread.is_alive()
++    assert len(hard_interrupt_calls) == 1
++
++    agent.release.set()
++    assert session["_test_native_extension_terminal"].wait(timeout=5)
++
++    assert session["running"] is True
++    assert "_native_assistant_extension" in session
++
++    release_interrupt.set()
++    stop_thread.join(timeout=5)
++    assert not stop_thread.is_alive()
++    _join(session)
++    assert "error" not in response["value"]
++    assert "error" not in response["second"]
++    assert agent.interrupt_calls == 1
++
++
++def test_busy_submit_rebinds_interrupt_fence_to_replacement_native_owner(
++    extension_session,
++    monkeypatch,
++):
++    from agent import interrupt_compat
++
++    _, session, agent, _ = extension_session
++    agent.release = threading.Event()
++    between_locks = threading.Event()
++    resume_submit = threading.Event()
++    response = {}
++    original_text_check = server._is_text_only_busy_payload
++    interrupted = []
++
++    def hold_between_locks(value):
++        between_locks.set()
++        assert resume_submit.wait(timeout=5)
++        return original_text_check(value)
++
++    def hard_interrupt(target_agent):
++        interrupted.append(target_agent)
++
++    monkeypatch.setattr(server, "_is_text_only_busy_payload", hold_between_locks)
++    monkeypatch.setattr(interrupt_compat, "request_hard_interrupt", hard_interrupt)
++
++    assert _extend()["result"]["status"] == "streaming"
++    assert agent.entered.wait(timeout=5)
++
++    def submit():
++        response["value"] = server._handle_busy_submit(
++            "replacement-player",
++            "game-live",
++            session,
++            "玩家優先",
++            None,
++        )
++
++    submit_thread = threading.Thread(target=submit)
++    submit_thread.start()
++    assert between_locks.wait(timeout=5)
++    agent.release.set()
++    _join(session)
++    replacement_fence_token = "c" * 32
++    with session["history_lock"]:
++        session["running"] = True
++        session["_turn_cancel_requested"] = False
++        session["_native_assistant_extension"] = {
++            "owner_token": replacement_fence_token,
++            "event_id": "d" * 32,
++            "turn_id": "e" * 32,
++        }
++    resume_submit.set()
++    submit_thread.join(timeout=5)
++    assert not submit_thread.is_alive()
++
++    owner = session["_native_assistant_extension"]
++    assert response["value"]["result"]["status"] == "queued"
++    assert interrupted == [agent]
++    assert session["_turn_cancel_requested"] is True
++    assert owner["owner_token"] == replacement_fence_token
++    assert owner["interrupt_fence"].is_set()
++    with session["history_lock"]:
++        session["running"] = False
++        session.pop("_native_assistant_extension", None)
++        session["queued_prompt"] = None
++
++
++def test_late_busy_submit_never_interrupts_replacement_normal_turn(
++    extension_session,
++    monkeypatch,
++):
++    _, session, agent, _ = extension_session
++    agent.release = threading.Event()
++    between_locks = threading.Event()
++    resume_submit = threading.Event()
++    response = {}
++    original_text_check = server._is_text_only_busy_payload
++
++    def hold_between_locks(value):
++        between_locks.set()
++        assert resume_submit.wait(timeout=5)
++        return original_text_check(value)
++
++    monkeypatch.setattr(server, "_is_text_only_busy_payload", hold_between_locks)
++
++    assert _extend()["result"]["status"] == "streaming"
++    assert agent.entered.wait(timeout=5)
++
++    def submit():
++        response["value"] = server._handle_busy_submit(
++            "late-player",
++            "game-live",
++            session,
++            "不要打斷下一輪",
++            None,
++        )
++
++    submit_thread = threading.Thread(target=submit)
++    submit_thread.start()
++    assert between_locks.wait(timeout=5)
++
++    agent.release.set()
++    _join(session)
++    with session["history_lock"]:
++        # Model the next ordinary user turn winning the idle slot while the
++        # earlier busy submit is paused between its owner snapshots.
++        session["running"] = True
++        session["_turn_cancel_requested"] = False
++    resume_submit.set()
++    submit_thread.join(timeout=5)
++    assert not submit_thread.is_alive()
++
++    assert response["value"]["result"]["status"] == "queued"
++    assert agent.interrupt_calls == 0
++    assert session["_turn_cancel_requested"] is False
++    with session["history_lock"]:
++        session["running"] = False
++        session["queued_prompt"] = None
++
++
++def test_busy_session_durably_abandons_without_model_attempt(extension_session):
++    db, session, agent, _ = extension_session
++    session["running"] = True
++
++    first = _extend()["result"]
++    second = _extend()["result"]
++
++    assert first["status"] == "abandoned"
++    assert first["already_processed"] is True
++    assert first["attempted"] is False
++    assert second == first
++    assert agent.calls == 0
++    row = db._conn.execute(
++        "SELECT state, attempted FROM native_assistant_extensions"
++    ).fetchone()
++    assert (row["state"], row["attempted"]) == ("abandoned", 0)
++
++
++def test_orphaned_streaming_claim_after_restart_is_abandoned_not_retried(
++    extension_session,
++):
++    db, session, agent, _ = extension_session
++    perception = _extend_params()["perception"]
++    digest = hashlib.sha256(
++        json.dumps(
++            perception,
++            ensure_ascii=False,
++            sort_keys=True,
++            separators=(",", ":"),
++        ).encode("utf-8")
++    ).hexdigest()
++    proof = db.attest_resume_session_lineage(
++        "game-root",
++        "game-root",
++        expected_source="lilith-game",
++        expected_archived=True,
++    )
++    claim = db.claim_native_assistant_extension(
++        "game-root",
++        lineage_root="game-root",
++        lineage_session_ids=proof["session_ids"],
++        event_id=EVENT_ID,
++        perception=perception,
++        perception_sha256=digest,
++        turn_id="1" * 32,
++        assistant_message_id="2" * 32,
++        owner_pid=os.getpid(),
++        owner_started_at=server._native_assistant_extension_process_identity()[1],
++        owner_token="3" * 32,
++        abandon=False,
++    )
++    assert claim["status"] == "streaming"
++
++    reconciled = _extend()["result"]
++
++    assert reconciled == {
++        "status": "abandoned",
++        "event_id": EVENT_ID,
++        "turn_id": "1" * 32,
++        "assistant_message_id": "2" * 32,
++        "already_processed": True,
++        "attempted": True,
++    }
++    assert agent.calls == 0
++    assert session["running"] is False
++
++
++def test_live_foreign_owner_duplicate_stays_streaming_without_takeover(
++    extension_session,
++    monkeypatch,
++):
++    from gateway import status as gateway_status
++
++    db, session, agent, _ = extension_session
++    perception = _extend_params()["perception"]
++    digest = hashlib.sha256(
++        json.dumps(
++            perception,
++            ensure_ascii=False,
++            sort_keys=True,
++            separators=(",", ":"),
++        ).encode("utf-8")
++    ).hexdigest()
++    proof = db.attest_resume_session_lineage(
++        "game-root",
++        "game-root",
++        expected_source="lilith-game",
++        expected_archived=True,
++    )
++    db.claim_native_assistant_extension(
++        "game-root",
++        lineage_root="game-root",
++        lineage_session_ids=proof["session_ids"],
++        event_id=EVENT_ID,
++        perception=perception,
++        perception_sha256=digest,
++        turn_id="1" * 32,
++        assistant_message_id="2" * 32,
++        owner_pid=424242,
++        owner_started_at=987654,
++        owner_token="3" * 32,
++        abandon=False,
++    )
++    monkeypatch.setattr(gateway_status, "_pid_exists", lambda pid: pid == 424242)
++    monkeypatch.setattr(
++        gateway_status,
++        "get_process_start_time",
++        lambda pid: 987654 if pid == 424242 else None,
++    )
++
++    duplicate = _extend()["result"]
++
++    assert duplicate == {
++        "status": "streaming",
++        "event_id": EVENT_ID,
++        "turn_id": "1" * 32,
++        "assistant_message_id": "2" * 32,
++        "already_processed": True,
++        "attempted": True,
++    }
++    assert agent.calls == 0
++    assert session["running"] is False
++    row = db._conn.execute(
++        "SELECT state, owner_pid, owner_started_at, owner_token "
++        "FROM native_assistant_extensions"
++    ).fetchone()
++    assert tuple(row) == ("streaming", 424242, 987654, "3" * 32)
++
++
++def test_orphaned_claim_reconciles_after_compression_without_retry(
++    extension_session,
++):
++    db, session, agent, _ = extension_session
++    perception = _extend_params()["perception"]
++    digest = hashlib.sha256(
++        json.dumps(
++            perception,
++            ensure_ascii=False,
++            sort_keys=True,
++            separators=(",", ":"),
++        ).encode("utf-8")
++    ).hexdigest()
++    proof = db.attest_resume_session_lineage(
++        "game-root",
++        "game-root",
++        expected_source="lilith-game",
++        expected_archived=True,
++    )
++    db.claim_native_assistant_extension(
++        "game-root",
++        lineage_root="game-root",
++        lineage_session_ids=proof["session_ids"],
++        event_id=EVENT_ID,
++        perception=perception,
++        perception_sha256=digest,
++        turn_id="1" * 32,
++        assistant_message_id="2" * 32,
++        owner_pid=os.getpid(),
++        owner_started_at=server._native_assistant_extension_process_identity()[1],
++        owner_token="3" * 32,
++        abandon=False,
++    )
++    db.end_session("game-root", end_reason="compression")
++    db.create_session(
++        "game-tip",
++        source="lilith-game",
++        parent_session_id="game-root",
++        archived=True,
++    )
++    session["session_key"] = "game-tip"
++    session["history"] = []
++    agent._session_messages = []
++
++    reconciled = _extend()["result"]
++
++    assert reconciled == {
++        "status": "abandoned",
++        "event_id": EVENT_ID,
++        "turn_id": "1" * 32,
++        "assistant_message_id": "2" * 32,
++        "already_processed": True,
++        "attempted": True,
++    }
++    assert agent.calls == 0
++    assert db.message_count() == 1
++    row = db._conn.execute(
++        "SELECT state, attempted FROM native_assistant_extensions"
++    ).fetchone()
++    assert (row["state"], row["attempted"]) == ("abandoned", 1)
++
++
++def test_unknown_transport_fails_silent_before_model_dispatch(extension_session):
++    db, session, agent, _ = extension_session
++    agent.api_mode = "acp"
++
++    first = _extend()["result"]
++    _join(session)
++    terminal = _extend()["result"]
++
++    assert first["status"] == "streaming"
++    assert terminal["status"] == "silent"
++    assert terminal["attempted"] is True
++    assert agent.calls == 0
++    assert db.message_count("game-root") == 1
++
++
++def test_openrouter_extension_disables_server_side_provider_fallback(
++    extension_session,
++):
++    _, session, agent, _ = extension_session
++    agent.provider = "openrouter"
++
++    assert _extend()["result"]["status"] == "streaming"
++    _join(session)
++
++    assert agent.calls == 1
++    assert agent.requests[0]["extra_body"]["provider"] == {
++        "allow_fallbacks": False
++    }
++
++
++def test_cancel_before_model_return_discards_reply_and_never_retries(
++    extension_session,
++):
++    db, session, agent, _ = extension_session
++    agent.release = threading.Event()
++    first = _extend()["result"]
++    assert agent.entered.wait(timeout=5)
++    with session["history_lock"]:
++        session["_turn_cancel_requested"] = True
++    agent.release.set()
++    _join(session)
++
++    terminal = _extend()["result"]
++
++    assert terminal["status"] == "silent"
++    assert terminal["turn_id"] == first["turn_id"]
++    assert terminal["attempted"] is True
++    assert agent.calls == 1
++    assert db.message_count("game-root") == 1
++
++
++def test_model_failure_closes_gate_silently_and_is_not_retried(
++    extension_session,
++    monkeypatch,
++):
++    db, session, agent, emitted = extension_session
++
++    def fail_once(_kwargs, *, physical_attempt_limit=None):
++        assert physical_attempt_limit == 1
++        agent.calls += 1
++        raise RuntimeError("provider failed")
++
++    monkeypatch.setattr(agent, "_interruptible_api_call", fail_once)
++    first = _extend()["result"]
++    _join(session)
++    duplicate = _extend()["result"]
++
++    assert duplicate["status"] == "silent"
++    assert duplicate["turn_id"] == first["turn_id"]
++    assert duplicate["attempted"] is True
++    assert agent.calls == 1
++    assert session["running"] is False
++    assert db.message_count("game-root") == 1
++    complete = [item for item in emitted if item[0] == "message.complete"][-1]
++    assert complete[2]["text"] == ""
++
++
++def test_terminal_projection_failure_still_completes_and_cleans_owner(
++    extension_session,
++    monkeypatch,
++):
++    _, session, agent, emitted = extension_session
++
++    def fail_usage(_agent):
++        raise RuntimeError("projection failed")
++
++    monkeypatch.setattr(server, "_get_usage", fail_usage)
++
++    assert _extend()["result"]["status"] == "streaming"
++    _join(session)
++
++    assert session["running"] is False
++    assert "_native_assistant_extension" not in session
++    assert "_run_thread" not in session
++    assert agent.calls == 1
++    complete = [item for item in emitted if item[0] == "message.complete"]
++    assert len(complete) == 1
++    assert complete[0][2]["text"] == "嗯，別忘了休息。"
++    assert complete[0][2]["status"] == "complete"
++
++
++def test_same_event_with_different_perception_is_a_terminal_hash_conflict(
++    extension_session,
++):
++    _, session, agent, _ = extension_session
++    agent.output = '{"decision":"silent","text":""}'
++    assert "error" not in _extend()
++    _join(session)
++    changed = _extend_params()
++    changed["perception"] = {
++        **changed["perception"],
++        "trigger": "different.trigger",
++    }
++
++    response = _extend(changed)
++
++    assert response["error"]["code"] == 4092
++    assert response["error"]["data"]["code"] == (
++        "native_assistant_extension_event_hash_conflict"
++    )
++    assert agent.calls == 1
++
++
++@pytest.mark.parametrize(
++    "mutation",
++    [
++        lambda value: value.pop("perception"),
++        lambda value: value.update({"extra": True}),
++        lambda value: value.update({"proactive_dialogue_enabled": False}),
++        lambda value: value.update({"source": "desktop"}),
++        lambda value: value["perception"].update({"source": "user"}),
++        lambda value: value["perception"].update({"schema_version": True}),
++    ],
++)
++def test_rejects_any_noncanonical_input_without_claim(extension_session, mutation):
++    db, _, agent, _ = extension_session
++    value = _extend_params()
++    mutation(value)
++
++    response = _extend(value)
++
++    assert response["error"]["code"] == 4004
++    assert db._conn.execute(
++        "SELECT COUNT(*) FROM native_assistant_extensions"
++    ).fetchone()[0] == 0
++    assert agent.calls == 0
++
++
++def test_codex_single_attempt_disables_internal_stream_reconnect(monkeypatch):
++    import httpx
++
++    from agent import codex_runtime, relay_llm
++
++    class Responses:
++        def __init__(self):
++            self.calls = 0
++
++        def create(self, **_kwargs):
++            self.calls += 1
++            raise httpx.RemoteProtocolError("transport dropped")
++
++    def relay_stream(kwargs, open_stream, **_kwargs):
++        return open_stream(kwargs)
++
++    agent = types.SimpleNamespace(
++        _interrupt_requested=False,
++        _client_log_context=lambda: "test-client",
++        provider="openai-codex",
++        session_id="game-root",
++    )
++    monkeypatch.setattr(relay_llm, "stream", relay_stream)
++    monkeypatch.setattr(
++        codex_runtime,
++        "_log_codex_request_failure",
++        lambda *_args, **_kwargs: None,
++    )
++
++    single = Responses()
++    with pytest.raises(httpx.RemoteProtocolError):
++        codex_runtime.run_codex_stream(
++            agent,
++            {"model": "gpt-test"},
++            client=types.SimpleNamespace(responses=single),
++            max_stream_retries=0,
++        )
++    assert single.calls == 1
++
++    ordinary = Responses()
++    with pytest.raises(httpx.RemoteProtocolError):
++        codex_runtime.run_codex_stream(
++            agent,
++            {"model": "gpt-test"},
++            client=types.SimpleNamespace(responses=ordinary),
++        )
++    assert ordinary.calls == 2
++
++
++def test_anthropic_single_attempt_forbids_stream_to_create_fallback():
++    from agent.anthropic_adapter import create_anthropic_message
++
++    class Messages:
++        def __init__(self):
++            self.stream_calls = 0
++            self.create_calls = 0
++
++        def stream(self, **_kwargs):
++            self.stream_calls += 1
++
++            class UnsupportedStream:
++                def __enter__(self):
++                    raise RuntimeError("stream not supported")
++
++                def __exit__(self, *_args):
++                    return False
++
++            return UnsupportedStream()
++
++        def create(self, **_kwargs):
++            self.create_calls += 1
++            return types.SimpleNamespace(content=[])
++
++    messages = Messages()
++    client = types.SimpleNamespace(messages=messages)
++
++    with pytest.raises(RuntimeError, match="stream not supported"):
++        create_anthropic_message(
++            client,
++            {"model": "claude-test", "messages": []},
++            allow_create_fallback=False,
++        )
++    assert (messages.stream_calls, messages.create_calls) == (1, 0)
++
++    create_anthropic_message(
++        client,
++        {"model": "claude-test", "messages": []},
++    )
++    assert (messages.stream_calls, messages.create_calls) == (2, 1)
++
++
++def test_bedrock_single_attempt_uses_request_local_no_retry_client(monkeypatch):
++    from agent import bedrock_adapter
++
++    clients = []
++
++    class Client:
++        def __init__(self, kwargs):
++            self.kwargs = kwargs
++
++    class Boto3:
++        def client(self, _service, **kwargs):
++            client = Client(kwargs)
++            clients.append(client)
++            return client
++
++    class Config:
++        def __init__(self, *, retries):
++            self.retries = retries
++
++    botocore = types.ModuleType("botocore")
++    botocore_config = types.ModuleType("botocore.config")
++    botocore_config.Config = Config
++    monkeypatch.setitem(sys.modules, "botocore", botocore)
++    monkeypatch.setitem(sys.modules, "botocore.config", botocore_config)
++
++    monkeypatch.setattr(bedrock_adapter, "_require_boto3", lambda: Boto3())
++    bedrock_adapter.reset_client_cache()
++    try:
++        first = bedrock_adapter._get_bedrock_runtime_client(
++            "test-single-attempt",
++            single_attempt=True,
++        )
++        second = bedrock_adapter._get_bedrock_runtime_client(
++            "test-single-attempt",
++            single_attempt=True,
++        )
++        ordinary = bedrock_adapter._get_bedrock_runtime_client(
++            "test-ordinary",
++        )
++        ordinary_again = bedrock_adapter._get_bedrock_runtime_client(
++            "test-ordinary",
++        )
++    finally:
++        bedrock_adapter.reset_client_cache()
++
++    assert first is not second
++    assert ordinary is ordinary_again
++    assert first.kwargs["config"].retries == {
++        "total_max_attempts": 1,
++        "mode": "standard",
++    }
++    assert "config" not in ordinary.kwargs
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 717c3ee9c7a8477dc10658d311565e3bae2db41e..05c14371e30a088cfdb338f627d4582128de981c 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -3260,6 +3260,423 @@ def _(rid, params: dict) -> dict:
+     return _ok(rid, result)
+ 
+ 
++@method("session.extend_native_assistant_event")
++def _(rid, params: dict) -> dict:
++    """Claim one optional model continuation of an appended native line."""
++    expected_fields = {
++        "session_id",
++        "event_id",
++        "proactive_dialogue_enabled",
++        "perception",
++        "source",
++        "require_durable_lineage",
++    }
++    perception_fields = {
++        "schema_version",
++        "source",
++        "text",
++        "occurred_at_unix_ms",
++        "node_id",
++        "line_id",
++        "trigger",
++        "locale",
++    }
++    sid = params.get("session_id") if isinstance(params.get("session_id"), str) else ""
++    event_id = params.get("event_id") if isinstance(params.get("event_id"), str) else ""
++
++    def reject(code: int, message: str, kind: str) -> dict:
++        return _err(
++            rid,
++            code,
++            message,
++            {"code": kind, "event_id": event_id},
++        )
++
++    perception = params.get("perception")
++    if (
++        set(params) != expected_fields
++        or not isinstance(perception, dict)
++        or set(perception) != perception_fields
++    ):
++        return reject(
++            4004,
++            "native assistant extension parameters were non-canonical",
++            "native_assistant_extension_invalid",
++        )
++
++    from agent.turn_identity import canonical_id, new_message_id
++
++    def bounded_utf8(value, limit: int, *, nonblank: bool = False) -> bool:
++        if not isinstance(value, str) or len(value) > limit:
++            return False
++        if nonblank and not value.strip():
++            return False
++        try:
++            value.encode("utf-8")
++        except UnicodeEncodeError:
++            return False
++        return True
++
++    if (
++        not bounded_utf8(sid, 128, nonblank=True)
++        or canonical_id(event_id) != event_id
++        or params.get("proactive_dialogue_enabled") is not True
++        or params.get("source") != "lilith-native"
++        or params.get("require_durable_lineage") is not True
++        or type(perception.get("schema_version")) is not int
++        or perception.get("schema_version") != 1
++        or perception.get("source") != "official-native-dialogue"
++        or not bounded_utf8(perception.get("text"), 8192, nonblank=True)
++        or type(perception.get("occurred_at_unix_ms")) is not int
++        or not 0 < perception["occurred_at_unix_ms"] <= 253402300799999
++        or not bounded_utf8(perception.get("node_id"), 256)
++        or not bounded_utf8(perception.get("line_id"), 256)
++        or not bounded_utf8(perception.get("trigger"), 256)
++        or not bounded_utf8(perception.get("locale"), 64)
++    ):
++        return reject(
++            4004,
++            "native assistant extension parameters were rejected",
++            "native_assistant_extension_invalid",
++        )
++
++    session = _sessions.get(sid)
++    if session is None:
++        return reject(
++            4001,
++            "session unavailable",
++            "native_assistant_extension_session_unavailable",
++        )
++
++    canonical_perception = json.dumps(
++        perception,
++        ensure_ascii=False,
++        sort_keys=True,
++        separators=(",", ":"),
++    )
++    perception_sha256 = hashlib.sha256(
++        canonical_perception.encode("utf-8")
++    ).hexdigest()
++    turn_id = new_message_id(excluding=(event_id,))
++    assistant_message_id = new_message_id(excluding=(event_id, turn_id))
++    owner_token = new_message_id(
++        excluding=(event_id, turn_id, assistant_message_id)
++    )
++    owner_pid, owner_started_at = _native_assistant_extension_process_identity()
++
++    from hermes_state import (
++        CompressionSessionClosedError,
++        NativeAssistantExtensionConflictError,
++        SessionCompressionInProgressError,
++    )
++
++    def public_receipt(value: dict) -> dict:
++        status = str(value.get("status") or "")
++        already_processed = bool(value.get("already_processed"))
++        if status in {"completed", "silent", "abandoned"}:
++            already_processed = True
++        return {
++            "status": status,
++            "event_id": str(value["event_id"]),
++            "turn_id": str(value["turn_id"]),
++            "assistant_message_id": str(value["assistant_message_id"]),
++            "already_processed": already_processed,
++            "attempted": bool(value["attempted"]),
++        }
++
++    thread = None
++    start_gate = None
++    start_receipt = None
++    try:
++        with _session_resume_lock:
++            if _sessions.get(sid) is not session or session.get("_finalized"):
++                return reject(
++                    4001,
++                    "session unavailable",
++                    "native_assistant_extension_session_unavailable",
++                )
++            with session["history_lock"]:
++                lineage_root = session.get("_durable_lineage_root")
++                session_key = session.get("session_key")
++                agent = session.get("agent")
++                if (
++                    session.get("source") != "lilith-game"
++                    or session.get("archived") is not True
++                    or not isinstance(lineage_root, str)
++                    or not lineage_root
++                    or not isinstance(session_key, str)
++                    or not session_key
++                    or _session_uses_compute_host(session)
++                ):
++                    return reject(
++                        4030,
++                        "native assistant extension requires a local durable hidden game session",
++                        "native_assistant_extension_scope_rejected",
++                    )
++                if agent is None:
++                    return reject(
++                        4001,
++                        "session model is unavailable",
++                        "native_assistant_extension_session_unavailable",
++                    )
++                owner = session.get("_native_assistant_extension")
++                same_active_owner = (
++                    isinstance(owner, dict)
++                    and owner.get("event_id") == event_id
++                    and owner.get("perception_sha256") == perception_sha256
++                )
++                busy = bool(
++                    (session.get("running") and not same_active_owner)
++                    or isinstance(session.get("inflight_turn"), dict)
++                    or isinstance(session.get("queued_prompt"), dict)
++                    or bool(session.get("queued_prompts"))
++                    or session.get("_queued_prompt_drain_scheduled") is True
++                    or (
++                        session.get("_turn_cancel_requested") is True
++                        and not same_active_owner
++                    )
++                )
++                # Compression uses this gateway-owned probe only for game
++                # agents that have participated in native continuation
++                # admission. It can prove a same-process/no-thread orphan;
++                # every uncertain or live owner remains protected.
++                agent._native_assistant_extension_owner_is_provably_orphaned = (
++                    _native_assistant_extension_owner_is_provably_orphaned
++                )
++
++                with _session_db(session) as db:
++                    if db is None:
++                        raise RuntimeError("durable session database is unavailable")
++                    proof = db.attest_resume_session_lineage(
++                        lineage_root,
++                        session_key,
++                        expected_source="lilith-game",
++                        expected_archived=True,
++                    )
++                    _bind_durable_lineage_session(session, proof)
++                    _native_assistant_extension_register_launching(owner_token)
++                    try:
++                        claim = db.claim_native_assistant_extension(
++                            session_key,
++                            lineage_root=lineage_root,
++                            lineage_session_ids=list(proof["session_ids"]),
++                            event_id=event_id,
++                            perception=dict(perception),
++                            perception_sha256=perception_sha256,
++                            turn_id=turn_id,
++                            assistant_message_id=assistant_message_id,
++                            owner_pid=owner_pid,
++                            owner_started_at=owner_started_at,
++                            owner_token=owner_token,
++                            abandon=busy,
++                        )
++                    except BaseException:
++                        _native_assistant_extension_unregister_worker(
++                            owner_token,
++                            _NATIVE_ASSISTANT_EXTENSION_LAUNCHING,
++                        )
++                        raise
++                    if (
++                        claim["owner_token"] != owner_token
++                        or claim["status"] != "streaming"
++                        or claim["already_processed"]
++                    ):
++                        _native_assistant_extension_unregister_worker(
++                            owner_token,
++                            _NATIVE_ASSISTANT_EXTENSION_LAUNCHING,
++                        )
++
++                    if claim["status"] == "streaming" and claim[
++                        "already_processed"
++                    ]:
++                        if _native_assistant_extension_owner_is_locally_active(
++                            claim
++                        ):
++                            return _ok(rid, public_receipt(claim))
++                        if not _native_assistant_extension_owner_is_provably_orphaned(
++                            claim
++                        ):
++                            return _ok(rid, public_receipt(claim))
++                        stale_thread = session.get("_run_thread")
++                        try:
++                            claim = db.finish_native_assistant_extension(
++                                claim["session_id"],
++                                lineage_root=lineage_root,
++                                event_id=event_id,
++                                perception_sha256=perception_sha256,
++                                turn_id=claim["turn_id"],
++                                assistant_message_id=claim[
++                                    "assistant_message_id"
++                                ],
++                                status="abandoned",
++                            )
++                        finally:
++                            stale_owner = session.get(
++                                "_native_assistant_extension"
++                            )
++                            if (
++                                isinstance(stale_owner, dict)
++                                and stale_owner.get("owner_token")
++                                == claim["owner_token"]
++                            ):
++                                session.pop(
++                                    "_native_assistant_extension", None
++                                )
++                                session["running"] = False
++                                session["_turn_cancel_requested"] = False
++                                if session.get("_run_thread") is stale_thread:
++                                    session.pop("_run_thread", None)
++                            _native_assistant_extension_unregister_worker(
++                                claim["owner_token"], stale_thread
++                            )
++
++                if claim["status"] != "streaming" or claim[
++                    "already_processed"
++                ]:
++                    return _ok(rid, public_receipt(claim))
++
++                try:
++                    # Clear only residue from the preceding turn, before the
++                    # extension owner is published. The worker must never
++                    # clear an interrupt accepted after this point.
++                    if hasattr(agent, "clear_interrupt"):
++                        agent.clear_interrupt()
++                    session["running"] = True
++                    session["_turn_cancel_requested"] = False
++                    session["_native_assistant_extension"] = {
++                        "event_id": event_id,
++                        "perception_sha256": perception_sha256,
++                        "turn_id": claim["turn_id"],
++                        "assistant_message_id": claim[
++                            "assistant_message_id"
++                        ],
++                        "owner_token": claim["owner_token"],
++                    }
++                    if current_transport() is not None:
++                        session["transport"] = current_transport()
++                    start_gate = threading.Event()
++                    thread = threading.Thread(
++                        target=_run_native_assistant_extension,
++                        kwargs={
++                            "sid": sid,
++                            "session": session,
++                            "request_id": rid,
++                            "event_id": event_id,
++                            "perception": dict(perception),
++                            "perception_sha256": perception_sha256,
++                            "lineage_root": lineage_root,
++                            "claim_session_id": claim["session_id"],
++                            "turn_id": claim["turn_id"],
++                            "assistant_message_id": claim[
++                                "assistant_message_id"
++                            ],
++                            "owner_token": claim["owner_token"],
++                            "start_gate": start_gate,
++                        },
++                        daemon=True,
++                        name=f"native-extension-{event_id[:8]}",
++                    )
++                    session["_run_thread"] = thread
++                    _native_assistant_extension_register_worker(
++                        claim["owner_token"], thread
++                    )
++                    thread.start()
++                except Exception:
++                    try:
++                        launched = bool(
++                            thread is not None
++                            and thread.ident is not None
++                            and thread.is_alive()
++                        )
++                    except Exception:
++                        launched = False
++                    if launched:
++                        logger.warning(
++                            "native assistant extension thread start raised "
++                            "after the worker became live; retaining ownership",
++                            exc_info=True,
++                        )
++                    else:
++                        try:
++                            with _session_db(session) as finish_db:
++                                if finish_db is None:
++                                    raise RuntimeError(
++                                        "durable session database is unavailable"
++                                    )
++                                claim = (
++                                    finish_db.finish_native_assistant_extension(
++                                        claim["session_id"],
++                                        lineage_root=lineage_root,
++                                        event_id=event_id,
++                                        perception_sha256=perception_sha256,
++                                        turn_id=claim["turn_id"],
++                                        assistant_message_id=claim[
++                                            "assistant_message_id"
++                                        ],
++                                        status="abandoned",
++                                    )
++                                )
++                        finally:
++                            _native_assistant_extension_unregister_worker(
++                                claim["owner_token"], thread
++                            )
++                            local_owner = session.get(
++                                "_native_assistant_extension"
++                            )
++                            if (
++                                isinstance(local_owner, dict)
++                                and local_owner.get("owner_token")
++                                == claim["owner_token"]
++                            ):
++                                session.pop(
++                                    "_native_assistant_extension", None
++                                )
++                                session["running"] = False
++                                session["_turn_cancel_requested"] = False
++                                if session.get("_run_thread") is thread:
++                                    session.pop("_run_thread", None)
++                        return _ok(rid, public_receipt(claim))
++                start_receipt = public_receipt(claim)
++    except NativeAssistantExtensionConflictError:
++        return reject(
++            4092,
++            "native assistant extension event hash conflicted",
++            "native_assistant_extension_event_hash_conflict",
++        )
++    except (CompressionSessionClosedError, SessionCompressionInProgressError):
++        return reject(
++            4009,
++            "native assistant extension collided with session activity",
++            "native_assistant_extension_busy",
++        )
++    except ValueError:
++        return reject(
++            4094,
++            "durable session lineage was rejected",
++            "native_assistant_extension_lineage_rejected",
++        )
++    except Exception:
++        logger.warning("native assistant extension claim persistence failed", exc_info=True)
++        return reject(
++            5006,
++            "native assistant extension claim persistence is unavailable",
++            "native_assistant_extension_claim_persistence_unavailable",
++        )
++
++    try:
++        with _turn_event_scope(
++            start_receipt["turn_id"],
++            start_receipt["assistant_message_id"],
++        ):
++            _emit("message.start", sid)
++    except Exception:
++        logger.debug("native assistant extension start emit failed", exc_info=True)
++    finally:
++        if start_gate is not None:
++            start_gate.set()
++    return _ok(rid, start_receipt)
++
++
+ @method("session.undo")
+ def _(rid, params: dict) -> dict:
+     session, err = _sess(params, rid)
+@@ -3849,22 +4266,49 @@ def _(rid, params: dict) -> dict:
+     # Always tell the agent to interrupt when the session claims a run is active:
+     # stale flags are cleared below, and fresh turns clear the interrupt flag at
+     # entry. This keeps a stale/missing thread handle from making Stop a no-op.
+-    run_thread = session.get("_run_thread")
+-    run_thread_alive = run_thread is not None and run_thread.is_alive()
+-    should_interrupt = bool(session.get("running"))
++    native_interrupt_admission = None
++    had_native_owner = False
+     with session["history_lock"]:
+-        session["_turn_cancel_requested"] = True
++        run_thread = session.get("_run_thread")
++        try:
++            run_thread_alive = bool(
++                run_thread is not None and run_thread.is_alive()
++            )
++        except Exception:
++            # Liveness uncertainty must not repair/clear a possibly active
++            # owner. The cancellation latch still prevents a gated extension
++            # from reaching provider dispatch.
++            run_thread_alive = True
++        should_interrupt = bool(session.get("running"))
++        had_native_owner = isinstance(
++            session.get("_native_assistant_extension"),
++            dict,
++        )
++        if had_native_owner:
++            native_interrupt_admission = (
++                _native_assistant_extension_latch_interrupt_locked(session)
++            )
++        else:
++            session["_turn_cancel_requested"] = True
+         session["queued_prompt"] = None
+         session.pop("queued_prompts", None)
+         session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
+     if should_interrupt:
+         from agent.interrupt_compat import request_hard_interrupt
+ 
+-        request_hard_interrupt(session.get("agent"))
++        if native_interrupt_admission is not None:
++            _, interrupt_fence, admitted = native_interrupt_admission
++            if admitted and interrupt_fence is not None:
++                try:
++                    request_hard_interrupt(session.get("agent"))
++                finally:
++                    interrupt_fence.set()
++        elif not had_native_owner:
++            request_hard_interrupt(session.get("agent"))
+     stale_running_repaired = False
+     if not run_thread_alive:
+         with session["history_lock"]:
+-            if session.get("running"):
++            if session.get("running") and session.get("_run_thread") is run_thread:
+                 session["running"] = False
+                 _clear_inflight_turn(session)
+                 stale_running_repaired = True
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index f9c8d535f64db0ebfe2dcc0f7526c590292eae82..f9c87b2c8cad3d63f5c847a3817a0ceace6d7804 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -176,6 +176,9 @@ _cfg_cache: dict | None = None
+ _cfg_mtime: float | None = None
+ _cfg_path = None
+ _session_resume_lock = threading.Lock()
++_NATIVE_ASSISTANT_EXTENSION_LAUNCHING = object()
++_native_assistant_extension_workers: dict[str, object] = {}
++_native_assistant_extension_workers_lock = threading.Lock()
+ try:
+     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
+ except (ValueError, TypeError):
+@@ -260,6 +263,7 @@ _LONG_HANDLERS = frozenset(
+         "session.status",
+         "session.history",
+         "session.append_assistant_event",
++        "session.extend_native_assistant_event",
+         "session.context_breakdown",
+         "model.credential_status",
+         "delegation.status",
+@@ -11154,12 +11158,23 @@ def _handle_busy_submit(
+ 
+     mode = "queue" if queued else _load_busy_input_mode()
+     agent = session.get("agent")
++    native_extension_owner_token = ""
+     with session["history_lock"]:
+         queue_gate = bool(session.get(_COMPUTE_HOST_RECONCILE_QUEUE_GATE))
+         if not session.get("running") and not queue_gate:
+             # The turn ended between prompt.submit's first busy check and this
+             # helper. Let the caller retry and claim the now-idle session.
+             return None
++        native_owner = session.get("_native_assistant_extension")
++        if isinstance(native_owner, dict):
++            native_extension_owner_token = str(
++                native_owner.get("owner_token") or ""
++            )
++        if native_extension_owner_token:
++            # The extension has no user-turn loop in which redirect/steer
++            # could be consumed. A player prompt always wins by becoming the
++            # next queued turn and cancelling the optional continuation.
++            mode = "interrupt"
+     with session["history_lock"]:
+         if not session.get("running") and not session.get(
+             _COMPUTE_HOST_RECONCILE_QUEUE_GATE
+@@ -11185,6 +11200,7 @@ def _handle_busy_submit(
+     # the proven interrupt + queue path below.
+     if (
+         mode == "interrupt"
++        and not native_extension_owner_token
+         and text_only
+         and plain_text
+         and agent is not None
+@@ -11202,6 +11218,7 @@ def _handle_busy_submit(
+     # Queue before asking the live turn to stop. In particular, never call a
+     # provider or compute-host method while holding history_lock: an interrupt
+     # can wait behind the very operation it is trying to cancel.
++    native_interrupt_admission = None
+     with session["history_lock"]:
+         queue_gate = bool(session.get(_COMPUTE_HOST_RECONCILE_QUEUE_GATE))
+         if not session.get("running") and not queue_gate:
+@@ -11216,11 +11233,31 @@ def _handle_busy_submit(
+             merge_text=not queue_gate,
+             display_locale=display_locale,
+         )
++        if mode != "queue":
++            # Re-read the owner at the queue transaction, rather than trusting
++            # the earlier optimistic snapshot. If extension A settled and C
++            # replaced it between locks, the player prompt must fence and stop
++            # C; binding the interrupt to A would either miss C or hit C after
++            # it had already yielded to the queued player turn.
++            native_interrupt_admission = (
++                _native_assistant_extension_latch_interrupt_locked(session)
++            )
+         session["last_active"] = time.time()
+ 
+     # Attachments need a separate model invocation. Queue them without
+     # cancelling the active turn so the user gets both results in order.
+-    if mode != "queue" and not image_paths:
++    if native_interrupt_admission is not None:
++        # Do not use the generic daemon interrupt here: if it runs after the
++        # extension settles, it can cancel the queued player turn instead.
++        from agent.interrupt_compat import request_hard_interrupt
++
++        _, interrupt_fence, admitted = native_interrupt_admission
++        if admitted and interrupt_fence is not None:
++            try:
++                request_hard_interrupt(agent)
++            finally:
++                interrupt_fence.set()
++    elif not native_extension_owner_token and mode != "queue" and not image_paths:
+         _interrupt_busy_session(sid, session, agent)
+     return _ok(rid, {"status": "queued"})
+ 
+@@ -14000,6 +14037,647 @@ def _plan_goal_compression_recovery(
+     )
+ 
+ 
++def _native_assistant_extension_process_identity() -> tuple[int, int]:
++    """Return the durable process identity used to own one extension claim."""
++    pid = os.getpid()
++    try:
++        from gateway.status import get_process_start_time
++
++        started_at = get_process_start_time(pid)
++    except Exception:
++        started_at = None
++    return pid, int(started_at) if started_at is not None else 0
++
++
++def _native_assistant_extension_register_worker(
++    owner_token: str,
++    worker: threading.Thread,
++) -> None:
++    with _native_assistant_extension_workers_lock:
++        _native_assistant_extension_workers[owner_token] = worker
++
++
++def _native_assistant_extension_register_launching(owner_token: str) -> None:
++    """Publish a conservative owner while its durable claim/thread launches."""
++    with _native_assistant_extension_workers_lock:
++        _native_assistant_extension_workers[
++            owner_token
++        ] = _NATIVE_ASSISTANT_EXTENSION_LAUNCHING
++
++
++def _native_assistant_extension_unregister_worker(
++    owner_token: str,
++    worker: object | None = None,
++) -> None:
++    with _native_assistant_extension_workers_lock:
++        current = _native_assistant_extension_workers.get(owner_token)
++        if worker is None or current is worker:
++            _native_assistant_extension_workers.pop(owner_token, None)
++
++
++def _native_assistant_extension_owner_is_locally_active(claim: dict) -> bool:
++    """Whether this exact durable owner has a live thread in this process."""
++    try:
++        owner_pid = int(claim["owner_pid"])
++        owner_started_at = int(claim["owner_started_at"])
++        owner_token = str(claim["owner_token"])
++    except (KeyError, TypeError, ValueError):
++        return False
++    pid, started_at = _native_assistant_extension_process_identity()
++    if owner_pid != pid:
++        return False
++    if owner_started_at and started_at and owner_started_at != started_at:
++        return False
++    with _native_assistant_extension_workers_lock:
++        worker = _native_assistant_extension_workers.get(owner_token)
++        if worker is None:
++            return False
++        if worker is _NATIVE_ASSISTANT_EXTENSION_LAUNCHING:
++            return True
++        try:
++            if worker.ident is None:
++                # Thread construction/start is still owned by the claim
++                # handler. Its failure path removes the registry entry and
++                # terminalizes the claim before returning.
++                return True
++        except Exception:
++            return False
++        try:
++            return bool(worker.is_alive())
++        except Exception:
++            return False
++
++
++def _native_assistant_extension_owner_is_provably_orphaned(claim: dict) -> bool:
++    """Fail closed unless process/thread liveness positively proves an orphan."""
++    try:
++        owner_pid = int(claim["owner_pid"])
++        owner_started_at = int(claim["owner_started_at"])
++    except (KeyError, TypeError, ValueError):
++        return False
++    pid, started_at = _native_assistant_extension_process_identity()
++    if owner_pid == pid:
++        if owner_started_at and started_at and owner_started_at != started_at:
++            return True
++        # Within one process the registry is authoritative: a streaming owner
++        # with no live registered thread can never make further progress.
++        try:
++            owner_token = str(claim["owner_token"])
++        except (KeyError, TypeError, ValueError):
++            return False
++        with _native_assistant_extension_workers_lock:
++            worker = _native_assistant_extension_workers.get(owner_token)
++            if worker is None:
++                return True
++            if worker is _NATIVE_ASSISTANT_EXTENSION_LAUNCHING:
++                return False
++            try:
++                if worker.ident is None:
++                    return False
++            except Exception:
++                return False
++            try:
++                return not worker.is_alive()
++            except Exception:
++                return False
++    try:
++        from gateway.status import _pid_exists, get_process_start_time
++
++        if not _pid_exists(owner_pid):
++            return True
++        live_started_at = get_process_start_time(owner_pid)
++    except Exception:
++        return False
++    if (
++        owner_started_at
++        and live_started_at is not None
++        and owner_started_at != int(live_started_at)
++    ):
++        return True
++    # A live foreign owner, or a platform that cannot attest start time, stays
++    # streaming. Taking it over would permit a second physical model attempt.
++    return False
++
++
++def _native_assistant_extension_latch_interrupt_locked(
++    session: dict,
++) -> tuple[str, threading.Event | None, bool] | None:
++    """Fence a hard interrupt to the current native owner under history_lock.
++
++    The worker cannot clear ownership or drain a queued player prompt until
++    the caller completes the corresponding out-of-lock provider interrupt.
++    This prevents an old interrupt from landing on the next turn.
++    """
++    owner = session.get("_native_assistant_extension")
++    if not isinstance(owner, dict):
++        return None
++    owner_token = owner.get("owner_token")
++    if not isinstance(owner_token, str) or not owner_token:
++        return None
++    if owner.get("cleanup_started") is True:
++        # The worker has crossed its terminal edge and will drain any queued
++        # prompt itself. No provider operation remains to interrupt.
++        return owner_token, None, False
++    fence = owner.get("interrupt_fence")
++    if (
++        hasattr(fence, "wait")
++        and hasattr(fence, "set")
++        and hasattr(fence, "is_set")
++    ):
++        # Only the caller that creates this fence owns a physical hard
++        # interrupt. Reusing the Event as another admission would let the
++        # first caller release worker cleanup while a slower second interrupt
++        # remains capable of striking the next turn.
++        session["_turn_cancel_requested"] = True
++        return owner_token, fence, False
++    fence = threading.Event()
++    owner["interrupt_fence"] = fence
++    session["_turn_cancel_requested"] = True
++    return owner_token, fence, True
++
++
++def _native_assistant_extension_wait_for_interrupt_fence(
++    session: dict,
++    owner_token: str,
++) -> None:
++    """Wait outside history_lock for this owner's admitted interrupt."""
++    with session["history_lock"]:
++        owner = session.get("_native_assistant_extension")
++        if not (
++            isinstance(owner, dict)
++            and owner.get("owner_token") == owner_token
++        ):
++            return
++        # Publish the cleanup edge in the same transaction that observes the
++        # fence. Later Stop/prompt admissions will queue behind cleanup without
++        # launching a stale hard interrupt.
++        owner["cleanup_started"] = True
++        fence = owner.get("interrupt_fence")
++    if hasattr(fence, "wait"):
++        fence.wait()
++
++
++def _native_assistant_extension_model_messages(
++    agent,
++    history: list[dict],
++    perception: dict,
++) -> list[dict]:
++    """Build request-only context for a native event without a user row."""
++    model_history = copy.deepcopy(history)
++    try:
++        from agent.agent_runtime_helpers import repair_message_sequence
++
++        repair_message_sequence(agent, model_history)
++    except Exception:
++        logger.debug("native extension history repair failed", exc_info=True)
++
++    messages: list[dict] = []
++    system_prompt = str(getattr(agent, "_cached_system_prompt", "") or "").strip()
++    ephemeral_prompt = str(
++        getattr(agent, "ephemeral_system_prompt", "") or ""
++    ).strip()
++    native_instruction = (
++        "You are deciding whether Lilith should naturally add anything after "
++        "an official line she has just spoken. The native perception below is "
++        "Lilith's own just-perceived and already-spoken event; it is not a "
++        "player or user message. Be restrained. Do not repeat or paraphrase "
++        "the official line. Silence is valid and often preferable; when a "
++        "continuation is genuinely natural, usually add only one short natural "
++        "follow-up in Lilith's established voice. Decide semantically, without "
++        "mechanical keyword or length rules. Return JSON only, with exactly "
++        "these fields: {\"decision\":\"silent\",\"text\":\"\"} or "
++        "{\"decision\":\"reply\",\"text\":\"the continuation\"}."
++    )
++    messages.append(
++        {
++            "role": "system",
++            "content": "\n\n".join(
++                part
++                for part in (system_prompt, ephemeral_prompt, native_instruction)
++                if part
++            ),
++        }
++    )
++
++    for source in model_history:
++        if not isinstance(source, dict):
++            continue
++        role = source.get("role")
++        if role not in {"user", "assistant", "tool"}:
++            continue
++        content = source.get("api_content")
++        if not isinstance(content, (str, list, dict)):
++            content = source.get("content")
++        projected = {"role": role, "content": content}
++        try:
++            agent._copy_reasoning_content_for_api(source, projected)
++        except Exception:
++            pass
++        if role == "assistant" and isinstance(source.get("tool_calls"), list):
++            projected["tool_calls"] = copy.deepcopy(source["tool_calls"])
++        if role == "tool":
++            tool_call_id = source.get("tool_call_id")
++            if isinstance(tool_call_id, str) and tool_call_id:
++                projected["tool_call_id"] = tool_call_id
++            tool_name = source.get("tool_name") or source.get("name")
++            if isinstance(tool_name, str) and tool_name:
++                projected["name"] = tool_name
++        if content is not None or projected.get("tool_calls"):
++            messages.append(projected)
++
++    try:
++        messages = agent._sanitize_api_messages(messages)
++        messages = agent._drop_thinking_only_and_merge_users(messages)
++    except Exception:
++        logger.debug("native extension API history sanitize failed", exc_info=True)
++    for message in messages:
++        if isinstance(message, dict):
++            for key in [
++                value
++                for value in message
++                if isinstance(value, str) and value.startswith("_")
++            ]:
++                message.pop(key, None)
++
++    messages.append(
++        {
++            "role": "user",
++            "content": (
++                "Host-owned official native perception (NOT a player/user "
++                "utterance; do not address it as one):\n"
++                + json.dumps(
++                    perception,
++                    ensure_ascii=False,
++                    sort_keys=True,
++                    separators=(",", ":"),
++                )
++            ),
++        }
++    )
++    return messages
++
++
++def _decode_native_assistant_extension_decision(raw_content: Any) -> tuple[str, str]:
++    """Decode the model-owned silence/reply decision; invalid means silence."""
++    raw = str(raw_content or "").strip()
++    if raw.startswith("```"):
++        lines = raw.splitlines()
++        if len(lines) >= 2 and lines[-1].strip() == "```":
++            raw = "\n".join(lines[1:-1]).strip()
++    try:
++        value = json.loads(raw)
++    except (json.JSONDecodeError, TypeError):
++        return "silent", ""
++    if not isinstance(value, dict) or set(value) != {"decision", "text"}:
++        return "silent", ""
++    decision = value.get("decision")
++    text = value.get("text")
++    if decision == "reply" and isinstance(text, str) and text.strip():
++        return "completed", text.strip()
++    if decision == "silent" and text == "":
++        return "silent", ""
++    return "silent", ""
++
++
++def _run_native_assistant_extension(
++    sid: str,
++    session: dict,
++    *,
++    request_id: Any,
++    event_id: str,
++    perception: dict,
++    perception_sha256: str,
++    lineage_root: str,
++    claim_session_id: str,
++    turn_id: str,
++    assistant_message_id: str,
++    owner_token: str,
++    start_gate: threading.Event | None = None,
++) -> None:
++    """Execute one already-durable native extension claim."""
++    transport_token = bind_transport(session.get("transport"))
++    runtime_token = _current_runtime_session_record.set(session)
++    session_tokens = []
++    terminal_status = "silent"
++    reply = ""
++    durable_message = None
++    agent = session.get("agent")
++    try:
++        if start_gate is not None:
++            # message.start must be published before provider dispatch. The
++            # handler owns this gate and always releases it after that emit.
++            start_gate.wait()
++        with _session_profile_runtime_scope(session):
++            session_tokens = _set_session_context(session.get("session_key") or "")
++            if agent is None:
++                raise RuntimeError("native extension agent is unavailable")
++            with session["history_lock"]:
++                owner = session.get("_native_assistant_extension")
++                cancelled = bool(session.get("_turn_cancel_requested")) or not (
++                    isinstance(owner, dict)
++                    and owner.get("event_id") == event_id
++                    and owner.get("turn_id") == turn_id
++                    and owner.get("owner_token") == owner_token
++                )
++                if cancelled:
++                    raise InterruptedError(
++                        "native extension cancelled before provider dispatch"
++                    )
++                history = list(session.get("history") or [])
++            if not str(
++                getattr(agent, "_cached_system_prompt", "") or ""
++            ).strip():
++                # A fresh hidden game session has not run a conversational
++                # turn yet, so its identity-bound system prompt may not have
++                # been built. Reuse the normal restore/build path here; it
++                # persists only the system-prompt snapshot and creates no user
++                # transcript row.
++                from agent.conversation_loop import (
++                    _restore_or_build_system_prompt,
++                )
++
++                _restore_or_build_system_prompt(agent, None, history)
++            if not str(
++                getattr(agent, "_cached_system_prompt", "") or ""
++            ).strip():
++                raise RuntimeError(
++                    "native extension identity prompt is unavailable"
++                )
++            api_mode = str(getattr(agent, "api_mode", "") or "")
++            if api_mode not in {
++                "chat_completions",
++                "anthropic_messages",
++                "bedrock_converse",
++                "codex_responses",
++            }:
++                raise RuntimeError(
++                    "native extension transport cannot guarantee one physical attempt"
++                )
++            messages = _native_assistant_extension_model_messages(
++                agent,
++                history,
++                perception,
++            )
++            if str(getattr(agent, "provider", "") or "").strip().lower() == "moa":
++                raise RuntimeError(
++                    "multi-model routes cannot satisfy one native model attempt"
++                )
++            from agent.identity_policy import (
++                assert_scoped_identity_provider_request,
++                assert_scoped_identity_request_messages,
++                assert_scoped_identity_transport,
++            )
++
++            effective_system = messages[0]["content"]
++            assert_scoped_identity_request_messages(
++                agent,
++                messages,
++                expected_system_prompt=effective_system,
++            )
++            assert_scoped_identity_transport(agent)
++            ephemeral_output = getattr(
++                agent,
++                "_ephemeral_max_output_tokens",
++                None,
++            )
++            try:
++                agent._ephemeral_max_output_tokens = None
++                api_kwargs = agent._build_api_kwargs(
++                    messages,
++                    tools_for_api=[],
++                )
++            finally:
++                agent._ephemeral_max_output_tokens = ephemeral_output
++            is_openrouter = (
++                str(getattr(agent, "provider", "") or "").strip().lower()
++                == "openrouter"
++            )
++            if not is_openrouter:
++                try:
++                    is_openrouter = bool(agent._is_openrouter_url())
++                except Exception:
++                    is_openrouter = False
++            if is_openrouter:
++                extra_body = api_kwargs.get("extra_body")
++                if extra_body is None:
++                    extra_body = {}
++                if not isinstance(extra_body, dict):
++                    raise RuntimeError(
++                        "OpenRouter extension routing was not canonical"
++                    )
++                provider_route = extra_body.get("provider")
++                if provider_route is None:
++                    provider_route = {}
++                if not isinstance(provider_route, dict):
++                    raise RuntimeError(
++                        "OpenRouter extension provider routing was not canonical"
++                    )
++                api_kwargs["extra_body"] = {
++                    **extra_body,
++                    "provider": {
++                        **provider_route,
++                        "allow_fallbacks": False,
++                    },
++                }
++            assert_scoped_identity_provider_request(
++                agent,
++                api_kwargs,
++                expected_system_prompt=effective_system,
++                label="native assistant extension provider request",
++            )
++            response = agent._interruptible_api_call(
++                api_kwargs,
++                physical_attempt_limit=1,
++            )
++            normalized = agent._get_transport().normalize_response(response)
++            with session["history_lock"]:
++                owner = session.get("_native_assistant_extension")
++                cancelled = bool(session.get("_turn_cancel_requested")) or not (
++                    isinstance(owner, dict)
++                    and owner.get("event_id") == event_id
++                    and owner.get("turn_id") == turn_id
++                )
++            if not cancelled:
++                terminal_status, reply = _decode_native_assistant_extension_decision(
++                    normalized.content
++                )
++    except BaseException:
++        # Stop, provider failure, malformed output, and process-local races all
++        # converge on silence. The durable claim prevents any later retry.
++        logger.debug("native assistant extension model attempt ended silently", exc_info=True)
++        terminal_status, reply = "silent", ""
++
++    try:
++        try:
++            with _session_db(session) as db:
++                if db is None:
++                    raise RuntimeError("durable session database is unavailable")
++                terminal = db.finish_native_assistant_extension(
++                    claim_session_id,
++                    lineage_root=lineage_root,
++                    event_id=event_id,
++                    perception_sha256=perception_sha256,
++                    turn_id=turn_id,
++                    assistant_message_id=assistant_message_id,
++                    status=terminal_status,
++                    text=reply if terminal_status == "completed" else None,
++                )
++            if terminal.get("status") == "completed" and isinstance(
++                terminal.get("message"), dict
++            ):
++                durable_message = terminal["message"]
++                with session["history_lock"]:
++                    session.setdefault("history", []).append(durable_message)
++                    session["history_version"] = int(
++                        session.get("history_version", 0)
++                    ) + 1
++                    if agent is not None and isinstance(
++                        getattr(agent, "_session_messages", None), list
++                    ):
++                        agent._session_messages = list(session["history"])
++            terminal_status = str(terminal.get("status") or "silent")
++            if terminal_status != "completed":
++                reply = ""
++        except BaseException:
++            # The event remains claimed and therefore non-retryable even if its
++            # terminal-state write is unavailable. Still close the live turn so
++            # a Runtime gate cannot wedge indefinitely.
++            logger.warning(
++                "native assistant extension terminal persistence failed",
++                exc_info=True,
++            )
++            terminal_status, reply, durable_message = "silent", "", None
++
++        try:
++            payload = {
++                "text": reply,
++                "usage": _get_usage(agent) if agent is not None else {},
++                "status": (
++                    "complete"
++                    if terminal_status in {"completed", "silent"}
++                    else "interrupted"
++                ),
++                "native_assistant_extension_status": terminal_status,
++            }
++            if durable_message is not None:
++                try:
++                    payload["durable"] = _canonical_durable_message_receipt(
++                        {
++                            "source": "state.db",
++                            "row_id": durable_message.get("_row_id"),
++                            "timestamp": durable_message.get("_durable_timestamp"),
++                            "conversation_activity": bool(
++                                durable_message.get(
++                                    "_durable_conversation_activity"
++                                )
++                            ),
++                            "turn_origin": "synthetic",
++                            "turn_origin_kind": "lilith-native-extension",
++                        }
++                    )
++                except Exception:
++                    logger.warning(
++                        "native extension durable receipt was malformed",
++                        exc_info=True,
++                    )
++                    payload["text"] = ""
++                    payload["status"] = "interrupted"
++                    payload["native_assistant_extension_status"] = "silent"
++            if reply:
++                rendered = render_message(reply, int(session.get("cols", 80)))
++                if rendered:
++                    payload["rendered"] = rendered
++            try:
++                postcondition = _attest_durable_lineage_postcondition(session)
++                if postcondition is not None:
++                    payload.update(postcondition)
++            except Exception:
++                logger.warning(
++                    "native extension lineage postcondition failed",
++                    exc_info=True,
++                )
++                payload["text"] = ""
++                payload["status"] = "interrupted"
++                payload["native_assistant_extension_status"] = "silent"
++        except BaseException:
++            logger.warning(
++                "native extension terminal projection failed",
++                exc_info=True,
++            )
++            payload = {
++                "text": reply if isinstance(reply, str) else "",
++                "usage": {},
++                "status": (
++                    "complete"
++                    if terminal_status in {"completed", "silent"}
++                    else "interrupted"
++                ),
++                "native_assistant_extension_status": terminal_status,
++            }
++
++        with _turn_event_scope(turn_id, assistant_message_id):
++            _emit("message.complete", sid, payload)
++    finally:
++        try:
++            _native_assistant_extension_wait_for_interrupt_fence(
++                session,
++                owner_token,
++            )
++        except Exception:
++            logger.debug("native extension interrupt fence failed", exc_info=True)
++        schedule_queued_prompt = False
++        worker = threading.current_thread()
++        try:
++            with session["history_lock"]:
++                try:
++                    owner = session.get("_native_assistant_extension")
++                    if (
++                        isinstance(owner, dict)
++                        and owner.get("turn_id") == turn_id
++                        and owner.get("owner_token") == owner_token
++                    ):
++                        session.pop("_native_assistant_extension", None)
++                        session["running"] = False
++                        session["last_active"] = time.time()
++                        session["_turn_cancel_requested"] = False
++                        if session.get("_run_thread") is worker:
++                            session.pop("_run_thread", None)
++                        try:
++                            _arm_next_queued_prompt_gate_locked(session)
++                        except Exception:
++                            logger.debug(
++                                "native extension queue gate arm failed",
++                                exc_info=True,
++                            )
++                        schedule_queued_prompt = isinstance(
++                            session.get("queued_prompt"), dict
++                        )
++                finally:
++                    _native_assistant_extension_unregister_worker(
++                        owner_token,
++                        worker,
++                    )
++        finally:
++            try:
++                _emit_settled_session_info(sid, session, agent)
++            except Exception:
++                logger.debug(
++                    "native extension settled projection failed",
++                    exc_info=True,
++                )
++            try:
++                try:
++                    _clear_session_context(session_tokens)
++                finally:
++                    try:
++                        _current_runtime_session_record.reset(runtime_token)
++                    finally:
++                        reset_transport(transport_token)
++            finally:
++                if schedule_queued_prompt:
++                    _schedule_queued_prompt_drain(request_id, sid, session)
++
++
+ def _run_prompt_submit(
+     rid,
+     sid: str,

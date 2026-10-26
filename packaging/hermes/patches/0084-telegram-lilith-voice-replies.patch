@@ -1,0 +1,1641 @@
+diff --git a/agent/lilith_telegram_tts.py b/agent/lilith_telegram_tts.py
+new file mode 100644
+index 0000000..2b62f8c
+--- /dev/null
++++ b/agent/lilith_telegram_tts.py
+@@ -0,0 +1,328 @@
++"""Host-supplied Lilith voice snapshot and turn-local native TTS selection."""
++import base64
++import asyncio
++from contextlib import contextmanager
++from contextvars import ContextVar
++import http.client
++import io
++import json
++import os
++from pathlib import Path
++import re
++import stat
++import struct
++import tempfile
++import threading
++import time
++from urllib.parse import urlsplit
++import wave
++
++from agent.tts_provider import TTSProvider
++
++PROVIDER = "lilith_gpt_sovits"
++ENVIRONMENT = "LILITH_TELEGRAM_VOICE_PROFILE"
++MAX_AUDIO = 25 * 1024 * 1024
++_ACTIVE = ContextVar("lilith_telegram_tts", default=False)
++_ALLOWED = ContextVar("lilith_telegram_tts_allowed", default=None)
++_FIELDS = frozenset({"version", "locale", "endpoint", "reference_path",
++                     "aux_reference_paths", "prompt_text", "config_fingerprint"})
++
++
++def _make_crc_table():
++    table = []
++    for byte in range(256):
++        crc = byte << 24
++        for _ in range(8):
++            crc = ((crc << 1) ^ (0x04C11DB7 if crc & 0x80000000 else 0)) & 0xffffffff
++        table.append(crc)
++    return tuple(table)
++
++
++_CRC_TABLE = _make_crc_table()
++
++
++def _object(pairs):
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise ValueError("Invalid Lilith voice snapshot")
++        result[key] = value
++    return result
++
++
++def read_snapshot():
++    try:
++        raw = os.environ.get(ENVIRONMENT, "")
++        if not raw or len(raw) > 65536:
++            raise ValueError()
++        result = json.loads(base64.b64decode(raw, validate=True).decode("utf-8"),
++                            object_pairs_hook=_object)
++        if type(result) is not dict or frozenset(result) != _FIELDS:
++            raise ValueError()
++        if type(result["version"]) is not int or result["version"] != 1:
++            raise ValueError()
++        if result["locale"] not in ("zh", "ja"):
++            raise ValueError()
++        if type(result["endpoint"]) is not str or len(result["endpoint"]) > 128:
++            raise ValueError()
++        url = urlsplit(result["endpoint"])
++        if (url.scheme != "http" or url.hostname not in ("127.0.0.1", "::1")
++                or url.port != (9880 if result["locale"] == "zh" else 9881)
++                or url.username or url.password or url.query or url.fragment
++                or url.path not in ("", "/", "/tts")):
++            raise ValueError()
++        paths = result["aux_reference_paths"]
++        if type(paths) is not list or len(paths) > 8:
++            raise ValueError()
++        for path in [result["reference_path"], *paths]:
++            if (type(path) is not str or not path or len(path.encode("utf-8")) > 4096
++                    or "\x00" in path or not Path(path).is_absolute()
++                    or Path(path).suffix.lower() != ".wav" or ".." in Path(path).parts):
++                raise ValueError()
++        prompt = result["prompt_text"]
++        if type(prompt) is not str or not prompt.strip() or len(prompt.encode("utf-8")) > 16384 or "\x00" in prompt:
++            raise ValueError()
++        if not re.fullmatch(r"[0-9a-fA-F]{64}", result["config_fingerprint"]):
++            raise ValueError()
++        return result
++    except (ValueError, TypeError, KeyError, UnicodeError):
++        raise ValueError("Lilith voice profile is unavailable") from None
++
++
++def scoped():
++    return _ACTIVE.get() is True
++
++
++def scope_permits_speech():
++    try:
++        current = _ALLOWED.get()
++        return current is None or current() is True
++    except Exception:
++        return False
++
++
++@contextmanager
++def voice_scope(enabled=True, allowed=None):
++    token = _ACTIVE.set(enabled is True)
++    permission_token = _ALLOWED.set(allowed)
++    try:
++        yield
++    finally:
++        _ALLOWED.reset(permission_token)
++        _ACTIVE.reset(token)
++
++
++def _wav(data):
++    if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
++        raise ValueError("Lilith synthesis did not return WAV audio")
++    if struct.unpack_from("<I", data, 4)[0] != len(data) - 8:
++        raise ValueError("Lilith synthesis returned incomplete WAV audio")
++    try:
++        with wave.open(io.BytesIO(data), "rb") as wav:
++            channels, width, rate, count, compression, _ = wav.getparams()
++            if (channels not in (1, 2) or width not in (1, 2, 3, 4)
++                    or not 8000 <= rate <= 96000 or not 0 < count / rate <= 300
++                    or compression != "NONE"):
++                raise ValueError()
++            if len(wav.readframes(count)) != count * channels * width:
++                raise ValueError()
++    except (ValueError, wave.Error, EOFError):
++        raise ValueError("Lilith synthesis returned invalid WAV audio") from None
++
++
++def validate_opus(path):
++    """Validate the bounded Ogg page/container and actual Opus identification.
++
++The encoder remains Hermes' native ffmpeg. Validate every page checksum,
++sequence, stream id, end flag and packet framing before native voice delivery.
++"""
++    with Path(path).open("rb") as handle:
++        data = handle.read(MAX_AUDIO + 1)
++    if not 100 <= len(data) <= MAX_AUDIO:
++        raise ValueError("Invalid Lilith Opus output")
++    offset = 0
++    serial = None
++    sequence = 0
++    packets = []
++    pending = bytearray()
++    ended = False
++    while offset < len(data):
++        start = offset
++        if offset + 27 > len(data) or data[offset:offset + 5] != b"OggS\x00" or ended:
++            raise ValueError("Invalid Lilith Opus container")
++        flags = data[offset + 5]
++        current_serial, current_sequence, checksum = struct.unpack_from("<III", data, offset + 14)
++        if serial is None:
++            serial = current_serial
++            if not flags & 2:
++                raise ValueError("Invalid Lilith Opus start")
++        if current_serial != serial or current_sequence != sequence or bool(flags & 1) != bool(pending):
++            raise ValueError("Invalid Lilith Opus sequence")
++        sequence += 1
++        segments = data[offset + 26]
++        offset += 27
++        if offset + segments > len(data):
++            raise ValueError("Incomplete Lilith Opus output")
++        laces = data[offset:offset + segments]
++        offset += segments
++        end = offset + sum(laces)
++        if end > len(data):
++            raise ValueError("Incomplete Lilith Opus output")
++        page = bytearray(data[start:end])
++        page[22:26] = b"\x00" * 4
++        crc = 0
++        for byte in page:
++            crc = ((crc << 8) ^ _CRC_TABLE[((crc >> 24) & 255) ^ byte]) & 0xffffffff
++        if crc != checksum:
++            raise ValueError("Invalid Lilith Opus checksum")
++        for size in laces:
++            pending.extend(data[offset:offset + size])
++            offset += size
++            if size < 255:
++                packets.append(bytes(pending))
++                pending.clear()
++        ended = bool(flags & 4)
++    if (not ended or pending or len(packets) < 3
++            or len(packets[0]) < 19 or packets[0][:9] != b"OpusHead\x01"
++            or packets[0][9] not in (1, 2) or not packets[1].startswith(b"OpusTags")
++            or any(not packet for packet in packets[2:])):
++        raise ValueError("Invalid Lilith Opus packets")
++
++
++async def synthesize_cancellable(tool, **kwargs):
++    """A cancelled await never delivers or strands late worker audio files."""
++    lock = threading.Lock()
++    cancelled = False
++    completed = None
++    requested = Path(kwargs["output_path"]).resolve()
++    existing = {str(p.resolve()) for p in requested.parent.glob(requested.stem + "*")}
++
++    def cleanup(raw):
++        try:
++            result = json.loads(raw)
++            paths = result.get("file_paths") or [result.get("file_path")]
++        except (ValueError, TypeError, AttributeError):
++            paths = []
++        for raw_path in [str(requested), str(requested.with_suffix(".wav")), *paths[:64]]:
++            if not raw_path:
++                continue
++            try:
++                path = Path(raw_path).resolve()
++                if (path.parent == requested.parent and path.name.startswith(requested.stem)
++                        and str(path) not in existing):
++                    path.unlink(missing_ok=True)
++            except (OSError, TypeError, ValueError):
++                pass
++
++    def work():
++        nonlocal completed
++        raw = tool(**kwargs)
++        with lock:
++            completed = raw
++            if cancelled:
++                cleanup(raw)
++        return raw
++
++    try:
++        return await asyncio.to_thread(work)
++    except asyncio.CancelledError:
++        with lock:
++            cancelled = True
++            if completed is not None:
++                cleanup(completed)
++        raise
++
++
++class LilithGptSovitsProvider(TTSProvider):
++    name = PROVIDER
++    display_name = "Lilith GPT-SoVITS (local)"
++    voice_compatible = True
++
++    def is_available(self):
++        try:
++            read_snapshot()
++            return True
++        except ValueError:
++            return False
++
++    def get_setup_schema(self):
++        return {"name": self.display_name, "badge": "local", "tag": "Host-supplied Lilith voice", "env_vars": []}
++
++    def synthesize(self, text, output_path, **_options):
++        profile = read_snapshot()
++        if Path(output_path).exists():
++            raise ValueError("Lilith synthesis output already exists")
++        if type(text) is not str or not text.strip() or len(text) > 5000:
++            raise ValueError("Lilith speech text exceeds limit")
++        for reference in [profile["reference_path"], *profile["aux_reference_paths"]]:
++            try:
++                info = Path(reference).lstat()
++                if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
++                        or int(getattr(info, "st_file_attributes", 0)) & 0x400):
++                    raise OSError()
++            except OSError:
++                raise ValueError("Lilith voice reference is unavailable") from None
++        url = urlsplit(profile["endpoint"])
++        payload = json.dumps({
++            "text": text, "text_lang": profile["locale"],
++            "ref_audio_path": profile["reference_path"],
++            "aux_ref_audio_paths": profile["aux_reference_paths"],
++            "prompt_text": profile["prompt_text"], "prompt_lang": profile["locale"],
++            "media_type": "wav", "streaming_mode": False,
++            "text_split_method": "cut0", "batch_size": 1, "seed": 42,
++        }, ensure_ascii=False).encode("utf-8")
++        connection = http.client.HTTPConnection(url.hostname, url.port, timeout=120)
++        # HTTPConnection connects directly to a numeric loopback address. It
++        # has no proxy/environment handling and never follows redirects.
++        try:
++            deadline = time.monotonic() + 120
++            connection.request("POST", "/tts", payload, {"Content-Type": "application/json"})
++            if connection.sock:
++                connection.sock.settimeout(max(0.1, deadline - time.monotonic()))
++            response = connection.getresponse()
++            if response.status != 200:
++                raise ValueError("Lilith synthesis service rejected the request")
++            length = response.getheader("Content-Length")
++            if length and (not length.isdecimal() or not 44 <= int(length) <= MAX_AUDIO):
++                raise ValueError("Lilith synthesis response exceeds limit")
++            chunks = []
++            total = 0
++            while True:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise TimeoutError()
++                if connection.sock:
++                    connection.sock.settimeout(remaining)
++                chunk = response.read1(min(65536, MAX_AUDIO + 1 - total))
++                if not chunk:
++                    break
++                total += len(chunk)
++                if total > MAX_AUDIO:
++                    raise ValueError("Lilith synthesis response exceeds limit")
++                chunks.append(chunk)
++            data = b"".join(chunks)
++            _wav(data)
++        except (OSError, http.client.HTTPException):
++            raise ValueError("Lilith synthesis service is unavailable") from None
++        finally:
++            connection.close()
++        destination = Path(output_path).with_suffix(".wav")
++        if destination.exists():
++            raise ValueError("Lilith synthesis output already exists")
++        destination.parent.mkdir(parents=True, exist_ok=True)
++        fd, scratch = tempfile.mkstemp(prefix=".lilith-voice-", suffix=".tmp", dir=destination.parent)
++        created = False
++        try:
++            with os.fdopen(fd, "wb") as handle:
++                handle.write(data)
++            # Exclusive output creation cannot replace a user-supplied file.
++            with destination.open("xb") as handle:
++                created = True
++                handle.write(Path(scratch).read_bytes())
++            return str(destination)
++        except Exception:
++            if created:
++                destination.unlink(missing_ok=True)
++            raise
++        finally:
++            Path(scratch).unlink(missing_ok=True)
+diff --git a/agent/tts_registry.py b/agent/tts_registry.py
+index 5e8f94b..3ac3232 100644
+--- a/agent/tts_registry.py
++++ b/agent/tts_registry.py
+@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
+ # create a circular dependency (``tools.tts_tool`` imports
+ # ``agent.tts_registry`` for dispatch).
+ _BUILTIN_NAMES = frozenset({
++    "sapi",
+     "edge",
+     "elevenlabs",
+     "openai",
+diff --git a/gateway/lilith_telegram_voice.py b/gateway/lilith_telegram_voice.py
+new file mode 100644
+index 0000000..59f5d92
+--- /dev/null
++++ b/gateway/lilith_telegram_voice.py
+@@ -0,0 +1,83 @@
++"""Lilith Telegram final-reply delivery policy, separate from permission policy."""
++import re
++
++from agent.identity_policy import identity_lock_required_by_host
++from gateway.config import Platform
++from gateway.lilith_voice_modes import read_modes
++
++
++def managed_source(runner, source):
++    try:
++        user = source.user_id
++        return (identity_lock_required_by_host() is True
++                and source.platform == Platform.TELEGRAM
++                and source.chat_type == "dm" and source.chat_id == user
++                and type(user) is str and re.fullmatch(r"[1-9][0-9]{0,18}", user) is not None
++                and int(user) <= 9223372036854775807
++                and runner._is_user_authorized(source) is True
++                and runner._pairing_store_for(source).is_approved("telegram", user) is True)
++    except Exception:
++        return False
++
++
++def managed_event(runner, event):
++    return (not bool(getattr(event, "internal", False))
++            and managed_source(runner, event.source))
++
++
++def strict_telegram(source):
++    return identity_lock_required_by_host() is True and source.platform == Platform.TELEGRAM
++
++
++_REQUESTS = (
++    r"(?:請|请|麻煩|麻烦)?(?:這次|这次|本次|這一則|这一则|這則|这则)?(?:請|请)?(?:用|以)(?:語音|语音|聲音|声音)(?:回覆|回復|回复|回答)(?:我)?(?:就好)?",
++    r"(?:請|请|麻煩|麻烦)?(?:語音|语音)(?:回覆|回復|回复|回答)(?:我)?",
++    r"(?:please\s+)?(?:reply|respond|answer)(?:\s+to\s+me)?\s+(?:with|in|using)\s+(?:a\s+)?(?:voice|audio)(?:\s+(?:message|reply))?(?:\s+(?:this\s+time|for\s+this\s+reply))?(?:\s+please)?",
++)
++
++
++def explicitly_requests_voice(text):
++    if type(text) is not str or not 0 < len(text) <= 16384:
++        return False
++    # Only a complete, unquoted directive sentence counts. Negated, reported,
++    # conditional and embedded instructions do not acquire delivery meaning.
++    if any(mark in text for mark in ('"', "'", "“", "”", "「", "」", "『", "』", "`", ">")):
++        return False
++    if re.search(r"(?:不要|不用|不需要|別|别|無需|无需).{0,12}(?:語音|语音|聲音|声音)|(?:do\s+not|no|never|without)\s+(?:.{0,20}\s)?(?:voice|audio)", text, re.IGNORECASE):
++        return False
++    sentences = re.split(r"[。！？!?\n]|(?<!\w)\.(?!\w)", text)
++    return any(any(re.fullmatch(pattern, sentence.strip(" \t,，.．"), re.IGNORECASE)
++                   for pattern in _REQUESTS) for sentence in sentences if sentence.strip())
++
++
++def reply_requested(runner, event):
++    try:
++        modes = read_modes(runner._VOICE_MODE_PATH)
++        mode = modes.get("telegram:" + event.source.user_id, "voice_only")
++    except Exception:
++        return False
++    if mode == "off":
++        return False
++    kind = str(getattr(event.message_type, "value", event.message_type)).lower()
++    return mode == "all" or kind == "voice" or explicitly_requests_voice(event.text)
++
++
++def scope_allowed(runner, ctx):
++    return bool(managed_source(runner, ctx.source)
++                and ctx._run_still_current() is True)
++
++
++def mode_allows_speech(runner, source):
++    try:
++        return (managed_source(runner, source)
++                and read_modes(runner._VOICE_MODE_PATH).get("telegram:" + source.user_id, "voice_only") != "off")
++    except Exception:
++        return False
++
++
++async def finish_voice_delivery(event, text_delivered):
++    callback = getattr(event, "_lilith_voice_delivery", None)
++    if callback is not None:
++        delattr(event, "_lilith_voice_delivery")
++    if callable(callback) and (text_delivered or getattr(event, "_lilith_voice_text_streamed", False)):
++        await callback()
+diff --git a/gateway/lilith_voice_modes.py b/gateway/lilith_voice_modes.py
+new file mode 100644
+index 0000000..7c13635
+--- /dev/null
++++ b/gateway/lilith_voice_modes.py
+@@ -0,0 +1,148 @@
++"""Shared native voice-mode store. Every writer merges under one process lock.
++
++The sibling lock is coordination only; gateway_voice_mode.json remains the
++single preference authority. No configuration, pairing or approval is written.
++"""
++from contextlib import contextmanager
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++import stat
++import tempfile
++import threading
++import time
++
++MODES = frozenset({"off", "voice_only", "all"})
++MAX_BYTES = 262144
++_LOCK = threading.RLock()
++
++
++class VoiceModeError(ValueError):
++    pass
++
++
++def _object(pairs):
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise VoiceModeError("Duplicate voice preference")
++        result[key] = value
++    return result
++
++
++def _regular(path):
++    try:
++        info = path.lstat()
++    except FileNotFoundError:
++        return None
++    if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
++            or int(getattr(info, "st_file_attributes", 0)) & 0x400):
++        raise VoiceModeError("Unsafe voice preference file")
++    return info
++
++
++def read_modes(path):
++    path = Path(path)
++    before = _regular(path)
++    if before is None:
++        return {}
++    if before.st_size > MAX_BYTES:
++        raise VoiceModeError("Voice preference store exceeds limit")
++    with path.open("rb") as handle:
++        opened = os.fstat(handle.fileno())
++        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
++            raise VoiceModeError("Voice preference file changed")
++        raw = handle.read(MAX_BYTES + 1)
++    if len(raw) > MAX_BYTES:
++        raise VoiceModeError("Voice preference store exceeds limit")
++    try:
++        result = json.loads(raw.decode("utf-8"), object_pairs_hook=_object)
++    except (ValueError, UnicodeError):
++        raise VoiceModeError("Invalid voice preference store") from None
++    if type(result) is not dict or any(
++        type(key) is not str or not re.fullmatch(r"[^\s\x00-\x1f:]{1,64}:[^\s\x00-\x1f]{1,256}", key)
++        or type(mode) is not str or mode not in MODES
++        for key, mode in result.items()
++    ):
++        raise VoiceModeError("Invalid voice preference store")
++    return result
++
++
++def revision(modes):
++    raw = json.dumps(modes, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
++    return hashlib.sha256(raw.encode("ascii")).hexdigest()
++
++
++@contextmanager
++def _locked(path):
++    lock_path = Path(str(path) + ".lock")
++    path.parent.mkdir(parents=True, exist_ok=True)
++    # Refuse a redirected parent; the native profile root is supplied by host.
++    for parent in (path.parent, *path.parent.parents):
++        info = parent.lstat()
++        if stat.S_ISLNK(info.st_mode) or int(getattr(info, "st_file_attributes", 0)) & 0x400:
++            raise VoiceModeError("Unsafe voice preference directory")
++    with _LOCK:
++        _regular(lock_path)
++        with lock_path.open("a+b") as handle:
++            opened = os.fstat(handle.fileno())
++            current = _regular(lock_path)
++            if current is None or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
++                raise VoiceModeError("Voice preference lock changed")
++            until = time.monotonic() + 5.0
++            while True:
++                try:
++                    if os.name == "nt":
++                        import msvcrt
++                        handle.seek(0)
++                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
++                    else:
++                        import fcntl
++                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++                    break
++                except OSError:
++                    if time.monotonic() >= until:
++                        raise VoiceModeError("Voice preference store is busy") from None
++                    time.sleep(0.02)
++            try:
++                yield
++            finally:
++                if os.name == "nt":
++                    handle.seek(0)
++                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
++                else:
++                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
++
++
++def merge_modes(path, changes, *, expected_revision=None, authorize=None):
++    path = Path(path)
++    if any(type(k) is not str or ":" not in k or v not in MODES for k, v in changes.items()):
++        raise VoiceModeError("Invalid voice preference update")
++    with _locked(path):
++        current = read_modes(path)
++        if expected_revision is not None and revision(current) != expected_revision:
++            raise VoiceModeError("Voice preferences changed; refresh and retry")
++        if authorize is not None and authorize() is not True:
++            raise VoiceModeError("Telegram user is not currently paired")
++        updated = {**current, **changes}
++        if updated == current:
++            return current
++        raw = json.dumps(updated, sort_keys=True, indent=2).encode("utf-8")
++        if len(raw) > MAX_BYTES:
++            raise VoiceModeError("Voice preference store exceeds limit")
++        fd, scratch = tempfile.mkstemp(prefix=".voice-", suffix=".tmp", dir=path.parent)
++        try:
++            with os.fdopen(fd, "wb") as handle:
++                handle.write(raw)
++                handle.flush()
++                os.fsync(handle.fileno())
++            _regular(path)
++            if authorize is not None and authorize() is not True:
++                raise VoiceModeError("Telegram user is not currently paired")
++            os.replace(scratch, path)
++        finally:
++            if os.path.exists(scratch):
++                os.unlink(scratch)
++        return updated
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 1a044d1..62322e3 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -6375,7 +6375,10 @@ class BasePlatformAdapter(ABC):
+                 _tts_path = None
+                 _tts_paths: List[str] = []
+                 _tts_requested_path = None
++                from gateway.lilith_telegram_voice import strict_telegram
+                 if (self._should_auto_tts_for_chat(event.source.chat_id)
++                        and not strict_telegram(event.source)
++                        and not getattr(event, "_lilith_voice_owner", False)
+                         and event.message_type == MessageType.VOICE
+                         and text_content
+                         and not media_files
+@@ -6729,6 +6732,12 @@ class BasePlatformAdapter(ABC):
+                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
+             )
+ 
++            # Lilith's local service may need time or be unavailable. Keep the
++            # original native text/media ACK ahead of synthesis, while the
++            # existing tracked message task owns cancellation and shutdown.
++            from gateway.lilith_telegram_voice import finish_voice_delivery
++            await finish_voice_delivery(event, delivery_succeeded)
++
+             # The active drain owns debounce state. If a queue-mode timer has
+             # not fired yet, force-flush into _pending_messages here and let
+             # this task hand off the follow-up.
+diff --git a/gateway/run.py b/gateway/run.py
+index d95d38f..e3fb7d9 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5030,7 +5030,12 @@ class TurnRunner:
+ 
+     def run_sync(self):
+         from gateway.lilith_session_policy import shared_f7_turn_scope
+-        with shared_f7_turn_scope(self._runner, self._ctx):
++        from gateway.lilith_telegram_voice import scope_allowed, mode_allows_speech
++        from agent.lilith_telegram_tts import voice_scope
++        with shared_f7_turn_scope(self._runner, self._ctx), voice_scope(
++            scope_allowed(self._runner, self._ctx),
++            allowed=lambda: scope_allowed(self._runner, self._ctx) and mode_allows_speech(self._runner, self._ctx.source),
++        ):
+             return self._run_sync_inner()
+ 
+     def _run_sync_inner(self):
+@@ -7009,39 +7014,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         return f"{platform.value}:{chat_id}"
+ 
+     def _load_voice_modes(self) -> Dict[str, str]:
++        from gateway.lilith_voice_modes import read_modes
+         try:
+-            data = json.loads(self._VOICE_MODE_PATH.read_text(encoding="utf-8"))
+-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+-            return {}
+-
+-        if not isinstance(data, dict):
+-            return {}
+-
+-        valid_modes = {"off", "voice_only", "all"}
+-        result = {}
+-        for chat_id, mode in data.items():
+-            if mode not in valid_modes:
+-                continue
+-            key = str(chat_id)
+-            # Skip legacy unprefixed keys (warn and skip)
+-            if ":" not in key:
+-                logger.warning(
+-                    "Skipping legacy unprefixed voice mode key %r during migration. "
+-                    "Re-enable voice mode on that chat to rebuild the prefixed key.",
+-                    key,
+-                )
+-                continue
+-            result[key] = mode
++            result = read_modes(self._VOICE_MODE_PATH)
++        except (OSError, ValueError):
++            logger.warning("Native voice preferences could not be loaded")
++            result = {}
++        self._voice_modes_persisted_snapshot = dict(result)
+         return result
+ 
+     def _save_voice_modes(self) -> None:
+-        try:
+-            self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
+-            self._VOICE_MODE_PATH.write_text(
+-                json.dumps(self._voice_mode, indent=2), encoding="utf-8"
+-            )
+-        except OSError as e:
+-            logger.warning("Failed to save voice modes: %s", e)
++        from gateway.lilith_voice_modes import merge_modes
++        before = getattr(self, "_voice_modes_persisted_snapshot", {})
++        changes = {key: mode for key, mode in self._voice_mode.items() if before.get(key) != mode}
++        persisted = merge_modes(self._VOICE_MODE_PATH, changes)
++        self._voice_mode = dict(persisted)
++        self._voice_modes_persisted_snapshot = dict(persisted)
+ 
+     def _set_adapter_auto_tts_disabled(self, adapter, chat_id: str, disabled: bool) -> None:
+         """Update an adapter's in-memory auto-TTS suppression set if present."""
+@@ -19997,11 +19985,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 _stts_adapter is not None
+                 and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation))
+             )
++            event._lilith_voice_failed = bool(agent_result.get("failed"))
+             if (
+                 not _streaming_tts_done
+                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
+             ):
+-                await self._send_voice_reply(event, response)
++                event._lilith_voice_generation = (session_key, run_generation)
++                if getattr(event, "_lilith_voice_owner", False):
++                    # Original native text/media delivery runs first. The base
++                    # adapter awaits this event-owned callback in its existing
++                    # tracked message task after successful text delivery.
++                    event._lilith_voice_delivery = lambda: self._send_voice_reply(event, response)
++                    event._lilith_voice_text_streamed = _already_sent
++                else:
++                    await self._send_voice_reply(event, response)
+ 
+             # If streaming already delivered the response, extract and
+             # deliver any MEDIA: files before returning None.  Streaming
+@@ -21097,6 +21094,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+           in which case the base adapter won't have text for auto-TTS so the
+           runner must handle it.
+         """
++        from gateway.lilith_telegram_voice import managed_event, reply_requested, strict_telegram
++        lilith_managed = managed_event(self, event)
++        if strict_telegram(event.source):
++            # Runner owns this final voice attempt, including failures. The
++            # adapter must not retry using another configured voice backend.
++            event._lilith_voice_owner = True
++            if not lilith_managed:
++                return False
++            if getattr(event, "_lilith_voice_failed", False):
++                return False
+         if not response or response.startswith("Error:"):
+             return False
+ 
+@@ -21113,7 +21120,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             except Exception:
+                 adapter_auto_tts = False
+ 
+-        should = (
++        should = reply_requested(self, event) if lilith_managed else (
+             (voice_mode == "all")
+             or (voice_mode == "voice_only" and is_voice_input)
+             # ``voice.auto_tts`` is synced into the adapter on gateway startup.
+@@ -21150,7 +21157,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         # When streaming already delivered the text (already_sent=True),
+         # the base adapter will receive None and can't run auto-TTS,
+         # so the runner must take over.
+-        if is_voice_input and not already_sent:
++        if is_voice_input and not already_sent and not lilith_managed:
+             return False
+ 
+         return True
+@@ -21161,6 +21168,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+ 
+     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
+         """Generate TTS audio and send as a voice message before the text reply."""
++        from gateway.lilith_telegram_voice import managed_event, reply_requested
++        if getattr(event, "_lilith_voice_owner", False):
++            generation = getattr(event, "_lilith_voice_generation", None)
++            if (not managed_event(self, event) or not reply_requested(self, event)
++                    or not getattr(self, "_running", True)
++                    or (generation is not None and not self._is_session_run_current(*generation))):
++                return
+         audio_path = None
+         actual_paths: List[str] = []
+         try:
+@@ -21177,9 +21191,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             # Ogg/Opus bytes for every provider. Others keep MP3.
+             audio_path = build_auto_tts_output_path(event.source.platform)
+ 
+-            result_json = await asyncio.to_thread(
+-                text_to_speech_tool, text=tts_text, output_path=audio_path
+-            )
++            from gateway.lilith_telegram_voice import managed_event, reply_requested
++            from agent.lilith_telegram_tts import voice_scope, validate_opus, synthesize_cancellable
++            lilith_managed = managed_event(self, event)
++            with voice_scope(lilith_managed, allowed=lambda: managed_event(self, event) and reply_requested(self, event)):
++                if lilith_managed:
++                    result_json = await synthesize_cancellable(
++                        text_to_speech_tool, text=tts_text, output_path=audio_path
++                    )
++                else:
++                    result_json = await asyncio.to_thread(
++                        text_to_speech_tool, text=tts_text, output_path=audio_path
++                    )
+             try:
+                 result = json.loads(result_json)
+             except (json.JSONDecodeError, TypeError):
+@@ -21200,6 +21223,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
+                 return
+ 
++            if lilith_managed:
++                if (not managed_event(self, event) or not reply_requested(self, event)
++                        or not getattr(self, "_running", True)):
++                    return
++                voice_generation = getattr(event, "_lilith_voice_generation", None)
++                if (voice_generation is not None
++                        and not self._is_session_run_current(*voice_generation)):
++                    return
++                if result.get("provider") != "lilith_gpt_sovits" or result.get("voice_compatible") is not True:
++                    return
++                for actual_path in actual_paths:
++                    validate_opus(actual_path)
++
+             adapter = self._adapter_for_source(event.source)
+ 
+             # If connected to a voice channel, play there instead of sending a file
+@@ -27618,9 +27654,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             message_type is not None
+             and str(getattr(message_type, "value", message_type)).lower() == "voice"
+         )
++        from gateway.lilith_telegram_voice import strict_telegram
+         if (
+             _stts_adapter is not None
+             and _is_voice_input
++            and not strict_telegram(source)
+             and _stts_adapter._should_auto_tts_for_chat(source.chat_id)
+         ):
+             try:
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+index 13463b1..f04e1ac 100644
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -3107,12 +3107,18 @@ class GatewaySlashCommandsMixin:
+ 
+     async def _handle_voice_command(self, event: MessageEvent) -> str:
+         """Handle /voice [on|off|tts|channel|leave|status] command."""
++        # Reload before applying a native explicit change: Control Center and
++        # gateway are separate processes sharing the same preference file.
++        if hasattr(self, "_load_voice_modes"):
++            self._voice_mode = self._load_voice_modes()
+         args = event.get_command_args().strip().lower()
+         chat_id = event.source.chat_id
+         platform = event.source.platform
+         voice_key = self._voice_key(platform, chat_id)
+ 
+         adapter = self.adapters.get(platform)
++        from gateway.lilith_telegram_voice import managed_event
++        _default_mode = "voice_only" if managed_event(self, event) else "off"
+ 
+         if args in {"on", "enable"}:
+             self._voice_mode[voice_key] = "voice_only"
+@@ -3137,7 +3143,7 @@ class GatewaySlashCommandsMixin:
+         elif args == "leave":
+             return await self._handle_voice_channel_leave(event)
+         elif args == "status":
+-            mode = self._voice_mode.get(voice_key, "off")
++            mode = self._voice_mode.get(voice_key, _default_mode)
+             labels = {
+                 "off": t("gateway.voice.label_off"),
+                 "voice_only": t("gateway.voice.label_voice_only"),
+@@ -3161,7 +3167,7 @@ class GatewaySlashCommandsMixin:
+             return t("gateway.voice.status_mode", label=labels.get(mode, mode))
+         else:
+             # Toggle: off → on, on/all → off
+-            current = self._voice_mode.get(voice_key, "off")
++            current = self._voice_mode.get(voice_key, _default_mode)
+             if current == "off":
+                 self._voice_mode[voice_key] = "voice_only"
+                 self._save_voice_modes()
+diff --git a/plugins/tts/lilith_gpt_sovits/__init__.py b/plugins/tts/lilith_gpt_sovits/__init__.py
+new file mode 100644
+index 0000000..00c70e9
+--- /dev/null
++++ b/plugins/tts/lilith_gpt_sovits/__init__.py
+@@ -0,0 +1,6 @@
++"""Native Hermes provider registration; no model or server lifecycle changes."""
++from agent.lilith_telegram_tts import LilithGptSovitsProvider
++
++
++def register(ctx):
++    ctx.register_tts_provider(LilithGptSovitsProvider())
+diff --git a/plugins/tts/lilith_gpt_sovits/plugin.yaml b/plugins/tts/lilith_gpt_sovits/plugin.yaml
+new file mode 100644
+index 0000000..f22a541
+--- /dev/null
++++ b/plugins/tts/lilith_gpt_sovits/plugin.yaml
+@@ -0,0 +1,5 @@
++name: lilith_gpt_sovits
++kind: backend
++version: 1.0.0
++description: "Host-supplied local Lilith GPT-SoVITS voice through the native TTS provider interface."
++author: "Lilith"
+diff --git a/tests/gateway/test_lilith_telegram_voice.py b/tests/gateway/test_lilith_telegram_voice.py
+new file mode 100644
+index 0000000..1b4e5a7
+--- /dev/null
++++ b/tests/gateway/test_lilith_telegram_voice.py
+@@ -0,0 +1,587 @@
++"""Synthetic Lilith Telegram voice contracts; no real chats or synthesis."""
++import asyncio
++import base64
++from concurrent.futures import ThreadPoolExecutor
++import io
++import json
++import os
++from pathlib import Path
++import struct
++import subprocess
++import sys
++import threading
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++import wave
++
++import pytest
++
++from agent import lilith_telegram_tts as voice
++from gateway import lilith_voice_modes as modes
++from gateway import lilith_telegram_voice as policy
++from gateway.config import Platform
++from gateway.platforms.base import MessageEvent, MessageType
++from gateway.session import SessionSource
++from tui_gateway import telegram_voice as rpc
++
++
++@pytest.fixture
++def profile(tmp_path, monkeypatch):
++    reference = tmp_path / "reference.wav"
++    reference.write_bytes(wav_bytes())
++    data = dict(version=1, locale="zh", endpoint="http://127.0.0.1:9880/tts",
++                reference_path=str(reference), aux_reference_paths=[], prompt_text="合成測試。",
++                config_fingerprint="A" * 64)
++    set_snapshot(monkeypatch, data)
++    return data
++
++
++def set_snapshot(monkeypatch, data):
++    monkeypatch.setenv(voice.ENVIRONMENT, base64.b64encode(json.dumps(data).encode()).decode())
++
++
++def wav_bytes():
++    output = io.BytesIO()
++    with wave.open(output, "wb") as wav:
++        wav.setparams((1, 2, 32000, 0, "NONE", "not compressed"))
++        wav.writeframes(b"\x00\x00" * 3200)
++    return output.getvalue()
++
++
++def ogg_bytes():
++    def page(seq, flags, packet):
++        data = bytearray(b"OggS\x00" + bytes([flags]) + struct.pack("<QIII", seq * 960, 7, seq, 0)
++                         + bytes([1, len(packet)]) + packet)
++        crc = 0
++        for byte in data:
++            crc ^= byte << 24
++            for _ in range(8):
++                crc = ((crc << 1) ^ (0x04C11DB7 if crc & 0x80000000 else 0)) & 0xffffffff
++        struct.pack_into("<I", data, 22, crc)
++        return bytes(data)
++    return (page(0, 2, b"OpusHead\x01\x01" + struct.pack("<HIhB", 312, 48000, 0, 0))
++            + page(1, 0, b"OpusTags" + struct.pack("<II", 0, 0))
++            + page(2, 4, b"\xf8\xff\xfe"))
++
++
++def test_snapshot_roundtrip(profile):
++    assert voice.read_snapshot() == profile
++    assert voice.LilithGptSovitsProvider().is_available()
++
++
++@pytest.mark.parametrize("field,value", [
++    ("version", True), ("version", 2), ("locale", "en"),
++    ("endpoint", "https://127.0.0.1:9880/tts"), ("endpoint", "http://example.com:9880/tts"),
++    ("endpoint", "http://localhost:9880/tts"), ("endpoint", "http://127.0.0.1:9881/tts"),
++    ("endpoint", "http://127.0.0.1:9880/tts?redirect=evil"), ("endpoint", "http://user@127.0.0.1:9880/tts"),
++    ("endpoint", "http://127.0.0.1:9880/control"), ("reference_path", "relative.wav"),
++    ("endpoint", True), ("endpoint", 42), ("endpoint", None), ("endpoint", []),
++    ("aux_reference_paths", "file.wav"), ("aux_reference_paths", ["bad.wav"] * 9),
++    ("prompt_text", ""), ("config_fingerprint", "0" * 63), ("config_fingerprint", 123),
++])
++def test_snapshot_rejects(profile, monkeypatch, field, value):
++    profile[field] = value
++    set_snapshot(monkeypatch, profile)
++    with pytest.raises(ValueError, match="unavailable"):
++        voice.read_snapshot()
++
++
++@pytest.mark.parametrize("raw", ["", "bad base64", "A" * 65537,
++    base64.b64encode(b'{"version":1,"version":1}').decode()], ids=["empty", "bad-base64", "oversize", "duplicate-json"])
++def test_bad_snapshot_encoding(monkeypatch, raw):
++    monkeypatch.setattr(voice.os, "environ", {voice.ENVIRONMENT: raw})
++    assert voice.LilithGptSovitsProvider().is_available() is False
++
++
++def fake_http(monkeypatch, payload=None, status=200, error=None):
++    seen = []
++    data = wav_bytes() if payload is None else payload
++    class Connection:
++        sock = None
++        def __init__(self, host, port, timeout):
++            seen.append((host, port, timeout))
++        def request(self, method, target, body, headers):
++            seen.append((method, target, json.loads(body), headers))
++            if error:
++                raise error
++        def getresponse(self):
++            output = io.BytesIO(data)
++            return SimpleNamespace(status=status, getheader=lambda _: str(len(data)), read1=output.read)
++        def close(self):
++            seen.append("closed")
++    monkeypatch.setattr(voice.http.client, "HTTPConnection", Connection)
++    return seen
++
++
++def test_provider_uses_fixed_local_profile(profile, tmp_path, monkeypatch):
++    monkeypatch.setenv("HTTP_PROXY", "http://invalid.test:1234")
++    seen = fake_http(monkeypatch)
++    result = voice.LilithGptSovitsProvider().synthesize("這是測試。", str(tmp_path / "out.ogg"), voice="wrong", model="wrong")
++    assert Path(result).suffix == ".wav"
++    voice._wav(Path(result).read_bytes())
++    assert seen[0] == ("127.0.0.1", 9880, 120)
++    assert seen[1][0:2] == ("POST", "/tts")
++    assert seen[1][2]["ref_audio_path"] == profile["reference_path"]
++    assert seen[1][2]["prompt_text"] == profile["prompt_text"]
++    assert "voice" not in seen[1][2]
++    assert seen[-1] == "closed"
++    assert not list(tmp_path.glob(".lilith-voice-*"))
++
++
++@pytest.mark.parametrize("status,payload,error", [(302, None, None), (500, None, None),
++    (200, b"not wave", None), (200, wav_bytes()[:-2], None), (200, None, TimeoutError())])
++def test_provider_failure_leaves_no_audio(profile, tmp_path, monkeypatch, status, payload, error):
++    seen = fake_http(monkeypatch, payload, status, error)
++    with pytest.raises(ValueError):
++        voice.LilithGptSovitsProvider().synthesize("測試", str(tmp_path / "out.ogg"))
++    assert list(tmp_path.iterdir()) == [Path(profile["reference_path"])]
++    assert seen[-1] == "closed"
++
++
++def test_opus_validation_and_corruption(tmp_path):
++    output = tmp_path / "test.ogg"
++    data = ogg_bytes()
++    output.write_bytes(data)
++    voice.validate_opus(output)
++    for bad in [wav_bytes(), b"OggSOpusHead", data[:-1], data[:50], data[:-1] + b"\x00", data + data]:
++        output.write_bytes(bad)
++        with pytest.raises(ValueError):
++            voice.validate_opus(output)
++
++
++def test_store_cas_and_preservation(tmp_path):
++    path = tmp_path / "modes.json"
++    original = modes.merge_modes(path, {"discord:7": "all", "telegram:8": "off"})
++    first_revision = modes.revision(original)
++    updated = modes.merge_modes(path, {"telegram:9": "voice_only"}, expected_revision=first_revision)
++    assert updated["discord:7"] == "all" and updated["telegram:8"] == "off"
++    before = path.read_bytes()
++    with pytest.raises(modes.VoiceModeError, match="refresh"):
++        modes.merge_modes(path, {"telegram:9": "all"}, expected_revision=first_revision)
++    assert path.read_bytes() == before
++    with pytest.raises(modes.VoiceModeError, match="paired"):
++        modes.merge_modes(path, {"telegram:9": "all"}, authorize=lambda: False)
++    assert path.read_bytes() == before
++
++
++def test_native_save_merges_external_update(tmp_path):
++    from gateway.run import GatewayRunner
++    runner = GatewayRunner.__new__(GatewayRunner)
++    runner._VOICE_MODE_PATH = tmp_path / "modes.json"
++    modes.merge_modes(runner._VOICE_MODE_PATH, {"telegram:9": "off"})
++    runner._voice_mode = runner._load_voice_modes()
++    modes.merge_modes(runner._VOICE_MODE_PATH, {"telegram:8": "all"})
++    runner._voice_mode["telegram:9"] = "voice_only"
++    runner._save_voice_modes()
++    assert modes.read_modes(runner._VOICE_MODE_PATH) == {"telegram:8": "all", "telegram:9": "voice_only"}
++
++
++def test_two_process_merges_do_not_lose_keys(tmp_path):
++    # Load only this stdlib-only store in independent copied interpreters.
++    worker = "import importlib.util,sys; s=importlib.util.spec_from_file_location('voice_store',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.merge_modes(sys.argv[2],{sys.argv[3]:sys.argv[4]})"
++    path = str(tmp_path / "modes.json")
++    commands = [[sys.executable, "-I", "-S", "-B", "-c", worker, modes.__file__, path, "telegram:" + str(i), "all"]
++                for i in (8, 9)]
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        results = list(pool.map(lambda cmd: subprocess.run(cmd, capture_output=True, timeout=30), commands))
++    assert all(result.returncode == 0 for result in results), [r.stderr.decode() for r in results]
++    assert modes.read_modes(Path(path)) == {"telegram:8": "all", "telegram:9": "all"}
++
++
++@pytest.mark.parametrize("text", ["請用語音回覆我。", "這次用語音回答。", "語音回覆", "Please reply with a voice message.",
++                                  "今天過得如何？請用語音回答我。", "Respond in audio this time!"])
++def test_explicit_requests(text):
++    assert policy.explicitly_requests_voice(text)
++
++
++@pytest.mark.parametrize("text", ["不要用語音回覆我。", "不用語音回答", "他說請用語音回覆。", "你可以用語音回覆嗎？",
++    "「請用語音回覆我。」", "Please don't reply with voice.", "If I ask, reply with voice.", "Translate: reply with voice.", "hello", ""])
++def test_no_inferred_requests(text):
++    assert not policy.explicitly_requests_voice(text)
++
++
++def source():
++    return SessionSource(platform=Platform.TELEGRAM, chat_id="9", user_id="9", chat_type="dm")
++
++
++@pytest.fixture
++def runner(tmp_path, monkeypatch):
++    from gateway.run import GatewayRunner
++    result = GatewayRunner.__new__(GatewayRunner)
++    result._VOICE_MODE_PATH = tmp_path / "modes.json"
++    result._voice_mode = {}
++    result.adapters = {}
++    result._is_user_authorized = lambda _: True
++    result._pairing_store_for = lambda _: SimpleNamespace(is_approved=lambda *_: True)
++    monkeypatch.setattr(policy, "identity_lock_required_by_host", lambda: True)
++    return result
++
++
++@pytest.mark.parametrize("mode,kind,text,expected", [
++    (None, MessageType.VOICE, "hello", True), (None, MessageType.TEXT, "hello", False),
++    (None, MessageType.TEXT, "請用語音回答。", True), ("all", MessageType.TEXT, "hello", True),
++    ("off", MessageType.VOICE, "hello", False), ("off", MessageType.TEXT, "請用語音回答。", False),
++    ("voice_only", MessageType.TEXT, "不用語音回答。", False),
++])
++def test_runner_delivery_matrix(runner, mode, kind, text, expected):
++    if mode:
++        modes.merge_modes(runner._VOICE_MODE_PATH, {"telegram:9": mode})
++    event = MessageEvent(source=source(), message_type=kind, text=text)
++    assert runner._should_send_voice_reply(event, "這是最後的回覆。", []) is expected
++    assert event._lilith_voice_owner is True
++
++
++def test_tts_dedup_only_current_turn(runner):
++    event = MessageEvent(source=source(), message_type=MessageType.VOICE, text="hello")
++    tts = {"role": "assistant", "tool_calls": [{"function": {"name": "text_to_speech"}}]}
++    assert runner._should_send_voice_reply(event, "final", [{"role": "user"}, tts]) is False
++    assert runner._should_send_voice_reply(event, "final", [tts, {"role": "user"}]) is True
++
++
++@pytest.mark.parametrize("bad_user", ["0", "01", "-1", "9.0", "9223372036854775808", 9])
++def test_rpc_rejects_bad_principal(bad_user):
++    with pytest.raises(ValueError):
++        rpc.status(bad_user)
++
++
++def test_rpc_scope_cas_and_exact_receipt(tmp_path, monkeypatch, profile):
++    path = tmp_path / "modes.json"
++    monkeypatch.setattr(rpc, "_path", lambda: path)
++    monkeypatch.setattr(rpc, "_store", lambda: SimpleNamespace(is_approved=lambda p, u: p == "telegram" and u == "9"))
++    before = rpc.status("9")
++    assert set(before) == {"user_id", "mode", "revision", "configured", "locale"}
++    assert before["mode"] == "voice_only" and before["configured"] and before["locale"] == "zh"
++    after = rpc.set_mode("9", "all", before["revision"])
++    assert after["mode"] == "all" and after["revision"] != before["revision"]
++    with pytest.raises(ValueError):
++        rpc.set_mode("9", "off", before["revision"])
++    with pytest.raises(ValueError):
++        rpc.status("8")
++    monkeypatch.delenv(voice.ENVIRONMENT)
++    unavailable = rpc.status("9")
++    assert unavailable["configured"] is False and unavailable["locale"] == "unavailable"
++
++
++def test_context_isolation_and_off(monkeypatch):
++    from tools import tts_tool
++    import hermes_cli.config
++    monkeypatch.setattr(hermes_cli.config, "load_config", lambda: {"tts": {"provider": "sapi"}})
++    assert tts_tool._load_tts_config()["provider"] == "sapi"
++    with voice.voice_scope(True, allowed=lambda: False):
++        assert tts_tool._load_tts_config()["provider"] == voice.PROVIDER
++        result = json.loads(tts_tool.text_to_speech_tool("sample", provider="edge"))
++        assert result["success"] is False and "disabled" in result["error"]
++    assert tts_tool._load_tts_config()["provider"] == "sapi"
++
++
++def test_missing_plugin_never_falls_back(monkeypatch, tmp_path):
++    from tools import tts_tool
++    from agent import tts_registry
++    import hermes_cli.plugins
++    monkeypatch.setattr(tts_registry, "get_provider", lambda _: None)
++    monkeypatch.setattr(hermes_cli.plugins, "_ensure_plugins_discovered", lambda **_: None)
++    monkeypatch.setattr(tts_tool, "_generate_edge_tts", lambda *_: pytest.fail("cloud fallback"))
++    with voice.voice_scope():
++        result = json.loads(tts_tool.text_to_speech_tool("sample", str(tmp_path / "result.ogg")))
++    assert result["success"] is False
++    assert not list(tmp_path.iterdir())
++
++
++def test_native_tts_provider_conversion_cleanup(profile, tmp_path, monkeypatch):
++    from tools import tts_tool
++    from agent import tts_registry
++    import hermes_cli.plugins
++    fake_http(monkeypatch)
++    provider = voice.LilithGptSovitsProvider()
++    monkeypatch.setattr(tts_registry, "get_provider", lambda _: provider)
++    monkeypatch.setattr(hermes_cli.plugins, "_ensure_plugins_discovered", lambda **_: None)
++    def convert(path):
++        output = Path(path).with_suffix(".ogg")
++        output.write_bytes(ogg_bytes())
++        return str(output)
++    monkeypatch.setattr(tts_tool, "_convert_to_opus", convert)
++    with voice.voice_scope():
++        result = json.loads(tts_tool.text_to_speech_tool("測試", str(tmp_path / "result.ogg"), provider="edge"))
++    assert result["success"] and result["provider"] == voice.PROVIDER and result["voice_compatible"]
++    assert not (tmp_path / "result.wav").exists()
++    voice.validate_opus(result["file_path"])
++
++
++@pytest.mark.parametrize("convert", [lambda _: None, lambda path: path])
++def test_opus_conversion_failure_cleans_audio(profile, tmp_path, monkeypatch, convert):
++    from tools import tts_tool
++    from agent import tts_registry
++    import hermes_cli.plugins
++    fake_http(monkeypatch)
++    monkeypatch.setattr(tts_registry, "get_provider", lambda _: voice.LilithGptSovitsProvider())
++    monkeypatch.setattr(hermes_cli.plugins, "_ensure_plugins_discovered", lambda **_: None)
++    monkeypatch.setattr(tts_tool, "_convert_to_opus", convert)
++    with voice.voice_scope():
++        result = json.loads(tts_tool.text_to_speech_tool("測試", str(tmp_path / "result.ogg")))
++    assert result["success"] is False
++    assert list(tmp_path.iterdir()) == [Path(profile["reference_path"])]
++
++
++def test_failed_encoder_partial_output_is_removed(profile, tmp_path, monkeypatch):
++    from tools import tts_tool
++    from agent import tts_registry
++    import hermes_cli.plugins
++    fake_http(monkeypatch)
++    monkeypatch.setattr(tts_registry, "get_provider", lambda _: voice.LilithGptSovitsProvider())
++    monkeypatch.setattr(hermes_cli.plugins, "_ensure_plugins_discovered", lambda **_: None)
++    def partial(path):
++        Path(path).with_suffix(".ogg").write_bytes(b"partial encoder output")
++        return None
++    monkeypatch.setattr(tts_tool, "_convert_to_opus", partial)
++    with voice.voice_scope():
++        result = json.loads(tts_tool.text_to_speech_tool("測試", str(tmp_path / "result.ogg")))
++    assert result["success"] is False
++    assert list(tmp_path.iterdir()) == [Path(profile["reference_path"])]
++
++
++def test_existing_ogg_sidecar_is_never_replaced(profile, tmp_path, monkeypatch):
++    from tools import tts_tool
++    from agent import tts_registry
++    import hermes_cli.plugins
++    fake_http(monkeypatch)
++    monkeypatch.setattr(tts_registry, "get_provider", lambda _: voice.LilithGptSovitsProvider())
++    monkeypatch.setattr(hermes_cli.plugins, "_ensure_plugins_discovered", lambda **_: None)
++    monkeypatch.setattr(tts_tool, "_convert_to_opus", lambda _: pytest.fail("must not overwrite existing output"))
++    prior = tmp_path / "result.ogg"
++    prior.write_bytes(b"keep existing user audio")
++    with voice.voice_scope():
++        result = json.loads(tts_tool.text_to_speech_tool("測試", str(tmp_path / "result.wav")))
++    assert result["success"] is False
++    assert prior.read_bytes() == b"keep existing user audio"
++    assert not (tmp_path / "result.wav").exists()
++
++
++def test_real_native_discovery_registers_bundled_backend(tmp_path, monkeypatch):
++    from hermes_cli import plugins
++    from agent import tts_registry
++    plugin_root = Path(voice.__file__).resolve().parents[1] / "plugins"
++    monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: plugin_root)
++    manager = plugins.PluginManager(scope_key=str(tmp_path))
++    try:
++        manager.discover_and_load()
++        loaded = manager._plugins["tts/lilith_gpt_sovits"]
++        assert loaded.manifest.kind == "backend" and loaded.enabled and not loaded.error
++        assert tts_registry.get_provider(voice.PROVIDER, scope=str(tmp_path)).name == voice.PROVIDER
++    finally:
++        manager.unload()
++    assert tts_registry.get_provider(voice.PROVIDER, scope=str(tmp_path)) is None
++
++
++@pytest.mark.parametrize("kind", ["group", "unpaired", "unauthorized", "internal"])
++def test_strict_chat_scope_does_not_emit(runner, kind):
++    event = MessageEvent(source=source(), message_type=MessageType.VOICE, text="hello")
++    runner._voice_mode["telegram:9"] = "all"
++    if kind == "group":
++        event.source.chat_type = "group"
++    elif kind == "unpaired":
++        runner._pairing_store_for = lambda _: SimpleNamespace(is_approved=lambda *_: False)
++    elif kind == "unauthorized":
++        runner._is_user_authorized = lambda _: False
++    else:
++        event.internal = True
++    assert not runner._should_send_voice_reply(event, "final", [])
++    assert event._lilith_voice_owner
++
++
++@pytest.mark.asyncio
++async def test_native_base_sends_text_before_slow_voice_and_keeps_original():
++    from gateway.config import PlatformConfig
++    from gateway.platforms.base import BasePlatformAdapter, SendResult
++    class Adapter(BasePlatformAdapter):
++        async def connect(self, **kwargs):
++            return True
++        async def disconnect(self):
++            pass
++        async def send(self, chat_id, content, **kwargs):
++            seen.append(("text", content))
++            return SendResult(success=True, message_id="123")
++        async def get_chat_info(self, chat_id):
++            return {"name": "test", "type": "dm"}
++    seen = []
++    release = asyncio.Event()
++    voice_started = asyncio.Event()
++    adapter = Adapter(PlatformConfig(), Platform.TELEGRAM)
++    adapter.config.extra["typing_indicator"] = False
++    event = MessageEvent(source=source(), message_type=MessageType.VOICE, text="hello")
++    event._lilith_voice_owner = True
++    original = "**原文完整保留。**"
++    async def voice_callback():
++        seen.append(("voice", None))
++        voice_started.set()
++        await release.wait()
++    async def handler(_):
++        event._lilith_voice_delivery = voice_callback
++        return original
++    adapter._message_handler = handler
++    task = asyncio.create_task(adapter._process_message_background(event, "test-session"))
++    try:
++        await asyncio.wait_for(voice_started.wait(), 2)
++        assert seen == [("text", original), ("voice", None)]
++        assert not task.done()
++        release.set()
++        await asyncio.wait_for(task, 2)
++        assert not hasattr(event, "_lilith_voice_delivery")
++    finally:
++        release.set()
++        if not task.done():
++            task.cancel()
++        await asyncio.gather(task, return_exceptions=True)
++
++
++@pytest.mark.asyncio
++async def test_failed_text_delivery_does_not_start_voice():
++    event = MessageEvent(source=source(), message_type=MessageType.VOICE, text="hello")
++    callback = AsyncMock()
++    event._lilith_voice_delivery = callback
++    await policy.finish_voice_delivery(event, False)
++    callback.assert_not_awaited()
++    await policy.finish_voice_delivery(event, True)
++    callback.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_streamed_text_voice_callback_is_one_shot():
++    event = MessageEvent(source=source(), message_type=MessageType.VOICE, text="hello")
++    callback = AsyncMock()
++    event._lilith_voice_delivery = callback
++    event._lilith_voice_text_streamed = True
++    await policy.finish_voice_delivery(event, False)
++    await policy.finish_voice_delivery(event, False)
++    callback.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_cancelled_worker_cleans_late_audio(tmp_path):
++    output = tmp_path / "cancel.ogg"
++    started = threading.Event()
++    release = threading.Event()
++    finished = threading.Event()
++    def slow_tool(**kwargs):
++        started.set()
++        assert release.wait(2)
++        output.write_bytes(ogg_bytes())
++        finished.set()
++        return json.dumps({"file_path": str(output)})
++    task = asyncio.create_task(voice.synthesize_cancellable(slow_tool, text="sample", output_path=str(output)))
++    try:
++        assert await asyncio.to_thread(started.wait, 2)
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++    finally:
++        release.set()
++    assert await asyncio.to_thread(finished.wait, 2)
++    # Synchronize with the executor worker's cleanup, not a wall-clock guess.
++    await asyncio.get_running_loop().run_in_executor(None, lambda: None)
++    for _ in range(20):
++        if not output.exists():
++            break
++        await asyncio.sleep(0.01)
++    assert not output.exists()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("reason", ["revoked", "off", "stale", "shutdown"])
++async def test_deferred_delivery_rechecks_before_synthesis(runner, monkeypatch, reason):
++    from tools import tts_tool
++    event = MessageEvent(source=source(), message_type=MessageType.VOICE, text="hello")
++    event._lilith_voice_owner = True
++    event._lilith_voice_generation = ("session", 1)
++    runner._running = True
++    runner._is_session_run_current = lambda *_: reason != "stale"
++    if reason == "revoked":
++        runner._is_user_authorized = lambda _: False
++    elif reason == "off":
++        modes.merge_modes(runner._VOICE_MODE_PATH, {"telegram:9": "off"})
++    elif reason == "shutdown":
++        runner._running = False
++    monkeypatch.setattr(tts_tool, "text_to_speech_tool", lambda **_: pytest.fail("synthesis after cancellation/revocation"))
++    await runner._send_voice_reply(event, "final")
++
++
++def test_rpc_registry_exact_params(tmp_path, monkeypatch):
++    from tui_gateway import methods_messaging
++    server = SimpleNamespace(_methods={})
++    methods_messaging.register(server)
++    handler = server._methods["messaging.telegram.voice.status"]
++    result = handler(1, {"user_id": "9", "unexpected": True})
++    assert result["error"]["code"] == -32602
++    monkeypatch.setattr(rpc, "status", lambda user: {"user_id": user})
++    assert handler(1, {"user_id": "9"})["result"] == {"user_id": "9"}
++
++
++@pytest.mark.asyncio
++async def test_native_voice_commands_show_effective_default_and_merge(runner):
++    event = MessageEvent(source=source(), message_type=MessageType.TEXT, text="/voice status")
++    default_status = await runner._handle_voice_command(event)
++    modes.merge_modes(runner._VOICE_MODE_PATH, {"telegram:9": "voice_only", "discord:6": "all"})
++    assert await runner._handle_voice_command(event) == default_status
++    event.text = "/voice off"
++    await runner._handle_voice_command(event)
++    assert modes.read_modes(runner._VOICE_MODE_PATH) == {"telegram:9": "off", "discord:6": "all"}
++
++
++@pytest.mark.asyncio
++async def test_early_error_base_never_uses_other_voice(monkeypatch):
++    from gateway.config import PlatformConfig
++    from gateway.platforms.base import BasePlatformAdapter, SendResult
++    from tools import tts_tool
++    seen = []
++    class Adapter(BasePlatformAdapter):
++        async def connect(self, **kwargs): return True
++        async def disconnect(self): pass
++        async def send(self, chat_id, content, **kwargs):
++            seen.append(content)
++            return SendResult(success=True, message_id="123")
++        async def get_chat_info(self, chat_id): return {"name": "test", "type": "dm"}
++    monkeypatch.setattr(policy, "identity_lock_required_by_host", lambda: True)
++    monkeypatch.setattr(tts_tool, "text_to_speech_tool", lambda **_: pytest.fail("wrong voice fallback"))
++    monkeypatch.setattr(tts_tool, "check_tts_requirements", lambda: pytest.fail("auto-TTS attempted"))
++    adapter = Adapter(PlatformConfig(), Platform.TELEGRAM)
++    adapter.config.extra["typing_indicator"] = False
++    adapter._auto_tts_default = True
++    event = MessageEvent(source=source(), message_type=MessageType.VOICE, text="hello")
++    async def handler(_): return "Error: synthetic failure"
++    adapter._message_handler = handler
++    await adapter._process_message_background(event, "early-error")
++    assert seen == ["Error: synthetic failure"]
++    assert not hasattr(event, "_lilith_voice_owner")
++
++
++def test_failed_agent_final_never_speaks(runner):
++    event = MessageEvent(source=source(), message_type=MessageType.VOICE, text="hello")
++    event._lilith_voice_failed = True
++    assert not runner._should_send_voice_reply(event, "服務暫時失敗", [])
++
++
++@pytest.mark.asyncio
++async def test_fake_sender_receives_only_verified_voice_and_cleanup(runner, tmp_path, monkeypatch):
++    import gateway.run
++    from tools import tts_tool
++    event = MessageEvent(source=source(), message_type=MessageType.VOICE, text="hello")
++    event._lilith_voice_owner = True
++    runner._running = True
++    runner._get_guild_id = lambda _: None
++    runner._reply_anchor_for_event = lambda _: "123"
++    runner._thread_metadata_for_source = lambda *_: {}
++    called = []
++    async def send_voice(**kwargs):
++        voice.validate_opus(kwargs["audio_path"])
++        called.append(kwargs)
++    runner._adapter_for_source = lambda _: SimpleNamespace(send_voice=send_voice)
++    output = tmp_path / "native.ogg"
++    monkeypatch.setattr(gateway.run, "build_auto_tts_output_path", lambda _: str(output))
++    def synth(**kwargs):
++        assert voice.scoped()
++        assert kwargs["text"] == "最後回覆。"
++        output.write_bytes(ogg_bytes())
++        return json.dumps({"success": True, "file_path": str(output), "provider": voice.PROVIDER, "voice_compatible": True})
++    monkeypatch.setattr(tts_tool, "text_to_speech_tool", synth)
++    await runner._send_voice_reply(event, "最後回覆。")
++    assert len(called) == 1 and called[0]["chat_id"] == "9" and called[0]["reply_to"] == "123"
++    assert not output.exists()
+diff --git a/tools/tts_tool.py b/tools/tts_tool.py
+index 925593e..d0512c6 100644
+--- a/tools/tts_tool.py
++++ b/tools/tts_tool.py
+@@ -641,6 +641,11 @@ def _load_tts_config() -> Dict[str, Any]:
+     Returns a dict with provider settings. Falls back to defaults
+     for any missing fields.
+     """
++    from agent.lilith_telegram_tts import PROVIDER, scoped
++    if scoped():
++        # The authenticated turn's host-selected voice is a contextual value,
++        # never a write to the user's global/native provider configuration.
++        return {"provider": PROVIDER, "output_format": "wav", PROVIDER: {"max_text_length": 5000}}
+     try:
+         from hermes_cli.config import load_config
+         config = load_config()
+@@ -931,9 +936,13 @@ def _dispatch_to_plugin_provider(
+             _ensure_plugins_discovered(force=True)
+             plugin_provider = get_provider(key)
+     except Exception as exc:  # noqa: BLE001 — discovery failure is non-fatal
++        if key == "lilith_gpt_sovits":
++            raise ValueError("Lilith local voice provider is unavailable") from None
+         logger.debug("tts plugin dispatch skipped (discovery failed): %s", exc)
+         return None
+     if plugin_provider is None:
++        if key == "lilith_gpt_sovits":
++            raise ValueError("Lilith local voice provider is unavailable")
+         return None
+ 
+     # Resolve voice / model / format from tts_config — providers should
+@@ -3538,6 +3547,9 @@ def _text_to_speech_single(
+         ) is not None:
+             file_str = _plugin_path
+ 
++        elif provider == "lilith_gpt_sovits":
++            raise ValueError("Lilith local voice provider is unavailable")
++
+         elif provider == "sapi":
+             logger.info("Generating speech with Windows SAPI (local)...")
+             file_str = _generate_sapi_tts(text, file_str, tts_config)
+@@ -3684,7 +3696,29 @@ def _text_to_speech_single(
+         # formats for local/CLI playback and only convert when the current
+         # platform actually needs Opus voice delivery.
+         voice_compatible = False
+-        if command_provider_config is not None:
++        if provider == "lilith_gpt_sovits":
++            from agent.lilith_telegram_tts import validate_opus
++            wav_path = file_str
++            opus_path = None
++            owned_opus_path = None
++            valid = False
++            try:
++                expected_opus_path = Path(wav_path).with_suffix(".ogg")
++                if expected_opus_path.exists():
++                    raise ValueError("Lilith voice output already exists")
++                owned_opus_path = expected_opus_path
++                opus_path = _convert_to_opus(wav_path)
++                if not opus_path or Path(opus_path) != expected_opus_path:
++                    raise ValueError("Lilith voice could not be converted to Opus")
++                validate_opus(opus_path)
++                file_str = opus_path
++                voice_compatible = valid = True
++            finally:
++                if wav_path != opus_path or not valid:
++                    Path(wav_path).unlink(missing_ok=True)
++                if owned_opus_path is not None and not valid:
++                    owned_opus_path.unlink(missing_ok=True)
++        elif command_provider_config is not None:
+             # Command providers are documents by default. Voice-bubble
+             # delivery only kicks in when the user explicitly opts in
+             # via ``voice_compatible: true`` in their provider config.
+@@ -3798,6 +3832,11 @@ def text_to_speech_tool(
+         return tool_error("Text is empty after TTS cleanup", success=False)
+ 
+     tts_config = _load_tts_config()
++    from agent.lilith_telegram_tts import PROVIDER, scoped, scope_permits_speech
++    if scoped():
++        if not scope_permits_speech():
++            return tool_error("Lilith voice is disabled for the current chat", success=False)
++        provider = PROVIDER
+ 
+     # When the model supplies a speed parameter, inject it into the config
+     # so all downstream provider functions pick it up uniformly.
+diff --git a/tui_gateway/methods_messaging.py b/tui_gateway/methods_messaging.py
+index 330af38..ef65fda 100644
+--- a/tui_gateway/methods_messaging.py
++++ b/tui_gateway/methods_messaging.py
+@@ -95,5 +95,18 @@ def _(rid, params: dict, _invoke=_call) -> dict:
+     )
+ 
+ 
++@method("messaging.telegram.voice.status")
++def _(rid, params: dict, _invoke=_call) -> dict:
++    from tui_gateway.telegram_voice import status
++    return _invoke(rid, params, ("user_id",), lambda: status(params.get("user_id")))
++
++
++@method("messaging.telegram.voice.set")
++def _(rid, params: dict, _invoke=_call) -> dict:
++    from tui_gateway.telegram_voice import set_mode
++    return _invoke(rid, params, ("user_id", "mode", "expected_revision"),
++                   lambda: set_mode(params.get("user_id"), params.get("mode"), params.get("expected_revision")))
++
++
+ def register(server) -> None:
+     _registry.install(server)
+diff --git a/tui_gateway/telegram_voice.py b/tui_gateway/telegram_voice.py
+new file mode 100644
+index 0000000..d817a48
+--- /dev/null
++++ b/tui_gateway/telegram_voice.py
+@@ -0,0 +1,60 @@
++"""Paired-user native voice preference management; no config mutation."""
++from pathlib import Path
++import re
++
++from agent.lilith_telegram_tts import read_snapshot
++from gateway.lilith_voice_modes import MODES, merge_modes, read_modes, revision, VoiceModeError
++from tui_gateway.telegram_messaging import TelegramMessagingRpcError
++
++
++def _user(value):
++    if (type(value) is not str or re.fullmatch(r"[1-9][0-9]{0,18}", value) is None
++            or int(value) > 9223372036854775807):
++        raise TelegramMessagingRpcError(-32602, "invalid params: user_id")
++    return value
++
++
++def _store():
++    from gateway.pairing import PairingStore
++    return PairingStore()
++
++
++def _path():
++    from hermes_constants import get_hermes_home
++    return Path(get_hermes_home()) / "gateway_voice_mode.json"
++
++
++def _receipt(user, modes):
++    try:
++        locale = read_snapshot()["locale"]
++    except ValueError:
++        locale = "unavailable"
++    return {"user_id": user, "mode": modes.get("telegram:" + user, "voice_only"),
++            "revision": revision(modes), "configured": locale != "unavailable", "locale": locale}
++
++
++def status(user_id):
++    user = _user(user_id)
++    if _store().is_approved("telegram", user) is not True:
++        raise TelegramMessagingRpcError(5072, "Telegram user is not currently paired")
++    try:
++        return _receipt(user, read_modes(_path()))
++    except (OSError, VoiceModeError):
++        raise TelegramMessagingRpcError(5073, "Telegram voice preferences are unavailable") from None
++
++
++def set_mode(user_id, mode, expected_revision):
++    user = _user(user_id)
++    if type(mode) is not str or mode not in MODES:
++        raise TelegramMessagingRpcError(-32602, "invalid params: mode")
++    if type(expected_revision) is not str or re.fullmatch(r"[0-9a-f]{64}", expected_revision) is None:
++        raise TelegramMessagingRpcError(-32602, "invalid params: expected_revision")
++    try:
++        modes = merge_modes(_path(), {"telegram:" + user: mode}, expected_revision=expected_revision,
++                            authorize=lambda: _store().is_approved("telegram", user))
++        persisted = read_modes(_path())
++        if revision(persisted) != revision(modes):
++            raise VoiceModeError("Voice preferences changed; refresh and retry")
++        return _receipt(user, persisted)
++    except (OSError, VoiceModeError):
++        raise TelegramMessagingRpcError(5073, "Telegram voice update was not confirmed; refresh and retry") from None

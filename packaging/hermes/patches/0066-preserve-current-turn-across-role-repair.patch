@@ -1,0 +1,383 @@
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index d1ed815d1f622f90159161d7f21e94e98780c98a..a8b21c9754d25156354a991e0f0ddb79561b6643 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -593,6 +593,20 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
+         return 0
+ 
+     repairs = 0
++    # Keep the exact current-turn object before any pass shrinks/reorders the
++    # list.  ``_persist_user_message_idx`` is established by turn setup and is
++    # re-anchored only after this repair returns; object identity is therefore
++    # the non-forgeable boundary available inside the repair itself.
++    current_turn_user = None
++    persist_user_index = getattr(agent, "_persist_user_message_idx", None)
++    if (
++        isinstance(persist_user_index, int)
++        and not isinstance(persist_user_index, bool)
++        and 0 <= persist_user_index < len(messages)
++    ):
++        candidate = messages[persist_user_index]
++        if isinstance(candidate, dict) and candidate.get("role") == "user":
++            current_turn_user = candidate
+ 
+     # Pass 0: merge consecutive assistant messages. Runs BEFORE Pass 1 so
+     # the merged turn's union of tool_call ids is known when Pass 1
+@@ -745,11 +759,30 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
+             # content alone — collapsing image/audio blocks risks
+             # mangling the attachment structure.
+             if isinstance(prev_content, str) and isinstance(new_content, str):
+-                prev["content"] = (
++                joined_content = (
+                     (prev_content + "\n\n" + new_content)
+                     if prev_content and new_content
+                     else (prev_content or new_content)
+                 )
++                preserve_current_turn_row = msg is current_turn_user
++                if preserve_current_turn_row:
++                    # Keep the *current prompt* object as the survivor whenever
++                    # role repair merges it with an adjacent historical row.
++                    # Its row receipt and typed provenance are the only valid
++                    # durable evidence for this turn.  This matters most after
++                    # a model switch: the preceding user-shaped timeline marker
++                    # carries display_kind=model_switch, and retaining that
++                    # older object makes stamp_turn_messages derive synthetic
++                    # provenance for the assistant.  More generally, no prior
++                    # row's durable receipt may be laundered onto the current
++                    # prompt if the prompt's own persistence failed.
++                    msg["content"] = joined_content
++                    drop_stale_api_content(msg)
++                    merged[-1] = msg
++                    repairs += 1
++                    continue
++
++                prev["content"] = joined_content
+                 # Merged content invalidates the api_content sidecar (exact
+                 # bytes previously sent for the pre-merge message) — drop it
+                 # so replay can't substitute stale bytes.
+diff --git a/tests/agent/test_turn_finalizer_final_response_persistence.py b/tests/agent/test_turn_finalizer_final_response_persistence.py
+index 2d96775ec241c8008e8e15213d0cefe16ed6942a..b1122e5311b488e6440bb50bd08d1c5b816404da 100644
+--- a/tests/agent/test_turn_finalizer_final_response_persistence.py
++++ b/tests/agent/test_turn_finalizer_final_response_persistence.py
+@@ -1,7 +1,11 @@
++import pytest
++
+ from types import SimpleNamespace
+ from typing import Any
+ 
++from agent.agent_runtime_helpers import repair_message_sequence
+ from agent.identity_policy import IdentityPolicy
++from agent.turn_context import reanchor_current_turn_user_idx
+ from agent.turn_finalizer import finalize_turn
+ from agent.turn_identity import (
+     MESSAGE_ID_METADATA_KEY,
+@@ -18,6 +22,7 @@ from agent.turn_identity import (
+     TURN_ORIGIN_USER,
+     TURN_ID_METADATA_KEY,
+     USER_MESSAGE_ID_METADATA_KEY,
++    stamp_turn_messages,
+ )
+ 
+ 
+@@ -288,6 +293,95 @@ def test_typed_memory_seam_prefers_exact_persisted_primary_rows(monkeypatch):
+     assert manager.calls[0]["assistant_response"] == "durable assistant"
+ 
+ 
++@pytest.mark.parametrize(
++    ("model", "provider"),
++    (
++        ("gemini/target", "gemini"),
++        ("deepseek/target", "deepseek"),
++        ("future/target", "future-provider"),
++    ),
++)
++def test_first_human_turn_after_any_model_switch_reaches_typed_memory_seam(
++    monkeypatch,
++    model,
++    provider,
++):
++    """The shared switch boundary must work for every target provider/model."""
++    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
++    text = "我喜歡吃草莓蛋糕"
++    answer = "好，我記住了。"
++    agent = FakeAgent()
++    agent.platform = "lilith-game"
++    agent.model = model
++    agent.provider = provider
++    agent._current_turn_id = _TURN_ID
++    agent._persist_user_message_idx = 1
++    agent._persist_user_message_override = text
++    manager = RecordingMemoryManager()
++    agent._memory_manager = manager
++
++    marker = {
++        "role": "user",
++        "content": (
++            "[System: The active model for this chat has changed to "
++            f"{model} via provider {provider}.]"
++        ),
++        "display_kind": "model_switch",
++        "_db_persisted": True,
++        "_row_id": 40,
++    }
++    current_user = _trusted_persisted_turn(
++        user_text=text,
++        assistant_text=answer,
++        human_origin=PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME,
++    )[0]
++    messages = [marker, current_user]
++
++    assert repair_message_sequence(agent, messages) == 1
++    assert messages[0] is current_user
++    current_index = reanchor_current_turn_user_idx(messages, text)
++    assert current_index == 0
++    agent._persist_user_message_idx = current_index
++    messages.append({"role": "assistant", "content": answer})
++    stamp_turn_messages(
++        messages,
++        user_index=current_index,
++        turn_id=_TURN_ID,
++        user_message_id=_USER_MESSAGE_ID,
++        assistant_message_id=_ASSISTANT_MESSAGE_ID,
++    )
++    # The real turn-end flush stamps this after the exact SQLite append.
++    messages[-1]["_db_persisted"] = True
++
++    finalize_turn(
++        agent,
++        final_response=answer,
++        api_call_count=1,
++        interrupted=False,
++        failed=False,
++        messages=messages,
++        conversation_history=[],
++        effective_task_id="task",
++        turn_id=_TURN_ID,
++        user_message=text,
++        original_user_message=text,
++        _should_review_memory=False,
++        _turn_exit_reason="text_response(stop)",
++    )
++
++    assert len(manager.calls) == 1
++    call = manager.calls[0]
++    assert call["user_message"] == text
++    assert "[System:" not in call["user_message"]
++    assert call["model"] == model
++    assert call["input_origin"]["attestation"] == (
++        PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME
++    )
++    assert call["input_origin"]["subject_id"] == (
++        PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID
++    )
++
++
+ def test_typed_memory_seam_accepts_only_the_three_attested_human_surfaces(
+     monkeypatch,
+ ):
+diff --git a/tests/run_agent/test_message_sequence_repair.py b/tests/run_agent/test_message_sequence_repair.py
+index e169f1e06821db4d30c7835c5d96147ffdccb5d2..eb22865df607dc054a66841dfe6e11e068eb530b 100644
+--- a/tests/run_agent/test_message_sequence_repair.py
++++ b/tests/run_agent/test_message_sequence_repair.py
+@@ -10,6 +10,7 @@ recovery every turn.
+ """
+ 
+ from run_agent import AIAgent
++from agent.agent_runtime_helpers import repair_message_sequence
+ 
+ 
+ def _bare_agent():
+@@ -69,6 +70,137 @@ def test_repair_preserves_user_content_when_one_side_empty():
+     assert messages == [{"role": "user", "content": "real message"}]
+ 
+ 
++def test_model_switch_merge_keeps_current_turn_row_and_its_durable_receipt():
++    agent = _bare_agent()
++    agent._current_turn_id = "1" * 32
++    agent._persist_user_message_idx = 1
++    agent._last_flushed_db_idx = 2
++    marker = {
++        "role": "user",
++        "content": "[System: model changed]",
++        "display_kind": "model_switch",
++        "_db_persisted": True,
++        "_row_id": 40,
++    }
++    current = {
++        "role": "user",
++        "content": "first prompt after switch",
++        "display_metadata": {
++            "hermes_turn_id": agent._current_turn_id,
++            "hermes_message_kind": "user",
++            "hermes_turn_origin": "user",
++        },
++        "_db_persisted": True,
++        "_row_id": 41,
++        "_durable_timestamp": 123.5,
++        "_durable_conversation_activity": True,
++        "api_content": "stale current-turn sidecar",
++    }
++    messages = [marker, current]
++
++    assert repair_message_sequence_with_cursor(agent, messages) == 1
++
++    assert messages == [current]
++    assert messages[0] is current
++    assert messages[0]["content"] == (
++        "[System: model changed]\n\nfirst prompt after switch"
++    )
++    assert messages[0]["_row_id"] == 41
++    assert messages[0]["_db_persisted"] is True
++    assert messages[0]["_durable_timestamp"] == 123.5
++    assert messages[0]["_durable_conversation_activity"] is True
++    assert agent._last_flushed_db_idx == 1
++    assert "display_kind" not in messages[0]
++    assert "api_content" not in messages[0]
++
++
++def test_model_switch_merge_never_lends_marker_receipt_to_unpersisted_prompt():
++    agent = _bare_agent()
++    agent._current_turn_id = "1" * 32
++    agent._persist_user_message_idx = 1
++    agent._last_flushed_db_idx = 1
++    marker = {
++        "role": "user",
++        "content": "[System: model changed]",
++        "display_kind": "model_switch",
++        "_db_persisted": True,
++        "_row_id": 40,
++    }
++    current = {
++        "role": "user",
++        "content": "prompt whose durable write failed",
++        "display_metadata": {
++            "hermes_turn_id": agent._current_turn_id,
++            "hermes_message_kind": "user",
++            "hermes_turn_origin": "user",
++        },
++    }
++    messages = [marker, current]
++
++    assert repair_message_sequence_with_cursor(agent, messages) == 1
++
++    assert messages == [current]
++    assert "_db_persisted" not in messages[0]
++    assert "_row_id" not in messages[0]
++    assert "_durable_timestamp" not in messages[0]
++    assert "_durable_conversation_activity" not in messages[0]
++    assert agent._last_flushed_db_idx == 0
++
++
++def test_current_turn_survives_an_unpersisted_prior_user_without_receipt_leak():
++    agent = _bare_agent()
++    agent._persist_user_message_idx = 1
++    current = {
++        "role": "user",
++        "content": "current",
++        "_db_persisted": True,
++        "_row_id": 41,
++        "_durable_timestamp": 123.5,
++        "_durable_conversation_activity": True,
++    }
++    messages = [
++        {
++            "role": "user",
++            "content": "unpersisted prior",
++            "display_kind": "synthetic-prior",
++        },
++        current,
++    ]
++
++    assert repair_message_sequence(agent, messages) == 1
++
++    assert messages == [current]
++    assert messages[0]["_row_id"] == 41
++    assert messages[0]["_durable_timestamp"] == 123.5
++    assert messages[0]["_durable_conversation_activity"] is True
++    assert "display_kind" not in messages[0]
++
++
++def test_historical_user_merge_without_current_object_keeps_earlier_survivor():
++    agent = _bare_agent()
++    agent._persist_user_message_idx = None
++    earlier = {
++        "role": "user",
++        "content": "historical one",
++        "_db_persisted": True,
++        "_row_id": 40,
++    }
++    later = {
++        "role": "user",
++        "content": "historical two",
++        "_db_persisted": True,
++        "_row_id": 41,
++    }
++    messages = [earlier, later]
++
++    assert repair_message_sequence(agent, messages) == 1
++
++    assert messages == [earlier]
++    assert messages[0] is earlier
++    assert messages[0]["content"] == "historical one\n\nhistorical two"
++    assert messages[0]["_row_id"] == 40
++
++
+ def test_repair_does_not_rewind_ongoing_dialog_tool_pair():
+     """assistant(tool_calls) + tool + user is a VALID pattern (user redirect
+     before the model gets its continuation turn). Repair must not touch it —
+@@ -377,6 +509,3 @@ def test_sanitize_drops_empty_tool_calls_array():
+ 
+ 
+ 
+-
+-
+-
+diff --git a/tests/test_tui_gateway_server_crash_history.py b/tests/test_tui_gateway_server_crash_history.py
+index 912ce759511197d982ce2fede00fbee5e3ed2b66..aa256ca6603c7b0b026a9474466d4bcf5138924f 100644
+--- a/tests/test_tui_gateway_server_crash_history.py
++++ b/tests/test_tui_gateway_server_crash_history.py
+@@ -242,24 +242,40 @@ def test_persisted_assistant_is_not_mutated_or_duplicated():
+ 
+ 
+ def test_role_repair_preserves_the_later_current_turn_identity():
++    agent = types.SimpleNamespace(
++        _current_turn_id="fresh-turn",
++        _persist_user_message_idx=1,
++    )
+     messages = [
+         {
+             "role": "user",
+             "content": "[System: model changed]",
+             "display_kind": "model_switch",
+             "display_metadata": {"provider": "gemini"},
++            "_db_persisted": True,
++            "_row_id": 40,
+         },
+         {
+             "role": "user",
+             "content": "fresh prompt",
+-            "display_metadata": {"hermes_turn_id": "fresh-turn"},
++            "display_metadata": {
++                "hermes_turn_id": "fresh-turn",
++                "hermes_message_kind": "user",
++            },
++            "_db_persisted": True,
++            "_row_id": 41,
+         },
+     ]
++    current_turn_row = messages[1]
+ 
+-    assert repair_message_sequence(None, messages) == 1
++    assert repair_message_sequence(agent, messages) == 1
+     assert len(messages) == 1
+-    assert messages[0]["display_kind"] == "model_switch"
++    assert messages[0] is current_turn_row
++    assert messages[0]["content"] == "[System: model changed]\n\nfresh prompt"
++    assert "display_kind" not in messages[0]
++    assert messages[0]["_row_id"] == 41
++    assert messages[0]["_db_persisted"] is True
+     assert messages[0]["display_metadata"] == {
+-        "provider": "gemini",
+         "hermes_turn_id": "fresh-turn",
++        "hermes_message_kind": "user",
+     }

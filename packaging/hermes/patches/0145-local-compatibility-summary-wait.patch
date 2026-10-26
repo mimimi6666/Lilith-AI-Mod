@@ -1,0 +1,16 @@
+diff --git a/agent/local_compatibility_summary.py b/agent/local_compatibility_summary.py
+index 9707bf2..6187de9 100644
+--- a/agent/local_compatibility_summary.py
++++ b/agent/local_compatibility_summary.py
+@@ -164,8 +164,10 @@ def generate_summary(compressor, policy, turns, *, focus_topic=None, memory_cont
+         messages = render(summary, chunk, index, len(chunks))
+         request = prepare_request(policy, {"messages": messages, "max_tokens": policy.output_reserve},
+             provider=compressor.provider, model=compressor.model, base_url=compressor.base_url, api_mode=compressor.api_mode)
++        # Local server queueing consumes the same bounded checkpoint deadline.
++        # Do not add a shorter per-call cutoff before the shared 90-second limit.
+         kwargs = dict(task="compression", messages=request["messages"],
+-                      max_tokens=request["max_tokens"], timeout=min(45.0, remaining),
++                      max_tokens=request["max_tokens"], timeout=remaining,
+                       main_runtime={"model": compressor.model, "provider": compressor.provider,
+                           "base_url": compressor.base_url, "api_key": compressor.api_key,
+                           "api_mode": compressor.api_mode})

@@ -1,0 +1,2 @@
+# Preserve source and pinned patch bytes, including intentional line endings.
+* -text

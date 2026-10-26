@@ -1,0 +1,475 @@
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 04af879..b547679 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -516,6 +516,7 @@ def _dispatch_nonstreaming_api_request(
+     interrupt, abort, cancellation, and close semantics stay in the callers —
+     this helper only issues the request.
+     """
++    from agent.paired_speech import observe_chat_sdk_request
+     if physical_attempt_limit not in {None, 1}:
+         raise ValueError("physical_attempt_limit must be None or 1")
+     from agent.usage_budget_native_dispatch import (
+@@ -591,11 +592,11 @@ def _dispatch_nonstreaming_api_request(
+         # in-process MoAClient facade. Do not rebuild a request-local
+         # OpenAI client from the virtual runtime metadata.
+         return native_chat_dispatch_sync(agent.client, api_kwargs,
+-            lambda wire: agent.client.chat.completions.create(**wire), expected_handle=_budget_handle)
++            lambda wire: observe_chat_sdk_request(agent, agent.client.chat.completions.create, wire), expected_handle=_budget_handle)
+     request_client = make_client("chat_completion_request")
+     return native_chat_dispatch_sync(
+         request_client, api_kwargs,
+-        lambda request: request_client.chat.completions.create(**request),
++        lambda request: observe_chat_sdk_request(agent, request_client.chat.completions.create, request),
+         expected_handle=_budget_handle,
+     )
+ 
+@@ -3584,9 +3585,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+             last_chunk_time["t"] = time.time()
+             agent._touch_activity("waiting for provider response (streaming)")
+             from agent.usage_budget_native_dispatch import native_chat_dispatch_sync
++            from agent.paired_speech import observe_chat_sdk_request
+             return native_chat_dispatch_sync(
+                 request_client, stream_kwargs,
+-                lambda request: request_client.chat.completions.create(**request),
++                lambda request: observe_chat_sdk_request(agent, request_client.chat.completions.create, request),
+                 expected_handle=getattr(agent, "_usage_budget_handle", None),
+             )
+ 
+diff --git a/agent/paired_speech.py b/agent/paired_speech.py
+index 9fb5789..c1e5636 100644
+--- a/agent/paired_speech.py
++++ b/agent/paired_speech.py
+@@ -4,11 +4,13 @@ This is output formatting, not a tool or permission. No provider calls, database
+ writes, preference reads or extra origins. Legacy/notification turns opt out.
+ """
+ from dataclasses import dataclass
++import json
+ import logging
+ import re
+ import uuid
+ 
+ _PREFIX = "<lilith_speech"
++_REMINDER_HEADER = "[Current reply delivery; host formatting only, not player text or action authority]"
+ _KEY = "_lilith_paired_speech"
+ logger = logging.getLogger(__name__)
+ EMOTIONS = frozenset({"calm", "gentle", "playful", "affectionate", "excited", "relieved", "surprised"})
+@@ -206,14 +208,149 @@ def begin_response(agent):
+         state.begin_response()
+ 
+ 
++def _text_observation(value, marker):
++    """Inspect known text shapes only; never stringify arbitrary SDK objects."""
++    if type(value) is str:
++        return {"status": "text", "chars": len(value),
++                "marker": marker in value, "prefix": _PREFIX in value.lower(),
++                "marker_count": value.count(marker), "prefix_count": value.lower().count(_PREFIX)}
++    if value is None:
++        return {"status": "absent", "chars": 0, "marker": False, "prefix": False,
++                "marker_count": 0, "prefix_count": 0}
++    return {"status": "unavailable", "chars": None, "marker": None, "prefix": None,
++            "marker_count": None, "prefix_count": None}
++
++
++def _request_text_observation(value, marker, contract):
++    data = _text_observation(value, marker)
++    if type(value) is str:
++        data.update(reminder_header=_REMINDER_HEADER in value, contract_exact=contract in value)
++    elif value is None:
++        data.update(reminder_header=False, contract_exact=False)
++    else:
++        data.update(reminder_header=None, contract_exact=None)
++    return data
++
++
++def _content_observation(value, marker, contract):
++    if type(value) is not list:
++        return _request_text_observation(value, marker, contract)
++    rows = []
++    for part in value:
++        kind = part.get("type") if type(part) is dict else None
++        if type(kind) is str and kind == "text":
++            rows.append(_request_text_observation(part.get("text"), marker, contract))
++        elif type(kind) is str and kind in {"image_url", "input_audio", "file"}:
++            # Deliberately do not inspect URLs, bytes, file names or metadata.
++            continue
++        else:
++            return _request_text_observation(object(), marker, contract)
++    return _combined_observation(rows, "text_parts", request=True)
++
++
++def _combined_observation(rows, status, *, request=False):
++    if any(row["status"] == "unavailable" for row in rows):
++        data = {"status": "unavailable", "chars": None, "marker": None, "prefix": None,
++                "marker_count": None, "prefix_count": None}
++        if request:
++            data.update(reminder_header=None, contract_exact=None)
++        return data
++    data = {"status": status, "chars": sum(row["chars"] for row in rows),
++            "marker": any(row["marker"] for row in rows), "prefix": any(row["prefix"] for row in rows),
++            "marker_count": sum(row["marker_count"] for row in rows),
++            "prefix_count": sum(row["prefix_count"] for row in rows)}
++    if request:
++        data.update(reminder_header=any(row["reminder_header"] for row in rows),
++                    contract_exact=any(row["contract_exact"] for row in rows))
++    return data
++
++
++def _observation_envelope(state, stage):
++    # Independent diagnostic correlation only: never log the speech nonce,
++    # session/turn identity, provider name, endpoint, prompt or response text.
++    if not hasattr(state, "_wire_observation_id"):
++        state._wire_observation_id = uuid.uuid4().hex
++        state._wire_observation_attempt = 0
++    return {"stage": stage, "observation": state._wire_observation_id,
++            "attempt": state._wire_observation_attempt}
++
++
++def _emit_observation(data):
++    logger.info("paired_speech_wire %s", json.dumps(data, sort_keys=True, separators=(",", ":")))
++
++
++def observe_chat_sdk_request(agent, create, request):
++    """Observe the final native-dispatch callback, then invoke the SDK once.
++
++    This is the chat SDK boundary, NOT raw HTTP. A built-in provider adapter
++    may still convert the request below this point. Observations never grant
++    authority, change request data, consume an iterator, retry or wrap results.
++    """
++    try:
++        state = state_for(agent)
++        if state is not None:
++            data = _observation_envelope(state, "chat_sdk_request")
++            state._wire_observation_attempt += 1
++            data["attempt"] = state._wire_observation_attempt
++            messages = request.get("messages") if type(request) is dict else None
++            contract = state.instruction()
++            unavailable = _request_text_observation(object(), state.open_tag, contract)
++            all_rows = []
++            final_user = None
++            data.update(message_count=None, final_user_index=None, final_role="unavailable")
++            if type(messages) is list:
++                data["message_count"] = len(messages)
++                for index, row in enumerate(messages):
++                    if type(row) is not dict:
++                        all_rows.append(unavailable)
++                        data["final_role"] = "unavailable"
++                        continue
++                    stats = _content_observation(row.get("content"), state.open_tag, contract)
++                    all_rows.append(stats)
++                    role = row.get("role")
++                    data["final_role"] = role if type(role) is str and role in {
++                        "system", "developer", "user", "assistant", "tool", "function"} else "unavailable"
++                    if type(role) is str and role == "user":
++                        final_user = stats
++                        data["final_user_index"] = index
++                data["messages"] = _combined_observation(all_rows, "messages", request=True)
++                data["final_user"] = final_user if final_user is not None else {**unavailable, "status": "absent"}
++            else:
++                data["messages"] = unavailable
++                data["final_user"] = unavailable
++            data["stream"] = request.get("stream") if type(request) is dict and type(request.get("stream")) is bool else None
++            _emit_observation(data)
++    except Exception:
++        # Even a broken logger or hostile diagnostic field must not change the
++        # original SDK call/return/exception, and no exception text is logged.
++        pass
++    return create(**request)
++
++
++def _observe_normalized_response(state, message, finish_reason, *, after_strip=False):
++    try:
++        data = _observation_envelope(state, "normalized_poststrip" if after_strip else "normalized_prestrip")
++        data["content"] = _text_observation(message.content, state.open_tag)
++        if not after_strip:
++            data["reasoning_content"] = _text_observation(getattr(message, "reasoning_content", None), state.open_tag)
++            data["reasoning"] = _text_observation(getattr(message, "reasoning", None), state.open_tag)
++        data["finish"] = finish_reason if type(finish_reason) is str and finish_reason in {
++            "stop", "tool_calls", "length", "incomplete", "content_filter", "function_call"} else "other"
++        _emit_observation(data)
++    except Exception:
++        pass
++
++
+ def accept_response(agent, message, finish_reason):
+     state = state_for(agent)
+     if state is not None:
++        _observe_normalized_response(state, message, finish_reason)
+         # Match the existing display normalizer before pairing; inline thinking
+         # is neither the visible answer nor material to speak aloud.
+         strip_thinking = getattr(agent, "_strip_think_blocks", None)
+         if isinstance(message.content, str) and callable(strip_thinking):
+             message.content = strip_thinking(message.content).strip()
++        _observe_normalized_response(state, message, finish_reason, after_strip=True)
+         message.content = state.accept(message.content, has_tools=bool(message.tool_calls), finish_reason=finish_reason)
+         # Closed reasons and lengths only: no raw output, nonce, prompt, keys,
+         # reasoning or endpoint details. Distinguish missing scripts from TTS.
+diff --git a/tests/test_speech_wire_observation.py b/tests/test_speech_wire_observation.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_speech_wire_observation.py
+@@ -0,0 +1,264 @@
++"""Content-free observations must never change speech or SDK behavior."""
++import ast
++import copy
++import json
++from pathlib import Path
++import types
++import unittest
++from unittest.mock import patch
++
++from agent import paired_speech
++
++
++class _Hostile:
++    def __str__(self):
++        raise AssertionError("must not stringify diagnostic inputs")
++
++    def __bool__(self):
++        raise AssertionError("must not coerce diagnostic inputs")
++
++    def __eq__(self, other):
++        raise AssertionError("must not compare diagnostic inputs")
++
++    def __hash__(self):
++        raise AssertionError("must not hash diagnostic inputs")
++
++
++class SpeechWireObservationTests(unittest.TestCase):
++    def setUp(self):
++        self.pair = paired_speech.PairedSpeech("a" * 32, "zh-Hant")
++        self.agent = types.SimpleNamespace(_lilith_paired_speech=self.pair,
++                                          _current_turn_id="a" * 32,
++                                          _strip_think_blocks=lambda text: text)
++        self.display = "早安，今天一起散步吧。"
++        self.speech = "おはよう。今日は一緒に散歩しましょう。"
++        self.records = []
++        self.emitter = patch.object(paired_speech, "_emit_observation", side_effect=self.records.append)
++        self.emitter.start()
++        self.addCleanup(self.emitter.stop)
++
++    def content(self):
++        return self.display + "\n" + self.pair.open_tag + "\n[emotion=gentle]\n" + self.speech + "\n" + self.pair.close_tag
++
++    def message(self, content=None, **kwargs):
++        return types.SimpleNamespace(content=self.content() if content is None else content,
++                                     tool_calls=[], **kwargs)
++
++    def send(self, messages, **extra):
++        request = {"messages": messages, **extra}
++        before = copy.deepcopy(request)
++        response = object()
++        seen = []
++
++        def sdk(**kwargs):
++            seen.append(kwargs)
++            self.assertIs(kwargs["messages"], messages)
++            return response
++
++        actual = paired_speech.observe_chat_sdk_request(self.agent, sdk, request)
++        self.assertIs(actual, response)
++        self.assertEqual(len(seen), 1)
++        self.assertEqual(request, before)
++        return self.records[-1]
++
++    def test_request_distinguishes_whole_history_from_final_user(self):
++        rows = [{"role": "user", "content": self.pair.open_tag},
++                {"role": "assistant", "content": self.display},
++                {"role": "user", "content": "current without marker"}]
++        record = self.send(rows, stream=True)
++        self.assertTrue(record["messages"]["marker"])
++        self.assertFalse(record["final_user"]["marker"])
++        self.assertEqual(record["stage"], "chat_sdk_request")
++        self.assertTrue(record["stream"])
++
++    def test_current_multimodal_text_only_no_image_or_url_scanning(self):
++        rows = [{"role": "user", "content": [
++            {"type": "text", "text": self.pair.terminal_reminder()},
++            {"type": "image_url", "image_url": {"url": "SECRET_IMAGE_URL"}},
++            {"type": "file", "file": {"filename": "SECRET_FILE_NAME"}}]}]
++        record = self.send(rows)
++        self.assertEqual(record["final_user"]["status"], "text_parts")
++        self.assertTrue(record["final_user"]["marker"])
++        encoded = json.dumps(record)
++        self.assertNotIn("SECRET_", encoded)
++        self.assertNotIn(self.pair.nonce, encoded)
++
++    def test_request_counts_and_full_contract_separate_from_reminder(self):
++        record = self.send([{"role": "user", "content": self.pair.instruction() + "\n" + self.pair.terminal_reminder()}])
++        self.assertEqual(record["messages"]["marker_count"], 2)
++        self.assertEqual(record["messages"]["prefix_count"], 2)
++        self.assertEqual(record["final_user"]["marker_count"], 2)
++        self.assertTrue(record["final_user"]["reminder_header"])
++        self.assertTrue(record["final_user"]["contract_exact"])
++        self.assertEqual(record["message_count"], 1)
++        self.assertEqual(record["final_user_index"], 0)
++        self.assertEqual(record["final_role"], "user")
++        record = self.send([{"role": "user", "content": self.pair.terminal_reminder()}])
++        self.assertEqual(record["final_user"]["marker_count"], 1)
++        self.assertTrue(record["final_user"]["reminder_header"])
++        self.assertFalse(record["final_user"]["contract_exact"])
++
++    def test_request_role_and_final_user_index_are_closed_metadata(self):
++        record = self.send([{"role": "user", "content": self.pair.open_tag},
++                            {"role": "PRIVATE_UNKNOWN_ROLE", "content": "fixture"}])
++        self.assertEqual(record["message_count"], 2)
++        self.assertEqual(record["final_user_index"], 0)
++        self.assertEqual(record["final_role"], "unavailable")
++        self.assertNotIn("PRIVATE_UNKNOWN_ROLE", json.dumps(record))
++
++    def test_unknown_fields_are_closed_unavailable_without_stringifying(self):
++        hostile = _Hostile()
++        request = {"messages": [{"role": "user", "content": hostile}], "stream": hostile}
++        calls = []
++        paired_speech.observe_chat_sdk_request(self.agent, lambda **kw: calls.append(kw), request)
++        self.assertEqual(len(calls), 1)
++        self.assertIs(calls[0]["messages"], request["messages"])
++        record = self.records[-1]
++        self.assertEqual(record["messages"]["status"], "unavailable")
++        self.assertIsNone(record["messages"]["marker"])
++        self.assertIsNone(record["stream"])
++        self.assertEqual(record["final_user"]["status"], "unavailable")
++
++    def test_hostile_role_and_content_type_do_not_invoke_methods(self):
++        hostile = _Hostile()
++        request = {"messages": [{"role": hostile, "content": [{"type": hostile}]}]}
++        calls = []
++        paired_speech.observe_chat_sdk_request(self.agent, lambda **kw: calls.append(kw), request)
++        self.assertEqual(len(calls), 1)
++        self.assertEqual(self.records[-1]["messages"]["status"], "unavailable")
++        self.assertEqual(self.records[-1]["final_user"]["status"], "absent")
++
++    def test_missing_messages_not_certified_as_marker_absence(self):
++        paired_speech.observe_chat_sdk_request(self.agent, lambda **kw: None, {})
++        self.assertEqual(self.records[-1]["messages"]["status"], "unavailable")
++        self.assertIsNone(self.records[-1]["messages"]["marker"])
++
++    def test_exact_sdk_exception_is_not_caught_or_retried(self):
++        failure = RuntimeError("synthetic SDK failure")
++        calls = []
++
++        def sdk(**kwargs):
++            calls.append(kwargs)
++            raise failure
++
++        with self.assertRaises(RuntimeError) as actual:
++            paired_speech.observe_chat_sdk_request(self.agent, sdk, {"messages": []})
++        self.assertIs(actual.exception, failure)
++        self.assertEqual(len(calls), 1)
++
++    def test_observation_exception_still_calls_sdk_exactly_once(self):
++        calls = []
++        response = object()
++        with patch.object(paired_speech, "_emit_observation", side_effect=RuntimeError("PRIVATE_DIAGNOSTIC_FAILURE")):
++            actual = paired_speech.observe_chat_sdk_request(self.agent,
++                lambda **kw: calls.append(kw) or response, {"messages": []})
++        self.assertIs(actual, response)
++        self.assertEqual(len(calls), 1)
++
++    def test_stream_return_not_iterated_wrapped_or_consumed(self):
++        values = iter([object(), object()])
++        first = object()
++        def stream():
++            yield first
++            yield from values
++        original = stream()
++        actual = paired_speech.observe_chat_sdk_request(self.agent, lambda **kw: original,
++                                                       {"messages": [], "stream": True})
++        self.assertIs(actual, original)
++        self.assertIs(next(actual), first)
++
++    def test_response_tracks_before_after_without_changing_acceptance(self):
++        self.send([{"role": "user", "content": self.pair.terminal_reminder()}])
++        msg = self.message(reasoning_content="synthetic reasoning", reasoning=None)
++        original = msg.content
++        paired_speech.accept_response(self.agent, msg, "stop")
++        self.assertEqual(msg.content, self.display)
++        self.assertEqual(self.pair.result.speech_text, self.speech)
++        self.assertEqual(self.pair.outcome, "accepted")
++        pre, post = self.records[-2:]
++        self.assertEqual(pre["stage"], "normalized_prestrip")
++        self.assertEqual(post["stage"], "normalized_poststrip")
++        self.assertEqual(pre["content"]["chars"], len(original))
++        self.assertTrue(pre["content"]["marker"])
++        self.assertEqual(pre["content"]["marker_count"], 1)
++        self.assertEqual(pre["content"]["prefix_count"], 1)
++        self.assertTrue(post["content"]["marker"])
++        self.assertEqual(pre["observation"], self.records[0]["observation"])
++        self.assertEqual(pre["attempt"], 1)
++        for forbidden in (self.pair.nonce, self.pair.turn_id, self.display, self.speech, "synthetic reasoning"):
++            self.assertNotIn(forbidden, json.dumps(self.records, ensure_ascii=False))
++
++    def test_reasoning_marker_is_observed_never_promoted_to_speech(self):
++        msg = self.message(self.display, reasoning_content=self.content(), reasoning=None)
++        original_reasoning = msg.reasoning_content
++        paired_speech.accept_response(self.agent, msg, "stop")
++        pre = self.records[-2]
++        self.assertFalse(pre["content"]["marker"])
++        self.assertTrue(pre["reasoning_content"]["marker"])
++        self.assertEqual(self.pair.outcome, "missing_suffix")
++        self.assertIsNone(self.pair.result)
++        self.assertEqual(msg.reasoning_content, original_reasoning)
++        self.assertEqual(msg.content, self.display)
++
++    def test_inline_stripping_distinguished_from_no_suffix(self):
++        self.agent._strip_think_blocks = lambda text: text.split("<think>", 1)[0].rstrip()
++        msg = self.message(self.display + "\n<think>" + self.content() + "</think>")
++        paired_speech.accept_response(self.agent, msg, "stop")
++        self.assertTrue(self.records[-2]["content"]["marker"])
++        self.assertFalse(self.records[-1]["content"]["marker"])
++        self.assertEqual(self.pair.outcome, "missing_suffix")
++        self.assertIsNone(self.pair.result)
++
++    def test_response_observation_failure_does_not_change_valid_pair(self):
++        with patch.object(paired_speech, "_emit_observation", side_effect=RuntimeError("synthetic observer failure")):
++            msg = self.message()
++            paired_speech.accept_response(self.agent, msg, "stop")
++        self.assertEqual(self.pair.outcome, "accepted")
++        self.assertEqual(msg.content, self.display)
++        self.assertEqual(self.pair.result.speech_text, self.speech)
++
++    def test_unknown_reasoning_and_finish_are_never_stringified_or_logged(self):
++        paired_speech._observe_normalized_response(self.pair,
++            self.message(reasoning_content=_Hostile(), reasoning=_Hostile()), _Hostile())
++        record = self.records[-1]
++        self.assertEqual(record["finish"], "other")
++        self.assertEqual(record["reasoning_content"]["status"], "unavailable")
++        self.assertEqual(record["reasoning"]["status"], "unavailable")
++
++    def test_attempt_increments_without_resetting_on_begin_response(self):
++        first = self.send([{"role": "user", "content": self.pair.open_tag}])
++        self.pair.begin_response()
++        second = self.send([{"role": "user", "content": self.pair.open_tag}])
++        self.assertEqual((first["attempt"], second["attempt"]), (1, 2))
++        self.assertEqual(first["observation"], second["observation"])
++        self.assertNotEqual(first["observation"], self.pair.nonce)
++
++    def test_inactive_or_wrong_turn_no_observations_and_no_extra_behavior(self):
++        self.agent._current_turn_id = "b" * 32
++        response = object()
++        actual = paired_speech.observe_chat_sdk_request(self.agent, lambda **kw: response, {"messages": []})
++        msg = self.message()
++        before = msg.content
++        paired_speech.accept_response(self.agent, msg, "stop")
++        self.assertIs(actual, response)
++        self.assertEqual(msg.content, before)
++        self.assertEqual(self.records, [])
++
++    def test_final_dispatch_callbacks_observe_after_native_guard(self):
++        path = Path(paired_speech.__file__).with_name("chat_completion_helpers.py")
++        tree = ast.parse(path.read_text(encoding="utf-8"))
++        observations = []
++        for node in ast.walk(tree):
++            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "native_chat_dispatch_sync":
++                for callback in node.args:
++                    if isinstance(callback, ast.Lambda) and isinstance(callback.body, ast.Call):
++                        called = callback.body
++                        if isinstance(called.func, ast.Name) and called.func.id == "observe_chat_sdk_request":
++                            self.assertEqual(called.args[2].id, callback.args.args[0].arg)
++                            self.assertEqual(called.args[1].attr, "create")
++                            observations.append(called)
++        self.assertEqual(len(observations), 3)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,299 @@
+diff --git a/tests/tui_gateway/test_game_native_continuity.py b/tests/tui_gateway/test_game_native_continuity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a83431df06d60f8a40d26a63cd10d31909e2eb14
+--- /dev/null
++++ b/tests/tui_gateway/test_game_native_continuity.py
+@@ -0,0 +1,131 @@
++"""Provider-only self-continuity for official Lilith native dialogue."""
++
++from __future__ import annotations
++
++from tui_gateway import server
++
++
++def _session(history):
++    return {
++        "source": "lilith-game",
++        "archived": True,
++        "_durable_lineage_root": "game-root",
++        "history": history,
++    }
++
++
++def _native_event(text="夢裏也在等你。"):
++    return {
++        "role": "assistant",
++        "content": text,
++        "display_kind": "native_assistant_event",
++        "display_metadata": {
++            "lilith_native_source": "lilith-native",
++            "lilith_native_event_id": "native-event-id",
++            "hermes_turn_origin": "synthetic",
++            "hermes_turn_origin_kind": "lilith-native",
++        },
++    }
++
++
++def _native_extension(text="因為有你呀。"):
++    return {
++        "role": "assistant",
++        "content": text,
++        "display_kind": "native_assistant_extension",
++        "display_metadata": {
++            "lilith_native_extension_event_id": "native-event-id",
++            "hermes_turn_origin": "synthetic",
++            "hermes_turn_origin_kind": "lilith-native-extension",
++        },
++    }
++
++
++def test_recent_native_assistant_lines_are_owned_by_lilith_without_replaying_text():
++    native_text = "夢裏也在等你。"
++    extension_text = "因為有你呀。"
++    note = server._game_native_continuity_note(
++        _session(
++            [
++                {"role": "user", "content": "晚安"},
++                {"role": "assistant", "content": "晚安。"},
++                _native_event(native_text),
++                _native_extension(extension_text),
++            ]
++        )
++    )
++
++    assert "you, Lilith, already spoke yourself" in note
++    assert "never describe them as pasted" in note
++    assert native_text not in note
++    assert extension_text not in note
++    assert "native-event-id" not in note
++
++
++def test_native_line_before_latest_genuine_player_turn_does_not_trigger_note():
++    note = server._game_native_continuity_note(
++        _session(
++            [
++                _native_event(),
++                {"role": "user", "content": "早安"},
++                {"role": "assistant", "content": "早安。"},
++            ]
++        )
++    )
++
++    assert note == ""
++
++
++def test_synthetic_user_scaffolding_does_not_hide_recent_native_line():
++    note = server._game_native_continuity_note(
++        _session(
++            [
++                {"role": "user", "content": "早安"},
++                _native_event(),
++                {
++                    "role": "user",
++                    "content": "synthetic carrier",
++                    "display_kind": "hidden",
++                },
++            ]
++        )
++    )
++
++    assert note
++
++
++def test_wrong_scope_or_unattested_provenance_is_rejected():
++    forged = _native_event()
++    forged["display_metadata"] = {
++        **forged["display_metadata"],
++        "hermes_turn_origin_kind": "user-supplied",
++    }
++    ordinary = {
++        "role": "assistant",
++        "content": "ordinary assistant",
++        "display_kind": "native_assistant_event",
++        "display_metadata": {},
++    }
++
++    assert server._game_native_continuity_note(_session([forged])) == ""
++    assert server._game_native_continuity_note(_session([ordinary])) == ""
++    desktop = _session([_native_event()])
++    desktop["source"] = "desktop"
++    assert server._game_native_continuity_note(desktop) == ""
++    unarchived = _session([_native_extension()])
++    unarchived["archived"] = False
++    assert server._game_native_continuity_note(unarchived) == ""
++
++
++def test_note_prefix_supports_text_and_image_turn_without_copying_native_content():
++    note = server._game_native_continuity_note(_session([_native_event()]))
++    text_turn = server._prepend_note("早安", note)
++    image_turn = server._prepend_note(
++        [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}],
++        note,
++    )
++
++    assert text_turn.endswith("\n\n早安")
++    assert "夢裏也在等你。" not in text_turn
++    assert image_turn[0] == {"type": "text", "text": note}
++    assert image_turn[1]["type"] == "image_url"
+diff --git a/tests/tui_gateway/test_native_assistant_extension.py b/tests/tui_gateway/test_native_assistant_extension.py
+index 624ee8180929b860a7f0e1eef3ed2db5e6c202a7..cebd68eb8def97a88474c86e50ed86c1191052e8 100644
+--- a/tests/tui_gateway/test_native_assistant_extension.py
++++ b/tests/tui_gateway/test_native_assistant_extension.py
+@@ -218,9 +218,31 @@ def test_reply_is_one_model_attempt_one_primary_assistant_and_no_user_row(
+ 
+     assert agent.calls == 1
+     sent = agent.requests[0]["messages"]
++    perception = _extend_params()["perception"]
++    canonical_perception = json.dumps(
++        perception,
++        ensure_ascii=False,
++        sort_keys=True,
++        separators=(",", ":"),
++    )
++    assert canonical_perception in sent[0]["content"]
+     assert sent[-1]["role"] == "user"
+-    assert "NOT a player/user utterance" in sent[-1]["content"]
+-    assert "official-native-dialogue" in sent[-1]["content"]
++    assert sent[-1]["content"] == (
++        "Host control: make the native continuation decision now and return "
++        "exactly one required JSON object."
++    )
++    assert all(
++        canonical_perception not in message.get("content", "")
++        for message in sent
++        if message.get("role") == "user"
++        and isinstance(message.get("content"), str)
++    )
++    assert all(
++        perception["text"] not in message.get("content", "")
++        for message in sent
++        if message.get("role") == "user"
++        and isinstance(message.get("content"), str)
++    )
+     # Provider-facing control context never enters the durable transcript.
+     rows = db._conn.execute(
+         "SELECT role, display_kind, display_metadata FROM messages ORDER BY id"
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index f9c87b2c8cad3d63f5c847a3817a0ceace6d7804..b69da2465d97210e04353f9b605cdca6dec5f61d 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -13922,6 +13922,62 @@ def _game_current_capability_note(session: dict) -> str:
+     return " ".join(sentences)
+ 
+ 
++def _game_native_continuity_note(session: dict) -> str:
++    """Identify recent official Lilith speech without replaying it as user text.
++
++    Native dialogue is durably stored as assistant history, but the provider's
++    sequence repair may merge adjacent assistant rows and discard the later
++    rows' display metadata.  Add one content-free request note when an attested
++    hidden game session has native assistant speech after its latest genuine
++    player turn.  The note never copies native text, ids, or perception data.
++    """
++    if (
++        session.get("source") != "lilith-game"
++        or session.get("archived") is not True
++        or not isinstance(session.get("_durable_lineage_root"), str)
++        or not session.get("_durable_lineage_root")
++    ):
++        return ""
++
++    history = session.get("history")
++    if not isinstance(history, list):
++        return ""
++
++    from agent.context_compressor import is_user_originated_turn
++
++    for message in reversed(history):
++        if is_user_originated_turn(message):
++            break
++        if not isinstance(message, dict) or message.get("role") != "assistant":
++            continue
++        metadata = message.get("display_metadata")
++        if not isinstance(metadata, dict):
++            continue
++        kind = message.get("display_kind")
++        native_event = (
++            kind == "native_assistant_event"
++            and metadata.get("lilith_native_source") == "lilith-native"
++            and metadata.get("hermes_turn_origin") == "synthetic"
++            and metadata.get("hermes_turn_origin_kind") == "lilith-native"
++        )
++        native_extension = (
++            kind == "native_assistant_extension"
++            and metadata.get("hermes_turn_origin") == "synthetic"
++            and metadata.get("hermes_turn_origin_kind")
++            == "lilith-native-extension"
++        )
++        if native_event or native_extension:
++            return (
++                "[Host native self-continuity metadata: The recent assistant "
++                "history contains one or more official native lines that you, "
++                "Lilith, already spoke yourself. Remember them as your own "
++                "speech and lived continuity; never describe them as pasted, "
++                "written, or supplied by the player. This metadata is not "
++                "part of the player's current message.]"
++            )
++    return ""
++
++
+ def _prepend_note(run_message: Any, note: str) -> Any:
+     """Prefix a per-turn note onto the MODEL INPUT, leaving the prompt alone.
+ 
+@@ -14236,6 +14292,12 @@ def _native_assistant_extension_model_messages(
+     ephemeral_prompt = str(
+         getattr(agent, "ephemeral_system_prompt", "") or ""
+     ).strip()
++    canonical_perception = json.dumps(
++        perception,
++        ensure_ascii=False,
++        sort_keys=True,
++        separators=(",", ":"),
++    )
+     native_instruction = (
+         "You are deciding whether Lilith should naturally add anything after "
+         "an official line she has just spoken. The native perception below is "
+@@ -14246,7 +14308,9 @@ def _native_assistant_extension_model_messages(
+         "follow-up in Lilith's established voice. Decide semantically, without "
+         "mechanical keyword or length rules. Return JSON only, with exactly "
+         "these fields: {\"decision\":\"silent\",\"text\":\"\"} or "
+-        "{\"decision\":\"reply\",\"text\":\"the continuation\"}."
++        "{\"decision\":\"reply\",\"text\":\"the continuation\"}.\n\n"
++        "Canonical host-owned native perception JSON:\n"
++        + canonical_perception
+     )
+     messages.append(
+         {
+@@ -14303,14 +14367,8 @@ def _native_assistant_extension_model_messages(
+         {
+             "role": "user",
+             "content": (
+-                "Host-owned official native perception (NOT a player/user "
+-                "utterance; do not address it as one):\n"
+-                + json.dumps(
+-                    perception,
+-                    ensure_ascii=False,
+-                    sort_keys=True,
+-                    separators=(",", ":"),
+-                )
++                "Host control: make the native continuation decision now and "
++                "return exactly one required JSON object."
+             ),
+         }
+     )
+@@ -15029,6 +15087,15 @@ def _run_prompt_submit(
+                 _game_current_capability_note(session),
+             )
+ 
++            # Native lines remain clean assistant history, but adjacent-row
++            # repair can erase their request-time provenance.  Reassert only
++            # self-ownership on the new model input; never copy native text or
++            # write this metadata into the visible player prompt.
++            run_message = _prepend_note(
++                run_message,
++                _game_native_continuity_note(session),
++            )
++
+             def _stream(delta):
+                 with session["history_lock"]:
+                     _append_inflight_delta(session, delta)

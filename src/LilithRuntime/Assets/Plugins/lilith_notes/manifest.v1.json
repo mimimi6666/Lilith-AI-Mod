@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "plugin_id": "lilith_notes",
+  "plugin_version": "1.0.0",
+  "files": [
+    {
+      "path": "__init__.py",
+      "sha256": "9647d082c7cd76c3335dad79b578c809c2b9d352ef3a86e14570e0e67a5d064c"
+    },
+    {
+      "path": "client.py",
+      "sha256": "00d34c1d232b78c5cee0007f8b38a4435db50fbcf79d2261f21140c98a9e6370"
+    },
+    {
+      "path": "plugin.yaml",
+      "sha256": "deea742c080cf392525efde2d98b72e3ef2ddb146f624dd55d96dae3bc78b6fb"
+    }
+  ]
+}

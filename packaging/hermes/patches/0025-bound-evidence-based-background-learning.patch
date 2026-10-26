@@ -1,0 +1,314 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 841f1d1..ec9abdb 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1970,6 +1970,24 @@ def init_agent(
+         _agent_section = {}
+     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+ 
++    # Background memory/skill review runs a full tool-capable agent fork. Keep
++    # that fork useful for durable learning while bounding the number of model
++    # turns it can consume. The runtime also validates this value at the point
++    # of use so tests and embedders that construct a partial agent cannot bypass
++    # the ceiling accidentally.
++    try:
++        _raw_review_iterations = _agent_section.get(
++            "background_review_max_iterations", 6
++        )
++        if isinstance(_raw_review_iterations, bool):
++            raise TypeError("boolean is not an iteration count")
++        _review_iterations = int(_raw_review_iterations)
++    except (TypeError, ValueError):
++        _review_iterations = 6
++    agent._background_review_max_iterations = max(
++        1, min(_review_iterations, 8)
++    )
++
+     # Intent-ack continuation config: "auto" (default — codex_responses only,
+     # the historical gate), true (all api_modes), false (never), or a list of
+     # model-name substrings.  Resolved against the active api_mode/model in the
+diff --git a/agent/background_review.py b/agent/background_review.py
+index eaf1faa..6ab775a 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -180,15 +180,17 @@ _MEMORY_REVIEW_PROMPT = (
+ )
+ 
+ _SKILL_REVIEW_PROMPT = (
+-    "Review the conversation above and update the skill library. Be "
+-    "ACTIVE — most sessions produce at least one skill update, even if "
+-    "small. A pass that does nothing is a missed learning opportunity, "
+-    "not a neutral outcome.\n\n"
++    "Review the conversation above and update the skill library only when "
++    "there is stable, reusable evidence worth carrying into future sessions. "
++    "A no-op is a correct and complete result; do not manufacture an update "
++    "merely because a review was scheduled. Judge the user's intent and the "
++    "resolved outcome semantically — example wording below is illustrative, "
++    "never a lexical trigger.\n\n"
+     "Target shape of the library: CLASS-LEVEL skills, each with a rich "
+     "SKILL.md and a `references/` directory for session-specific detail. "
+     "Not a long flat list of narrow one-session-one-skill entries. This "
+     "shapes HOW you update, not WHETHER you update.\n\n"
+-    "Signals to look for (any one of these warrants action):\n"
++    "Potential signals to evaluate (none warrants action by itself):\n"
+     "  • User corrected your style, tone, format, legibility, or "
+     "verbosity. Frustration signals like 'stop doing X', 'this is too "
+     "verbose', 'don't format like this', 'why are you explaining', "
+@@ -204,8 +206,10 @@ _SKILL_REVIEW_PROMPT = (
+     "from. Capture it.\n"
+     "  • A skill that got loaded or consulted this session turned out "
+     "to be wrong, missing a step, or outdated. Patch it NOW.\n\n"
+-    "Preference order — prefer the earliest action that fits, but do "
+-    "pick one when a signal above fired:\n"
++    "Before acting, require evidence that the learning is durable beyond this "
++    "turn, applies to a reusable class of work, and is supported by an explicit "
++    "user preference or a verified working outcome. Then prefer the earliest "
++    "action that fits:\n"
+     "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the "
+     "conversation for skills the user loaded via /skill-name or you "
+     "read via skill_view. If any of them covers the territory of the "
+@@ -298,10 +302,9 @@ _SKILL_REVIEW_PROMPT = (
+     "command, config step, env var to set) under an existing setup or "
+     "troubleshooting skill — never 'this tool does not work' as a "
+     "standalone constraint.\n\n"
+-    "'Nothing to save.' is a real option but should NOT be the "
+-    "default. If the session ran smoothly with no corrections and "
+-    "produced no new technique, just say 'Nothing to save.' and stop. "
+-    "Otherwise, act."
++    "If the evidence threshold is not met, say 'Nothing to save.' and stop "
++    "without listing, viewing, or modifying skills. If it is met, make only "
++    "the smallest durable update supported by the evidence."
+ )
+ 
+ _COMBINED_REVIEW_PROMPT = (
+@@ -310,13 +313,16 @@ _COMBINED_REVIEW_PROMPT = (
+     "desires, preferences, personal details, or expectations about "
+     "how you should behave? Save facts about the user and durable "
+     "preferences with the memory tool.\n\n"
+-    "**Skills**: how to do this class of task. Be ACTIVE — most "
+-    "sessions produce at least one skill update. A pass that does "
+-    "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
++    "**Skills**: how to do this class of task. Update skills only when "
++    "there is stable, reusable evidence worth carrying into future sessions. "
++    "A no-op is a correct and complete result; do not manufacture an update "
++    "merely because a review was scheduled. Judge intent and resolved outcomes "
++    "semantically — example wording below is illustrative, never a lexical "
++    "trigger.\n\n"
+     "Target shape of the skill library: CLASS-LEVEL skills with a rich "
+     "SKILL.md and a `references/` directory for session-specific detail. "
+     "Not a long flat list of narrow one-session-one-skill entries.\n\n"
+-    "Signals that warrant a skill update (any one is enough):\n"
++    "Potential skill signals to evaluate (none is sufficient by itself):\n"
+     "  • User corrected your style, tone, format, legibility, "
+     "verbosity, or approach. Frustration is a FIRST-CLASS skill "
+     "signal, not just a memory signal. 'stop doing X', 'don't format "
+@@ -326,7 +332,10 @@ _COMBINED_REVIEW_PROMPT = (
+     "emerged.\n"
+     "  • A skill that was loaded or consulted turned out wrong, "
+     "missing, or outdated — patch it now.\n\n"
+-    "Preference order for skills — pick the earliest that fits:\n"
++    "Before changing a skill, require evidence that the learning is durable "
++    "beyond this turn, applies to a reusable class of work, and is supported "
++    "by an explicit user preference or a verified working outcome. Then pick "
++    "the earliest action that fits:\n"
+     "  1. UPDATE A CURRENTLY-LOADED SKILL. Check what skills were "
+     "loaded via /skill-name or skill_view in the conversation. If one "
+     "of them covers the learning, PATCH it first. It was in play; "
+@@ -400,9 +409,10 @@ _COMBINED_REVIEW_PROMPT = (
+     "command, config step, env var to set) under an existing setup or "
+     "troubleshooting skill — never 'this tool does not work' as a "
+     "standalone constraint.\n\n"
+-    "Act on whichever of the two dimensions has real signal. If "
+-    "genuinely nothing stands out on either, say 'Nothing to save.' "
+-    "and stop — but don't reach for that conclusion as a default."
++    "Act only on a dimension whose evidence threshold is met. If neither "
++    "threshold is met, say 'Nothing to save.' and stop without listing, "
++    "viewing, or modifying skills. When action is justified, make only the "
++    "smallest durable update supported by the evidence."
+ )
+ 
+ 
+@@ -812,9 +822,17 @@ def _run_review_in_thread(
+                     _pref_val = getattr(agent, _pref_attr, None)
+                     if _pref_val:
+                         _fork_kwargs[_pref_attr] = _pref_val
++            try:
++                _review_max_iterations = int(
++                    getattr(agent, "_background_review_max_iterations", 6)
++                )
++            except (TypeError, ValueError):
++                _review_max_iterations = 6
++            _review_max_iterations = max(1, min(_review_max_iterations, 8))
++
+             review_agent = AIAgent(
+                 model=_rt.get("model") or agent.model,
+-                max_iterations=16,
++                max_iterations=_review_max_iterations,
+                 quiet_mode=True,
+                 platform=agent.platform,
+                 provider=_rt.get("provider") or agent.provider,
+diff --git a/tests/run_agent/test_background_review.py b/tests/run_agent/test_background_review.py
+index 6ed90d8..de3b4eb 100644
+--- a/tests/run_agent/test_background_review.py
++++ b/tests/run_agent/test_background_review.py
+@@ -26,6 +26,7 @@ def _bare_agent() -> AIAgent:
+     agent._MEMORY_REVIEW_PROMPT = "review memory"
+     agent._SKILL_REVIEW_PROMPT = "review skills"
+     agent._COMBINED_REVIEW_PROMPT = "review both"
++    agent._background_review_max_iterations = 6
+     agent.background_review_callback = None
+     agent.status_callback = None
+     agent._safe_print = lambda *_args, **_kwargs: None
+@@ -79,6 +80,45 @@ def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
+         "shutdown_memory_provider",
+         "close",
+     ]
++    assert events[0][1]["max_iterations"] == 6
++
++
++def test_background_review_uses_bounded_configured_iteration_budget(monkeypatch):
++    captured = []
++
++    class FakeReviewAgent:
++        def __init__(self, **kwargs):
++            captured.append(kwargs["max_iterations"])
++            self._session_messages = []
++
++        def run_conversation(self, **kwargs):
++            pass
++
++        def shutdown_memory_provider(self):
++            pass
++
++        def close(self):
++            pass
++
++    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
++    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
++
++    agent = _bare_agent()
++    agent._background_review_max_iterations = 3
++    AIAgent._spawn_background_review(
++        agent,
++        messages_snapshot=[{"role": "user", "content": "hello"}],
++        review_memory=True,
++    )
++
++    agent._background_review_max_iterations = 999
++    AIAgent._spawn_background_review(
++        agent,
++        messages_snapshot=[{"role": "user", "content": "hello"}],
++        review_memory=True,
++    )
++
++    assert captured == [3, 8]
+ 
+ 
+ def test_background_review_fork_opts_out_of_shared_session_ownership(monkeypatch):
+diff --git a/tests/run_agent/test_review_prompt_class_first.py b/tests/run_agent/test_review_prompt_class_first.py
+index bf0555b..0f56a69 100644
+--- a/tests/run_agent/test_review_prompt_class_first.py
++++ b/tests/run_agent/test_review_prompt_class_first.py
+@@ -1,7 +1,7 @@
+ """Behavior tests for the skill review / combined review prompts.
+ 
+-The review prompts steer the background review agent toward actively updating
+-the skill library after most sessions, with a strong bias toward:
++The review prompts steer the background review agent toward evidence-based,
++durable updates, with a strong bias toward:
+   1. Patching currently-loaded skills first,
+   2. Patching existing umbrellas next,
+   3. Adding references/ files under an existing umbrella,
+@@ -21,16 +21,16 @@ from run_agent import AIAgent
+ # _SKILL_REVIEW_PROMPT
+ # ---------------------------------------------------------------------------
+ 
+-def test_skill_review_prompt_biases_toward_active_updates():
+-    """Prompt must frame updating as the default stance, not something rare."""
++def test_skill_review_prompt_requires_durable_evidence_and_allows_noop():
++    """Scheduled review is not itself evidence that a write is warranted."""
+     prompt = AIAgent._SKILL_REVIEW_PROMPT
+-    assert "ACTIVE" in prompt or "active" in prompt.lower(), (
+-        "must tell the reviewer to be active"
+-    )
+-    # "missed learning opportunity" or equivalent framing for not acting
+-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower(), (
+-        "must frame inaction as a miss, not a neutral outcome"
+-    )
++    lower = prompt.lower()
++    assert "stable, reusable evidence" in lower
++    assert "no-op is a correct and complete result" in lower
++    assert "never a lexical trigger" in lower
++    assert "without listing, viewing, or modifying skills" in lower
++    assert "most sessions" not in lower
++    assert "missed learning opportunity" not in lower
+ 
+ 
+ def test_skill_review_prompt_treats_user_corrections_as_skill_signal():
+@@ -76,6 +76,16 @@ def test_combined_review_prompt_has_memory_section():
+     assert "memory tool" in prompt
+ 
+ 
++def test_combined_review_prompt_requires_evidence_and_allows_noop():
++    prompt = AIAgent._COMBINED_REVIEW_PROMPT
++    lower = prompt.lower()
++    assert "stable, reusable evidence" in lower
++    assert "no-op is a correct and complete result" in lower
++    assert "never a lexical trigger" in lower
++    assert "without listing, viewing, or modifying skills" in lower
++    assert "most sessions" not in lower
++
++
+ 
+ 
+ 
+diff --git a/tests/run_agent/test_api_max_retries_config.py b/tests/run_agent/test_api_max_retries_config.py
+index 5060c5e..961803c 100644
+--- a/tests/run_agent/test_api_max_retries_config.py
++++ b/tests/run_agent/test_api_max_retries_config.py
+@@ -9,12 +9,16 @@ from unittest.mock import patch
+ from run_agent import AIAgent
+ 
+ 
+-def _make_agent(api_max_retries=None):
++def _make_agent(api_max_retries=None, background_review_max_iterations=None):
+     """Build an AIAgent with a mocked config.load_config that returns a
+     config tree containing the given agent.api_max_retries (or default)."""
+     cfg = {"agent": {}}
+     if api_max_retries is not None:
+         cfg["agent"]["api_max_retries"] = api_max_retries
++    if background_review_max_iterations is not None:
++        cfg["agent"]["background_review_max_iterations"] = (
++            background_review_max_iterations
++        )
+ 
+     with patch("run_agent.OpenAI"), \
+          patch("hermes_cli.config.load_config", return_value=cfg), \
+@@ -44,5 +48,25 @@ def test_api_max_retries_honors_config_override():
+     assert agent2._api_max_retries == 5
+ 
+ 
+-
+-
++def test_background_review_iteration_budget_is_configurable_and_bounded():
++    assert _make_agent()._background_review_max_iterations == 6
++    assert (
++        _make_agent(background_review_max_iterations=4)
++        ._background_review_max_iterations
++        == 4
++    )
++    assert (
++        _make_agent(background_review_max_iterations=999)
++        ._background_review_max_iterations
++        == 8
++    )
++    assert (
++        _make_agent(background_review_max_iterations=0)
++        ._background_review_max_iterations
++        == 1
++    )
++    assert (
++        _make_agent(background_review_max_iterations=True)
++        ._background_review_max_iterations
++        == 6
++    )

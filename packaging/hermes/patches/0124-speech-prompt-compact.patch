@@ -1,0 +1,461 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index d2ab25c..d021925 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -2326,6 +2326,11 @@ def run_conversation(
+                 # ordinary plugin/gateway and sanitize-divergence sidecars.
+                 api_msg["api_content"] = _api_content
+                 substitute_api_content(api_msg)
++                if idx < current_turn_user_idx:
++                    # Retire exact old host speech formats from the API copy,
++                    # never from stored player text or other historical notes.
++                    from agent.paired_speech import project_historical_speech
++                    api_msg = project_historical_speech(agent, msg, api_msg)
+ 
+             # Strict identity migrations preserve the SQLite/UI transcript
+             # verbatim.  Only the provider projection receives this typed
+diff --git a/agent/paired_speech.py b/agent/paired_speech.py
+index 8a123d2..848a442 100644
+--- a/agent/paired_speech.py
++++ b/agent/paired_speech.py
+@@ -4,6 +4,7 @@ This is output formatting, not a tool or permission. No provider calls, database
+ writes, preference reads or extra origins. Legacy/notification turns opt out.
+ """
+ from dataclasses import dataclass
++import hashlib
+ import json
+ import logging
+ import re
+@@ -20,19 +21,31 @@ EMOTIONS = frozenset({"calm", "gentle", "playful", "affectionate", "excited", "r
+ # Never interpolate per-turn values here: this suffix precedes cache planning.
+ SYSTEM_OUTPUT_CONTRACT = (
+     "[Host paired reply delivery]\n"
+-    "This turn requires one final assistant message with two serialized parts in its content: "
+-    "the visible reply first, then the hidden Japanese speech rendition specified by the "
+-    "current turn's host presentation contract. Display-language and brevity guidance "
+-    "apply to the visible reply, not to removing its required speech rendition. Completing "
+-    "a short visible reply does not complete this output format: include exactly one "
+-    "complete speech suffix before ending the final response. Use the current host "
+-    "contract's exact delimiter and id, never an id from history. Put the suffix in "
+-    "final message content, not reasoning, tool arguments or interim commentary. "
+-    "It renders the same answer for audio, not another conversational answer or a second "
+-    "identity/locale supplement. Preserve meaning, persona and emotion without adding "
+-    "advice or facts. Continue normal tool use when needed, but do not make an extra "
+-    "model or translation-tool call to produce this rendition. This presentation format "
+-    "does not change identity, permissions, safety, cancellation or tool authority."
++    "REQUIRED OUTPUT: EVERY final reply has two parts in the SAME message content: "
++    "(1) the visible answer in the requested display language; (2) its hidden Japanese "
++    "speech rendition in the current host template. This includes short replies and "
++    "replies WITHOUT an interjection. Use the current id, exactly one complete suffix, "
++    "no code fence or formatting explanation, and nothing after its closing tag. "
++    "Never put the suffix in reasoning, tool arguments or interim commentary. "
++    "Previous replies are display-only history, not valid examples of this turn's output format.\n"
++    "MEANING: the rendition is the same answer for audio, not a second answer. Keep "
++    "persona, names, tone and facts; add no advice or claims. Use natural Japanese, "
++    "kana readings for Han-only names, no Chinese clauses, unreadable markup, URLs "
++    "or local paths. Japanese display still requires the same faithful audio rendition.\n"
++    "EMOTION: choose one [emotion=VALUE] for the speech body even WITHOUT an interjection: "
++    "calm=factual; gentle=soft support; playful=teasing; affectionate=warm closeness; "
++    "excited=delighted reveal; relieved=release of tension; surprised=genuine surprise. "
++    "This is delivery metadata, not spoken words, a mood diagnosis or an action.\n"
++    "VOCAL CUES are OPTIONAL: ふふ=amused teasing; えへへ=bashful delight; ジャジャーン=excited "
++    "reveal; ふぅ=relief; はぁー=quiet exhale; すぅー=deliberate inhale; ん=soft response; "
++    "えっ=surprise; すぅー……はぁー=intentional breath cycle. Choose only when fitting; "
++    "do not force, rotate or chain cues or laugh every reply. Breathing cues are rare, "
++    "not filler or advice. Keep a cue and matching body in the SAME paragraph; a reveal "
++    "stays excited. Without a cue, keep the selected body emotion AND the required "
++    "speech suffix. Do not pad facts, invent intimacy or add effects to serious explanations.\n"
++    "BOUNDARY: use real tools normally, then attach speech only to the final answer. "
++    "Do not call another model or translation tool for it. This format changes no "
++    "identity, permissions, safety, cancellation or tool authority."
+ )
+ 
+ 
+@@ -62,39 +75,12 @@ class PairedSpeech:
+ 
+     def instruction(self):
+         return (
+-            "Host presentation contract for THIS turn only: write your answer in the "
+-            "requested display language exactly as usual. In the SAME final text response, "
+-            "after that complete answer append a faithful Japanese TTS rendition, enclosed "
+-            f"exactly as: \n{self.open_tag}\n[emotion=gentle]\nJapanese speech text\n{self.close_tag}\n"
+-            "Do not explain or label this formatting. Do not wrap it in a code fence. "
+-            "The display answer comes first; nothing follows the closing tag. The enclosed "
+-            "script is not a second answer: preserve meaning, persona, names, tone and facts; "
+-            "add no advice, claims or actions. Use natural Japanese sentences and kana readings "
+-            "for Han-only names/headings; never leave Chinese clauses for a Japanese voice. "
+-            "Omit unreadable markup, URLs and local file paths from speech. "
+-            "Do not attach a speech script to tool calls or interim commentary. Continue using "
+-            "real tools normally when needed, then attach the script only to the final answer. "
+-            "This contract neither authorizes any action nor changes conversation language. "
+-            "Inside the suffix, choose ONE overall delivery for this reply using a first line "
+-            "[emotion=VALUE], where VALUE is calm (matter-of-fact), gentle (soft support), "
+-            "playful (light teasing), affectionate (warm closeness), excited (delighted reveal), "
+-            "relieved (relaxing after tension), or surprised (brief genuine surprise). Choose "
+-            "from the meaning and situation even WITHOUT an interjection; this is performance "
+-            "metadata, not words to display or speak, a mood diagnosis, or an action. "
+-            "Native Japanese vocal cues are OPTIONAL expressive speech: ふふ for amused teasing; "
+-            "えへへ for bashful warm delight; ジャジャーン for a playful reveal; ふぅ for relief; "
+-            "はぁー for a quiet exhale; すぅー for a deliberate inhale; ん for a soft response; "
+-            "えっ for surprise; すぅー……はぁー for an intentional breath cycle. Use these only "
+-            "when the conversational situation fits; do not force, rotate or demonstrate all "
+-            "nine, chain unrelated cues, or prefix every answer with laughter. Inhale/exhale "
+-            "performances should be rare, not filler or breathing advice. Explicit user requests "
+-            "for a demonstration are different from normal conversation. Put a chosen cue and "
+-            "its continuation in the SAME paragraph and keep their emotional delivery coherent; "
+-            "ジャジャーン determines an excited reveal, not a calm continuation. Without a cue, "
+-            "the chosen delivery still applies. Do not add vocal effects to serious explanations "
+-            "or invented intimacy, and do not change facts or pad the answer to fit a sound. "
+-            "When display is Japanese, faithfully render that same answer rather than inventing "
+-            "a second response. Never put the emotion line in the visible answer."
++            "Host presentation contract for THIS turn only: after the visible answer, "
++            "ALWAYS append this Japanese speech template, even without vocal cues. "
++            "Choose VALUE from the host emotion list; the emotion line is hidden.\n"
++            f"{self.open_tag}\n[emotion=VALUE]\nFaithful Japanese rendition\n{self.close_tag}\n"
++            "Only this id is valid. No suffix on tool calls. Nothing after the closing tag.\n"
++            "[End host presentation contract]"
+         )
+ 
+     def begin_response(self):
+@@ -109,14 +95,10 @@ class PairedSpeech:
+         # suffix. They are not examples of a valid current wire response.
+         return (
+             "[Current reply delivery; host formatting only, not player text or action authority]\n"
+-            "Previous replies are display-only history; their hidden audio was removed. "
+-            "Even for a short reply, the final answer in THIS completion must include "
+-            "its Japanese speech suffix. Only the following current id is valid; "
+-            "do not copy an id from history. After your display answer append:\n"
++            "Before ending: visible answer + Japanese suffix are BOTH required, even "
++            "for a short reply WITHOUT a cue. Use this current id, not history:\n"
+             f"{self.open_tag}\n[emotion=VALUE]\nJapanese rendition\n{self.close_tag}\n"
+-            "VALUE: calm, gentle, playful, affectionate, excited, relieved, or surprised. "
+-            "Keep meaning and cue/body emotion consistent. No speech suffix on tool calls. "
+-            "The suffix is hidden from chat; do not omit it to keep chat in its display language."
++            "Choose VALUE from the host emotion list. No suffix on tool calls; no extra call."
+         )
+ 
+     def feed(self, delta):
+@@ -220,6 +202,69 @@ def display_only(agent, text):
+     return state.display(text) if state is not None else text
+ 
+ 
++# Exact host-generated templates from native108 and native118-123. The nonce
++# alone is normalized. Unknown wording is not ours to remove from a sidecar.
++_LEGACY_CONTRACT_HASHES = frozenset({
++    "301cbda82c0bd5f024767c1cad43f47635e62e7906adce9ded77d6f7f860adcd",
++    "de5ebb4157a6b96a89cd78cedf9a76d36c4f29a3322c6c102aa71cb4b786e94d",
++})
++_HOST_OPEN = re.compile(r'<lilith_speech id="([a-f0-9]{32})" locale="ja">')
++
++
++def _host_contract_digest(block):
++    if (type(block) is not str or len(block) > 4096
++            or not block.startswith("Host presentation contract for THIS turn only:")):
++        return None, None
++    matches = list(_HOST_OPEN.finditer(block))
++    if len(matches) != 1:
++        return None, None
++    match = matches[0]
++    normalized = block[:match.start(1)] + "0" * 32 + block[match.end(1):]
++    return hashlib.sha256(normalized.encode("utf-8")).hexdigest(), match[1]
++
++
++def project_historical_speech(agent, source, actual):
++    """Remove only an exact old host format from a historical USER send copy.
++
++    Caller owns the historical-index decision. Sidecar provenance and exact
++    clean-text suffix are required; no parsing of player text, multimodal rows,
++    assistant reasoning, generic plugin envelopes or unknown sidecar versions.
++    Original rows and every other host note remain byte-for-byte untouched.
++    """
++    state = state_for(agent)
++    if (state is None or type(source) is not dict or type(actual) is not dict
++            or source.get("role") != "user" or actual.get("role") != "user"
++            or source.get("display_kind") not in (None, "", "user")):
++        return actual
++    clean, sidecar = source.get("content"), source.get("api_content")
++    if (type(clean) is not str or not clean or type(sidecar) is not str
++            or type(actual.get("content")) is not str or actual["content"] != sidecar
++            or not sidecar.endswith("\n\n" + clean)):
++        return actual
++    prefix = sidecar[:-(len(clean) + 2)]
++    if len(prefix) > 65536:
++        return actual
++    blocks = prefix.split("\n\n")
++    if len(blocks) > 64:
++        return actual
++    known = _LEGACY_CONTRACT_HASHES | {_host_contract_digest(state.instruction())[0]}
++    recognized = []
++    for index, block in enumerate(blocks):
++        digest, nonce = _host_contract_digest(block)
++        if block.startswith("Host presentation contract for THIS turn only:") and digest not in known:
++            return actual  # A different/ambiguous host-format version is not certified.
++        if digest is not None and digest in known:
++            if nonce == state.nonce:
++                return actual  # Never erase the current host id, even in a misrouted row.
++            recognized.append(index)
++    if len(recognized) != 1:
++        return actual  # Ambiguous duplicates and unknown templates stay intact.
++    remaining = blocks[:recognized[0]] + blocks[recognized[0] + 1:]
++    result = dict(actual)
++    result["content"] = "\n\n".join(remaining + [clean])
++    return result
++
++
+ def with_current_reminder(agent, content):
+     """Current user API copy only; never rewrite a past row or persist this reminder.
+ 
+diff --git a/agent/usage_budget_context.py b/agent/usage_budget_context.py
+index 654f93f..cdacf28 100644
+--- a/agent/usage_budget_context.py
++++ b/agent/usage_budget_context.py
+@@ -432,6 +432,8 @@ def _strategy_projection_units(agent, history, source, projected, offset, *, nor
+             expected = deepcopy(source[index])
+             if isinstance(expected.get("api_content"), str):
+                 substitute_api_content(expected)
++                from agent.paired_speech import project_historical_speech
++                expected = project_historical_speech(agent, source[index], expected)
+             kind = scoped_legacy_history_record_type(agent, source[index], index)
+             if kind == "legacy_user_api_sidecar":
+                 expected["content"] = deepcopy(source[index].get("content"))
+diff --git a/tests/test_paired_speech.py b/tests/test_paired_speech.py
+index ce27b42..4bda72b 100644
+--- a/tests/test_paired_speech.py
++++ b/tests/test_paired_speech.py
+@@ -88,7 +88,8 @@ class PairTests(unittest.TestCase):
+         pair.accept(self.speech + "\n" + pair.open_tag + "\n[emotion=excited]\n" + self.speech + "\n" + pair.close_tag)
+         self.assertEqual(self.speech, pair.result.speech_text)
+         self.assertEqual("excited", pair.result.speech_emotion)
+-        instruction = pair.instruction()
++        from agent.paired_speech import SYSTEM_OUTPUT_CONTRACT
++        instruction = SYSTEM_OUTPUT_CONTRACT + "\n" + pair.instruction()
+         for cue in ("ふふ", "えへへ", "ジャジャーン", "ふぅ", "はぁー", "すぅー", "ん", "えっ", "すぅー……はぁー"):
+             self.assertIn(cue, instruction)
+         for phrase in ("OPTIONAL", "WITHOUT an interjection", "do not force, rotate", "SAME paragraph"):
+@@ -113,7 +114,9 @@ class PairTests(unittest.TestCase):
+         self.assertIn(self.pair.open_tag, current[-1]["text"])
+         text = with_current_reminder(agent, "player text\nplugin context")
+         self.assertTrue(text.startswith("player text\nplugin context\n\n"))
+-        self.assertIn("Previous replies are display-only", text)
++        from agent.paired_speech import SYSTEM_OUTPUT_CONTRACT
++        self.assertIn("Previous replies are display-only history", SYSTEM_OUTPUT_CONTRACT)
++        self.assertIn("Use this current id, not history", text)
+         agent._current_turn_id = "b"*32
+         self.assertIs(with_current_reminder(agent, original), original)
+         self.assertEqual(with_current_reminder(agent, "player text"), "player text")
+diff --git a/tests/test_speech_prompt_compaction.py b/tests/test_speech_prompt_compaction.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_speech_prompt_compaction.py
+@@ -0,0 +1,198 @@
++"""Exact historical-host projection; entirely synthetic, no profile or provider."""
++import ast
++from copy import deepcopy
++from pathlib import Path
++from types import SimpleNamespace
++import unittest
++
++from agent.paired_speech import (
++    PairedSpeech, SYSTEM_OUTPUT_CONTRACT, EMOTIONS, _host_contract_digest,
++    _LEGACY_CONTRACT_HASHES, project_historical_speech,
++)
++
++
++def legacy_contract(nonce="b" * 32, expressive=True):
++    # Frozen native108/native118 host templates, never player data.
++    marker = f'<lilith_speech id="{nonce}" locale="ja">'
++    emotion = "[emotion=gentle]\n" if expressive else ""
++    text = (
++        "Host presentation contract for THIS turn only: write your answer in the "
++        "requested display language exactly as usual. In the SAME final text response, "
++        "after that complete answer append a faithful Japanese TTS rendition, enclosed "
++        f"exactly as: \n{marker}\n{emotion}Japanese speech text\n</lilith_speech>\n"
++        "Do not explain or label this formatting. Do not wrap it in a code fence. "
++        "The display answer comes first; nothing follows the closing tag. The enclosed "
++        "script is not a second answer: preserve meaning, persona, names, tone and facts; "
++        "add no advice, claims or actions. Use natural Japanese sentences and kana readings "
++        "for Han-only names/headings; never leave Chinese clauses for a Japanese voice. "
++        "Omit unreadable markup, URLs and local file paths from speech. "
++        "Do not attach a speech script to tool calls or interim commentary. Continue using "
++        "real tools normally when needed, then attach the script only to the final answer. "
++        "This contract neither authorizes any action nor changes conversation language."
++    )
++    if expressive:
++        text += (
++            " Inside the suffix, choose ONE overall delivery for this reply using a first line "
++            "[emotion=VALUE], where VALUE is calm (matter-of-fact), gentle (soft support), "
++            "playful (light teasing), affectionate (warm closeness), excited (delighted reveal), "
++            "relieved (relaxing after tension), or surprised (brief genuine surprise). Choose "
++            "from the meaning and situation even WITHOUT an interjection; this is performance "
++            "metadata, not words to display or speak, a mood diagnosis, or an action. "
++            "Native Japanese vocal cues are OPTIONAL expressive speech: ふふ for amused teasing; "
++            "えへへ for bashful warm delight; ジャジャーン for a playful reveal; ふぅ for relief; "
++            "はぁー for a quiet exhale; すぅー for a deliberate inhale; ん for a soft response; "
++            "えっ for surprise; すぅー……はぁー for an intentional breath cycle. Use these only "
++            "when the conversational situation fits; do not force, rotate or demonstrate all "
++            "nine, chain unrelated cues, or prefix every answer with laughter. Inhale/exhale "
++            "performances should be rare, not filler or breathing advice. Explicit user requests "
++            "for a demonstration are different from normal conversation. Put a chosen cue and "
++            "its continuation in the SAME paragraph and keep their emotional delivery coherent; "
++            "ジャジャーン determines an excited reveal, not a calm continuation. Without a cue, "
++            "the chosen delivery still applies. Do not add vocal effects to serious explanations "
++            "or invented intimacy, and do not change facts or pad the answer to fit a sound. "
++            "When display is Japanese, faithfully render that same answer rather than inventing "
++            "a second response. Never put the emotion line in the visible answer."
++        )
++    return text
++
++
++class SpeechPromptCompactionTests(unittest.TestCase):
++    def setUp(self):
++        self.pair = PairedSpeech("a" * 32, "zh-Hant")
++        self.agent = SimpleNamespace(_lilith_paired_speech=self.pair, _current_turn_id=self.pair.turn_id)
++
++    def row(self, contract=None, clean="ordinary synthetic question", notes=("capability note", "locale note")):
++        if contract is None:
++            contract = legacy_contract()
++        source = {"role": "user", "content": clean,
++                  "api_content": "\n\n".join([notes[0], contract, notes[1], clean]),
++                  "display_kind": "user", "_row_id": 1}
++        actual = {"role": "user", "content": source["api_content"], "preserve": "untouched"}
++        return source, actual
++
++    def test_frozen_templates_match_both_exact_allowlisted_hashes(self):
++        observed = {_host_contract_digest(legacy_contract(expressive=value))[0] for value in (False, True)}
++        self.assertEqual(observed, _LEGACY_CONTRACT_HASHES)
++
++    def test_exact_legacy_templates_remove_only_host_block(self):
++        for expressive in (False, True):
++            source, actual = self.row(legacy_contract(expressive=expressive))
++            before = deepcopy((source, actual))
++            output = project_historical_speech(self.agent, source, actual)
++            self.assertEqual(output, {**actual, "content": "capability note\n\nlocale note\n\n" + source["content"]})
++            self.assertEqual((source, actual), before)
++            self.assertIsNot(output, actual)
++
++    def test_previous_compact_template_is_recognized_too(self):
++        old = PairedSpeech("c" * 32, "ja")
++        source, actual = self.row(old.instruction())
++        self.assertNotIn(old.open_tag, project_historical_speech(self.agent, source, actual)["content"])
++
++    def test_contract_only_prefix_returns_clean_text(self):
++        source = {"role": "user", "content": "clean", "api_content": legacy_contract() + "\n\nclean"}
++        actual = {"role": "user", "content": source["api_content"]}
++        self.assertEqual(project_historical_speech(self.agent, source, actual)["content"], "clean")
++
++    def test_user_quotation_is_preserved_verbatim_even_if_it_is_a_known_template(self):
++        clean = "player quoted this:\n\n" + legacy_contract()
++        source, actual = self.row(clean=clean)
++        result = project_historical_speech(self.agent, source, actual)
++        self.assertTrue(result["content"].endswith(clean))
++        self.assertEqual(result["content"].count(legacy_contract()), 1)
++
++    def test_without_sidecar_or_clean_suffix_no_projection(self):
++        for field, value in (("api_content", None), ("api_content", "different"), ("content", ""),
++                             ("content", "different"), ("content", [{"type": "text", "text": "x"}])):
++            source, actual = self.row()
++            source[field] = value
++            self.assertIs(project_historical_speech(self.agent, source, actual), actual)
++
++    def test_unknown_modified_duplicated_and_ambiguous_contracts_are_untouched(self):
++        known = legacy_contract()
++        for contract in (known + " altered", known.replace("persona", "identity"),
++                         known + "\n\n" + known,
++                         known + "\n\n" + known + " changed", "unknown host note"):
++            source, actual = self.row(contract)
++            self.assertIs(project_historical_speech(self.agent, source, actual), actual)
++
++    def test_old_template_carrying_current_nonce_is_never_removed(self):
++        for text in (legacy_contract(self.pair.nonce), self.pair.instruction()):
++            source, actual = self.row(text)
++            self.assertIs(project_historical_speech(self.agent, source, actual), actual)
++
++    def test_actual_mismatch_unknown_type_and_nonuser_are_noops(self):
++        class Hostile:
++            def __eq__(self, other):
++                raise AssertionError("must not compare arbitrary objects")
++        for content in ("different", None, [{"type": "text", "text": "x"}], Hostile()):
++            source, actual = self.row()
++            actual["content"] = content
++            self.assertIs(project_historical_speech(self.agent, source, actual), actual)
++        for role in ("assistant", "tool", "system", "developer"):
++            source, actual = self.row()
++            source["role"] = actual["role"] = role
++            source["reasoning_content"] = "leave reasoning unchanged"
++            self.assertIs(project_historical_speech(self.agent, source, actual), actual)
++
++    def test_stale_off_and_lookalike_pairs_do_not_modify_history(self):
++        for state, current in ((None, self.pair.turn_id), (self.pair, "b" * 32),
++                               (SimpleNamespace(turn_id=self.pair.turn_id), self.pair.turn_id)):
++            agent = SimpleNamespace(_lilith_paired_speech=state, _current_turn_id=current)
++            source, actual = self.row()
++            self.assertIs(project_historical_speech(agent, source, actual), actual)
++
++    def test_nonchat_display_kind_and_bounds_fail_closed(self):
++        source, actual = self.row()
++        source["display_kind"] = "notification"
++        self.assertIs(project_historical_speech(self.agent, source, actual), actual)
++        for notes in (("x" * 65537, "tail"), ("\n\n".join(["x"] * 65), "tail")):
++            source, actual = self.row(notes=notes)
++            self.assertIs(project_historical_speech(self.agent, source, actual), actual)
++
++    def test_other_host_notes_and_line_endings_stay_byte_exact(self):
++        notes = ("native continuity\r\n保留記憶", "tool note\n\n  preserve spacing\r\n")
++        source, actual = self.row(notes=notes, clean="玩家\n\n引言與空白 ")
++        self.assertEqual(project_historical_speech(self.agent, source, actual)["content"],
++                         "\n\n".join([*notes, source["content"]]))
++
++    def test_required_output_emotion_optional_cues_are_independent(self):
++        for phrase in ("EVERY final reply", "WITHOUT an interjection", "VOCAL CUES are OPTIONAL",
++                       "same answer", "No", "tool authority"):
++            self.assertIn(phrase.lower(), SYSTEM_OUTPUT_CONTRACT.lower())
++        for emotion in EMOTIONS:
++            self.assertIn(emotion + "=", SYSTEM_OUTPUT_CONTRACT)
++        for cue in ("ふふ", "えへへ", "ジャジャーン", "ふぅ", "はぁー", "すぅー", "ん", "えっ", "すぅー……はぁー"):
++            self.assertIn(cue + "=", SYSTEM_OUTPUT_CONTRACT)
++        self.assertNotIn("[emotion=gentle]", self.pair.instruction())
++        self.assertIn("even without vocal cues", self.pair.instruction())
++        self.assertIn("WITHOUT a cue", self.pair.terminal_reminder())
++
++    def test_fixed_contract_and_current_material_are_smaller_in_total(self):
++        current = SYSTEM_OUTPUT_CONTRACT + self.pair.instruction() + self.pair.terminal_reminder()
++        self.assertLess(len(current), 0.75 * (1096 + 2646 + 791))
++        self.assertLess(len(self.pair.instruction()), 600)
++        self.assertLess(len(self.pair.terminal_reminder()), 550)
++        self.assertNotIn(self.pair.nonce, SYSTEM_OUTPUT_CONTRACT)
++
++    def test_history_projection_only_at_historical_user_branch_and_verifier(self):
++        root = Path(__file__).parents[1]
++        loop = ast.parse((root / "agent/conversation_loop.py").read_text(encoding="utf-8"))
++        nodes = [n for n in ast.walk(loop) if isinstance(n, ast.If)
++                 and ast.unparse(n.test) == "idx < current_turn_user_idx"]
++        self.assertEqual(len(nodes), 1)
++        self.assertIn("project_historical_speech(agent, msg, api_msg)", ast.unparse(nodes[0]))
++        verifier = (root / "agent/usage_budget_context.py").read_text(encoding="utf-8")
++        self.assertIn("project_historical_speech(agent, source[index], expected)", verifier)
++
++    def test_display_label_is_traditional_chinese_without_region_emphasis(self):
++        path = Path(__file__).parents[1] / "tui_gateway/server.py"
++        tree = ast.parse(path.read_text(encoding="utf-8"))
++        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_game_display_locale_note")
++        text = ast.unparse(function)
++        self.assertIn("Traditional Chinese", text)
++        self.assertNotIn("Taiwan", text)
++        self.assertIn("zh-Hant", text)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index acb2d5d..66bee58 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -14226,7 +14226,7 @@ def _game_display_locale_note(display_locale: str | None, *, paired_speech: bool
+     """Return host-owned reply-language guidance for one hidden game turn."""
+ 
+     labels = {
+-        "zh-Hant": "Traditional Chinese (Taiwan)",
++        "zh-Hant": "Traditional Chinese",
+         "zh-Hans": "Simplified Chinese",
+         "ja": "natural Japanese",
+         "en": "natural English",

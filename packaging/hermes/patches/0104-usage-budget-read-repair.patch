@@ -1,0 +1,377 @@
+diff --git a/agent/usage_budget_preview.py b/agent/usage_budget_preview.py
+new file mode 100644
+--- /dev/null
++++ b/agent/usage_budget_preview.py
+@@ -0,0 +1,90 @@
++"""Content-free, read-only counterfactuals of the native six-level policy.
++
++The caller supplies an already parsed, launch-profile configuration and native
++resolved iteration/reasoning settings. This module never loads configuration,
++constructs an agent/client, resolves a provider, counts prompts, or accesses a
++preference/ledger. A configured preview is NOT an effective session or turn.
++Model context capacity, memory contents and credentials are not projected.
++"""
++from __future__ import annotations
++
++from agent.usage_budget import BudgetError, NormalBudget, VerifiedModelLimits
++from agent.usage_budget_dispatch import WireRoute
++from agent.usage_budget_host_policy import (
++    DEFAULT_ECONOMY_REFERENCES, ECONOMY_REFERENCE_VERSION, HostPolicySnapshot,
++    _native_optional_positive,
++)
++from agent.usage_budget_preferences import UsagePreference
++
++
++SCHEMA_VERSION = 1
++MAX_SAFE_INTEGER = 9_007_199_254_740_991
++_LIMIT_FIELDS = (
++    "request_input_tokens", "request_output_tokens", "request_thinking_tokens",
++    "logical_iterations", "turn_token_allowance", "turn_actual_call_allowance",
++)
++
++
++def _preview_number(value):
++    # Match native numeric/unset parsing, then apply the cross-language wire
++    # bound. A known positive value outside that bound cannot become "unset";
++    # reject this configured preview so the UI can retain labelled references.
++    parsed = _native_optional_positive(value)
++    if parsed is not None and parsed > MAX_SAFE_INTEGER:
++        raise BudgetError("invalid_preview_limit")
++    return parsed
++
++
++def build_budget_preview(config=None, *, max_iterations=None, reasoning_config=None):
++    """Return the closed ``budget.preview`` v1 result, with six ordered rows.
++
++    ``None`` or empty config produces a reference-only preview; it must not
++    claim an unverified normal iteration default. For a nonempty plain dict,
++    only model.context_length/model.max_tokens and the caller's native-resolved
++    iteration/reasoning values are read. Do not pass a live agent or property
++    wrapper. The selected route is deliberately not discovered or certified.
++
++    Null is contextual: modes 1--4 have an unknown/unset native field; mode 5
++    keeps the native/serving default; mode 6 adds no human usage ceiling. Native
++    context/compression settings and mandatory API parameters still apply.
++    """
++    if config is not None and type(config) is not dict:
++        raise BudgetError("invalid_preview_config")
++    configured = bool(config)
++    normal = NormalBudget()
++    if configured:
++        model = config.get("model")
++        model = model if type(model) is dict else {}
++        reasoning = reasoning_config if type(reasoning_config) is dict else {}
++        normal = NormalBudget(
++            input_tokens=_preview_number(model.get("context_length")),
++            output_tokens=_preview_number(model.get("max_tokens")),
++            thinking_tokens=_preview_number(reasoning.get("max_tokens")),
++            max_iterations=_preview_number(max_iterations),
++        )
++    snapshot = HostPolicySnapshot(
++        # This pure policy key is never registered as an outbound capability.
++        route=WireRoute("preview-only", "configured-values", "no-dispatch"),
++        normal=normal, reference=DEFAULT_ECONOMY_REFERENCES,
++        limits=VerifiedModelLimits(), input_count_is_exact=False,
++    )
++    levels = []
++    for level in range(1, 7):
++        # The resolver accepts versioned preferences. Version 1 is only a
++        # counterfactual input here: never returned, saved, admitted or applied.
++        described = snapshot.describe(UsagePreference(revision=1, level=level))
++        row = {"level": level}
++        for name in _LIMIT_FIELDS:
++            value = described[name]
++            if value is not None and (type(value) is not int or not 0 < value <= MAX_SAFE_INTEGER):
++                raise BudgetError("invalid_preview_limit")
++            row[name] = value
++        levels.append(row)
++    return {
++        "schema_version": SCHEMA_VERSION,
++        "scope": "configured_preview" if configured else "reference_preview",
++        "reference_version": ECONOMY_REFERENCE_VERSION,
++        "input_count_mode": "estimated",
++        "memory_policy": "unchanged_no_per_level_count",
++        "levels": levels,
++    }
+diff --git a/tests/test_lilith_usage_budget_handlers.py b/tests/test_lilith_usage_budget_handlers.py
+index 76cf7d7..f18f5f9 100644
+--- a/tests/test_lilith_usage_budget_handlers.py
++++ b/tests/test_lilith_usage_budget_handlers.py
+@@ -18,6 +18,7 @@ class HandlerTests(unittest.TestCase):
+         self.profile = object()  # Not an actual player/test directory.
+         self.server = SimpleNamespace(
+             _hermes_home=self.profile, _stdio_transport=self.stdio, _methods={},
++            _LONG_HANDLERS=frozenset({"budget.get", "budget.set", "budget.preview"}),
+             current_transport=lambda: None,
+             _native_authority_quarantine_rpc_error=lambda rid: None,
+             _ok=lambda rid, value: {"jsonrpc": "2.0", "id": rid, "result": value},
+@@ -54,7 +55,7 @@ class HandlerTests(unittest.TestCase):
+         return value
+ 
+     def test_actual_registration_closed_methods_and_exact_packets(self):
+-        self.assertEqual(set(self.server._methods), {"budget.get", "budget.set"})
++        self.assertEqual(set(self.server._methods), {"budget.get", "budget.set", "budget.preview"})
+         self.assertEqual(self.call("budget.get"), dict(schema_version=1, revision=0, level=5))
+         result = self.call("budget.set", self.update())
+         self.assertEqual(set(result), {"preference", "receipt", "replay"})
+@@ -90,6 +91,22 @@ class HandlerTests(unittest.TestCase):
+             self.assertEqual(self.call("budget.get")["code"], "budget.host_required")
+         self.assertEqual(self.calls, [])
+ 
++    def test_attested_runtime_ws_is_admitted_without_relaxing_host_lock(self):
++        self.server.current_transport = lambda: SimpleNamespace(lilith_runtime_attested=True, _closed=False)
++        self.assertEqual(self.call("budget.get")["level"], 5)
++        self.assertEqual(self.call("budget.set", self.update())["preference"]["level"], 1)
++        self.assertIn("budget.preview", self.server._LONG_HANDLERS)
++        with patch.object(handlers, "_strict_host_required", return_value=False):
++            self.assertEqual(self.call("budget.get")["code"], "budget.host_required")
++
++    def test_closed_unattested_and_truthy_not_boolean_ws_rejected(self):
++        for attested, closed in ((False, False), ("true", False), (1, False), (True, True)):
++            self.server.current_transport = lambda: SimpleNamespace(lilith_runtime_attested=attested, _closed=closed)
++            for method in ("budget.get", "budget.set", "budget.preview"):
++                self.assertEqual(self.call(method, self.update() if method == "budget.set" else {})["code"],
++                                 "budget.host_required")
++        self.assertEqual(self.calls, [])
++
+     def test_frozen_host_profile_does_not_follow_session_override(self):
+         self.server._hermes_home = object()
+         self.server._sessions = {"active": {"profile_home": "untrusted", "running": True}}
+@@ -111,7 +128,10 @@ class HandlerTests(unittest.TestCase):
+                 self.assertEqual(self.call("budget.set", self.update()), {"schema_version": 1, "code": code})
+ 
+     def test_candidate_server_registers_module_without_booting_native(self):
+-        source = (Path(__file__).parents[1] / "tui_gateway" / "server.py").read_text(encoding="utf-8")
++        source_path = Path(__file__).parents[1] / "tui_gateway" / "server.py"
++        if not source_path.exists():
++            source_path = Path(__file__).parents[3] / "usage-budget" / "overlay" / "tui_gateway" / "server.py"
++        source = source_path.read_text(encoding="utf-8")
+         tree = ast.parse(source)
+         self.assertTrue(any(isinstance(node, ast.ImportFrom) and any(
+             item.name == "methods_usage_budget" for item in node.names) for node in tree.body))
+diff --git a/tests/test_lilith_usage_budget_preview.py b/tests/test_lilith_usage_budget_preview.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_lilith_usage_budget_preview.py
+@@ -0,0 +1,156 @@
++from copy import deepcopy
++import json
++from pathlib import Path
++import unittest
++from unittest.mock import patch
++
++from agent.usage_budget import BudgetError, NormalBudget, VerifiedModelLimits
++from agent.usage_budget_dispatch import WireRoute
++from agent.usage_budget_host_policy import HostPolicySnapshot, DEFAULT_ECONOMY_REFERENCES
++from agent.usage_budget_preferences import UsagePreference
++from agent.usage_budget_preview import build_budget_preview, MAX_SAFE_INTEGER
++
++
++FIELDS = {"level", "request_input_tokens", "request_output_tokens", "request_thinking_tokens",
++          "logical_iterations", "turn_token_allowance", "turn_actual_call_allowance"}
++
++
++class PreviewTests(unittest.TestCase):
++    def test_exact_reference_shape_and_six_ordered_rows(self):
++        result = build_budget_preview()
++        self.assertEqual({"schema_version", "scope", "reference_version", "input_count_mode",
++                          "memory_policy", "levels"}, set(result))
++        self.assertEqual(1, result["schema_version"])
++        self.assertEqual("reference_preview", result["scope"])
++        self.assertEqual("lilith-economy-20260926-v2", result["reference_version"])
++        self.assertEqual("estimated", result["input_count_mode"])
++        self.assertEqual("unchanged_no_per_level_count", result["memory_policy"])
++        self.assertEqual(list(range(1, 7)), [row["level"] for row in result["levels"]])
++        for row in result["levels"]:
++            self.assertEqual(FIELDS, set(row))
++
++    def test_reference_numbers_include_engineering_input_reserve(self):
++        rows = build_budget_preview()["levels"][:4]
++        self.assertEqual([45056, 57344, 81920, 106496], [r["request_input_tokens"] for r in rows])
++        self.assertEqual([2048, 4096, 8192, 12288], [r["request_output_tokens"] for r in rows])
++        self.assertEqual([262144, 524288, 1048576, 1572864], [r["turn_token_allowance"] for r in rows])
++        self.assertEqual([8, 16, 32, 48], [r["turn_actual_call_allowance"] for r in rows])
++        self.assertTrue(all(r["logical_iterations"] is None for r in rows))
++
++    def test_configured_preview_uses_native_resolved_iterations_not_fixed_32(self):
++        config = {"model": {"default": "synthetic"}, "agent": {"max_turns": 32}}
++        rows = build_budget_preview(config, max_iterations=500)["levels"]
++        self.assertEqual([62, 125, 250, 375, 500, None], [r["logical_iterations"] for r in rows])
++
++    def test_native_32_if_actually_supplied(self):
++        rows = build_budget_preview({"model": {}}, max_iterations=32)["levels"]
++        self.assertEqual([4, 8, 16, 24, 32, None], [r["logical_iterations"] for r in rows])
++
++    def test_smaller_custom_settings_preserved_and_scaled_by_same_resolver(self):
++        config = {"model": {"context_length": "65536", "max_tokens": "8000"}}
++        result = build_budget_preview(config, max_iterations="20", reasoning_config={"max_tokens": "4096"})
++        expected = HostPolicySnapshot(
++            WireRoute("synthetic", "model", "adapter"), NormalBudget(65536, 8000, 4096, 20),
++            DEFAULT_ECONOMY_REFERENCES, VerifiedModelLimits(), input_count_is_exact=False)
++        self.assertEqual("configured_preview", result["scope"])
++        for row in result["levels"]:
++            described = expected.describe(UsagePreference(revision=91, level=row["level"]))
++            self.assertEqual(row, {key: described[key] for key in FIELDS})
++
++    def test_model_window_not_claimed_and_low_input_unchanged_by_reserve(self):
++        rows = build_budget_preview({"model": {"context_length": 16000}})["levels"]
++        self.assertEqual([16000] * 5 + [None], [r["request_input_tokens"] for r in rows])
++        self.assertNotIn("model_context_tokens", rows[0])
++
++    def test_larger_custom_normal_restores_after_economy(self):
++        rows = build_budget_preview({"model": {"context_length": 1000000, "max_tokens": 64000}})["levels"]
++        self.assertEqual(45056, rows[0]["request_input_tokens"])
++        self.assertEqual(2048, rows[0]["request_output_tokens"])
++        self.assertEqual(1000000, rows[4]["request_input_tokens"])
++        self.assertEqual(64000, rows[4]["request_output_tokens"])
++        self.assertTrue(all(rows[5][name] is None for name in FIELDS - {"level"}))
++
++    def test_normal_unset_and_unbounded_do_not_adopt_references(self):
++        for row in build_budget_preview()["levels"][4:]:
++            self.assertTrue(all(row[key] is None for key in FIELDS - {"level"}))
++
++    def test_empty_or_missing_config_does_not_advertise_host_defaults(self):
++        self.assertEqual(build_budget_preview(), build_budget_preview({}, max_iterations=500))
++
++    def test_invalid_numeric_fields_are_unknown_not_zero_or_false(self):
++        for value in (True, False, 0, -1, 1.5, float("inf"), [], {}, "bad"):
++            with self.subTest(value=value):
++                rows = build_budget_preview({"model": {"context_length": value, "max_tokens": value}},
++                                            max_iterations=value, reasoning_config={"max_tokens": value})["levels"]
++                self.assertTrue(all(rows[4][key] is None for key in FIELDS - {"level"}))
++                self.assertIsNone(rows[0]["request_thinking_tokens"])
++                self.assertIsNone(rows[0]["logical_iterations"])
++
++    def test_known_oversized_positive_settings_reject_not_mislabel_as_unset(self):
++        for value in (MAX_SAFE_INTEGER + 1, str(MAX_SAFE_INTEGER + 1)):
++            for kwargs in (
++                {"config": {"model": {"context_length": value}}},
++                {"config": {"model": {"max_tokens": value}}},
++                {"config": {"model": {}}, "max_iterations": value},
++                {"config": {"model": {}}, "reasoning_config": {"max_tokens": value}},
++            ):
++                with self.subTest(value=value, kwargs=kwargs):
++                    with self.assertRaisesRegex(BudgetError, "invalid_preview_limit"):
++                        build_budget_preview(**kwargs)
++
++    def test_safe_integer_boundary(self):
++        result = build_budget_preview({"model": {"context_length": MAX_SAFE_INTEGER,
++                                                    "max_tokens": MAX_SAFE_INTEGER}},
++                                      max_iterations=MAX_SAFE_INTEGER)
++        for row in result["levels"]:
++            for key in FIELDS - {"level"}:
++                self.assertTrue(row[key] is None or type(row[key]) is int and 0 < row[key] <= MAX_SAFE_INTEGER)
++        self.assertEqual(MAX_SAFE_INTEGER, result["levels"][4]["logical_iterations"])
++
++    def test_unknown_subsections_do_not_call_custom_getters(self):
++        class Probe:
++            def get(self, *_args):
++                raise AssertionError("probe")
++            @property
++            def context_length(self):
++                raise AssertionError("network-capable property")
++        rows = build_budget_preview({"model": Probe(), "compressor": Probe()},
++                                    max_iterations=Probe(), reasoning_config=Probe())["levels"]
++        self.assertIsNone(rows[4]["request_input_tokens"])
++
++    def test_reject_custom_top_level_mapping_without_invoking_it(self):
++        class Custom(dict):
++            def __bool__(self):
++                raise AssertionError("custom mapping executed")
++        with self.assertRaisesRegex(BudgetError, "invalid_preview_config"):
++            build_budget_preview(Custom())
++
++    def test_does_not_mutate_input_or_expose_private_fields(self):
++        config = {"model": {"default": "PRIVATE_MODEL", "provider": "PRIVATE_PROVIDER",
++                            "base_url": "https://PRIVATE_ENDPOINT?key=PRIVATE_KEY", "max_tokens": 7000},
++                  "api_key": "PRIVATE_KEY", "memory": ["PRIVATE_MEMORY"]}
++        reasoning = {"max_tokens": 2000, "private": "PRIVATE_THOUGHT"}
++        before, before_reasoning = deepcopy(config), deepcopy(reasoning)
++        result = build_budget_preview(config, max_iterations=32, reasoning_config=reasoning)
++        self.assertEqual(before, config)
++        self.assertEqual(before_reasoning, reasoning)
++        self.assertNotIn("PRIVATE_", json.dumps(result))
++        self.assertNotIn("revision", json.dumps(result))
++
++    def test_no_store_ledger_agent_or_provider_imports(self):
++        import builtins
++        real_import = builtins.__import__
++        def guarded(name, *args, **kwargs):
++            if any(word in name for word in ("store", "runtime", "run_agent", "openai", "anthropic", "httpx")):
++                raise AssertionError("forbidden import: " + name)
++            return real_import(name, *args, **kwargs)
++        with patch.object(builtins, "__import__", guarded):
++            self.assertEqual(6, len(build_budget_preview({"model": {}}, max_iterations=32)["levels"]))
++
++    def test_reference_resource_exactly_matches_same_native_resolver(self):
++        resource = Path(__file__).resolve().parents[2] / "reference-preview.json"
++        self.assertEqual(build_budget_preview(), json.loads(resource.read_text(encoding="utf-8")))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tui_gateway/methods_usage_budget.py b/tui_gateway/methods_usage_budget.py
+index a59dd68..16ca374 100644
+--- a/tui_gateway/methods_usage_budget.py
++++ b/tui_gateway/methods_usage_budget.py
+@@ -3,7 +3,8 @@
+ Registration freezes the trusted gateway launch profile. Neither a session's
+ ambient home override nor any client-supplied path can redirect this store.
+ The authenticated Runtime enforces Workbench ownership; native additionally
+-rejects generic/WS transports and hosts without the pinned identity contract.
++rejects generic WebSockets and hosts without the pinned identity contract.
++The existing server-attested Runtime WebSocket is the production ingress.
+ """
+ from agent.usage_budget_preferences import PreferenceError, parse_update
+ from agent.usage_budget_store import get_preference, set_preference
+@@ -21,10 +22,14 @@ def register(server):
+     def failure(rid, code):
+         return server._ok(rid, {"schema_version": 1, "code": "budget." + code})
+ 
+-    def invoke(rid, params, *, mutation):
++    def invoke(rid, params, *, method):
++        mutation = method == "budget.set"
+         try:
+             transport = server.current_transport()
+-            if (transport is not None and transport is not stdio) or not _strict_host_required():
++            trusted_transport = (transport is None or transport is stdio
++                                 or getattr(transport, "lilith_runtime_attested", False) is True)
++            if (not trusted_transport or getattr(transport, "_closed", False)
++                    or not _strict_host_required()):
+                 return failure(rid, "host_required")
+         except Exception:
+             return failure(rid, "host_required")
+@@ -41,6 +46,22 @@ def register(server):
+         except PreferenceError:
+             return failure(rid, "invalid_request")
+         try:
++            if method == "budget.preview":
++                from hermes_constants import (
++                    set_hermes_home_override, reset_hermes_home_override, resolve_reasoning_config)
++                from agent.usage_budget_preview import build_budget_preview
++                # Always the host-owned launch profile, never ambient session
++                # state or a JSON-supplied path. No agent, credentials resolver,
++                # model inventory or provider request is created for this read.
++                token = set_hermes_home_override(profile_root)
++                try:
++                    config = server._load_cfg()
++                    preview = build_budget_preview(
++                        config, max_iterations=server._cfg_max_turns(config, 500),
++                        reasoning_config=resolve_reasoning_config(config))
++                finally:
++                    reset_hermes_home_override(token)
++                return server._ok(rid, preview)
+             if mutation:
+                 return server._ok(rid, set_preference(profile_root, update).to_wire())
+             return server._ok(rid, get_preference(profile_root).to_wire())
+@@ -59,5 +80,8 @@ def register(server):
+             # must use the same operation ID/readback, not presume rollback.
+             return failure(rid, "operation_failed")
+ 
+-    server._methods["budget.get"] = lambda rid, params: invoke(rid, params, mutation=False)
+-    server._methods["budget.set"] = lambda rid, params: invoke(rid, params, mutation=True)
++    server._methods["budget.get"] = lambda rid, params: invoke(rid, params, method="budget.get")
++    server._methods["budget.set"] = lambda rid, params: invoke(rid, params, method="budget.set")
++    server._methods["budget.preview"] = lambda rid, params: invoke(rid, params, method="budget.preview")
++    # This reads local config only, but must not block the shared WS reader.
++    server._LONG_HANDLERS = server._LONG_HANDLERS | frozenset({"budget.preview"})

@@ -1,0 +1,819 @@
+diff --git a/tests/tui_gateway/test_lilith_noteinbox_bridge.py b/tests/tui_gateway/test_lilith_noteinbox_bridge.py
+new file mode 100644
+index 0000000..853891f
+--- /dev/null
++++ b/tests/tui_gateway/test_lilith_noteinbox_bridge.py
+@@ -0,0 +1,411 @@
++from __future__ import annotations
++
++import contextvars
++import gc
++import hashlib
++import threading
++import weakref
++import pytest
++
++from tui_gateway import lilith_noteinbox_bridge as bridge, server
++from tui_gateway.transport import bind_transport, reset_transport
++
++SID, TID = "note-tool-fixture", "1" * 32
++ARGS = {"action": "deliver", "locale": "zh-TW", "text": "今天也辛苦了。 —莉莉絲"}
++
++
++def receipt(payload, status="delivered"):
++    return {
++        "version": 1,
++        "kind": bridge.RESULT_KIND,
++        "operation_id": payload["operation_id"],
++        "delivery_id": payload["delivery_id"],
++        "status": status,
++        "code": "ok" if status == "delivered" else "runtime.note_owner_unavailable",
++        "artifact": {
++            "artifact_id": payload["delivery_id"],
++            "sha256": "A" * 64,
++            "byte_length": 123,
++            "completed_at_utc": "2026-09-07T00:00:00.0000000+00:00",
++        }
++        if status == "delivered"
++        else None,
++    }
++
++
++@pytest.fixture
++def owner(monkeypatch):
++    old = dict(server._sessions)
++    bridge._reset_for_tests()
++    frames = []
++
++    class Transport:
++        def write(self, frame):
++            frames.append(frame)
++            return True
++
++    transport = Transport()
++    session = {
++        "transport": transport,
++        "running": True,
++        "inflight_turn": {"turn_id": TID},
++    }
++    server._sessions[SID] = session
++    monkeypatch.setattr(
++        "gateway.session_context.get_session_env",
++        lambda key, default="": SID if key == "HERMES_UI_SESSION_ID" else default,
++    )
++    tokens = (
++        bind_transport(transport),
++        server._current_runtime_session_record.set(session),
++        server._current_turn_event_id.set(TID),
++    )
++    emit = server._emit
++    control = {"reply": True, "status": "delivered"}
++
++    def complete(payload, result=None, via=None):
++        return server.dispatch(
++            {
++                "jsonrpc": "2.0",
++                "id": "ack",
++                "method": "lilith.host.complete",
++                "params": {
++                    "session_id": SID,
++                    "turn_id": TID,
++                    "result": result or receipt(payload, control["status"]),
++                },
++            },
++            transport=via or transport,
++        )
++
++    def wrapped(kind, sid, payload):
++        outcome = emit(kind, sid, payload)
++        if control["reply"]:
++            control["ack"] = complete(payload)
++        return outcome
++
++    monkeypatch.setattr(server, "_emit", wrapped)
++    yield frames, session, control, complete
++    server._current_turn_event_id.reset(tokens[2])
++    server._current_runtime_session_record.reset(tokens[1])
++    reset_transport(tokens[0])
++    bridge._reset_for_tests()
++    server._sessions.clear()
++    server._sessions.update(old)
++
++
++def test_real_current_authority_event_and_exact_three_field_ack(owner):
++    frames, _, control, _ = owner
++    result = bridge.request_note(ARGS)
++    frame = frames[0]["params"]
++    payload = frame["payload"]
++    assert (
++        frame["type"] == "lilith.host.request"
++        and frame["session_id"] == SID
++        and frame["turn_id"] == TID
++    )
++    assert set(payload) == {
++        "version",
++        "kind",
++        "operation_id",
++        "delivery_id",
++        "arguments",
++    }
++    assert (
++        payload["kind"] == "lilith.noteinbox.host-request"
++        and payload["arguments"] == ARGS
++    )
++    assert result == receipt(payload)
++    assert control["ack"]["result"] == {
++        "accepted": True,
++        "operation_id": payload["operation_id"],
++        "delivery_id": payload["delivery_id"],
++    }
++
++
++def test_delivery_identity_exact_cross_language_vector():
++    expected = hashlib.sha256(
++        ("lilith.noteinbox.delivery.v1\0" + SID + "\0" + TID).encode()
++    ).hexdigest()[:32]
++    assert bridge.delivery_id_for_turn(SID, TID) == expected
++    assert bridge.delivery_id_for_turn(SID, "2" * 32) != expected
++    assert bridge.delivery_id_for_turn(SID + "x", TID) != expected
++
++
++@pytest.mark.parametrize(
++    "status", ["delivered", "deferred", "rejected", "failed", "unknown", "not_found"]
++)
++def test_same_turn_retry_queries_same_delivery_and_never_emits_another_deliver(
++    owner, status
++):
++    frames, _, control, _ = owner
++    control["status"] = status
++    bridge.request_note(ARGS)
++    bridge.request_note(ARGS)
++    a, b = [frame["params"]["payload"] for frame in frames]
++    assert (
++        a["delivery_id"] == b["delivery_id"] and a["operation_id"] != b["operation_id"]
++    )
++    assert b["arguments"] == {"action": "status", "locale": "zh-TW"}
++
++
++@pytest.mark.parametrize("changed", [{"text": "different"}, {"locale": "en"}])
++def test_same_turn_different_payload_rejected_before_emit(owner, changed):
++    frames, _, _, _ = owner
++    bridge.request_note(ARGS)
++    with pytest.raises(bridge.LilithHostAuthorityError):
++        bridge.request_note({**ARGS, **changed})
++    assert len(frames) == 1
++
++
++def test_status_does_not_mint_write_seal(owner):
++    frames, _, control, _ = owner
++    control["status"] = "not_found"
++    bridge.request_note({"action": "status", "locale": "en"})
++    assert not bridge._seals
++    bridge.request_note(ARGS)
++    assert [frame["params"]["payload"]["arguments"]["action"] for frame in frames] == [
++        "status",
++        "deliver",
++    ]
++
++
++def test_timeout_retains_seal_late_completion_rejected_retry_status_only(owner):
++    frames, _, control, complete = owner
++    control["reply"] = False
++    with pytest.raises(bridge.LilithHostUnavailableError):
++        bridge.request_note(ARGS, timeout_seconds=0.005)
++    assert not bridge._pending and len(bridge._seals) == 1
++    assert "error" in complete(frames[0]["params"]["payload"])
++    control["reply"] = True
++    bridge.request_note(ARGS)
++    assert frames[-1]["params"]["payload"]["arguments"]["action"] == "status"
++
++
++def test_exact_completion_replay_and_conflict(owner):
++    frames, _, _, complete = owner
++    bridge.request_note(ARGS)
++    payload = frames[0]["params"]["payload"]
++    assert complete(payload)["result"]["accepted"] is True
++    altered = receipt(payload)
++    altered["artifact"]["byte_length"] += 1
++    assert "error" in complete(payload, altered)
++    assert "error" in complete(payload, via=object())
++
++
++@pytest.mark.parametrize("change", ["running", "turn", "transport", "session"])
++def test_stale_owner_is_rejected_before_dispatch(owner, change):
++    frames, session, _, _ = owner
++    if change == "running":
++        session["running"] = False
++    if change == "turn":
++        session["inflight_turn"]["turn_id"] = "2" * 32
++    if change == "transport":
++        session["transport"] = object()
++    if change == "session":
++        server._sessions[SID] = dict(session)
++    with pytest.raises(bridge.LilithHostAuthorityError):
++        bridge.request_note(ARGS)
++    assert not frames
++
++
++def test_delivery_capacity_fails_closed_without_eviction(owner, monkeypatch):
++    frames, _, _, _ = owner
++    monkeypatch.setattr(bridge, "MAX_DELIVERY_SEALS", 0)
++    with pytest.raises(bridge.LilithHostUnavailableError):
++        bridge.request_note(ARGS)
++    assert not frames
++
++
++@pytest.mark.parametrize("change", ["running", "turn", "transport", "session"])
++def test_inflight_owner_change_rejects_completion_and_result(
++    owner, monkeypatch, change
++):
++    frames, session, control, complete = owner
++    control["reply"] = False
++    emit = server._emit
++
++    def changed(kind, sid, payload):
++        emitted = emit(kind, sid, payload)
++        if change == "running":
++            session["running"] = False
++        if change == "turn":
++            session["inflight_turn"]["turn_id"] = "2" * 32
++        if change == "transport":
++            session["transport"] = object()
++        if change == "session":
++            server._sessions[SID] = dict(session)
++        assert "error" in complete(payload)
++        return emitted
++
++    monkeypatch.setattr(server, "_emit", changed)
++    with pytest.raises(bridge.LilithHostAuthorityError):
++        bridge.request_note(ARGS, timeout_seconds=0.005)
++    assert len(frames) == 1 and not bridge._pending and len(bridge._seals) == 1
++
++
++def test_concurrent_same_turn_delivery_has_only_one_write_request(owner, monkeypatch):
++    frames, _, control, _ = owner
++    control["reply"] = False
++    emitted = threading.Event()
++    original = server._emit
++
++    def capture(kind, sid, payload):
++        result = original(kind, sid, payload)
++        emitted.set()
++        return result
++
++    monkeypatch.setattr(server, "_emit", capture)
++    outcome = []
++
++    def first():
++        try:
++            bridge.request_note(ARGS, timeout_seconds=0.15)
++        except bridge.LilithHostUnavailableError:
++            outcome.append("unknown")
++
++    context = contextvars.copy_context()
++    worker = threading.Thread(target=context.run, args=(first,))
++    worker.start()
++    assert emitted.wait(1)
++    control["reply"] = True
++    bridge.request_note(ARGS)
++    worker.join(1)
++    assert not worker.is_alive() and outcome == ["unknown"]
++    payloads = [frame["params"]["payload"] for frame in frames]
++    assert [payload["arguments"]["action"] for payload in payloads] == [
++        "deliver",
++        "status",
++    ]
++    assert len({payload["delivery_id"] for payload in payloads}) == 1
++
++
++def test_pending_capacity_does_not_emit_or_mint_delivery(owner, monkeypatch):
++    frames, _, _, _ = owner
++    monkeypatch.setattr(bridge, "MAX_PENDING_REQUESTS", 0)
++    with pytest.raises(bridge.LilithHostUnavailableError):
++        bridge.request_note(ARGS)
++    assert not frames and not bridge._seals
++
++
++def test_permanent_seal_does_not_keep_closed_session_container_alive():
++    bridge._reset_for_tests()
++
++    def closed_session():
++        session = {"fixture_conversation": ["private fake history"]}
++        epoch = bridge._authority_epoch_locked(session, object())
++        reference = weakref.ref(epoch)
++        bridge._seals["1" * 32] = (reference, b"fixture digest")
++        return reference
++
++    reference = closed_session()
++    gc.collect()
++    assert reference() is None
++    assert len(bridge._seals) == 1  # Tombstone survives GC; no new grant.
++    bridge._reset_for_tests()
++
++
++def test_same_session_id_with_new_current_container_cannot_reuse_old_seal(owner):
++    frames, session, _, _ = owner
++    bridge.request_note(ARGS)
++    replacement = dict(session)  # Even copying the private epoch is not authority.
++    server._sessions[SID] = replacement
++    token = server._current_runtime_session_record.set(replacement)
++    try:
++        with pytest.raises(bridge.LilithHostAuthorityError):
++            bridge.request_note(ARGS)
++    finally:
++        server._current_runtime_session_record.reset(token)
++    assert len(frames) == 1
++
++
++def test_same_current_container_rebound_transport_cannot_reuse_old_seal(owner):
++    frames, session, _, _ = owner
++    bridge.request_note(ARGS)
++    transport = object()
++    session["transport"] = transport
++    token = bind_transport(transport)
++    try:
++        with pytest.raises(bridge.LilithHostAuthorityError):
++            bridge.request_note(ARGS)
++    finally:
++        reset_transport(token)
++    assert len(frames) == 1
++
++
++@pytest.mark.parametrize(
++    "arguments",
++    [
++        None,
++        {},
++        {**ARGS, "path": "x"},
++        {**ARGS, "delivery_id": "a" * 32},
++        {**ARGS, "text": " "},
++        {**ARGS, "text": "a" * 1201},
++        {**ARGS, "text": "😀" * 601},
++        {**ARGS, "text": "\ud800"},
++        {**ARGS, "text": "a\0b"},
++        {**ARGS, "locale": "zh-Hant"},
++        {"action": "status", "locale": "en", "text": "x"},
++        {"action": "deliver", "locale": "en"},
++    ],
++)
++def test_closed_arguments_reject_model_identity_path_and_bounds(arguments):
++    with pytest.raises(bridge.LilithHostProtocolError):
++        bridge.normalize_note_arguments(arguments)
++
++
++@pytest.mark.parametrize("locale", ["zh-TW", "zh-CN", "ja", "en"])
++def test_supported_locales_and_utf16_boundary(locale):
++    value = {**ARGS, "locale": locale, "text": "😀" * 600}
++    assert bridge.normalize_note_arguments(value) == value
++
++
++@pytest.mark.parametrize(
++    "change",
++    [
++        "extra",
++        "id",
++        "sha",
++        "size",
++        "time",
++        "offset",
++        "artifact_extra",
++        "missing_time",
++        "code",
++        "status",
++        "nonready_artifact",
++    ],
++)
++def test_receipts_reject_forged_or_unverified_artifacts(change):
++    result = receipt({"operation_id": "3" * 32, "delivery_id": "4" * 32})
++    if change == "extra":
++        result["path"] = "x"
++    if change == "id":
++        result["artifact"]["artifact_id"] = "5" * 32
++    if change == "sha":
++        result["artifact"]["sha256"] = "a" * 64
++    if change == "size":
++        result["artifact"]["byte_length"] = True
++    if change == "time":
++        result["artifact"]["completed_at_utc"] = "2026-09-07"
++    if change == "offset":
++        result["artifact"]["completed_at_utc"] = "2026-09-07T00:00:00.0000000+08:00"
++    if change == "artifact_extra":
++        result["artifact"]["path"] = "x"
++    if change == "missing_time":
++        result["artifact"].pop("completed_at_utc")
++    if change == "code":
++        result["code"] = "queued"
++    if change == "status":
++        result["status"] = "ready"
++    if change == "nonready_artifact":
++        result.update(status="unknown", code="unknown")
++    with pytest.raises(bridge.LilithHostProtocolError):
++        bridge.normalize_note_result(result, "3" * 32, "4" * 32)
++
++
++@pytest.mark.parametrize("timeout", [0, -1, True, 21, float("inf"), float("nan")])
++def test_timeout_must_be_finite_and_bounded(timeout):
++    with pytest.raises(bridge.LilithHostProtocolError):
++        bridge.request_note(ARGS, timeout_seconds=timeout)
+diff --git a/tui_gateway/lilith_noteinbox_bridge.py b/tui_gateway/lilith_noteinbox_bridge.py
+new file mode 100644
+index 0000000..6c4bfe7
+--- /dev/null
++++ b/tui_gateway/lilith_noteinbox_bridge.py
+@@ -0,0 +1,377 @@
++"""Typed, turn-bound image-note delivery. No model, file, speech or cron work.
++
++The game owns image rendering, durable receipts and verified completion.
++This module retains only bounded correlation and payload digests. A repeated
++deliver in the same turn is a status query, including after an unknown outcome.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import math
++import re
++import threading
++import time
++import uuid
++import weakref
++from dataclasses import dataclass, field
++from datetime import datetime, timedelta
++from typing import Any
++
++from tui_gateway.lilith_host_bridge import (
++    LilithHostAuthorityError,
++    LilithHostProtocolError,
++    LilithHostUnavailableError,
++    _canonical_result_bytes,
++    _canonical_turn_id,
++    _current_turn_authority,
++    _session_id,
++)
++
++REQUEST_KIND = "lilith.noteinbox.host-request"
++RESULT_KIND = "lilith.noteinbox.result"
++HOST_REQUEST_TIMEOUT_SECONDS = 20.0
++MAX_PENDING_REQUESTS = 16
++MAX_DELIVERY_SEALS = 4096  # No eviction: exhaustion must not permit another write.
++MAX_COMPLETION_RECEIPTS = 32
++COMPLETION_RECEIPT_TTL_SECONDS = 60.0
++_ID = re.compile(r"^[0-9a-f]{32}$")
++_SHA = re.compile(r"^[0-9A-F]{64}$")
++_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}(?:Z|\+00:00)$")
++_LOCALES = frozenset({"zh-TW", "zh-CN", "ja", "en"})
++_STATUSES = frozenset({
++    "delivered",
++    "deferred",
++    "rejected",
++    "failed",
++    "unknown",
++    "not_found",
++})
++
++
++def normalize_note_arguments(arguments: Any) -> dict:
++    if not isinstance(arguments, dict):
++        raise LilithHostProtocolError("image-note arguments must be an object")
++    action = arguments.get("action")
++    if not isinstance(action, str) or action not in {"deliver", "status"}:
++        raise LilithHostProtocolError("image-note action was rejected")
++    fields = (
++        {"action", "locale", "text"} if action == "deliver" else {"action", "locale"}
++    )
++    if set(arguments) != fields:
++        raise LilithHostProtocolError("image-note argument shape was rejected")
++    if not isinstance(arguments["locale"], str) or arguments["locale"] not in _LOCALES:
++        raise LilithHostProtocolError("image-note locale was rejected")
++    if action == "deliver":
++        text = arguments["text"]
++        if not isinstance(text, str) or not text.strip() or "\x00" in text:
++            raise LilithHostProtocolError("image-note text was rejected")
++        try:
++            # Match the C# contract's UTF-16 length, including supplementary characters.
++            if len(text.encode("utf-16-le")) // 2 > 1200:
++                raise ValueError("text bound")
++        except (UnicodeError, ValueError) as exc:
++            raise LilithHostProtocolError("image-note text exceeded its bound") from exc
++    return dict(arguments)
++
++
++def delivery_id_for_turn(session_id: str, turn_id: str) -> str:
++    session_id = _session_id(session_id)
++    turn_id = _canonical_turn_id(turn_id)
++    return hashlib.sha256(
++        ("lilith.noteinbox.delivery.v1\0" + session_id + "\0" + turn_id).encode("utf-8")
++    ).hexdigest()[:32]
++
++
++def normalize_note_result(result: Any, operation_id: str, delivery_id: str) -> dict:
++    fields = {
++        "version",
++        "kind",
++        "operation_id",
++        "delivery_id",
++        "status",
++        "code",
++        "artifact",
++    }
++    if not isinstance(result, dict) or set(result) != fields:
++        raise LilithHostProtocolError("image-note result shape was rejected")
++    if (
++        type(result["version"]) is not int
++        or result["version"] != 1
++        or result["kind"] != RESULT_KIND
++    ):
++        raise LilithHostProtocolError("image-note result protocol was rejected")
++    for name, expected in (
++        ("operation_id", operation_id),
++        ("delivery_id", delivery_id),
++    ):
++        if (
++            not isinstance(result[name], str)
++            or not _ID.fullmatch(result[name])
++            or result[name] != expected
++        ):
++            raise LilithHostProtocolError("image-note result identity was rejected")
++    status, code, artifact = result["status"], result["code"], result["artifact"]
++    if not isinstance(status, str) or status not in _STATUSES:
++        raise LilithHostProtocolError("image-note status was rejected")
++    if not isinstance(code, str) or not re.fullmatch(r"[a-z][a-z0-9_.]{0,95}", code):
++        raise LilithHostProtocolError("image-note result code was rejected")
++    if (status == "delivered") != (code == "ok"):
++        raise LilithHostProtocolError("image-note success and code disagree")
++    if status == "delivered":
++        if not isinstance(artifact, dict) or set(artifact) != {
++            "artifact_id",
++            "sha256",
++            "byte_length",
++            "completed_at_utc",
++        }:
++            raise LilithHostProtocolError("image-note artifact shape was rejected")
++        if (
++            artifact["artifact_id"] != delivery_id
++            or not isinstance(artifact["sha256"], str)
++            or not _SHA.fullmatch(artifact["sha256"])
++        ):
++            raise LilithHostProtocolError("image-note artifact identity was rejected")
++        if (
++            type(artifact["byte_length"]) is not int
++            or not 0 < artifact["byte_length"] <= 2**63 - 1
++        ):
++            raise LilithHostProtocolError("image-note artifact size was rejected")
++        timestamp = artifact["completed_at_utc"]
++        try:
++            if not isinstance(timestamp, str) or not _UTC.fullmatch(timestamp):
++                raise ValueError("timestamp shape")
++            if datetime.fromisoformat(
++                timestamp.replace("Z", "+00:00")
++            ).utcoffset() != timedelta(0):
++                raise ValueError("timestamp offset")
++        except ValueError as exc:
++            raise LilithHostProtocolError(
++                "image-note completion time was rejected"
++            ) from exc
++        artifact = dict(artifact)
++    elif artifact is not None:
++        raise LilithHostProtocolError(
++            "unverified image-note must not claim an artifact"
++        )
++    return {**result, "artifact": artifact}
++
++
++@dataclass
++class _Pending:
++    operation_id: str
++    delivery_id: str
++    session_id: str
++    turn_id: str
++    transport: Any
++    session: dict
++    deadline: float
++    completed: threading.Event = field(default_factory=threading.Event)
++    result: dict | None = None
++
++
++_lock = threading.Lock()
++_pending: dict[str, _Pending] = {}
++_receipts: dict[str, tuple[_Pending, bytes, float]] = {}
++
++
++@dataclass(eq=False)
++class _AuthorityEpoch:
++    # Owned by the session itself. This cycle is GC-able; seals never keep it,
++    # its session/conversation container, or its transport alive.
++    session: dict
++    transport: Any
++
++
++_seals: dict[str, tuple[weakref.ReferenceType[_AuthorityEpoch], bytes]] = {}
++
++
++def _authority_epoch_locked(session: dict, transport: Any) -> _AuthorityEpoch:
++    epoch = session.get("_lilith_noteinbox_authority_epoch")
++    if (
++        not isinstance(epoch, _AuthorityEpoch)
++        or epoch.session is not session
++        or epoch.transport is not transport
++    ):
++        epoch = _AuthorityEpoch(session, transport)
++        session["_lilith_noteinbox_authority_epoch"] = epoch
++    return epoch
++
++
++def _expire_locked(now: float) -> None:
++    for key, pending in list(_pending.items()):
++        if pending.deadline <= now:
++            _pending.pop(key)
++            pending.completed.set()
++    for key, (_, _, expires) in list(_receipts.items()):
++        if expires <= now:
++            _receipts.pop(key)
++
++
++def request_note(
++    arguments: Any, *, timeout_seconds: float = HOST_REQUEST_TIMEOUT_SECONDS
++) -> dict:
++    normalized = normalize_note_arguments(arguments)
++    if (
++        type(timeout_seconds) not in (int, float)
++        or not math.isfinite(timeout_seconds)
++        or not 0 < timeout_seconds <= HOST_REQUEST_TIMEOUT_SECONDS
++    ):
++        raise LilithHostProtocolError("image-note timeout was rejected")
++    sid, tid, transport, session = _current_turn_authority()
++    delivery_id = delivery_id_for_turn(sid, tid)
++    operation_id = uuid.uuid4().hex
++    pending = _Pending(
++        operation_id,
++        delivery_id,
++        sid,
++        tid,
++        transport,
++        session,
++        time.monotonic() + timeout_seconds,
++    )
++    from tui_gateway import server
++
++    # Same lock order as completion. Seal before the first emission; never clear
++    # it on timeout, cancellation or failure. Status cannot mint a seal.
++    with server._sessions_lock:
++        with _lock:
++            _expire_locked(time.monotonic())
++            _require_current(pending, transport, sid, tid, require_running=True)
++            if len(_pending) >= MAX_PENDING_REQUESTS:
++                raise LilithHostUnavailableError(
++                    "image-note pending capacity exhausted"
++                )
++            if normalized["action"] == "deliver":
++                digest = hashlib.sha256(_canonical_result_bytes(normalized)).digest()
++                epoch = _authority_epoch_locked(session, transport)
++                previous = _seals.get(delivery_id)
++                if previous is not None:
++                    if previous[0]() is not epoch or previous[1] != digest:
++                        raise LilithHostAuthorityError(
++                            "image-note turn payload conflict"
++                        )
++                    normalized = {"action": "status", "locale": normalized["locale"]}
++                else:
++                    if len(_seals) >= MAX_DELIVERY_SEALS:
++                        raise LilithHostUnavailableError(
++                            "image-note delivery capacity exhausted"
++                        )
++                    _seals[delivery_id] = (weakref.ref(epoch), digest)
++            _pending[operation_id] = pending
++    payload = {
++        "version": 1,
++        "kind": REQUEST_KIND,
++        "operation_id": operation_id,
++        "delivery_id": delivery_id,
++        "arguments": normalized,
++    }
++    try:
++        if server._emit("lilith.host.request", sid, payload) is not True:
++            raise LilithHostUnavailableError("image-note host request was not emitted")
++        pending.completed.wait(max(0.0, pending.deadline - time.monotonic()))
++        with server._sessions_lock:
++            with _lock:
++                _require_current(pending, transport, sid, tid, require_running=True)
++                if pending.result is None:
++                    raise LilithHostUnavailableError(
++                        "image-note outcome unknown; query status, do not redeliver"
++                    )
++                return pending.result
++    except (
++        LilithHostProtocolError,
++        LilithHostAuthorityError,
++        LilithHostUnavailableError,
++    ):
++        raise
++    except Exception as exc:
++        raise LilithHostUnavailableError(
++            "image-note outcome unknown; query status"
++        ) from exc
++    finally:
++        with _lock:
++            _pending.pop(operation_id, None)
++
++
++def _require_current(
++    pending: _Pending, transport: Any, sid: str, tid: str, *, require_running: bool
++) -> None:
++    from tui_gateway import server
++
++    session = pending.session
++    if (
++        transport is None
++        or transport is not pending.transport
++        or sid != pending.session_id
++        or tid != pending.turn_id
++        or server._sessions.get(sid) is not session
++        or session.get("transport") is not transport
++    ):
++        raise LilithHostAuthorityError("image-note owning authority changed")
++    if require_running and (
++        not session.get("running")
++        or not isinstance(session.get("inflight_turn"), dict)
++        or session["inflight_turn"].get("turn_id") != tid
++    ):
++        raise LilithHostAuthorityError("image-note turn is no longer active")
++
++
++def complete_note_request(params: Any, transport: Any) -> dict:
++    if not isinstance(params, dict) or set(params) != {
++        "session_id",
++        "turn_id",
++        "result",
++    }:
++        raise LilithHostProtocolError("image-note completion shape was rejected")
++    sid, tid = _session_id(params["session_id"]), _canonical_turn_id(params["turn_id"])
++    raw = params["result"]
++    operation_id = raw.get("operation_id") if isinstance(raw, dict) else None
++    if not isinstance(operation_id, str) or not _ID.fullmatch(operation_id):
++        raise LilithHostProtocolError("image-note operation identity was rejected")
++    result = normalize_note_result(raw, operation_id, delivery_id_for_turn(sid, tid))
++    from tui_gateway import server
++
++    with server._sessions_lock:
++        with _lock:
++            now = time.monotonic()
++            _expire_locked(now)
++            receipt = _receipts.get(operation_id)
++            if receipt is not None:
++                _require_current(receipt[0], transport, sid, tid, require_running=False)
++                if receipt[1] != _canonical_result_bytes(result):
++                    raise LilithHostAuthorityError(
++                        "image-note completion receipt conflict"
++                    )
++                return {
++                    "accepted": True,
++                    "operation_id": operation_id,
++                    "delivery_id": result["delivery_id"],
++                }
++            pending = _pending.get(operation_id)
++            if pending is None:
++                raise LilithHostAuthorityError("image-note completion was not pending")
++            _require_current(pending, transport, sid, tid, require_running=True)
++            _pending.pop(operation_id)
++            pending.result = result
++            while len(_receipts) >= MAX_COMPLETION_RECEIPTS:
++                _receipts.pop(next(iter(_receipts)))
++            _receipts[operation_id] = (
++                pending,
++                _canonical_result_bytes(result),
++                now + COMPLETION_RECEIPT_TTL_SECONDS,
++            )
++            pending.completed.set()
++    return {
++        "accepted": True,
++        "operation_id": operation_id,
++        "delivery_id": result["delivery_id"],
++    }
++
++
++def _reset_for_tests() -> None:
++    with _lock:
++        for pending in _pending.values():
++            pending.completed.set()
++        _pending.clear()
++        _receipts.clear()
++        _seals.clear()
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 883c28d..c2056be 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2955,7 +2955,13 @@ def _complete_lilith_host_request(rid, params: dict) -> dict:
+     )
+ 
+     try:
+-        result = complete_notes_request(params, current_transport())
++        raw_result = params.get("result") if isinstance(params, dict) else None
++        if isinstance(raw_result, dict) and raw_result.get("kind") == "lilith.noteinbox.result":
++            from tui_gateway.lilith_noteinbox_bridge import complete_note_request
++
++            result = complete_note_request(params, current_transport())
++        else:
++            result = complete_notes_request(params, current_transport())
+     except LilithHostBridgeError as exc:
+         return _err(rid, exc.rpc_code, str(exc))
+     return _ok(rid, result)

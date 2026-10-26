@@ -1,0 +1,596 @@
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 9a0f69f..61fc2e1 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -3963,6 +3963,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
+         turns_to_summarize: List[Dict[str, Any]],
+         focus_topic: Optional[str] = None,
+         memory_context: str = "",
++        local_auto_focus: bool = False,
+     ) -> Optional[str]:
+         """Generate a structured summary of conversation turns.
+ 
+@@ -3987,7 +3988,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
+             from agent.local_compatibility_summary import generate_summary
+             try:
+                 return generate_summary(self, local_policy, turns_to_summarize,
+-                    focus_topic=focus_topic, memory_context=memory_context)
++                    focus_topic=focus_topic, memory_context=memory_context,
++                    automatic_focus=local_auto_focus)
+             except BudgetError:
+                 raise
+             except Exception as exc:
+@@ -6915,12 +6917,16 @@ This compaction should PRIORITISE preserving all information related to the focu
+         else:
+             # Deriving the auto focus topic scans recent user turns — only pay
+             # for it when a summary will actually be generated.
+-            summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
++            local_summary = compressor_policy(self) is not None
++            summary_focus_topic = focus_topic or self._derive_auto_focus_topic(
++                turns_to_summarize if local_summary else messages)
++            summary_options = {"local_auto_focus": not bool(focus_topic)} if local_summary else {}
+             try:
+                 summary = self._generate_summary(
+                     turns_to_summarize,
+                     focus_topic=summary_focus_topic,
+                     memory_context=memory_context,
++                    **summary_options,
+                 )
+             except (AuxiliaryExplicitCancellation, BudgetError):
+                 # Explicit cancellation is a true no-op. Restore state mutated by
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 8ad50a9..0754089 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -1156,10 +1156,12 @@ def _emit_compression_attempt_telemetry(
+     commit_status: str,
+     split_status: str,
+     failure_class: str | None = None,
++    telemetry_override: dict | None = None,
+ ) -> None:
+     """Emit one content-free JSON log line for a compression attempt."""
+     try:
+-        telemetry = getattr(agent.context_compressor, "_last_compression_telemetry", None)
++        telemetry = (telemetry_override if telemetry_override is not None else
++                     getattr(agent.context_compressor, "_last_compression_telemetry", None))
+         if not isinstance(telemetry, dict):
+             telemetry = {}
+         payload = dict(telemetry)
+@@ -3051,6 +3053,21 @@ def compress_context(
+                 except Exception:
+                     pass
+     except AuxiliaryExplicitCancellation:
++        # Roll back semantic state, but retain this attempt's content-free
++        # local progress. Never borrow a previous attempt's cached counters.
++        _cancel_telemetry = None
++        try:
++            from agent.local_compatibility_checkpoint import preserve_attempt_telemetry
++            _cancel_telemetry = preserve_attempt_telemetry(agent.context_compressor, _attempt_id)
++            from agent.local_compatibility import LocalCompatibilityPolicy
++            # Reporting is not a dispatch authorization check. A route change
++            # must not throw here and skip rollback or release of the lease.
++            if (_cancel_telemetry is None and
++                    type(getattr(agent, "_local_compatibility_policy", None)) is LocalCompatibilityPolicy):
++                _cancel_telemetry = {"event": "compression_attempt", "attempt_id": _attempt_id,
++                                     "session_id": agent.session_id or ""}
++        except Exception:
++            pass  # Best-effort metadata must never obstruct cancellation.
+         try:
+             _restore_compressor_attempt_state(
+                 agent.context_compressor,
+@@ -3076,6 +3093,7 @@ def compress_context(
+                 commit_status="aborted",
+                 split_status="aborted",
+                 failure_class=f"rollback:{type(_rollback_exc).__name__}",
++                telemetry_override=_cancel_telemetry,
+             )
+             raise
+         if (
+@@ -3093,6 +3111,7 @@ def compress_context(
+             commit_status="aborted",
+             split_status="aborted",
+             failure_class="explicit_interrupt",
++            telemetry_override=_cancel_telemetry,
+         )
+         _existing_sp = getattr(agent, "_cached_system_prompt", None)
+         if not _existing_sp:
+diff --git a/agent/local_compatibility_checkpoint.py b/agent/local_compatibility_checkpoint.py
+new file mode 100644
+--- /dev/null
++++ b/agent/local_compatibility_checkpoint.py
+@@ -0,0 +1,205 @@
++"""Host-owned, bounded process-memory work cache; never durable memory.
++
++Only validated local checkpoint results enter this cache. No transcript, files,
++database, credentials or authority are persisted. A validated summary and its
++source-derived focus contain private semantics in process memory only. Process
++restart intentionally forgets every result. A later caller may reuse an unchanged source
++prefix; this module never schedules, calls a model, or commits conversation state.
++"""
++from collections import OrderedDict
++from dataclasses import dataclass
++from hashlib import sha256
++import json
++import os
++import threading
++import time
++from weakref import WeakValueDictionary
++
++VERSION = "local-checkpoint-resume-v1"
++TTL_SECONDS = 1800.0
++MAX_SCOPES = 16
++MAX_BYTES = 1024 * 1024
++MAX_SUMMARY_BYTES = 65536
++MAX_SOURCE_ROWS = 20000
++_lock = threading.RLock()
++_states = OrderedDict()
++# Live generation fences outlive result eviction only while a caller owns its
++# ticket. Weak values cannot become a second unbounded result store.
++_leases = WeakValueDictionary()
++
++
++def _hash(value):
++    return sha256(value.encode("utf-8")).hexdigest()
++
++
++def _canonical(value):
++    return json.dumps(value, ensure_ascii=False, sort_keys=True,
++                      separators=(",", ":"), allow_nan=False)
++
++
++@dataclass(frozen=True)
++class _Record:
++    source_rows: tuple
++    boundaries: tuple
++    summary: str
++    focus: str
++
++
++@dataclass(eq=False)
++class _Lease:
++    revoked: bool = False
++
++
++@dataclass(frozen=True)
++class Ticket:
++    scope: str
++    lease: object
++    source_rows: tuple
++    boundaries: tuple = ()
++    summary: str = ""
++    focus: str = ""
++
++    @property
++    def completed(self):
++        return len(self.boundaries)
++
++    @property
++    def consumed(self):
++        return self.boundaries[-1][0] if self.boundaries else 0
++
++
++def _weight(state):
++    record = state[2]
++    if record is None:
++        return 128
++    return (len(record.summary.encode("utf-8")) + len(record.focus.encode("utf-8"))
++            + len(record.source_rows) * 64 + len(record.boundaries) * 80 + 128)
++
++
++def _prune(now):
++    for key, value in list(_states.items()):
++        if now - value[0] >= TTL_SECONDS:
++            del _states[key]
++    while _states and (len(_states) > MAX_SCOPES or sum(map(_weight, _states.values())) > MAX_BYTES):
++        _states.popitem(last=False)
++
++
++def begin(compressor, policy, turns, serialized, contract, previous, focus):
++    """Issue one generation lease; reuse only exact old rows and chunk bytes.
++
++    `contract` is the actual render with empty data and fixed fragment counters.
++    For automatic focus only, the host uses a fixed strategy marker in that
++    render and may retain the old source-derived focus after prefix proof.
++    Explicit focus remains literal in the render and therefore in this key.
++    """
++    from agent.local_compatibility import LocalCompatibilityPolicy, for_agent
++    from agent.usage_budget_runtime import current_origin
++    from agent.identity_policy import scoped_identity_metadata
++    from hermes_cli.config import get_hermes_home
++    if type(policy) is not LocalCompatibilityPolicy:
++        return None
++    agent = getattr(compressor, "_strict_identity_agent", None)
++    if agent is None or for_agent(agent) is not policy:
++        return None
++    session = getattr(agent, "session_id", None)
++    if not isinstance(session, str) or not session or len(session) > 256:
++        return None
++    if not isinstance(turns, list) or len(turns) > MAX_SOURCE_ROWS:
++        return None
++    try:
++        # The only excluded key is the host's transient flush marker. Row IDs,
++        # role, content, source provenance and all other fields remain bound.
++        rows = tuple(_hash(_canonical({key: value for key, value in row.items()
++                                        if key != "_db_persisted"})) for row in turns)
++        origin = current_origin()
++        strategy = None if origin is None else (
++            origin.preference.level, origin.preference.revision)
++        profile = os.path.normcase(os.path.abspath(os.fspath(get_hermes_home())))
++        origin_profile = (None if origin is None else os.path.normcase(os.path.abspath(
++            os.fspath(origin._owner.store.profile_root))))
++        scope = _hash(_canonical((VERSION, profile, origin_profile, session, policy.route_digest,
++            policy.requested_provider, policy.provider, policy.context_tokens,
++            policy.input_budget, policy.output_reserve, strategy,
++            scoped_identity_metadata(agent), contract, previous)))
++    except (TypeError, ValueError, AttributeError):
++        # An unsupported source shape disables optimization, never compaction.
++        return None
++    now, lease = time.monotonic(), _Lease()
++    with _lock:
++        _prune(now)
++        old_lease = _leases.get(scope)
++        if old_lease is not None:
++            old_lease.revoked = True
++        _leases[scope] = lease
++        prior = _states.get(scope)
++        record = prior[2] if prior else None
++        matched = record is not None and rows[:len(record.source_rows)] == record.source_rows
++        if matched:
++            start = 0
++            for end, digest in record.boundaries:
++                if end <= start or end > len(serialized) or _hash(serialized[start:end]) != digest:
++                    matched = False
++                    break
++                start = end
++        if not matched:
++            record = None
++        _states[scope] = (now, lease, record)
++        _states.move_to_end(scope)
++        _prune(now)
++        return Ticket(scope, lease, rows,
++            record.boundaries if record else (), record.summary if record else "",
++            record.focus if record else focus)
++
++
++def publish(ticket, serialized, end, summary, focus, check_cancel):
++    """Publish only on the owning thread after validation and before cancellation.
++
++    A superseded lease cannot publish. Detached transport workers
++    never receive this method or a ticket. A new attempt invalidates old writers.
++    """
++    if ticket is None:
++        return None
++    check_cancel()
++    if not isinstance(summary, str) or len(summary.encode("utf-8")) > MAX_SUMMARY_BYTES:
++        return ticket
++    if type(end) is not int or end <= ticket.consumed or end > len(serialized):
++        raise ValueError("invalid checkpoint boundary")
++    boundary = (end, _hash(serialized[ticket.consumed:end]))
++    updated = Ticket(ticket.scope, ticket.lease, ticket.source_rows,
++                     ticket.boundaries + (boundary,), summary, focus)
++    now = time.monotonic()
++    with _lock:
++        _prune(now)
++        check_cancel()
++        if ticket.lease.revoked:
++            from agent.auxiliary_client import AuxiliaryExplicitCancellation
++            raise AuxiliaryExplicitCancellation()
++        record = _Record(updated.source_rows, updated.boundaries, summary, focus)
++        _states[ticket.scope] = (now, ticket.lease, record)
++        _states.move_to_end(ticket.scope)
++        _prune(now)
++    return updated
++
++
++def check_current(ticket):
++    """An older generation may neither send again nor commit after replacement."""
++    if ticket is None:
++        return
++    with _lock:
++        if ticket.lease.revoked:
++            from agent.auxiliary_client import AuxiliaryExplicitCancellation
++            raise AuxiliaryExplicitCancellation()
++
++
++def preserve_attempt_telemetry(compressor, expected_attempt_id):
++    """Copy only this local attempt's count metadata, not mutable authority."""
++    value = getattr(compressor, "_last_compression_telemetry", None)
++    if (not isinstance(value, dict) or value.get("local_checkpoint_version") != VERSION
++            or not isinstance(expected_attempt_id, str) or not expected_attempt_id
++            or value.get("attempt_id") != expected_attempt_id):
++        return None
++    return {key: value[key] for key in (
++        "event", "attempt_id", "session_id", "trigger_source", "chunking", "chunk_count",
++        "effective_aux_context", "aux_output_reservation", "local_checkpoint_version",
++        "local_chunks_completed", "local_chunks_reused", "local_summary_calls")
++        if key in value and (type(value[key]) in (str, int, bool) or value[key] is None)}
+diff --git a/agent/local_compatibility_summary.py b/agent/local_compatibility_summary.py
+index 6187de9..4db55bd 100644
+--- a/agent/local_compatibility_summary.py
++++ b/agent/local_compatibility_summary.py
+@@ -96,7 +96,8 @@ def plan_chunks(content, render, policy, previous):
+     return chunks or [""]
+ 
+ 
+-def generate_summary(compressor, policy, turns, *, focus_topic=None, memory_context=""):
++def generate_summary(compressor, policy, turns, *, focus_topic=None, memory_context="",
++                     automatic_focus=False):
+     from agent.context_compressor import (
+         _redact_compaction_text, sanitize_memory_context,
+         _collect_ghosted_skill_names, _extract_pruned_skill_names,
+@@ -109,10 +110,21 @@ def generate_summary(compressor, policy, turns, *, focus_topic=None, memory_cont
+         call_llm, aux_interrupt_protection, _aux_interrupt_cancel_requested,
+         AuxiliaryExplicitCancellation,
+     )
++    from agent import local_compatibility_checkpoint as checkpoints
++
++    # Capture the fence now: the outer owner clears its attribute when it
++    # departs. A late result must still observe the original cancellation.
++    fence_cancelled = getattr(compressor, "_compression_cancelled_check", None)
++    owner = getattr(compressor, "_strict_identity_agent", None)
++    hard_cancel = getattr(owner, "_hard_interrupt_requested", None)
++    ticket = None
+ 
+     def check_cancel():
+-        if _aux_interrupt_cancel_requested():
++        if (_aux_interrupt_cancel_requested()
++                or (callable(fence_cancelled) and fence_cancelled())
++                or (hard_cancel is not None and hard_cancel.is_set())):
+             raise AuxiliaryExplicitCancellation()
++        checkpoints.check_current(ticket)
+ 
+     deadline = time.monotonic() + TOTAL_SECONDS
+     previous = _redact_compaction_text(compressor._previous_summary or "")
+@@ -149,19 +161,59 @@ def generate_summary(compressor, policy, turns, *, focus_topic=None, memory_cont
+         )
+         return compressor._strict_identity_summary_messages([{"role": "user", "content": prompt}])
+ 
+-    chunks = plan_chunks(serialized, render, policy, previous)
++    # Bind actual prompt/settings/identity, without making a changing *auto*
++    # focus from an appended source suffix invalidate otherwise exact work.
++    # Explicit focus is always literal, and may never be replaced by the cache.
++    current_focus = focus
++    if automatic_focus:
++        focus = "HOST_SOURCE_AUTO_FOCUS_V1"
++    contract = render("", "", MAX_CALLS, MAX_CALLS)
++    focus = current_focus
++    check_cancel()
++    ticket = checkpoints.begin(compressor, policy, turns, serialized, contract, previous, focus)
++    reused = ticket.completed if ticket is not None else 0
++    consumed = ticket.consumed if ticket is not None else 0
++    if reused and automatic_focus:
++        focus = ticket.focus
++    summary = ticket.summary if reused else previous
++    chunks = ([] if reused and consumed == len(serialized)
++              else plan_chunks(serialized[consumed:], render, policy, summary))
++    total = reused + len(chunks)
+     telemetry = getattr(compressor, "_active_compression_telemetry", None)
+     if isinstance(telemetry, dict):
+-        telemetry.update(chunking=len(chunks) > 1, chunk_count=len(chunks),
++        telemetry.update(chunking=total > 1, chunk_count=total,
+                          effective_aux_context=policy.context_tokens,
+-                         aux_output_reservation=policy.output_reserve)
+-    summary = previous
+-    for index, chunk in enumerate(chunks, 1):
++                         aux_output_reservation=policy.output_reserve,
++                         local_checkpoint_version=checkpoints.VERSION,
++                         local_chunks_completed=reused, local_chunks_reused=reused,
++                         local_summary_calls=0)
++
++    def progress(completed, calls):
++        # Fixed host-authored metadata only. It is a transient progress signal,
++        # not a model response, durable memory, or a claim of final commit.
++        payload = {"version": checkpoints.VERSION, "completed": completed,
++                   "total": total, "reused": reused, "calls": calls,
++                   "scope": "process_memory", "committed": False}
++        if isinstance(telemetry, dict):
++            telemetry.update(local_chunks_completed=completed, local_summary_calls=calls)
++        logger.info("[local_summary_progress] %s", json.dumps(payload, sort_keys=True))
++        status = getattr(owner, "status_callback", None)
++        if callable(status):
++            try:
++                from agent.conversation_compression import COMPACTION_STATUS_MARKER
++                status("lifecycle", f"{COMPACTION_STATUS_MARKER} — summarizing earlier conversation: "
++                       f"{completed}/{total} fragments; "
++                       f"reused {reused}. Original history is unchanged until completion.")
++            except Exception:
++                logger.debug("local summary status callback unavailable")
++
++    progress(reused, 0)
++    for call_index, chunk in enumerate(chunks, 1):
+         check_cancel()
+         remaining = deadline - time.monotonic()
+         if remaining <= 0:
+             raise LocalCompatibilityError("local_compatibility_summary_deadline")
+-        messages = render(summary, chunk, index, len(chunks))
++        messages = render(summary, chunk, reused + call_index, total)
+         request = prepare_request(policy, {"messages": messages, "max_tokens": policy.output_reserve},
+             provider=compressor.provider, model=compressor.model, base_url=compressor.base_url, api_mode=compressor.api_mode)
+         # Local server queueing consumes the same bounded checkpoint deadline.
+@@ -172,6 +224,8 @@ def generate_summary(compressor, policy, turns, *, focus_topic=None, memory_cont
+                           "base_url": compressor.base_url, "api_key": compressor.api_key,
+                           "api_mode": compressor.api_mode})
+         compressor._strict_identity_summary_runtime(kwargs)
++        if isinstance(telemetry, dict):
++            telemetry["local_summary_calls"] = call_index
+         # Native protection inherits the host Event and polls hard cancellation;
+         # it ignores only soft interrupts. Keep the original origin/ledger.
+         with bind_policy(policy), aux_interrupt_protection():
+@@ -190,6 +244,15 @@ def generate_summary(compressor, policy, turns, *, focus_topic=None, memory_cont
+         if not summary or estimate_tokens_rough(summary) > policy.output_reserve:
+             raise LocalCompatibilityError("local_compatibility_summary_output_too_large")
+         summary = _validate_checkpoint_text(summary)
++        if time.monotonic() > deadline:
++            raise LocalCompatibilityError("local_compatibility_summary_deadline")
++        check_cancel()
++        consumed += len(chunk)
++        # Empty source has no reusable boundary. It still follows the existing
++        # generation path and quality gate, without recording an empty prefix.
++        if chunk:
++            ticket = checkpoints.publish(ticket, serialized, consumed, summary, focus, check_cancel)
++        progress(reused + call_index, call_index)
+     if time.monotonic() > deadline:
+         raise LocalCompatibilityError("local_compatibility_summary_deadline")
+     names = _collect_ghosted_skill_names(turns)
+@@ -204,7 +267,8 @@ def generate_summary(compressor, policy, turns, *, focus_topic=None, memory_cont
+     compressor._validate_summary_user_provenance(summary, has_user)
+     check_cancel()
+     # Commit only the final complete, grounded checkpoint. All intermediate
+-    # results are ephemeral; any failure preserves the original checkpoint.
++    # results live only in the bounded process cache; any failure preserves
++    # the original checkpoint and requires a later explicit caller to resume.
+     compressor._previous_summary = summary
+     compressor._clear_compression_failure_cooldown()
+     compressor._last_summary_error = None
+diff --git a/hermes_state.py b/hermes_state.py
+index 30d6b7a..3da97cf 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -129,6 +129,106 @@ def _display_tools_are_subset(original, rewritten):
+     return True
+ 
+ 
++def _display_legacy_copy_kind(original, copy, original_meta, copy_meta):
++    """Recognize three bounded old display rewrites, never execution authority.
++
++    The archived canonical row is kept byte-for-byte. This is not a general
++    identity conflict fallback: unarchived copies, new receipts, cross-session
++    copies and changed correlation remain rejected by the existing reader.
++    """
++    if (not original["compacted"] or original["session_id"] != copy["session_id"]
++            or original["id"] >= copy["id"]
++            or _COMPACTION_DISPLAY_PROVENANCE in original_meta
++            or _COMPACTION_DISPLAY_PROVENANCE in copy_meta
++            or _display_canonical_metadata(original_meta) != _display_canonical_metadata(copy_meta)
++            or any(original[key] != copy[key] for key in ("role", "tool_call_id", "tool_name", "platform_message_id"))):
++        return None
++    from agent.turn_identity import canonical_id
++
++    turn, message = (canonical_id(original_meta.get(key))
++                     for key in ("hermes_turn_id", "hermes_message_id"))
++    if not turn or not message or turn == message:
++        return None
++    fields = ("api_content", "reasoning", "reasoning_content", "reasoning_details",
++              "codex_reasoning_items", "codex_message_items", "finish_reason", "effect_disposition")
++    no_tools = not any(row[key] for row in (original, copy)
++                       for key in ("tool_calls", "tool_call_id", "tool_name"))
++    if (original["role"] == "user" and original["display_kind"] is None
++            and copy["display_kind"] == "model_switch" and no_tools
++            and original_meta.get("hermes_message_kind") == "user"
++            and original_meta.get("hermes_user_message_id") == message
++            and original_meta.get("hermes_turn_origin") == "user"
++            and all(original[key] == copy[key] for key in fields)):
++        # Old replay repair could attach a typed model-switch event to the
++        # following user's correlation. It is not another player statement;
++        # preserve the archived user, never infer this from the marker's text.
++        return "model_marker"
++    if (original["timestamp"] != copy["timestamp"]
++            or original["display_kind"] != copy["display_kind"]):
++        return None
++    if (original["role"] == "assistant"
++            and original_meta.get("hermes_message_kind") == "tool_call"
++            and original["content"] == copy["content"]
++            and all(original[key] == copy[key] for key in fields)):
++        old, new = _display_tool_calls(original["tool_calls"]), _display_tool_calls(copy["tool_calls"])
++        if not isinstance(old, list) or not old or not isinstance(new, list) or len(old) != len(new):
++            return None
++        ids = set()
++        for before, after in zip(old, new):
++            if not isinstance(before, dict) or not isinstance(after, dict):
++                return None
++            call_id = before.get("id")
++            if (not isinstance(call_id, str) or not call_id or call_id in ids
++                    or before.get("type") != "function"
++                    or {key: value for key, value in before.items() if key != "function"}
++                    != {key: value for key, value in after.items() if key != "function"}):
++                return None
++            ids.add(call_id)
++            left, right = before.get("function"), after.get("function")
++            if (not isinstance(left, dict) or not isinstance(right, dict)
++                    or not isinstance(left.get("name"), str) or not left["name"]
++                    or {key: value for key, value in left.items() if key != "arguments"}
++                    != {key: value for key, value in right.items() if key != "arguments"}):
++                return None
++            for function in (left, right):
++                arguments = function.get("arguments")
++                try:
++                    arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
++                except (TypeError, ValueError):
++                    return None
++                if not isinstance(arguments, dict):
++                    return None
++        if old != new:
++            # Older compaction pruned argument bodies without the new typed
++            # rewrite receipt. The exact call order/id/name remains binding;
++            # display the original arguments, never the rewritten command.
++            return "tool_arguments"
++    native_keys = ("lilith_native_event_id", "lilith_native_source", "lilith_native_occurred_at_unix_ms",
++                   "lilith_native_node_id", "lilith_native_line_id", "lilith_native_trigger", "lilith_native_locale")
++    occurred = original_meta.get("lilith_native_occurred_at_unix_ms")
++    if (original["role"] == "assistant" and original["display_kind"] == "native_assistant_event"
++            and original_meta.get("hermes_message_kind") == "primary"
++            and original_meta.get("hermes_turn_origin") == "synthetic"
++            and original_meta.get("hermes_turn_origin_kind") == "lilith-native"
++            and original_meta.get("lilith_native_event_id") == message
++            and original_meta.get("lilith_native_source") == "lilith-native"
++            and type(occurred) is int and occurred >= 0
++            and type(original["timestamp"]) in (int, float)
++            and math.isfinite(original["timestamp"])
++            and round(original["timestamp"] * 1000) == occurred
++            and all(key in original_meta and original_meta[key] == copy_meta.get(key) for key in native_keys)
++            and all(isinstance(original_meta.get(key), str) and original_meta[key]
++                    for key in native_keys if key != "lilith_native_occurred_at_unix_ms")
++            and no_tools and original["reasoning_content"] is None
++            and isinstance(copy["reasoning_content"], str) and copy["reasoning_content"]
++            and all(original[key] == copy[key] for key in fields if key != "reasoning_content")):
++        # Adjacent-assistant replay could merge a generated answer/reasoning
++        # into a native-event carry row. The complete native event provenance
++        # binds the archived official line; no prose or content-prefix guess.
++        return "native_event"
++    return None
++
++
+ class HistoryProjectionError(ValueError):
+     """A bounded display read failed; this never changes model/session authority."""
+ 
+@@ -10725,6 +10825,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             groups.setdefault(key, []).append(row)
+ 
+         selected = []
++        recovered = {"tool_arguments": 0, "model_marker": 0, "native_event": 0}
+         for key, copies in groups.items():
+             # An edit/rewind withdraws a whole canonical revision. Do not reach
+             # across that boundary to an older compacted original. A subsequent
+@@ -10734,8 +10835,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             if not eligible:
+                 continue
+             original = eligible[0]
++            recovered_legacy_ids = set()
+             for copy in eligible[1:]:
+                 typed_replica = _COMPACTION_DISPLAY_PROVENANCE in metadata[copy["id"]]
++                if typed_replica and origins[copy["id"]] in recovered_legacy_ids:
++                    # The typed receipt was already checked against its exact
++                    # source above, including tools and immutable correlation.
++                    # Keep that source's proven legacy display representative.
++                    if copy["display_kind"] != by_id[origins[copy["id"]]]["display_kind"]:
++                        raise HistoryProjectionError("history_identity_conflict")
++                    continue
++                legacy_kind = _display_legacy_copy_kind(
++                    original, copy, metadata[original["id"]], metadata[copy["id"]])
++                if legacy_kind is not None:
++                    recovered[legacy_kind] += 1
++                    recovered_legacy_ids.add(copy["id"])
++                    continue
+                 immutable = ("role", "tool_call_id", "tool_name", "display_kind")
+                 if (any(original[field] != copy[field] for field in immutable)
+                         or (not _display_tools_are_subset(original["tool_calls"], copy["tool_calls"])
+@@ -10768,6 +10883,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             logger.info("history_legacy_provenance_unknown count=%d", unknown)
+         if divergence:
+             logger.warning("history_legacy_content_divergence count=%d", divergence)
++        for kind, count in recovered.items():
++            if count:
++                logger.warning("history_legacy_copy_recovered kind=%s count=%d", kind, count)
+         display = self._rows_to_conversation(
+             selected, session_id=session_id, include_ancestors=False,
+             repair_alternation=False, include_row_ids=True,

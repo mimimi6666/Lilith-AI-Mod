@@ -1,0 +1,752 @@
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 672cc14822a95fc853594b8d2c9b70139a7e537c..c257cb10e48cbcef4589020df985da4a8cd052aa 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -182,9 +182,11 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ # * ``SHELL`` — what subprocess uses with ``shell=True`` (we try to
+ #   avoid that, but defense in depth).
+ # * ``HERMES_HOME`` / ``HERMES_PROFILE`` / ``HERMES_CONFIG`` /
+-#   ``HERMES_ENV`` — Hermes runtime location flags. Writing these into
+-#   ``.env`` would relocate state in ways the user did not request from
+-#   the dashboard. ``config.yaml`` is the supported surface for these.
++#   ``HERMES_ENV`` / managed-scope authority pins — Hermes runtime location
++#   and policy-integrity flags. Writing these into
++#   ``.env`` would relocate state or replace Runtime authority in ways the
++#   user did not request from the dashboard. Ordinary settings belong in
++#   ``config.yaml``; authority values come only from the Runtime launcher.
+ #
+ # IMPORTANT: ``HERMES_*`` overall is NOT blocked. Many legitimate
+ # integration credentials follow that prefix (HERMES_LANGFUSE_PUBLIC_KEY,
+@@ -214,6 +216,7 @@ _ENV_VAR_NAME_DENYLIST: frozenset[str] = frozenset({
+     # NOT a HERMES_* blanket: integration credentials (HERMES_GEMINI_*,
+     # HERMES_LANGFUSE_*, HERMES_SPOTIFY_*, ...) ARE allowed.
+     "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV",
++    "HERMES_MANAGED_DIR", "HERMES_MANAGED_CONFIG_SHA256",
+ })
+ 
+ 
+@@ -3423,6 +3426,10 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+         # cached merged result. (0, 0) means "no managed config file".
+         from hermes_cli import managed_scope
+ 
++        managed_pin_active = "HERMES_MANAGED_CONFIG_SHA256" in os.environ
++        pinned_managed_config = (
++            managed_scope.load_managed_config() if managed_pin_active else None
++        )
+         managed_dir = managed_scope.get_managed_dir()
+         managed_cfg_path = (managed_dir / "config.yaml") if managed_dir else None
+         try:
+@@ -3444,6 +3451,11 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+             cache_sig = (0, 0, managed_sig[0], managed_sig[1])
+         else:
+             cache_sig = None
++        if managed_pin_active:
++            # A metadata-only cache cannot detect same-size, same-mtime
++            # replacement. Strict managed config is deliberately hashed on
++            # every load, so the merged-config cache must not bypass it.
++            cache_sig = None
+ 
+         cached = _LOAD_CONFIG_CACHE.get(path_key)
+         if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+@@ -3519,7 +3531,11 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+         # against the process environment, never against user-config-defined refs.
+         # This deliberately inverts the usual env-over-config precedence for the
+         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
+-        managed_config = managed_scope.load_managed_config()
++        managed_config = (
++            pinned_managed_config
++            if managed_pin_active
++            else managed_scope.load_managed_config()
++        )
+         if managed_config:
+             managed_expanded = _expand_env_vars(managed_config)
+             expanded = _deep_merge(expanded, managed_expanded)
+diff --git a/hermes_cli/env_loader.py b/hermes_cli/env_loader.py
+index 5cfb744998d489295e893e53d8a52b76353ccab6..2030f9bc97f3603fb8fc3c0cdc6d0cc791e1d0e5 100644
+--- a/hermes_cli/env_loader.py
++++ b/hermes_cli/env_loader.py
+@@ -62,6 +62,8 @@ _TRUSTED_IDENTITY_ENV_KEYS: tuple[str, ...] = (
+     "HERMES_IDENTITY_EXPECTED_CONFIG_SHA256",
+     "HERMES_IDENTITY_EXPECTED_SOUL_SHA256",
+     "HERMES_IDENTITY_EXPECTED_PERSONALITY_SHA256",
++    "HERMES_MANAGED_DIR",
++    "HERMES_MANAGED_CONFIG_SHA256",
+     "HERMES_HOME",
+     "TERMINAL_CWD",
+ )
+@@ -91,7 +93,10 @@ def _capture_trusted_identity_environment() -> dict[str, str | None] | None:
+     with _TRUSTED_IDENTITY_ENV_LOCK:
+         if _TRUSTED_IDENTITY_ENV_SNAPSHOT is not None:
+             return _TRUSTED_IDENTITY_ENV_SNAPSHOT
+-        if "HERMES_IDENTITY_REQUIRED" not in os.environ:
++        if (
++            "HERMES_IDENTITY_REQUIRED" not in os.environ
++            and "HERMES_MANAGED_CONFIG_SHA256" not in os.environ
++        ):
+             return None
+         _TRUSTED_IDENTITY_ENV_SNAPSHOT = {
+             key: os.environ.get(key) for key in _TRUSTED_IDENTITY_ENV_KEYS
+@@ -740,6 +745,10 @@ def _apply_managed_env() -> None:
+     try:
+         from hermes_cli import managed_scope
+ 
++        if managed_scope.managed_config_integrity_required():
++            # A Runtime digest pin closes managed scope to config.yaml only;
++            # never admit an adjacent, unauthenticated dotenv channel.
++            return
+         managed_dir = managed_scope.get_managed_dir()
+     except Exception:  # noqa: BLE001 — managed scope must never block startup
+         return
+diff --git a/hermes_cli/managed_scope.py b/hermes_cli/managed_scope.py
+index 12af07ad1eb496a1682a9f211dcf10646ce9c6b1..ff8c3c84dedfc4ab4588ba0581054f5097332d36 100644
+--- a/hermes_cli/managed_scope.py
++++ b/hermes_cli/managed_scope.py
+@@ -18,8 +18,12 @@ Attribution: do not reference any third-party product by name in this file.
+ from __future__ import annotations
+ 
+ import copy
++import hashlib
++import hmac
+ import logging
+ import os
++import re
++import stat
+ import threading
+ from pathlib import Path
+ from typing import Dict, Optional
+@@ -32,12 +36,24 @@ logger = logging.getLogger(__name__)
+ # they belong ONLY inside get_managed_dir().
+ _DEFAULT_MANAGED_DIR = Path("/etc/hermes")
+ 
++_MANAGED_CONFIG_PIN_ENV = "HERMES_MANAGED_CONFIG_SHA256"
++_MAX_MANAGED_CONFIG_BYTES = 1024 * 1024
++
+ _CACHE_LOCK = threading.Lock()
+ # path_key -> (mtime_ns, size, parsed)
+ _CONFIG_CACHE: Dict[str, tuple] = {}
+ _ENV_CACHE: Dict[str, tuple] = {}
+ 
+ 
++class ManagedConfigIntegrityError(RuntimeError):
++    """Raised when a Runtime-pinned managed config cannot be authenticated."""
++
++
++def managed_config_integrity_required() -> bool:
++    """Whether Runtime closed managed scope to one digest-pinned YAML file."""
++    return _MANAGED_CONFIG_PIN_ENV in os.environ
++
++
+ def _under_pytest() -> bool:
+     """True when running inside the test suite.
+ 
+@@ -112,9 +128,155 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
+     return parsed
+ 
+ 
++def _is_reparse_point(path_stat) -> bool:
++    """Recognize symlinks plus Windows junctions and other reparse points."""
++    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
++    file_attributes = getattr(path_stat, "st_file_attributes", 0)
++    return stat.S_ISLNK(path_stat.st_mode) or bool(
++        file_attributes & reparse_attribute
++    )
++
++
++def _validate_pinned_path_ancestry(path: Path):
++    """lstat every absolute path component and reject indirection."""
++    if not path.is_absolute() or ".." in path.parts:
++        raise ManagedConfigIntegrityError(
++            "pinned managed config.yaml must use an absolute, normalized path"
++        )
++
++    current = Path(path.anchor)
++    components = path.parts[1:]
++    try:
++        root_stat = current.lstat()
++    except OSError as exc:
++        raise ManagedConfigIntegrityError(
++            "pinned managed config.yaml ancestry is missing or unreadable"
++        ) from exc
++    if _is_reparse_point(root_stat):
++        raise ManagedConfigIntegrityError(
++            "pinned managed config.yaml ancestry must not contain a reparse point"
++        )
++    if components and not stat.S_ISDIR(root_stat.st_mode):
++        raise ManagedConfigIntegrityError(
++            "pinned managed config.yaml ancestry must contain only directories"
++        )
++
++    leaf_stat = root_stat
++    for index, component in enumerate(components):
++        current /= component
++        try:
++            leaf_stat = current.lstat()
++        except OSError as exc:
++            raise ManagedConfigIntegrityError(
++                "pinned managed config.yaml ancestry is missing or unreadable"
++            ) from exc
++        if _is_reparse_point(leaf_stat):
++            raise ManagedConfigIntegrityError(
++                "pinned managed config.yaml ancestry must not contain a reparse point"
++            )
++        if index < len(components) - 1 and not stat.S_ISDIR(leaf_stat.st_mode):
++            raise ManagedConfigIntegrityError(
++                "pinned managed config.yaml ancestry must contain only directories"
++            )
++    return leaf_stat
++
++
++def _load_pinned_managed_config(managed_dir: Path, raw_pin: str) -> dict:
++    """Read and authenticate one Runtime-pinned managed config without caching."""
++    if re.fullmatch(r"[0-9a-fA-F]{64}", raw_pin) is None:
++        raise ManagedConfigIntegrityError(
++            f"{_MANAGED_CONFIG_PIN_ENV} must be exactly 64 hexadecimal characters"
++        )
++    expected_sha256 = raw_pin.lower()
++    path = managed_dir / "config.yaml"
++    path_stat = _validate_pinned_path_ancestry(path)
++    if not stat.S_ISREG(path_stat.st_mode):
++        raise ManagedConfigIntegrityError(
++            "pinned managed config.yaml must be a regular file"
++        )
++    if path_stat.st_size > _MAX_MANAGED_CONFIG_BYTES:
++        raise ManagedConfigIntegrityError(
++            "pinned managed config.yaml exceeds the 1 MiB size limit"
++        )
++
++    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
++    fd = -1
++    try:
++        fd = os.open(path, flags)
++        opened_stat = os.fstat(fd)
++        if not stat.S_ISREG(opened_stat.st_mode):
++            raise ManagedConfigIntegrityError(
++                "pinned managed config.yaml must be a regular file"
++            )
++        if (path_stat.st_dev, path_stat.st_ino) != (
++            opened_stat.st_dev,
++            opened_stat.st_ino,
++        ):
++            raise ManagedConfigIntegrityError(
++                "pinned managed config.yaml changed while it was being opened"
++            )
++        if opened_stat.st_size > _MAX_MANAGED_CONFIG_BYTES:
++            raise ManagedConfigIntegrityError(
++                "pinned managed config.yaml exceeds the 1 MiB size limit"
++            )
++        handle = os.fdopen(fd, "rb")
++        fd = -1
++        with handle:
++            raw = handle.read(_MAX_MANAGED_CONFIG_BYTES + 1)
++    except ManagedConfigIntegrityError:
++        raise
++    except OSError as exc:
++        raise ManagedConfigIntegrityError(
++            "pinned managed config.yaml is missing or unreadable"
++        ) from exc
++    finally:
++        if fd >= 0:
++            os.close(fd)
++
++    if len(raw) > _MAX_MANAGED_CONFIG_BYTES:
++        raise ManagedConfigIntegrityError(
++            "pinned managed config.yaml exceeds the 1 MiB size limit"
++        )
++    actual_sha256 = hashlib.sha256(raw).hexdigest()
++    if not hmac.compare_digest(actual_sha256, expected_sha256):
++        raise ManagedConfigIntegrityError(
++            "pinned managed config.yaml does not match its SHA-256 pin"
++        )
++    try:
++        text = raw.decode("utf-8")
++    except UnicodeDecodeError as exc:
++        raise ManagedConfigIntegrityError(
++            "pinned managed config.yaml is not strict UTF-8"
++        ) from exc
++    try:
++        parsed = yaml.safe_load(text)
++    except Exception as exc:  # noqa: BLE001 — normalize parser failures to fail-closed
++        raise ManagedConfigIntegrityError(
++            "pinned managed config.yaml is not valid YAML"
++        ) from exc
++    if not isinstance(parsed, dict):
++        raise ManagedConfigIntegrityError(
++            "pinned managed config.yaml must contain a YAML mapping"
++        )
++    return parsed
++
++
+ def load_managed_config() -> dict:
+-    """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
++    """Load managed config, optionally enforcing a Runtime-supplied digest pin.
++
++    With no ``HERMES_MANAGED_CONFIG_SHA256`` in the process environment this
++    retains the upstream fail-open, metadata-cached behavior exactly. When the
++    variable is present, every call re-reads and authenticates the bounded file
++    and any validation error is fail-closed.
++    """
++    raw_pin = os.environ.get(_MANAGED_CONFIG_PIN_ENV)
+     managed_dir = get_managed_dir()
++    if raw_pin is not None:
++        if managed_dir is None:
++            raise ManagedConfigIntegrityError(
++                "pinned managed configuration directory is missing or unreadable"
++            )
++        return _load_pinned_managed_config(managed_dir, raw_pin)
+     if managed_dir is None:
+         return {}
+     parsed = _cached_read(
+@@ -126,7 +288,14 @@ def load_managed_config() -> dict:
+ 
+ 
+ def load_managed_env() -> Dict[str, str]:
+-    """Parsed managed .env (KEY=VALUE), or {} when absent (fail-open)."""
++    """Load the legacy managed dotenv unless strict pinned-YAML mode is active.
++
++    A Runtime digest pin closes managed scope to exactly ``config.yaml``.
++    Adjacent ``.env`` content is therefore ignored rather than becoming a
++    second, unauthenticated policy channel.
++    """
++    if managed_config_integrity_required():
++        return {}
+     managed_dir = get_managed_dir()
+     if managed_dir is None:
+         return {}
+@@ -150,10 +319,12 @@ def apply_managed_overlay(config: dict) -> dict:
+       * leaf-level deep-merge managed ON TOP, so managed wins per-leaf while
+         sibling keys stay user-controlled.
+ 
+-    Fail-open: returns ``config`` unchanged if no managed scope is present or on
+-    any error — managed scope must never break a caller's startup. Mutates and
+-    returns ``config`` (callers pass a dict they own).
++    Without a Runtime integrity pin, returns ``config`` unchanged if no managed
++    scope is present or on any error. A pinned-config integrity failure is
++    deliberately re-raised so callers cannot silently discard Runtime policy.
++    Mutates and returns ``config`` (callers pass a dict they own).
+     """
++    pin_required = managed_config_integrity_required()
+     try:
+         managed = load_managed_config()
+         if not managed:
+@@ -172,7 +343,9 @@ def apply_managed_overlay(config: dict) -> dict:
+             managed_expanded = dict(managed_expanded)
+             managed_expanded["model"] = {"default": managed_expanded["model"]}
+         return _deep_merge(config, managed_expanded)
+-    except Exception:  # noqa: BLE001 — overlay must never break a caller
++    except Exception:  # noqa: BLE001 — unpinned overlay remains fail-open
++        if pin_required:
++            raise
+         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
+         return config
+ 
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 9c1140db9fe1ed7c3768603d33290e127adeff02..0beac287d77e89f126e92c95cb1574ea036842e2 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -272,6 +272,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
+     "HERMES_TUI_PROVIDER",
+     "HERMES_MANAGED",
+     "HERMES_MANAGED_DIR",
++    "HERMES_MANAGED_CONFIG_SHA256",
+     "HERMES_DEV",
+     "HERMES_CONTAINER",
+     "HERMES_EPHEMERAL_SYSTEM_PROMPT",
+diff --git a/tests/hermes_cli/test_config.py b/tests/hermes_cli/test_config.py
+index 54910db4728d50bc823110a49830eec8c63dde46..ce0c78ce12d02e40c9aa6dff742ac849fde97416 100644
+--- a/tests/hermes_cli/test_config.py
++++ b/tests/hermes_cli/test_config.py
+@@ -1073,8 +1073,8 @@ class TestEnvWriteDenylist:
+         ],
+     )
+     def test_hermes_integration_keys_still_writable(self, allowed_key):
+-        """``HERMES_*`` overall is NOT blocked — only the four runtime
+-        location names (HOME/PROFILE/CONFIG/ENV) are. Integration
++        """``HERMES_*`` overall is NOT blocked — only explicit runtime
++        authority names are. Integration
+         credentials following the ``HERMES_*`` convention must keep
+         working or we'd regress every provider setup wizard that
+         currently writes one of these (auth.py, Spotify, Langfuse, …)."""
+@@ -1083,6 +1083,15 @@ class TestEnvWriteDenylist:
+         assert env[allowed_key] == "test-value-123"
+ 
+ 
++    @pytest.mark.parametrize("secure", [False, True], ids=["plain", "secure"])
++    def test_managed_config_authority_keys_are_not_writable(self, secure):
++        writer = save_env_value_secure if secure else save_env_value
++        for key in ("HERMES_MANAGED_DIR", "HERMES_MANAGED_CONFIG_SHA256"):
++            with pytest.raises(ValueError, match="denylist"):
++                writer(key, "attacker-controlled")
++            assert key not in load_env()
++
++
+ 
+     def test_save_env_value_secure_inherits_denylist(self):
+         """The ``_secure`` variant goes through ``save_env_value`` so
+diff --git a/tests/hermes_cli/test_env_loader.py b/tests/hermes_cli/test_env_loader.py
+index 8fee20a280c5496cb0dd82dd6a1832d4293ebf59..27c2e24b6375213827ea906c3fd350503949cd39 100644
+--- a/tests/hermes_cli/test_env_loader.py
++++ b/tests/hermes_cli/test_env_loader.py
+@@ -1,4 +1,5 @@
+ import codecs
++import hashlib
+ import importlib
+ import os
+ import sys
+@@ -601,12 +602,18 @@ def test_other_profile_home_does_not_bridge_process_config(tmp_path, monkeypatch
+ 
+ 
+ def _seed_strict_parent_env(monkeypatch, home):
++    managed = home / "managed"
++    managed.mkdir(exist_ok=True)
++    managed_config = b"{}\n"
++    (managed / "config.yaml").write_bytes(managed_config)
+     values = {
+         "HERMES_IDENTITY_REQUIRED": "1",
+         "HERMES_IDENTITY_EXPECTED_FINGERPRINT": "a" * 64,
+         "HERMES_IDENTITY_EXPECTED_CONFIG_SHA256": "b" * 64,
+         "HERMES_IDENTITY_EXPECTED_SOUL_SHA256": "c" * 64,
+         "HERMES_IDENTITY_EXPECTED_PERSONALITY_SHA256": "d" * 64,
++        "HERMES_MANAGED_DIR": str(managed),
++        "HERMES_MANAGED_CONFIG_SHA256": hashlib.sha256(managed_config).hexdigest(),
+         "HERMES_HOME": str(home),
+         "TERMINAL_CWD": str(home),
+     }
+@@ -624,6 +631,8 @@ def test_strict_parent_identity_env_is_immutable_across_hot_reload(tmp_path, mon
+ 
+     monkeypatch.setenv("HERMES_IDENTITY_REQUIRED", "0")
+     monkeypatch.setenv("HERMES_IDENTITY_EXPECTED_CONFIG_SHA256", "f" * 64)
++    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "attacker-managed"))
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", "f" * 64)
+     monkeypatch.setenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "You are Hermes Agent")
+     load_hermes_dotenv(hermes_home=home)
+ 
+@@ -648,3 +657,60 @@ def test_strict_reserved_dotenv_key_fails_before_override(tmp_path, monkeypatch)
+         "HERMES_IDENTITY_REQUIRED"
+     ]
+     assert "OPENAI_API_KEY" not in os.environ
++
++
++@pytest.mark.parametrize(
++    ("key", "attempted_value"),
++    [
++        ("HERMES_MANAGED_DIR", "/tmp/attacker-managed"),
++        ("HERMES_MANAGED_CONFIG_SHA256", "f" * 64),
++    ],
++)
++def test_strict_managed_authority_dotenv_key_fails_before_override(
++    tmp_path, monkeypatch, key, attempted_value
++):
++    home = tmp_path / "strict"
++    home.mkdir()
++    expected = _seed_strict_parent_env(monkeypatch, home)
++    (home / ".env").write_text(
++        f"{key}={attempted_value}\nOPENAI_API_KEY=must-not-load\n",
++        encoding="utf-8",
++    )
++    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
++
++    with pytest.raises(TrustedIdentityEnvironmentError, match="forbidden"):
++        load_hermes_dotenv(hermes_home=home)
++    assert os.environ[key] == expected[key]
++    assert "OPENAI_API_KEY" not in os.environ
++
++
++def test_managed_pin_alone_activates_immutable_runtime_snapshot(
++    tmp_path, monkeypatch
++):
++    home = tmp_path / "pinned"
++    home.mkdir()
++    managed = home / "managed"
++    managed.mkdir()
++    managed_config = b"{}\n"
++    (managed / "config.yaml").write_bytes(managed_config)
++    expected_dir = str(managed)
++    expected_pin = hashlib.sha256(managed_config).hexdigest()
++    monkeypatch.delenv("HERMES_IDENTITY_REQUIRED", raising=False)
++    monkeypatch.setenv("HERMES_MANAGED_DIR", expected_dir)
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", expected_pin)
++    monkeypatch.setattr(env_loader, "_TRUSTED_IDENTITY_ENV_SNAPSHOT", None)
++
++    load_hermes_dotenv(hermes_home=home)
++    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "attacker-managed"))
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", "f" * 64)
++    load_hermes_dotenv(hermes_home=home)
++    assert os.environ["HERMES_MANAGED_DIR"] == expected_dir
++    assert os.environ["HERMES_MANAGED_CONFIG_SHA256"] == expected_pin
++
++    (home / ".env").write_text(
++        "HERMES_MANAGED_DIR=attacker-managed\n",
++        encoding="utf-8",
++    )
++    with pytest.raises(TrustedIdentityEnvironmentError, match="forbidden"):
++        load_hermes_dotenv(hermes_home=home)
++    assert os.environ["HERMES_MANAGED_DIR"] == expected_dir
+diff --git a/tests/hermes_cli/test_managed_scope.py b/tests/hermes_cli/test_managed_scope.py
+index c60653c5986a9ff3fc9faba6b048f8f98e544be0..c73db2643d879a99dacf8c6bcc58345995356524 100644
+--- a/tests/hermes_cli/test_managed_scope.py
++++ b/tests/hermes_cli/test_managed_scope.py
+@@ -1,5 +1,8 @@
+ """Unit tests for hermes_cli.managed_scope (resolver + loaders + key helpers)."""
++import hashlib
++import os
+ import textwrap
++from pathlib import Path
+ 
+ import pytest
+ 
+@@ -28,6 +31,249 @@ def _write_managed(tmp_path, monkeypatch, *, config=None, env=None):
+     return managed
+ 
+ 
++def _pin_managed_config(managed, monkeypatch):
++    from hermes_cli import managed_scope
++
++    digest = hashlib.sha256((managed / "config.yaml").read_bytes()).hexdigest()
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", digest)
++    managed_scope.invalidate_managed_cache()
++    return digest
++
++
++def test_pinned_managed_config_loads_and_applies(tmp_path, monkeypatch):
++    from hermes_cli import managed_scope
++
++    managed = _write_managed(
++        tmp_path,
++        monkeypatch,
++        config="display:\n  skin: pinned\n",
++    )
++    _pin_managed_config(managed, monkeypatch)
++
++    assert managed_scope.load_managed_config() == {
++        "display": {"skin": "pinned"}
++    }
++    assert managed_scope.apply_managed_overlay(
++        {"display": {"skin": "user", "show_reasoning": True}}
++    ) == {"display": {"skin": "pinned", "show_reasoning": True}}
++
++
++@pytest.mark.parametrize(
++    "pin",
++    ["", "a" * 63, "a" * 65, "g" * 64],
++    ids=["empty", "short", "long", "non-hex"],
++)
++def test_pinned_managed_config_rejects_invalid_pin(tmp_path, monkeypatch, pin):
++    from hermes_cli import managed_scope
++
++    _write_managed(tmp_path, monkeypatch, config="{}\n")
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", pin)
++
++    with pytest.raises(managed_scope.ManagedConfigIntegrityError, match="64 hexadecimal"):
++        managed_scope.load_managed_config()
++
++
++def test_pinned_managed_config_requires_file(tmp_path, monkeypatch):
++    from hermes_cli import managed_scope
++
++    _write_managed(tmp_path, monkeypatch)
++    monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", "0" * 64)
++
++    with pytest.raises(managed_scope.ManagedConfigIntegrityError, match="missing"):
++        managed_scope.load_managed_config()
++
++
++@pytest.mark.parametrize(
++    "case",
++    ["oversized", "invalid-utf8", "invalid-yaml", "non-mapping"],
++)
++def test_pinned_managed_config_rejects_invalid_payload(
++    tmp_path, monkeypatch, case
++):
++    from hermes_cli import managed_scope
++
++    managed = _write_managed(tmp_path, monkeypatch)
++    if case == "oversized":
++        payload = b"x" * (managed_scope._MAX_MANAGED_CONFIG_BYTES + 1)
++    elif case == "invalid-utf8":
++        payload = b"key: \xff\n"
++    elif case == "invalid-yaml":
++        payload = b"key: [\n"
++    else:
++        payload = b"- item\n"
++    (managed / "config.yaml").write_bytes(payload)
++    _pin_managed_config(managed, monkeypatch)
++
++    with pytest.raises(managed_scope.ManagedConfigIntegrityError):
++        managed_scope.load_managed_config()
++
++
++@pytest.mark.linux_only
++def test_pinned_managed_config_rejects_symlink(tmp_path, monkeypatch):
++    from hermes_cli import managed_scope
++
++    managed = _write_managed(tmp_path, monkeypatch)
++    target = managed / "real-config.yaml"
++    target.write_text("display:\n  skin: pinned\n", encoding="utf-8")
++    (managed / "config.yaml").symlink_to(target)
++    monkeypatch.setenv(
++        "HERMES_MANAGED_CONFIG_SHA256",
++        hashlib.sha256(target.read_bytes()).hexdigest(),
++    )
++
++    with pytest.raises(managed_scope.ManagedConfigIntegrityError, match="reparse point"):
++        managed_scope.load_managed_config()
++
++
++@pytest.mark.linux_only
++def test_pinned_managed_config_rejects_symlinked_directory_ancestor(
++    tmp_path, monkeypatch
++):
++    from hermes_cli import managed_scope
++
++    real_managed = tmp_path / "real-managed"
++    real_managed.mkdir()
++    config_path = real_managed / "config.yaml"
++    config_path.write_bytes(b"{}\n")
++    linked_managed = tmp_path / "linked-managed"
++    linked_managed.symlink_to(real_managed, target_is_directory=True)
++    monkeypatch.setenv("HERMES_MANAGED_DIR", str(linked_managed))
++    monkeypatch.setenv(
++        "HERMES_MANAGED_CONFIG_SHA256",
++        hashlib.sha256(config_path.read_bytes()).hexdigest(),
++    )
++
++    with pytest.raises(managed_scope.ManagedConfigIntegrityError, match="reparse point"):
++        managed_scope.load_managed_config()
++
++
++def test_pinned_managed_config_rejects_windows_reparse_attribute_in_ancestor(
++    tmp_path, monkeypatch
++):
++    from hermes_cli import managed_scope
++
++    managed = _write_managed(tmp_path, monkeypatch, config="{}\n")
++    _pin_managed_config(managed, monkeypatch)
++    original_lstat = Path.lstat
++
++    class ReparseStat:
++        def __init__(self, original):
++            self.st_mode = original.st_mode
++            self.st_file_attributes = 0x0400
++
++    def lstat_with_reparse(path):
++        result = original_lstat(path)
++        return ReparseStat(result) if path == managed else result
++
++    monkeypatch.setattr(Path, "lstat", lstat_with_reparse)
++
++    with pytest.raises(managed_scope.ManagedConfigIntegrityError, match="reparse point"):
++        managed_scope.load_managed_config()
++
++
++def test_pinned_managed_config_requires_absolute_normalized_directory(
++    tmp_path, monkeypatch
++):
++    from hermes_cli import managed_scope
++
++    managed = tmp_path / "managed"
++    managed.mkdir()
++    config_path = managed / "config.yaml"
++    config_path.write_bytes(b"{}\n")
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setenv("HERMES_MANAGED_DIR", "managed")
++    monkeypatch.setenv(
++        "HERMES_MANAGED_CONFIG_SHA256",
++        hashlib.sha256(config_path.read_bytes()).hexdigest(),
++    )
++
++    with pytest.raises(managed_scope.ManagedConfigIntegrityError, match="absolute"):
++        managed_scope.load_managed_config()
++
++
++def test_pinned_config_detects_same_metadata_tamper_and_overlay_cannot_swallow(
++    tmp_path, monkeypatch
++):
++    from hermes_cli import config as config_module
++    from hermes_cli import managed_scope
++
++    managed = _write_managed(
++        tmp_path,
++        monkeypatch,
++        config="display:\n  skin: one\n",
++    )
++    _pin_managed_config(managed, monkeypatch)
++    config_module._LOAD_CONFIG_CACHE.clear()
++    assert config_module.load_config()["display"]["skin"] == "one"
++
++    config_path = managed / "config.yaml"
++    original_stat = config_path.stat()
++    replacement = config_path.read_bytes().replace(b"one", b"two")
++    assert len(replacement) == original_stat.st_size
++    config_path.write_bytes(replacement)
++    os.utime(
++        config_path,
++        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
++    )
++    assert config_path.stat().st_mtime_ns == original_stat.st_mtime_ns
++    assert config_path.stat().st_size == original_stat.st_size
++
++    with pytest.raises(managed_scope.ManagedConfigIntegrityError, match="SHA-256"):
++        managed_scope.apply_managed_overlay({"display": {"skin": "user"}})
++    with pytest.raises(managed_scope.ManagedConfigIntegrityError, match="SHA-256"):
++        config_module.load_config()
++
++
++def test_unpinned_managed_config_keeps_fail_open_behavior(tmp_path, monkeypatch):
++    from hermes_cli import managed_scope
++
++    _write_managed(tmp_path, monkeypatch, config="key: [\n")
++    monkeypatch.delenv("HERMES_MANAGED_CONFIG_SHA256", raising=False)
++    source = {"display": {"skin": "user"}}
++
++    assert managed_scope.load_managed_config() == {}
++    assert managed_scope.apply_managed_overlay(source) is source
++
++
++def test_pinned_overlay_never_swallows_unexpected_error(tmp_path, monkeypatch):
++    from hermes_cli import managed_scope
++
++    managed = _write_managed(tmp_path, monkeypatch, config="{}\n")
++    _pin_managed_config(managed, monkeypatch)
++
++    def fail_load():
++        raise OSError("unexpected strict-loader failure")
++
++    monkeypatch.setattr(managed_scope, "load_managed_config", fail_load)
++    with pytest.raises(OSError, match="strict-loader"):
++        managed_scope.apply_managed_overlay({})
++
++
++def test_pinned_config_disables_adjacent_managed_dotenv(tmp_path, monkeypatch):
++    from hermes_cli import managed_scope
++    from hermes_cli.env_loader import load_hermes_dotenv
++
++    managed = _write_managed(
++        tmp_path,
++        monkeypatch,
++        config="{}\n",
++        env="D053_MANAGED_ENV_PROBE=managed\n",
++    )
++    _pin_managed_config(managed, monkeypatch)
++    home = tmp_path / "home"
++    home.mkdir()
++    (home / ".env").write_text(
++        "D053_MANAGED_ENV_PROBE=user\n",
++        encoding="utf-8",
++    )
++    monkeypatch.setenv("D053_MANAGED_ENV_PROBE", "shell")
++
++    assert managed_scope.load_managed_env() == {}
++    assert managed_scope.is_env_managed("D053_MANAGED_ENV_PROBE") is False
++    load_hermes_dotenv(hermes_home=home)
++    assert os.environ["D053_MANAGED_ENV_PROBE"] == "user"
++
++
+ 
+ 
+ 
+@@ -54,3 +300,4 @@ def test_managed_dir_env_scrubbed_by_default():
+     import os
+ 
+     assert "HERMES_MANAGED_DIR" not in os.environ
++    assert "HERMES_MANAGED_CONFIG_SHA256" not in os.environ
+

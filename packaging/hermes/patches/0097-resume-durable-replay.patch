@@ -1,0 +1,518 @@
+diff --git a/hermes_state.py b/hermes_state.py
+index 3eed0db..1c3ffba 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -10247,6 +10247,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         include_inactive: bool = False,
+         repair_alternation: bool = False,
+         include_row_ids: bool = False,
++        mark_persisted: bool = False,
+     ) -> List[Dict[str, Any]]:
+         """
+         Load messages in the OpenAI conversation format (role + content dicts).
+@@ -10294,6 +10295,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             include_ancestors=include_ancestors,
+             repair_alternation=repair_alternation,
+             include_row_ids=include_row_ids,
++            mark_persisted=mark_persisted,
+         )
+ 
+     # Columns every conversation projection decodes. Shared by
+@@ -10314,6 +10316,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         include_ancestors: bool,
+         repair_alternation: bool,
+         include_row_ids: bool = False,
++        mark_persisted: bool = False,
+     ) -> List[Dict[str, Any]]:
+         """Decode fetched message rows into the OpenAI conversation format.
+ 
+@@ -10437,10 +10440,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     repaired,
+                     session_id,
+                 )
++        if mark_persisted:
++            # This projection contains only committed DB rows. Replay repair
++            # may merge them, but every constituent is already durable. Mark
++            # here before publishing to live history: shutdown must not append
++            # the restored prefix again after a native event/extension copies
++            # it into the agent snapshot. Never stamp arbitrary live history
++            # (which may contain an unflushed tail), or infer this from row ids.
++            for message in messages:
++                message["_db_persisted"] = True
+         return messages
+ 
+     def get_resume_conversations(
+-        self, session_id: str
++        self, session_id: str, *, mark_persisted: bool = False
+     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+         """Return ``(model_history, display_history)`` for a session resume in ONE SELECT.
+ 
+@@ -10480,6 +10492,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             include_ancestors=False,
+             repair_alternation=True,
+             include_row_ids=True,
++            mark_persisted=mark_persisted,
+         )
+         display_history = self._rows_to_conversation(
+             rows,
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 6a57e3a..9379ce6 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -676,7 +676,7 @@ def _(rid, params: dict) -> dict:
+                     # history and must never be installed into working context
+                     # when resolving a compute-host uncertainty latch.
+                     reconciliation_history, _ = db.get_resume_conversations(
+-                        target
++                        target, mark_persisted=True
+                     )
+                 except Exception as exc:
+                     return _err(
+@@ -779,7 +779,8 @@ def _(rid, params: dict) -> dict:
+                 # so heal a durable ``user;user`` violation once here instead of
+                 # re-firing the pre-request repair on every subsequent turn.
+                 history = db.get_messages_as_conversation(
+-                    target, repair_alternation=True, include_row_ids=True
++                    target, repair_alternation=True, include_row_ids=True,
++                    mark_persisted=True,
+                 )
+             except Exception as e:
+                 if lease is not None:
+@@ -881,11 +882,13 @@ def _(rid, params: dict) -> dict:
+                 # inspection/export must show what is actually stored.
+                 if omit_messages:
+                     raw_history = db.get_messages_as_conversation(
+-                        target, repair_alternation=True
++                        target, repair_alternation=True, mark_persisted=True
+                     )
+                     display_history = []
+                 else:
+-                    raw_history, display_history = db.get_resume_conversations(target)
++                    raw_history, display_history = db.get_resume_conversations(
++                        target, mark_persisted=True
++                    )
+             except Exception as e:
+                 if lease is not None:
+                     lease.release()
+@@ -986,11 +989,13 @@ def _(rid, params: dict) -> dict:
+             # display copy stays verbatim.
+             if omit_messages:
+                 raw_history = db.get_messages_as_conversation(
+-                    target, repair_alternation=True
++                    target, repair_alternation=True, mark_persisted=True
+                 )
+                 display_history = []
+             else:
+-                raw_history, display_history = db.get_resume_conversations(target)
++                raw_history, display_history = db.get_resume_conversations(
++                    target, mark_persisted=True
++                )
+             # The display transcript keeps every row so the user still sees their
+             # full history.  The model-fed history is sanitized: a session whose
+             # last turn died mid-tool-loop persists a dangling assistant(tool_calls)
+@@ -2859,7 +2864,7 @@ def _(rid, params: dict) -> dict:
+             if db is not None:
+                 try:
+                     model_history, history = db.get_resume_conversations(
+-                        session["session_key"]
++                        session["session_key"], mark_persisted=True
+                     )
+                     authoritative_read = True
+                 except Exception:
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index b0736e4..3e371b3 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -2712,7 +2712,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
+         def reopen_session(self, target):
+             captured["reopened"] = target
+ 
+-        def get_resume_conversations(self, session_id):
++        def get_resume_conversations(self, session_id, *, mark_persisted=False):
+             return (
+                 self.get_messages_as_conversation(session_id, repair_alternation=True),
+                 self.get_messages_as_conversation(session_id, include_ancestors=True),
+@@ -3145,7 +3145,7 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
+         def reopen_session(self, target):
+             pass
+ 
+-        def get_resume_conversations(self, session_id):
++        def get_resume_conversations(self, session_id, *, mark_persisted=False):
+             return (
+                 self.get_messages_as_conversation(session_id, repair_alternation=True),
+                 self.get_messages_as_conversation(session_id, include_ancestors=True),
+@@ -3214,7 +3214,7 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
+         def reopen_session(self, _target):
+             captured["reopened"] = _target
+ 
+-        def get_resume_conversations(self, session_id):
++        def get_resume_conversations(self, session_id, *, mark_persisted=False):
+             return (
+                 self.get_messages_as_conversation(session_id, repair_alternation=True),
+                 self.get_messages_as_conversation(session_id, include_ancestors=True),
+@@ -8793,7 +8793,7 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
+                 "pinned": True,
+             }
+ 
+-        def get_resume_conversations(self, session_id):
++        def get_resume_conversations(self, session_id, *, mark_persisted=False):
+             return (
+                 self.get_messages_as_conversation(session_id, repair_alternation=True),
+                 self.get_messages_as_conversation(session_id, include_ancestors=True),
+@@ -13064,7 +13064,7 @@ def test_session_history_uses_session_profile_db(monkeypatch, tmp_path):
+         def __init__(self, db_path=None):
+             seen["db_path"] = db_path
+ 
+-        def get_resume_conversations(self, _key):
++        def get_resume_conversations(self, _key, *, mark_persisted=False):
+             seen["profile"] = True
+             messages = [{"role": "user", "content": "from-profile"}]
+             return messages, messages
+diff --git a/tests/tui_gateway/test_protocol.py b/tests/tui_gateway/test_protocol.py
+index cf7aac5..8345d52 100644
+--- a/tests/tui_gateway/test_protocol.py
++++ b/tests/tui_gateway/test_protocol.py
+@@ -429,7 +429,7 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
+         def reopen_session(self, _sid):
+             return None
+ 
+-        def get_resume_conversations(self, session_id):
++        def get_resume_conversations(self, session_id, *, mark_persisted=False):
+             return (
+                 self.get_messages_as_conversation(session_id, repair_alternation=True),
+                 self.get_messages_as_conversation(session_id, include_ancestors=True),
+diff --git a/tests/tui_gateway/test_session_resume_db_ownership.py b/tests/tui_gateway/test_session_resume_db_ownership.py
+index 309d1e3..9219f88 100644
+--- a/tests/tui_gateway/test_session_resume_db_ownership.py
++++ b/tests/tui_gateway/test_session_resume_db_ownership.py
+@@ -63,7 +63,7 @@ class _RecordingDB:
+         if self.reopen_error is not None:
+             raise self.reopen_error
+ 
+-    def get_resume_conversations(self, _target):
++    def get_resume_conversations(self, _target, *, mark_persisted=False):
+         return ([], [])
+ 
+     def get_ancestor_display_prefix(self, _target):
+diff --git a/tests/tui_gateway/test_resume_durable_replay.py b/tests/tui_gateway/test_resume_durable_replay.py
+new file mode 100644
+--- /dev/null
++++ b/tests/tui_gateway/test_resume_durable_replay.py
+@@ -0,0 +1,317 @@
++"""Restored DB history must never become new durable rows at gateway shutdown."""
++from __future__ import annotations
++
++import copy
++import json
++import threading
++import types
++
++import pytest
++
++from hermes_state import SessionDB
++from tui_gateway import server
++from tests.tui_gateway.test_native_extension_durable_replay import _persistence_agent, _rows
++from tests.tui_gateway.test_native_assistant_extension import (
++    _append_params, _extend, _foreground, _join, extension_session,
++)
++
++
++@pytest.fixture
++def stored(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("game-root", source="lilith-game")
++    rows = [
++        {"role": "user", "content": "A stored question."},
++        {"role": "assistant", "content": "First part.", "reasoning": "A stored thought."},
++        {"role": "assistant", "content": "Second part."},
++        {"role": "user", "content": "Use a tool."},
++        {"role": "assistant", "content": "", "tool_calls": [
++            {"id": "call-test", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
++        {"role": "tool", "content": "A stored result.", "tool_call_id": "call-test", "tool_name": "lookup"},
++        {"role": "assistant", "content": "A stored conclusion."},
++    ]
++    db.append_messages_batch("game-root", rows)
++    yield db
++    db.close()
++
++
++def _loaded(db, mode):
++    if mode == "combined":
++        return db.get_resume_conversations("game-root", mark_persisted=True)[0]
++    return db.get_messages_as_conversation(
++        "game-root", repair_alternation=True, mark_persisted=True,
++        include_row_ids=mode == "lazy",
++    )
++
++
++@pytest.mark.parametrize("mode", ["combined", "lazy", "omit"])
++def test_restored_repaired_history_repeated_flush_is_read_only(stored, mode):
++    original = _rows(stored)
++    history = _loaded(stored, mode)
++    assert len(history) == len(original) - 1
++    assert history[1]["content"] == "First part.\nSecond part."
++    assert all(row.get("_db_persisted") is True for row in history)
++    agent = _persistence_agent(stored, history)
++    for _ in range(3):
++        assert agent._flush_messages_to_session_db(copy.deepcopy(history)) is True
++        assert _rows(stored) == original
++
++
++def test_unmarked_inspection_copied_into_agent_reproduces_old_shutdown_growth(stored):
++    # Control arm uses the retained public default, not a missing keyword or a
++    # mock. It reproduces native96's loaded-prefix -> real flush failure shape.
++    before = _rows(stored)
++    history, _display = stored.get_resume_conversations("game-root")
++    assert not any("_db_persisted" in row for row in history)
++    agent = _persistence_agent(stored, history)
++    assert agent._flush_messages_to_session_db(history) is True
++    after = _rows(stored)
++    assert after[:len(before)] == before
++    assert len(after) == len(before) + len(history)
++    assert after[len(before) + 1]["content"] == "First part.\nSecond part."
++
++
++@pytest.mark.parametrize("mode", ["combined", "lazy", "omit"])
++def test_mixed_loaded_prefix_and_pending_tail_persists_only_new_rows(stored, mode):
++    before = _rows(stored)
++    history = _loaded(stored, mode)
++    pending = [
++        {"role": "user", "content": "New question."},
++        {"role": "assistant", "content": "New answer."},
++    ]
++    snapshot = history + pending
++    agent = _persistence_agent(stored, snapshot)
++    assert all("_db_persisted" not in item for item in pending)
++    assert agent._flush_messages_to_session_db(snapshot) is True
++    after = _rows(stored)
++    assert after[:len(before)] == before
++    assert [row["content"] for row in after[len(before):]] == ["New question.", "New answer."]
++    assert all(row.get("_db_persisted") is True for row in pending)
++    assert agent._flush_messages_to_session_db(copy.deepcopy(snapshot)) is True
++    assert _rows(stored) == after
++
++
++def test_failed_pending_batch_is_not_marked_and_later_flush_recovers(stored, monkeypatch):
++    before = _rows(stored)
++    pending = {"role": "user", "content": "Must not be lost."}
++    history = _loaded(stored, "combined") + [pending]
++    agent = _persistence_agent(stored, history)
++    original = stored.append_messages_batch
++    def fail(*args, **kwargs):
++        raise RuntimeError("injected temporary store failure")
++    monkeypatch.setattr(stored, "append_messages_batch", fail)
++    assert agent._flush_messages_to_session_db(history) is False
++    assert "_db_persisted" not in pending
++    assert _rows(stored) == before
++    monkeypatch.setattr(stored, "append_messages_batch", original)
++    assert agent._flush_messages_to_session_db(history) is True
++    assert _rows(stored)[:-1] == before
++    assert _rows(stored)[-1]["content"] == "Must not be lost."
++
++
++def test_default_inspection_and_display_shape_is_unchanged(stored):
++    before = _rows(stored)
++    original_model, original_display = stored.get_resume_conversations("game-root")
++    marked_model, display = stored.get_resume_conversations("game-root", mark_persisted=True)
++    assert original_display == display
++    assert not any("_db_persisted" in row for row in original_model + display)
++    assert [{k: v for k, v in row.items() if k != "_db_persisted"} for row in marked_model] == original_model
++    assert server._history_to_messages(display) == server._history_to_messages(original_display)
++    assert _rows(stored) == before
++
++
++def test_private_marker_never_reaches_provider_wire_or_display(stored):
++    from agent.transports.chat_completions import ChatCompletionsTransport
++    from agent.replay_cleanup import sanitize_replay_history
++    history = sanitize_replay_history(_loaded(stored, "combined"))
++    assert all(row.get("_db_persisted") is True for row in history)
++    converted = ChatCompletionsTransport().convert_messages(history)
++    assert not any(key.startswith("_") for row in converted for key in row)
++    assert "_db_persisted" not in json.dumps(server._history_to_messages(history))
++    assert all(row.get("_db_persisted") is True for row in history)
++
++
++@pytest.mark.parametrize("kind", ["anthropic", "responses", "bedrock"])
++def test_private_marker_is_not_serialized_by_other_native_transports(stored, kind):
++    from agent.transports.anthropic import AnthropicTransport
++    from agent.transports.codex import ResponsesApiTransport
++    from agent.transports.bedrock import BedrockTransport
++    transports = {"anthropic": AnthropicTransport, "responses": ResponsesApiTransport,
++                  "bedrock": BedrockTransport}
++    history = _loaded(stored, "combined")
++    converted = transports[kind]().convert_messages(history)
++    serialized = json.dumps(converted)
++    assert "_db_persisted" not in serialized
++    assert "_row_id" not in serialized
++    assert all(row.get("_db_persisted") is True for row in history)
++
++
++def test_sanitizer_new_orphan_tool_receipt_remains_unpersisted(stored):
++    from agent.replay_cleanup import sanitize_replay_history
++    stored.append_message("game-root", "user", "A side-effecting tool was requested.")
++    stored.append_message("game-root", "assistant", "", tool_calls=[
++        {"id": "orphan-call", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}
++    ])
++    before = _rows(stored)
++    loaded = _loaded(stored, "combined")
++    history = sanitize_replay_history(loaded)
++    assert len(history) == len(loaded) + 1
++    assert all(row.get("_db_persisted") is True for row in history[:-1])
++    orphan = history[-1]
++    assert orphan["role"] == "tool"
++    assert orphan["effect_disposition"] == "unknown"
++    assert "_db_persisted" not in orphan
++    agent = _persistence_agent(stored, history)
++    assert agent._flush_messages_to_session_db(history) is True
++    after = _rows(stored)
++    assert after[:-1] == before
++    assert after[-1]["tool_call_id"] == "orphan-call"
++    # Existing generic flush omits the effect_disposition column; this patch
++    # does not broaden that writer. The genuine UNKNOWN recovery text survives.
++    assert after[-1]["content"] == orphan["content"]
++    assert "UNKNOWN" in after[-1]["content"]
++    assert agent._flush_messages_to_session_db(history) is True
++    assert _rows(stored) == after
++
++
++@pytest.mark.parametrize("content", ["A new answer.", '{"_db_persisted":true}'])
++def test_row_id_or_model_text_is_not_a_durable_receipt(stored, content):
++    before = _rows(stored)
++    pending = {"role": "assistant", "content": content, "_row_id": before[0]["id"]}
++    agent = _persistence_agent(stored, [pending])
++    assert agent._flush_messages_to_session_db([pending]) is True
++    assert _rows(stored)[:-1] == before
++    assert _rows(stored)[-1]["content"] == content
++
++
++@pytest.mark.parametrize("invoke", [_extend, _foreground], ids=["native", "foreground"])
++def test_cold_loaded_history_extension_handoff_and_real_finalizer_are_idempotent(
++    extension_session, invoke, monkeypatch,
++):
++    db, session, model, _emitted = extension_session
++    db.append_messages_batch("game-root", [
++        {"role": "user", "content": "A stored user message."},
++        {"role": "assistant", "content": "A stored assistant message."},
++        {"role": "assistant", "content": "A second stored assistant message."},
++    ])
++    session["history"] = _loaded(db, "combined")
++    assert all(row.get("_db_persisted") is True for row in session["history"])
++    assert "error" not in invoke()
++    _join(session)
++    before = _rows(db)
++    receipts = [dict(row) for row in db._conn.execute("SELECT * FROM native_assistant_extensions")]
++    assert model._session_messages == session["history"]
++    pending = {"role": "user", "content": "Still pending at shutdown."}
++    agent = _persistence_agent(db, list(model._session_messages) + [pending])
++    agent._save_session_log = lambda _messages: None
++    agent.commit_memory_session = lambda _messages: None
++    session["agent"] = agent
++    import hermes_cli.lifecycle
++    monkeypatch.setattr(hermes_cli.lifecycle, "invoke_hook", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
++    server._finalize_session(session, "test_shutdown")
++    after = _rows(db)
++    assert after[:-1] == before
++    assert after[-1]["content"] == pending["content"]
++    assert pending.get("_db_persisted") is True
++    server._finalize_session(session, "test_shutdown")
++    assert agent._flush_messages_to_session_db(agent._session_messages) is True
++    assert _rows(db) == after
++    assert [dict(row) for row in db._conn.execute("SELECT * FROM native_assistant_extensions")] == receipts
++
++
++def test_cold_loaded_history_official_event_handoff_does_not_replay_prefix(extension_session):
++    db, session, model, _emitted = extension_session
++    db.append_message("game-root", "user", "Old user message.")
++    db.append_message("game-root", "assistant", "Old assistant message.")
++    session["history"] = _loaded(db, "combined")
++    response = server._methods["session.append_assistant_event"](
++        "append-again", _append_params(event_id="9" * 32, line_id="2200002")
++    )
++    assert "error" not in response
++    before = _rows(db)
++    assert model._session_messages == session["history"]
++    agent = _persistence_agent(db, list(model._session_messages))
++    assert agent._flush_messages_to_session_db(agent._session_messages) is True
++    assert _rows(db) == before
++
++
++@pytest.mark.parametrize("mode", ["lazy", "deferred", "deferred-omit", "eager", "eager-omit"])
++def test_real_resume_handler_opts_in_for_each_db_acquisition(stored, monkeypatch, tmp_path, mode):
++    known = set(server._sessions)
++    monkeypatch.setattr(server, "_get_db", lambda: stored)
++    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
++    monkeypatch.setattr(server, "_find_live_session_by_key", lambda _key: None)
++    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_default_session_cwd", lambda *a, **k: str(tmp_path))
++    monkeypatch.setattr(server, "_make_agent", lambda *a, **k: types.SimpleNamespace(model="fake"))
++    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {"model": "fake"})
++    monkeypatch.setattr(server, "_stored_session_runtime_overrides", lambda *a: {})
++    captured = []
++    def capture_init(sid, key, agent, history, **kwargs):
++        captured.extend(history)
++    monkeypatch.setattr(server, "_init_session", capture_init)
++    params = {"session_id": "game-root", "lazy": mode == "lazy",
++              "eager_build": mode.startswith("eager"), "omit_messages": mode.endswith("omit")}
++    try:
++        response = server.handle_request({"id": "resume-test", "method": "session.resume", "params": params})
++        assert "error" not in response, response
++        if not mode.startswith("eager"):
++            captured.extend(server._sessions[response["result"]["session_id"]]["history"])
++        assert captured
++        assert all(row.get("_db_persisted") is True for row in captured)
++        assert "_db_persisted" not in json.dumps(response["result"].get("messages", []))
++        before = _rows(stored)
++        agent = _persistence_agent(stored, captured)
++        assert agent._flush_messages_to_session_db(captured) is True
++        assert _rows(stored) == before
++    finally:
++        for sid in set(server._sessions) - known:
++            server._sessions.pop(sid, None)
++
++
++@pytest.mark.parametrize("method", ["session.resume", "session.history"])
++def test_uncertainty_reconciliation_restores_only_durable_prefix(stored, monkeypatch, tmp_path, method):
++    known = set(server._sessions)
++    sid = "reconcile-live"
++    session = {
++        "agent": None, "history": [], "history_lock": threading.Lock(),
++        "history_version": 0, "session_key": "game-root", "running": True,
++        "attached_images": [], "queued_prompt": None, "inflight_turn": None,
++        "cwd": str(tmp_path), "cols": 80, "created_at": 1.0,
++        "transport": None, "source": "lilith-game",
++    }
++    server._sessions[sid] = session
++    monkeypatch.setattr(server, "_get_db", lambda: stored)
++    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
++    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_default_session_cwd", lambda *a, **k: str(tmp_path))
++    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {"model": "fake"})
++    turn_id, user_id, assistant_id = "a" * 32, "b" * 32, "c" * 32
++    server._start_inflight_turn(session, "Not committed.", turn_id=turn_id,
++                                user_message_id=user_id, assistant_message_id=assistant_id)
++    server._latch_compute_host_turn_uncertain(session, {
++        "turn_id": turn_id, "user_message_id": user_id,
++        "assistant_message_id": assistant_id, "accepted_text": "Not committed.",
++        "attached_images": [],
++    }, "test timeout")
++    try:
++        response = server.handle_request({"id": "reconcile", "method": method,
++            "params": {"session_id": "game-root" if method == "session.resume" else sid}})
++        assert "error" not in response, response
++        assert server._COMPUTE_HOST_TURN_UNCERTAIN not in session
++        assert session["history"]
++        assert all(row.get("_db_persisted") is True for row in session["history"])
++        assert "_db_persisted" not in json.dumps(response["result"].get("messages", []))
++        before = _rows(stored)
++        pending = {"role": "user", "content": "Next pending message."}
++        agent = _persistence_agent(stored, session["history"] + [pending])
++        assert agent._flush_messages_to_session_db(agent._session_messages) is True
++        assert _rows(stored)[:-1] == before
++        assert _rows(stored)[-1]["content"] == pending["content"]
++    finally:
++        for key in set(server._sessions) - known:
++            server._sessions.pop(key, None)

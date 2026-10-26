@@ -1,0 +1,2658 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 1d34a473ed64054cc920b294c39c3e3af97a72c4..535bbd5efd1eef0a19278b739564473507ff8ae6 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -43,6 +43,7 @@ from agent.turn_context import (
+     build_turn_context,
+     compose_user_api_content,
+     reanchor_current_turn_user_idx,
++    substitute_api_content,
+ )
+ from agent.turn_retry_state import TurnRetryState
+ from agent.runtime_cwd import resolve_agent_cwd
+@@ -1766,6 +1767,8 @@ def run_conversation(
+     persist_user_timestamp: Optional[float] = None,
+     persist_user_display_kind: Optional[str] = None,
+     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
++    persist_user_human_origin: Optional[str] = None,
++    persist_user_human_subject_id: Optional[str] = None,
+     moa_config: Optional[dict[str, Any]] = None,
+ ) -> Dict[str, Any]:
+     """
+@@ -1791,6 +1794,11 @@ def run_conversation(
+             the message unchanged.
+         persist_user_display_metadata: Optional payload for that event
+             (e.g. a delegation's task count).
++        persist_user_human_origin: Host-issued attestation for a direct human
++            turn that may update durable profile/relationship memory.  This is
++            never accepted from model output or inferred from message role.
++        persist_user_human_subject_id: Exact owner subject paired with the
++            host-issued human origin.
+                 or queuing follow-up prefetch work.
+ 
+     Returns:
+@@ -1870,6 +1878,8 @@ def run_conversation(
+         persist_user_timestamp,
+         persist_user_display_kind=persist_user_display_kind,
+         persist_user_display_metadata=persist_user_display_metadata,
++        persist_user_human_origin=persist_user_human_origin,
++        persist_user_human_subject_id=persist_user_human_subject_id,
+         restore_or_build_system_prompt=_restore_or_build_system_prompt,
+         install_safe_stdio=_install_safe_stdio,
+         sanitize_surrogates=_sanitize_surrogates,
+@@ -2220,7 +2230,8 @@ def run_conversation(
+             # stored content (see compose_user_api_content in turn_context).
+             # It is bookkeeping, never a provider field — pop it from EVERY
+             # outgoing copy.
+-            _api_content = api_msg.pop("api_content", None)
++            _api_content = api_msg.get("api_content")
++            api_msg.pop("api_content", None)
+ 
+             # Display-only timeline metadata. Never a provider field — strip
+             # from every outgoing copy so strict OpenAI-compatible backends
+@@ -2246,23 +2257,19 @@ def run_conversation(
+             # never mutated beyond the api_content stamp, so nothing leaks
+             # into the clean transcript content.
+             if idx == current_turn_user_idx and msg.get("role") == "user":
+-                if isinstance(_api_content, str) and _api_content:
+-                    # Stamped by the prologue from the same composition —
+-                    # reuse it so the persisted sidecar and the wire cannot
+-                    # drift, and so every pass this turn sends identical
+-                    # bytes (composed from msg["content"], never from a
+-                    # previously-injected copy).
+-                    api_msg["content"] = _api_content
+-                else:
+-                    # Callers that bypass the prologue stamping: compose live.
+-                    _composed = compose_user_api_content(
+-                        api_msg.get("content", ""),
+-                        _ext_prefetch_cache,
+-                        _plugin_user_context,
+-                        agent=agent,
+-                    )
+-                    if _composed is not None:
+-                        api_msg["content"] = _composed
++                # Always compose from the clean current-turn message.  The
++                # durable sidecar intentionally excludes mutable external
++                # memory; reusing it here would either omit today's recall or
++                # replay a stale/deleted snapshot.  The per-turn caches make
++                # this deterministic across every provider pass in the turn.
++                _composed = compose_user_api_content(
++                    msg.get("content", ""),
++                    _ext_prefetch_cache,
++                    _plugin_user_context,
++                    agent=agent,
++                )
++                if _composed is not None:
++                    api_msg["content"] = _composed
+             elif (
+                 isinstance(_api_content, str)
+                 and _api_content
+@@ -2277,7 +2284,11 @@ def run_conversation(
+                 # ``get_messages_as_conversation``'s sanitize_context/strip
+                 # would rewrite on reload — see the capture in
+                 # ``_flush_messages_to_session_db``).
+-                api_msg["content"] = _api_content
++                # Central substitution rejects pre-D057 sidecars containing
++                # an appended external-memory snapshot while preserving
++                # ordinary plugin/gateway and sanitize-divergence sidecars.
++                api_msg["api_content"] = _api_content
++                substitute_api_content(api_msg)
+ 
+             # Strict identity migrations preserve the SQLite/UI transcript
+             # verbatim.  Only the provider projection receives this typed
+diff --git a/agent/memory_manager.py b/agent/memory_manager.py
+index df0127f3fe0244e44923f4e7ef5f6cd2b12c9377..6ac55579bb4037dfcd603fe974e4af5b3cb155f9 100644
+--- a/agent/memory_manager.py
++++ b/agent/memory_manager.py
+@@ -522,6 +522,94 @@ class MemoryManager:
+         """
+         return extract_user_instruction_from_skill_message(text)
+ 
++    def core_context_all(self, query: str, *, session_id: str = "") -> str:
++        """Collect explicitly opted-in, dynamically refreshed core memory.
++
++        This path is intentionally separate from normal semantic prefetch so
++        a provider can keep a tiny player-locked core available on greetings
++        without re-enabling every network-backed provider on trivial turns.
++        Existing providers return empty through the base implementation.
++        """
++        clean_query = self._strip_skill_scaffolding(query)
++        if clean_query is None:
++            return ""
++        parts = []
++        for provider in self._providers:
++            try:
++                result = self._core_context_provider(
++                    provider,
++                    clean_query,
++                    session_id=session_id,
++                )
++                if result and result.strip():
++                    parts.append(result)
++            except Exception as e:
++                logger.debug(
++                    "Memory provider '%s' core context failed (non-fatal): %s",
++                    provider.name,
++                    e,
++                )
++        return "\n\n".join(parts)
++
++    def _core_context_provider(
++        self, provider: MemoryProvider, query: str, *, session_id: str = ""
++    ) -> str:
++        if provider.name == "builtin":
++            return provider.core_context(query, session_id=session_id)
++
++        result_box: Dict[str, str] = {}
++        error_box: Dict[str, Exception] = {}
++
++        def _run() -> None:
++            try:
++                result_box["value"] = (
++                    provider.core_context(query, session_id=session_id) or ""
++                )
++            except Exception as exc:  # pragma: no cover - re-raised by caller
++                error_box["value"] = exc
++
++        # Use an independent key so a slow semantic prefetch cannot suppress
++        # the much smaller core read, while retaining the same bounded wait.
++        import contextvars
++        from functools import partial
++
++        context_key = f"{provider.name}:core"
++        thread = threading.Thread(
++            target=partial(contextvars.copy_context().run, _run),
++            daemon=True,
++            name=f"memory-core-context-{provider.name}",
++        )
++        with self._external_prefetch_lock:
++            existing = self._external_prefetch_threads.get(context_key)
++            if existing is not None:
++                if existing.is_alive():
++                    logger.debug(
++                        "Memory provider '%s' core context is still running; "
++                        "skipping this turn",
++                        provider.name,
++                    )
++                    return ""
++                self._external_prefetch_threads.pop(context_key, None)
++            self._external_prefetch_threads[context_key] = thread
++            thread.start()
++
++        thread.join(self._external_prefetch_timeout)
++        if thread.is_alive():
++            logger.warning(
++                "Memory provider '%s' core context timed out after %.1fs; "
++                "skipping it until the stuck call returns",
++                provider.name,
++                self._external_prefetch_timeout,
++            )
++            return ""
++
++        with self._external_prefetch_lock:
++            if self._external_prefetch_threads.get(context_key) is thread:
++                self._external_prefetch_threads.pop(context_key, None)
++        if error_box:
++            raise error_box["value"]
++        return result_box.get("value", "")
++
+     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
+         """Collect prefetch context from all providers.
+ 
+diff --git a/agent/memory_provider.py b/agent/memory_provider.py
+index 9d8ee5e3b8805ca1655bdbf8c5692ad5c15aa7b9..1333c03ab83f1170331e622269658deb28b9d349 100644
+--- a/agent/memory_provider.py
++++ b/agent/memory_provider.py
+@@ -164,6 +164,22 @@ class MemoryProvider(ABC):
+         """
+         return ""
+ 
++    def core_context(self, query: str, *, session_id: str = "") -> str:
++        """Return a tiny, dynamically refreshed core-memory block.
++
++        Unlike :meth:`prefetch`, this hook is evaluated for every model turn,
++        including bare greetings and acknowledgements.  It is intended only
++        for a provider's bounded player-locked identity, relationship, or
++        safety facts that must survive a long-lived prompt snapshot.  Slow
++        semantic lookup and broad history do not belong here; callers apply
++        the same external-provider timeout used by normal prefetch.
++
++        The default is empty so existing providers retain their current
++        behavior and trivial prompts still perform no provider work unless a
++        provider explicitly opts in.
++        """
++        return ""
++
+     def prefetch(self, query: str, *, session_id: str = "") -> str:
+         """Recall relevant context for the upcoming turn.
+ 
+@@ -235,6 +251,23 @@ class MemoryProvider(ABC):
+         """
+         raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")
+ 
++    def handle_management_request(
++        self,
++        action: str,
++        request: Dict[str, Any],
++    ) -> Dict[str, Any]:
++        """Handle one authenticated, player-facing provider management call.
++
++        The generic gateway exposes this only as a host/control-plane seam;
++        it is not a model tool and grants no new tool authority. Providers
++        that opt in must validate actions, revisions, idempotency keys and
++        persisted content themselves.  Returning a mapping keeps the generic
++        boundary independent of provider-specific schemas.
++        """
++        raise NotImplementedError(
++            f"Provider {self.name} does not expose memory management"
++        )
++
+     def shutdown(self) -> None:
+         """Clean shutdown — flush queues, close connections."""
+ 
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index ef71a86d1fa35ac47488ec3e66df4be65f606bb7..ee41215994c5069dea40cee8c70bd78e6f461943 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -51,6 +51,12 @@ from agent.model_metadata import (
+ logger = logging.getLogger(__name__)
+ 
+ 
++_DYNAMIC_EXTERNAL_MEMORY_MARKERS = (
++    "<memory-context>\n",
++    "[Subordinate operational context: external memory recall]",
++)
++
++
+ def compose_user_api_content(
+     content: Any,
+     ext_prefetch_cache: str,
+@@ -64,12 +70,12 @@ def compose_user_api_content(
+     target="user_message" (the default). Both are appended to the *API copy*
+     of the user message only — the stored content stays clean.
+ 
+-    This is the single source of that composition. The prologue stamps the
+-    result onto the live message as ``api_content`` (persisted alongside the
+-    clean content) and the ``api_messages`` build in ``conversation_loop``
+-    sends the same helper's output, so the persisted sidecar can never drift
+-    from the bytes on the wire — which is the whole prompt-cache invariant:
+-    what turn N sends must be what turn N+1 replays.
++    This is the single source of that composition.  ``conversation_loop``
++    uses it to add the current external-memory snapshot only to the live API
++    request.  The prologue deliberately calls it with an empty memory value
++    when creating the durable ``api_content`` sidecar: plugin/gateway context
++    remains replayable, while mutable memory is refreshed on every turn and
++    can disappear immediately after a correction, hide, or deletion.
+ 
+     Returns ``None`` when nothing is injected (multimodal/non-string content,
+     or no ephemeral context), meaning the message is sent as-is.
+@@ -110,12 +116,19 @@ def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
+     Used at every API-bound message-build site (the ``api_messages`` build in
+     ``conversation_loop``, the max-iterations summary in
+     ``chat_completion_helpers``, the chat-completions transport). The sidecar
+-    carries the exact bytes previously sent to the API for this message when
++    carries replay-safe bytes previously sent to the API for this message when
+     they differ from the clean stored content; substituting it here keeps the
+     provider prompt-cache prefix byte-stable across turns.
+ 
+-    Returns the popped sidecar string (for callers that need the value for
+-    current-turn composition logic) or ``None`` when absent.
++    Older sessions may contain sidecars that persisted an external-memory
++    snapshot.  Those bytes are mutable player data, not durable transcript
++    context.  Detect the known memory markers only in the suffix appended
++    after the clean stored content, then discard that legacy sidecar instead
++    of replaying stale or deleted memory.  Looking only at the suffix avoids
++    misclassifying a user's literal mention of a marker in their own text.
++
++    Returns the substituted sidecar string, or ``None`` when absent, invalid,
++    or rejected as a legacy external-memory sidecar.
+     """
+     sidecar = api_msg.pop("api_content", None)
+     if (
+@@ -123,8 +136,26 @@ def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
+         and sidecar
+         and api_msg.get("role") in ("user", "assistant")
+     ):
++        clean_content = api_msg.get("content")
++        if isinstance(clean_content, str):
++            if sidecar.startswith(clean_content):
++                injected_suffix = sidecar[len(clean_content):]
++                if any(
++                    marker in injected_suffix
++                    for marker in _DYNAMIC_EXTERNAL_MEMORY_MARKERS
++                ):
++                    return None
++            elif any(
++                marker in sidecar for marker in _DYNAMIC_EXTERNAL_MEMORY_MARKERS
++            ):
++                # sanitize_context may have removed a literal marker from the
++                # stored text, so the clean-content prefix can diverge from a
++                # pre-D057 sidecar. A sidecar that then also contains an
++                # external-memory marker is ambiguous and must fail closed.
++                return None
+         api_msg["content"] = sidecar
+-    return sidecar
++        return sidecar
++    return None
+ 
+ 
+ def drop_stale_api_content(msg: Dict[str, Any]) -> None:
+@@ -471,6 +502,8 @@ def build_turn_context(
+     *,
+     persist_user_display_kind: Optional[str] = None,
+     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
++    persist_user_human_origin: Optional[str] = None,
++    persist_user_human_subject_id: Optional[str] = None,
+     restore_or_build_system_prompt,
+     install_safe_stdio,
+     sanitize_surrogates,
+@@ -733,6 +766,43 @@ def build_turn_context(
+         if persist_user_display_metadata:
+             user_msg["display_metadata"] = persist_user_display_metadata
+ 
++    # This marker is not presentation metadata and is never inferred from a
++    # generic user role.  Trusted ingress code supplies it explicitly for the
++    # only three surfaces allowed to teach the durable Lilith profile.  Keep it
++    # off any typed/synthetic row even if a caller accidentally supplies both.
++    from agent.turn_identity import (
++        PROFILE_MEMORY_HUMAN_ORIGIN_METADATA_KEY,
++        PROFILE_MEMORY_SUBJECT_ID_METADATA_KEY,
++        canonical_profile_memory_human_origin,
++        canonical_profile_memory_subject_id,
++        profile_memory_origin_matches_platform,
++    )
++
++    canonical_human_origin = canonical_profile_memory_human_origin(
++        persist_user_human_origin
++    )
++    canonical_human_subject = canonical_profile_memory_subject_id(
++        canonical_human_origin,
++        persist_user_human_subject_id,
++    )
++    if (
++        not persist_user_display_kind
++        and canonical_human_origin
++        and canonical_human_subject
++        and profile_memory_origin_matches_platform(
++            canonical_human_origin,
++            getattr(agent, "platform", None),
++        )
++    ):
++        human_metadata = dict(user_msg.get("display_metadata") or {})
++        human_metadata[
++            PROFILE_MEMORY_HUMAN_ORIGIN_METADATA_KEY
++        ] = canonical_human_origin
++        human_metadata[
++            PROFILE_MEMORY_SUBJECT_ID_METADATA_KEY
++        ] = canonical_human_subject
++        user_msg["display_metadata"] = human_metadata
++
+     # Durable current-turn identity. SessionDB is append-only and turn setup
+     # may append other synthetic user rows (todo snapshots, compaction
+     # carriers) after this prompt, so "latest user" is not a safe rollback
+@@ -1339,16 +1409,31 @@ def build_turn_context(
+         except Exception:
+             pass
+ 
+-    # External memory provider: prefetch once before the tool loop.
+-    #
+-    # Skip prefetch on trivial prompts (greetings, acknowledgements) to
+-    # prevent memory-context injection on turns that carry no semantic signal.
++    # External memory provider: inject the explicitly opted-in tiny core on
++    # every model turn, then add normal semantic prefetch only for substantive
++    # prompts.  This keeps player-locked identity/relationship facts current
++    # even in a long-lived prompt snapshot without re-enabling slow providers
++    # for greetings and acknowledgements.
+     ext_prefetch_cache = ""
+     if agent._memory_manager:
+         try:
+             _query = original_user_message if isinstance(original_user_message, str) else ""
++            _memory_session_id = getattr(agent, "session_id", "") or ""
++            _memory_parts = []
++            _core_context = agent._memory_manager.core_context_all(
++                _query,
++                session_id=_memory_session_id,
++            ) or ""
++            if _core_context:
++                _memory_parts.append(_core_context)
+             if not is_trivial_prompt(_query):
+-                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
++                _prefetched_context = agent._memory_manager.prefetch_all(
++                    _query,
++                    session_id=_memory_session_id,
++                ) or ""
++                if _prefetched_context:
++                    _memory_parts.append(_prefetched_context)
++            ext_prefetch_cache = "\n\n".join(_memory_parts)
+         except Exception:
+             pass
+         # Deterministic, model-independent recall indicator: when memory was
+@@ -1363,19 +1448,16 @@ def build_turn_context(
+             except Exception:
+                 pass
+ 
+-    # ── api_content sidecar: persist what you send ──
+-    # The prefetch/plugin context above is injected into the API copy of this
+-    # turn's user message, never into the stored content — so on the next
+-    # turn the message would replay WITHOUT the injection, diverging the
+-    # request prefix at this point and re-prefilling everything after it
+-    # (the whole previous turn's assistant/tool chain). Stamp the exact
+-    # API-bound bytes on the live dict, only when they differ from the clean
+-    # content, so the crash persist below writes both in the same row and
+-    # replay can reproduce the sent prefix byte-for-byte. Guarded by the
+-    # same predicate the api_messages build uses, so the stamped bytes are
+-    # exactly the bytes the loop sends. codex_app_server turns bypass the
+-    # api_messages build entirely (the codex thread gets the plain user
+-    # message), so stamping there would persist bytes that were never sent.
++    # ── api_content sidecar: persist replay-safe context only ──
++    # Plugin/gateway context is part of the historical wire prefix and remains
++    # replayable. External memory is mutable player data: persisting it here
++    # would make a correction, hide, or permanent deletion ineffective for
++    # the rest of this session and would duplicate the core on every turn.
++    # Therefore the live API build composes memory + plugin context, while
++    # this durable sidecar intentionally contains plugin/gateway context only.
++    # codex_app_server turns bypass the api_messages build entirely (the codex
++    # thread gets the plain user message), so stamping there would persist
++    # bytes that were never sent.
+     # MoA turns append per-call aggregated reference context to the same API
+     # copy AFTER this composition, so the stamped bytes would never match the
+     # wire either — skip the stamp rather than persist provably wrong "exact
+@@ -1389,7 +1471,7 @@ def build_turn_context(
+         _turn_user_msg = messages[current_turn_user_idx]
+         _api_content = compose_user_api_content(
+             _turn_user_msg.get("content", ""),
+-            ext_prefetch_cache,
++            "",
+             plugin_user_context,
+             agent=agent,
+         )
+diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
+index 75deb8f2e35cec22946f31a04dc9aa0cee11bd96..12e59e9191c9e336254aa09ecdc9f9d1aa8d2645 100644
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -96,6 +96,128 @@ def _exact_persisted_primary_texts(
+     return persisted_user, persisted_assistant
+ 
+ 
++def _trusted_persisted_human_input_origin(messages, *, turn_id, platform):
++    """Return a provider-facing human-origin proof for one exact durable turn.
++
++    A user-shaped row is not evidence of human authorship.  Synthetic cron,
++    proactive, delegation, native, and continuation turns all run through the
++    same transcript machinery.  Profile review is therefore admitted only
++    when a trusted ingress stamped the initiating row and the database-backed
++    turn contains one unambiguous user/primary-assistant identity pair.
++    """
++
++    from agent.turn_identity import (
++        MESSAGE_ID_METADATA_KEY,
++        MESSAGE_KIND_METADATA_KEY,
++        PROFILE_MEMORY_HUMAN_ORIGIN_METADATA_KEY,
++        PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED,
++        PROFILE_MEMORY_SUBJECT_ID_METADATA_KEY,
++        TURN_ORIGIN_KIND_METADATA_KEY,
++        TURN_ORIGIN_METADATA_KEY,
++        TURN_ORIGIN_USER,
++        TURN_ID_METADATA_KEY,
++        USER_MESSAGE_ID_METADATA_KEY,
++        canonical_id,
++        canonical_profile_memory_human_origin,
++        canonical_profile_memory_subject_id,
++        profile_memory_origin_matches_platform,
++    )
++
++    canonical_turn = canonical_id(turn_id)
++    if not canonical_turn:
++        return None
++
++    turn_rows = []
++    for message in messages:
++        if not isinstance(message, dict):
++            continue
++        metadata = message.get("display_metadata")
++        if not isinstance(metadata, dict):
++            continue
++        if canonical_id(metadata.get(TURN_ID_METADATA_KEY)) != canonical_turn:
++            continue
++        # Do not silently ignore an in-memory duplicate/uncommitted row with
++        # the same turn identity.  Its presence makes the persisted input
++        # ambiguous, so profile review must fail closed.
++        if message.get("_db_persisted") is not True:
++            return None
++        turn_rows.append((message, metadata))
++
++    if not turn_rows:
++        return None
++
++    message_ids = []
++    user_rows = []
++    assistant_rows = []
++    for message, metadata in turn_rows:
++        message_id = canonical_id(metadata.get(MESSAGE_ID_METADATA_KEY))
++        if not message_id or message_id == canonical_turn:
++            return None
++        message_ids.append(message_id)
++        if metadata.get(TURN_ORIGIN_METADATA_KEY) != TURN_ORIGIN_USER:
++            return None
++        if str(metadata.get(TURN_ORIGIN_KIND_METADATA_KEY) or "").strip():
++            return None
++        if (
++            message.get("role") == "user"
++            and metadata.get(MESSAGE_KIND_METADATA_KEY) == "user"
++        ):
++            user_rows.append((message, metadata))
++        elif (
++            message.get("role") == "assistant"
++            and metadata.get(MESSAGE_KIND_METADATA_KEY) == "primary"
++        ):
++            assistant_rows.append((message, metadata))
++
++    if len(message_ids) != len(set(message_ids)):
++        return None
++    if len(user_rows) != 1 or len(assistant_rows) != 1:
++        return None
++
++    user_message, user_metadata = user_rows[0]
++    assistant_message, assistant_metadata = assistant_rows[0]
++    user_message_id = canonical_id(
++        user_metadata.get(USER_MESSAGE_ID_METADATA_KEY)
++    )
++    assistant_message_id = canonical_id(
++        assistant_metadata.get(MESSAGE_ID_METADATA_KEY)
++    )
++    if (
++        not user_message_id
++        or user_message_id
++        != canonical_id(user_metadata.get(MESSAGE_ID_METADATA_KEY))
++        or user_message_id == assistant_message_id
++        or str(user_message.get("display_kind") or "").strip()
++        or str(assistant_message.get("display_kind") or "").strip()
++    ):
++        return None
++
++    human_origin = canonical_profile_memory_human_origin(
++        user_metadata.get(PROFILE_MEMORY_HUMAN_ORIGIN_METADATA_KEY)
++    )
++    if not profile_memory_origin_matches_platform(human_origin, platform):
++        return None
++    subject_id = canonical_profile_memory_subject_id(
++        human_origin,
++        user_metadata.get(PROFILE_MEMORY_SUBJECT_ID_METADATA_KEY),
++    )
++    if not subject_id:
++        return None
++
++    return {
++        "schema_version": 1,
++        "kind": "human",
++        "surface": platform,
++        "authorization": (
++            "paired-user"
++            if human_origin == PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED
++            else "runtime-ingress"
++        ),
++        "attestation": human_origin,
++        "subject_id": subject_id,
++    }
++
++
+ def finalize_turn(
+     agent,
+     *,
+@@ -782,25 +904,36 @@ def finalize_turn(
+     _memory_manager = getattr(agent, "_memory_manager", None)
+     if _memory_manager is not None:
+         try:
+-            _persisted_user, _persisted_assistant = _exact_persisted_primary_texts(
++            _platform = getattr(agent, "platform", None) or ""
++            _input_origin = _trusted_persisted_human_input_origin(
+                 messages,
+                 turn_id=turn_id,
+-                fallback_user=original_user_message,
+-                fallback_assistant=final_response,
+-            )
+-            _memory_manager.on_persisted_turn(
+-                session_id=agent.session_id or "",
+-                turn_id=turn_id,
+-                user_message=_persisted_user,
+-                assistant_response=_persisted_assistant,
+-                conversation_history=list(messages),
+-                completed=completed,
+-                failed=failed,
+-                interrupted=interrupted,
+-                turn_exit_reason=_turn_exit_reason,
+-                model=agent.model,
+-                platform=getattr(agent, "platform", None) or "",
++                platform=_platform,
+             )
++            if _input_origin is not None:
++                _persisted_user, _persisted_assistant = (
++                    _exact_persisted_primary_texts(
++                        messages,
++                        turn_id=turn_id,
++                        fallback_user=original_user_message,
++                        fallback_assistant=final_response,
++                    )
++                )
++                _memory_manager.on_persisted_turn(
++                    session_id=agent.session_id or "",
++                    turn_id=turn_id,
++                    user_message=_persisted_user,
++                    assistant_response=_persisted_assistant,
++                    conversation_history=list(messages),
++                    completed=completed,
++                    failed=failed,
++                    interrupted=interrupted,
++                    turn_exit_reason=_turn_exit_reason,
++                    model=agent.model,
++                    platform=_platform,
++                    human_authored=True,
++                    input_origin=_input_origin,
++                )
+         except Exception as exc:
+             # MemoryManager already isolates provider failures.  Retain this
+             # boundary for lightweight manager doubles and third-party
+diff --git a/agent/turn_identity.py b/agent/turn_identity.py
+index d63dfc5b30b9069319886d773ef7725f0f1d2e57..6ae7c34f9dbb71870bced11e89486f5d673e639e 100644
+--- a/agent/turn_identity.py
++++ b/agent/turn_identity.py
+@@ -23,6 +23,80 @@ TURN_ORIGIN_KIND_METADATA_KEY = "hermes_turn_origin_kind"
+ TURN_ORIGIN_USER = "user"
+ TURN_ORIGIN_SYNTHETIC = "synthetic"
+ 
++# A separate, host-issued provenance proof for the small set of human input
++# surfaces that may update Lilith's durable relationship/profile memory.  The
++# generic ``TURN_ORIGIN_USER`` bit is intentionally not sufficient: cron,
++# proactive continuations, delegation completions, and other internal work can
++# all be represented by a user-shaped row while driving the normal agent loop.
++PROFILE_MEMORY_HUMAN_ORIGIN_METADATA_KEY = (
++    "hermes_profile_memory_human_origin"
++)
++PROFILE_MEMORY_SUBJECT_ID_METADATA_KEY = "hermes_profile_memory_subject_id"
++PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID = "local-owner"
++PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME = "lilith-game"
++PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME = "lilith-runtime"
++PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED = "telegram-paired"
++PROFILE_MEMORY_HUMAN_ORIGINS = frozenset(
++    {
++        PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME,
++        PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME,
++        PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED,
++    }
++)
++
++
++def canonical_profile_memory_human_origin(value: Any) -> str:
++    """Return an exact host-issued profile-memory input origin or ``""``.
++
++    No normalization is performed.  This value is an internal attestation,
++    not user input, so accepting case/whitespace aliases would only widen the
++    boundary and make accidental synthetic stamping harder to detect.
++    """
++
++    return (
++        value
++        if isinstance(value, str) and value in PROFILE_MEMORY_HUMAN_ORIGINS
++        else ""
++    )
++
++
++def canonical_profile_memory_subject_id(origin: Any, value: Any) -> str:
++    """Return an exact bounded subject for a trusted human origin.
++
++    Local Lilith surfaces share one fixed owner identity.  Telegram subjects
++    are opaque transport identifiers issued by the paired adapter: retain the
++    exact bytes, but reject empty, non-ASCII, whitespace/control, or unbounded
++    values so they remain safe persisted metadata and routing keys.
++    """
++
++    canonical_origin = canonical_profile_memory_human_origin(origin)
++    if canonical_origin in {
++        PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME,
++        PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME,
++    }:
++        return value if value == PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID else ""
++    if canonical_origin != PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED:
++        return ""
++    if not isinstance(value, str) or not 1 <= len(value) <= 128:
++        return ""
++    if any(ord(char) < 0x21 or ord(char) > 0x7E for char in value):
++        return ""
++    return value
++
++
++def profile_memory_origin_matches_platform(origin: Any, platform: Any) -> bool:
++    """Validate the persisted attestation against the owning agent surface."""
++
++    canonical_origin = canonical_profile_memory_human_origin(origin)
++    if not canonical_origin or not isinstance(platform, str):
++        return False
++    expected_platform = {
++        PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME: "lilith-game",
++        PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME: "lilith-runtime",
++        PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED: "telegram",
++    }[canonical_origin]
++    return platform == expected_platform
++
+ MESSAGE_KINDS = frozenset({"interim", "primary", "tool", "tool_call", "user"})
+ 
+ _CANONICAL_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+diff --git a/gateway/run.py b/gateway/run.py
+index f93cae9b94c231f4f83c3c6c8b9ee7358c53aca8..be0fd55b219e94e583be891cc9819de45c8b6a0e 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -6109,6 +6109,14 @@ class TurnRunner:
+                 _conversation_kwargs["persist_user_display_kind"] = (
+                     ctx.persist_user_display_kind
+                 )
++            if ctx.persist_user_human_origin:
++                _conversation_kwargs["persist_user_human_origin"] = (
++                    ctx.persist_user_human_origin
++                )
++            if ctx.persist_user_human_subject_id:
++                _conversation_kwargs["persist_user_human_subject_id"] = (
++                    ctx.persist_user_human_subject_id
++                )
+             if ctx.moa_config is not None:
+                 _conversation_kwargs["moa_config"] = ctx.moa_config
+             if _persist_user_timestamp_override is not None:
+@@ -18179,6 +18187,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         persist_user_display_kind = (
+             "internal_notification" if getattr(event, "internal", False) else None
+         )
++        # Authorization for delivery is broader than authorization to teach a
++        # permanent personal profile.  Only an exact Telegram sender recorded
++        # in the pairing store receives the latter attestation; allowlisted
++        # groups/users and all internal/plugin injections remain fail-closed.
++        persist_user_human_origin = None
++        persist_user_human_subject_id = None
++        if (
++            persist_user_display_kind is None
++            and getattr(event, "internal", False) is not True
++            and source.platform == Platform.TELEGRAM
++            and source.user_id is not None
++        ):
++            try:
++                pairing_store = self._pairing_store_for(source)
++                if (
++                    pairing_store is not None
++                    and pairing_store.is_approved(
++                        "telegram", str(source.user_id)
++                    )
++                    is True
++                ):
++                    from agent.turn_identity import (
++                        PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED,
++                    )
++
++                    persist_user_human_origin = (
++                        PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED
++                    )
++                    persist_user_human_subject_id = str(source.user_id)
++            except Exception:
++                logger.warning(
++                    "Telegram profile-memory pairing proof failed closed",
++                    exc_info=True,
++                )
+         try:
+             _pcfg = _load_gateway_config()
+             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
+@@ -19362,6 +19404,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_message=persist_user_message,
+                 persist_user_timestamp=persist_user_timestamp,
+                 persist_user_display_kind=persist_user_display_kind,
++                persist_user_human_origin=persist_user_human_origin,
++                persist_user_human_subject_id=persist_user_human_subject_id,
+                 message_type=event.message_type,
+             )
+             _turn_seconds = time.monotonic() - _turn_started_monotonic
+@@ -26777,6 +26821,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         persist_user_message: Optional[Any] = None,
+         persist_user_timestamp: Optional[float] = None,
+         persist_user_display_kind: Optional[str] = None,
++        persist_user_human_origin: Optional[str] = None,
++        persist_user_human_subject_id: Optional[str] = None,
+         message_type: Optional[str] = None,
+     ) -> Dict[str, Any]:
+         """Profile-scoping wrapper around the agent run.
+@@ -26797,6 +26843,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_message=persist_user_message,
+                 persist_user_timestamp=persist_user_timestamp,
+                 persist_user_display_kind=persist_user_display_kind,
++                persist_user_human_origin=persist_user_human_origin,
++                persist_user_human_subject_id=persist_user_human_subject_id,
+                 message_type=message_type,
+             )
+ 
+@@ -26810,6 +26858,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_message=persist_user_message,
+                 persist_user_timestamp=persist_user_timestamp,
+                 persist_user_display_kind=persist_user_display_kind,
++                persist_user_human_origin=persist_user_human_origin,
++                persist_user_human_subject_id=persist_user_human_subject_id,
+                 message_type=message_type,
+             )
+ 
+@@ -26953,6 +27003,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         persist_user_message: Optional[Any] = None,
+         persist_user_timestamp: Optional[float] = None,
+         persist_user_display_kind: Optional[str] = None,
++        persist_user_human_origin: Optional[str] = None,
++        persist_user_human_subject_id: Optional[str] = None,
+         message_type: Optional[str] = None,
+     ) -> Dict[str, Any]:
+         """
+@@ -27271,6 +27323,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             persist_user_message=persist_user_message,
+             persist_user_timestamp=persist_user_timestamp,
+             persist_user_display_kind=persist_user_display_kind,
++            persist_user_human_origin=persist_user_human_origin,
++            persist_user_human_subject_id=persist_user_human_subject_id,
+         )
+         turn_runner = TurnRunner(self, turn_ctx)
+         # Callback invoked by agent on tool lifecycle events — extracted to
+diff --git a/gateway/turn_context.py b/gateway/turn_context.py
+index 284875e228d3708fa369f6efb0414d53e2195d72..6ed609e39f8d40935bfb391f5a9c233f27a84cfd 100644
+--- a/gateway/turn_context.py
++++ b/gateway/turn_context.py
+@@ -96,6 +96,11 @@ class TurnContext:
+     # "internal_notification" for async-delegation/background notifications
+     # (#82888). DB-only presentation metadata; never sent to the provider.
+     persist_user_display_kind: Optional[str] = None
++    # Host-issued provenance for profile-memory review.  Currently populated
++    # only for an exact, paired Telegram human sender; internal events and
++    # generic allowlisted users leave it unset.
++    persist_user_human_origin: Optional[str] = None
++    persist_user_human_subject_id: Optional[str] = None
+     user_config: Any = None
+     enabled_toolsets: Any = None
+     disabled_toolsets: Any = None
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 9855fc16a9f5290583bfe37ed57616d98b0020ee..01dcc89aa843ff13a8b8cd316556337873bae85a 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -15300,6 +15300,26 @@ def _ws_auth_ok(ws: "WebSocket") -> bool:
+     """True when the WS-upgrade credential is accepted. See _ws_auth_reason."""
+     return _ws_auth_reason(ws)[0] is None
+ 
++
++_LILITH_RUNTIME_TRUST_ENV = "HERMES_LILITH_RUNTIME_TRUST_TOKEN"
++_LILITH_RUNTIME_TRUST_HEADER = "x-lilith-runtime-trust"
++
++
++def _lilith_runtime_ws_attested(ws: "WebSocket") -> bool:
++    """Verify the private Runtime-to-Hermes ingress capability.
++
++    Dashboard authentication deliberately remains a separate concern: its
++    token is also available to the embedded browser chat and therefore cannot
++    attest a Lilith Runtime peer.  This nonce is supplied only to the spawned
++    Hermes process and is never projected into HTML or gateway state.
++    """
++
++    expected = str(os.environ.get(_LILITH_RUNTIME_TRUST_ENV) or "")
++    presented = str(ws.headers.get(_LILITH_RUNTIME_TRUST_HEADER) or "")
++    if not expected or not presented:
++        return False
++    return hmac.compare_digest(presented.encode(), expected.encode())
++
+ # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
+ # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
+ # the chat tab generates on mount; entries auto-evict when the last subscriber
+@@ -16395,7 +16415,10 @@ async def gateway_ws(ws: WebSocket) -> None:
+ 
+     from tui_gateway.ws import handle_ws
+ 
+-    await handle_ws(ws)
++    await handle_ws(
++        ws,
++        lilith_runtime_attested=_lilith_runtime_ws_attested(ws),
++    )
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/run_agent.py b/run_agent.py
+index 214b9f25e965bed97ec73622fa9a24cac12a27a9..d764af78ad4321cc257b3ee8bc386804cbc96a75 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -8477,6 +8477,8 @@ class AIAgent:
+         persist_user_timestamp: Optional[float] = None,
+         persist_user_display_kind: Optional[str] = None,
+         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
++        persist_user_human_origin: Optional[str] = None,
++        persist_user_human_subject_id: Optional[str] = None,
+         moa_config: Optional[dict[str, Any]] = None,
+     ) -> Dict[str, Any]:
+         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+@@ -8603,6 +8605,8 @@ class AIAgent:
+                     persist_user_timestamp=persist_user_timestamp,
+                     persist_user_display_kind=persist_user_display_kind,
+                     persist_user_display_metadata=persist_user_display_metadata,
++                    persist_user_human_origin=persist_user_human_origin,
++                    persist_user_human_subject_id=persist_user_human_subject_id,
+                     moa_config=moa_config,
+                 )
+             terminal = result if isinstance(result, dict) else {}
+diff --git a/tests/agent/test_api_content_sidecar.py b/tests/agent/test_api_content_sidecar.py
+index ce7f3cb9be3b658a9bd54abe9a53c20d35aeb0b2..cf3caafb39760faf414a13856bdb9bf7a80bc9bd 100644
+--- a/tests/agent/test_api_content_sidecar.py
++++ b/tests/agent/test_api_content_sidecar.py
+@@ -30,7 +30,11 @@ from unittest.mock import MagicMock, patch
+ import pytest
+ 
+ from agent.memory_manager import build_memory_context_block
+-from agent.turn_context import build_turn_context, compose_user_api_content
++from agent.turn_context import (
++    build_turn_context,
++    compose_user_api_content,
++    substitute_api_content,
++)
+ from hermes_state import SessionDB
+ 
+ 
+@@ -49,6 +53,69 @@ class TestComposeUserApiContent:
+         assert out == "hello" + "\n\n" + fenced + "\n\n" + "PLUGIN-CTX"
+ 
+ 
++class TestSubstituteApiContent:
++    def test_plugin_only_sidecar_is_replayed(self):
++        msg = {
++            "role": "user",
++            "content": "hello",
++            "api_content": "hello\n\nPLUGIN-CTX",
++        }
++
++        assert substitute_api_content(msg) == "hello\n\nPLUGIN-CTX"
++        assert msg == {"role": "user", "content": "hello\n\nPLUGIN-CTX"}
++
++    def test_legacy_plain_memory_sidecar_is_discarded(self):
++        msg = {
++            "role": "user",
++            "content": "hello",
++            "api_content": (
++                "hello\n\n<memory-context>\nOLD PRIVATE FACT\n</memory-context>"
++            ),
++        }
++
++        assert substitute_api_content(msg) is None
++        assert msg == {"role": "user", "content": "hello"}
++
++    def test_legacy_scoped_memory_sidecar_is_discarded(self):
++        msg = {
++            "role": "user",
++            "content": "hello",
++            "api_content": (
++                "hello\n\n"
++                "[Subordinate operational context: external memory recall]\n"
++                "OLD PRIVATE FACT\n"
++                "[End subordinate operational context: external memory recall]"
++            ),
++        }
++
++        assert substitute_api_content(msg) is None
++        assert msg == {"role": "user", "content": "hello"}
++
++    def test_literal_marker_in_clean_user_text_is_not_misclassified(self):
++        clean = "what does <memory-context>\n mean?"
++        msg = {
++            "role": "user",
++            "content": clean,
++            "api_content": clean + "\n\nPLUGIN-CTX",
++        }
++
++        assert substitute_api_content(msg) == clean + "\n\nPLUGIN-CTX"
++        assert msg["content"] == clean + "\n\nPLUGIN-CTX"
++
++    def test_sanitize_divergence_cannot_replay_legacy_memory_suffix(self):
++        msg = {
++            "role": "user",
++            "content": "what does a literal  tag do?",
++            "api_content": (
++                "what does a literal <memory-context> tag do?\n\n"
++                "<memory-context>\nSTALE_PRIVATE_FACT\n</memory-context>"
++            ),
++        }
++
++        assert substitute_api_content(msg) is None
++        assert msg == {"role": "user", "content": "what does a literal  tag do?"}
++
++
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -269,6 +336,43 @@ class TestPrologueStamping:
+         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+         assert agent.api_content_at_persist is None
+ 
++    def test_dynamic_memory_is_returned_but_not_persisted_in_sidecar(self):
++        agent = _FakeAgent()
++        memory_manager = MagicMock()
++        memory_manager.core_context_all.return_value = "PLAYER-LOCKED CORE"
++        memory_manager.prefetch_all.return_value = ""
++        memory_manager.describe_recall.return_value = "memory recalled"
++        agent._memory_manager = memory_manager
++
++        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
++            ctx = _build(agent)
++
++        assert ctx.ext_prefetch_cache == "PLAYER-LOCKED CORE"
++        msg = ctx.messages[ctx.current_turn_user_idx]
++        assert msg["content"] == "hello"
++        assert "api_content" not in msg
++        assert agent.api_content_at_persist is None
++
++    def test_sidecar_persists_plugin_context_but_excludes_dynamic_memory(self):
++        agent = _FakeAgent()
++        memory_manager = MagicMock()
++        memory_manager.core_context_all.return_value = "PLAYER-LOCKED CORE"
++        memory_manager.prefetch_all.return_value = ""
++        memory_manager.describe_recall.return_value = "memory recalled"
++        agent._memory_manager = memory_manager
++
++        with patch(
++            "hermes_cli.plugins.invoke_hook",
++            return_value=[{"context": "PLUGIN-CTX"}],
++        ):
++            ctx = _build(agent)
++
++        assert ctx.ext_prefetch_cache == "PLAYER-LOCKED CORE"
++        msg = ctx.messages[ctx.current_turn_user_idx]
++        assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
++        assert "PLAYER-LOCKED CORE" not in msg["api_content"]
++        assert agent.api_content_at_persist == "hello\n\nPLUGIN-CTX"
++
+     def test_no_stamp_for_codex_app_server(self):
+         """codex_app_server turns bypass the api_messages build, so the
+         injected bytes are never sent — stamping would persist a lie."""
+@@ -546,6 +650,59 @@ class TestWireInvariant:
+         current = _user_messages(_chat_requests(handler)[0])[-1]
+         assert current["content"] == "second question\n\nPLUGIN-CTX"
+ 
++    def test_dynamic_memory_is_current_turn_only_and_refreshes_after_restart(
++        self, wire_env
++    ):
++        """Mutable memory reaches the live request but never durable replay.
++
++        A fresh agent on turn N+1 models a correction/deletion between turns:
++        the historical user row retains only replay-safe plugin context and
++        the new current turn receives only the freshly fetched memory value.
++        """
++        make_agent, handler, db, sid = wire_env
++
++        agent1 = make_agent()
++        memory1 = MagicMock()
++        memory1.core_context_all.return_value = ""
++        memory1.prefetch_all.return_value = "OLD MEMORY VALUE"
++        memory1.describe_recall.return_value = "memory recalled"
++        agent1._memory_manager = memory1
++        agent1.run_conversation(
++            "recall the deployment decision",
++            conversation_history=[],
++            task_id="memory-1",
++        )
++
++        first_sent = _user_messages(_chat_requests(handler)[0])[0]["content"]
++        assert "OLD MEMORY VALUE" in first_sent
++        first_history = db.get_messages_as_conversation(sid)
++        assert first_history[0]["content"] == "recall the deployment decision"
++        assert first_history[0]["api_content"] == (
++            "recall the deployment decision\n\nPLUGIN-CTX"
++        )
++        assert "OLD MEMORY VALUE" not in first_history[0]["api_content"]
++
++        handler.captured_requests = []
++        agent2 = make_agent()
++        memory2 = MagicMock()
++        memory2.core_context_all.return_value = ""
++        memory2.prefetch_all.return_value = "NEW MEMORY VALUE"
++        memory2.describe_recall.return_value = "memory recalled"
++        agent2._memory_manager = memory2
++        agent2.run_conversation(
++            "what is the current deployment decision?",
++            conversation_history=first_history,
++            task_id="memory-2",
++        )
++
++        users = _user_messages(_chat_requests(handler)[0])
++        assert users[0]["content"] == (
++            "recall the deployment decision\n\nPLUGIN-CTX"
++        )
++        assert "OLD MEMORY VALUE" not in users[0]["content"]
++        assert "NEW MEMORY VALUE" in users[-1]["content"]
++        assert "OLD MEMORY VALUE" not in users[-1]["content"]
++
+ 
+ # ---------------------------------------------------------------------------
+ # Review fixes: re-anchoring, MoA, in-place compaction backfill, override
+diff --git a/tests/agent/test_memory_provider.py b/tests/agent/test_memory_provider.py
+index 5b0ebdadfa533e5ccc4c99ae09ebacc4679c53da..1dd85ffc4a52fb5e4f696a2754de3efa8b130b69 100644
+--- a/tests/agent/test_memory_provider.py
++++ b/tests/agent/test_memory_provider.py
+@@ -25,6 +25,7 @@ class FakeMemoryProvider(MemoryProvider):
+         self.initialized = False
+         self.synced_turns = []
+         self.prefetch_queries = []
++        self.core_context_queries = []
+         self.queued_prefetches = []
+         self.persisted_turns = []
+         self.turn_starts = []
+@@ -33,6 +34,7 @@ class FakeMemoryProvider(MemoryProvider):
+         self.memory_writes = []
+         self.shutdown_called = False
+         self._prefetch_result = ""
++        self._core_context_result = ""
+         self._prompt_block = ""
+ 
+     @property
+@@ -53,6 +55,10 @@ class FakeMemoryProvider(MemoryProvider):
+         self.prefetch_queries.append(query)
+         return self._prefetch_result
+ 
++    def core_context(self, query, *, session_id=""):
++        self.core_context_queries.append((query, session_id))
++        return self._core_context_result
++
+     def queue_prefetch(self, query, *, session_id=""):
+         self.queued_prefetches.append(query)
+ 
+@@ -156,6 +162,7 @@ class TestMemoryManager:
+         assert [p.name for p in mgr.providers] == []
+         assert mgr.get_all_tool_schemas() == []
+         assert mgr.build_system_prompt() == ""
++        assert mgr.core_context_all("hi") == ""
+         assert mgr.prefetch_all("test") == ""
+ 
+     def test_add_provider(self):
+@@ -216,6 +223,22 @@ class TestMemoryManager:
+         assert p1.prefetch_queries == ["what do you know?"]
+         assert p2.prefetch_queries == ["what do you know?"]
+ 
++    def test_core_context_is_independent_and_session_scoped(self):
++        mgr = MemoryManager()
++        builtin = FakeMemoryProvider("builtin")
++        external = FakeMemoryProvider("external")
++        external._core_context_result = "PLAYER-LOCKED CORE"
++        mgr.add_provider(builtin)
++        mgr.add_provider(external)
++
++        result = mgr.core_context_all("hi", session_id="session-a")
++
++        assert result == "PLAYER-LOCKED CORE"
++        assert builtin.core_context_queries == [("hi", "session-a")]
++        assert external.core_context_queries == [("hi", "session-a")]
++        assert builtin.prefetch_queries == []
++        assert external.prefetch_queries == []
++
+ 
+     def test_queue_prefetch_all(self):
+         mgr = MemoryManager()
+diff --git a/tests/agent/test_turn_context.py b/tests/agent/test_turn_context.py
+index 1ca237285e60c0772aba31fbb119a63c9de661b3..8230eec7b904430b0c32565f480a2b0b29f40407 100644
+--- a/tests/agent/test_turn_context.py
++++ b/tests/agent/test_turn_context.py
+@@ -8,6 +8,7 @@ confirm the prologue produces the right ``TurnContext`` and applies the
+ 
+ from __future__ import annotations
+ 
++import inspect
+ import threading
+ import types
+ from unittest.mock import MagicMock, patch
+@@ -16,9 +17,28 @@ import pytest
+ 
+ from agent.context_compressor import ContextCompressor
+ from agent.turn_context import TurnContext, build_turn_context
++from agent.turn_identity import (
++    PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME,
++    PROFILE_MEMORY_HUMAN_ORIGIN_METADATA_KEY,
++    PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED,
++    PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID,
++    PROFILE_MEMORY_SUBJECT_ID_METADATA_KEY,
++    canonical_profile_memory_subject_id,
++)
+ from hermes_state import SessionDB
+ 
+ 
++def test_aiagent_wrapper_forwards_profile_memory_human_origin_contract():
++    from run_agent import AIAgent
++
++    signature = inspect.signature(AIAgent.run_conversation)
++    assert "persist_user_human_origin" in signature.parameters
++    assert "persist_user_human_subject_id" in signature.parameters
++    source = inspect.getsource(AIAgent.run_conversation)
++    assert "persist_user_human_origin=persist_user_human_origin" in source
++    assert "persist_user_human_subject_id=persist_user_human_subject_id" in source
++
++
+ class _FakeTodoStore:
+     def has_items(self):
+         return True
+@@ -208,6 +228,69 @@ def test_returns_turn_context_with_user_message_appended():
+     assert ctx.active_system_prompt == "SYSTEM"
+ 
+ 
++def test_host_attested_human_origin_is_persisted_off_wire_metadata():
++    agent = _FakeAgent()
++    agent.platform = "lilith-runtime"
++
++    ctx = _build(
++        agent,
++        persist_user_human_origin=PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME,
++        persist_user_human_subject_id=PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID,
++    )
++
++    assert ctx.messages[-1]["display_metadata"] == {
++        PROFILE_MEMORY_HUMAN_ORIGIN_METADATA_KEY:
++            PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME,
++        PROFILE_MEMORY_SUBJECT_ID_METADATA_KEY:
++            PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID,
++    }
++
++
++def test_human_origin_fails_closed_for_platform_mismatch_or_synthetic_row():
++    for platform, display_kind in (
++        ("cli", None),
++        ("lilith-runtime", "proactive"),
++    ):
++        agent = _FakeAgent()
++        agent.platform = platform
++        ctx = _build(
++            agent,
++            persist_user_display_kind=display_kind,
++            persist_user_human_origin=(
++                PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME
++            ),
++            persist_user_human_subject_id=PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID,
++        )
++
++        metadata = ctx.messages[-1].get("display_metadata") or {}
++        assert PROFILE_MEMORY_HUMAN_ORIGIN_METADATA_KEY not in metadata
++
++
++@pytest.mark.parametrize(
++    "subject_id",
++    [None, "", "has space", "line\nbreak", "用戶", "x" * 129, 12345],
++)
++def test_telegram_profile_memory_subject_is_bounded_ascii_opaque(subject_id):
++    assert (
++        canonical_profile_memory_subject_id(
++            PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED,
++            subject_id,
++        )
++        == ""
++    )
++
++
++def test_telegram_profile_memory_subject_preserves_exact_opaque_id():
++    subject_id = "-10012345:@owner.v1"
++    assert (
++        canonical_profile_memory_subject_id(
++            PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED,
++            subject_id,
++        )
++        == subject_id
++    )
++
++
+ # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
+ #
+ # The prologue is the ONLY place the per-turn synchronous
+@@ -220,6 +303,7 @@ def test_returns_turn_context_with_user_message_appended():
+ def _agent_with_memory_manager():
+     agent = _FakeAgent()
+     mm = MagicMock()
++    mm.core_context_all.return_value = ""
+     mm.prefetch_all.return_value = "REMEMBERED CONTEXT"
+     agent._memory_manager = mm
+     return agent, mm
+@@ -232,11 +316,23 @@ def test_prefetch_skipped_for_trivial_user_message():
+     assert ctx.ext_prefetch_cache == ""
+ 
+ 
++def test_dynamic_core_memory_runs_for_trivial_user_message():
++    agent, mm = _agent_with_memory_manager()
++    mm.core_context_all.return_value = "PLAYER-LOCKED CORE"
++
++    ctx = _build(agent, user_message="hi!")
++
++    mm.core_context_all.assert_called_once_with("hi!", session_id="sess-1")
++    mm.prefetch_all.assert_not_called()
++    assert ctx.ext_prefetch_cache == "PLAYER-LOCKED CORE"
++
++
+ def test_prefetch_runs_for_substantive_user_message():
+     agent, mm = _agent_with_memory_manager()
+     query = "what did we decide about the deploy pipeline?"
+     ctx = _build(agent, user_message=query)
+-    mm.prefetch_all.assert_called_once_with(query)
++    mm.core_context_all.assert_called_once_with(query, session_id="sess-1")
++    mm.prefetch_all.assert_called_once_with(query, session_id="sess-1")
+     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+ 
+ 
+@@ -323,6 +419,7 @@ def test_recall_indicator_emitted_when_memory_injected():
+     agent = _FakeAgent()
+     agent._emit_status = MagicMock()
+     mm = MagicMock()
++    mm.core_context_all.return_value = ""
+     mm.prefetch_all.return_value = "- recalled fact"
+     mm.describe_recall.return_value = "👁️ Hindsight — recalled 2 memories"
+     agent._memory_manager = mm
+@@ -339,6 +436,7 @@ def test_recall_indicator_skipped_when_nothing_injected():
+     agent = _FakeAgent()
+     agent._emit_status = MagicMock()
+     mm = MagicMock()
++    mm.core_context_all.return_value = ""
+     mm.prefetch_all.return_value = ""
+     agent._memory_manager = mm
+ 
+@@ -438,4 +536,3 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
+     overwritten or never read.
+     """
+     assert not _title_turn(platform).called
+-
+diff --git a/tests/agent/test_turn_finalizer_final_response_persistence.py b/tests/agent/test_turn_finalizer_final_response_persistence.py
+index 93201189dfcfe162c063eaca514cb17f9a28d0e9..2d96775ec241c8008e8e15213d0cefe16ed6942a 100644
+--- a/tests/agent/test_turn_finalizer_final_response_persistence.py
++++ b/tests/agent/test_turn_finalizer_final_response_persistence.py
+@@ -3,6 +3,27 @@ from typing import Any
+ 
+ from agent.identity_policy import IdentityPolicy
+ from agent.turn_finalizer import finalize_turn
++from agent.turn_identity import (
++    MESSAGE_ID_METADATA_KEY,
++    MESSAGE_KIND_METADATA_KEY,
++    PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME,
++    PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME,
++    PROFILE_MEMORY_HUMAN_ORIGIN_METADATA_KEY,
++    PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED,
++    PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID,
++    PROFILE_MEMORY_SUBJECT_ID_METADATA_KEY,
++    TURN_ORIGIN_KIND_METADATA_KEY,
++    TURN_ORIGIN_METADATA_KEY,
++    TURN_ORIGIN_SYNTHETIC,
++    TURN_ORIGIN_USER,
++    TURN_ID_METADATA_KEY,
++    USER_MESSAGE_ID_METADATA_KEY,
++)
++
++
++_TURN_ID = "1" * 32
++_USER_MESSAGE_ID = "2" * 32
++_ASSISTANT_MESSAGE_ID = "3" * 32
+ 
+ 
+ class FakeAgent:
+@@ -32,7 +53,7 @@ class FakeAgent:
+         self._skill_nudge_interval = 0
+         self._iters_since_skill = 0
+         self.valid_tool_names = []
+-        self.platform = "test-platform"
++        self.platform = "lilith-runtime"
+         self._memory_manager = None
+         self.persisted_messages: list[dict[str, Any]] | None = None
+         self._persist_user_message_idx: int | None = None
+@@ -92,6 +113,46 @@ class RecordingMemoryManager:
+         self.calls.append(payload)
+ 
+ 
++def _trusted_persisted_turn(
++    *,
++    user_text: str = "remember this",
++    assistant_text: str = "I will.",
++    turn_origin: str = TURN_ORIGIN_USER,
++    human_origin: str | None = PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME,
++    subject_id: str | None = PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID,
++) -> list[dict[str, Any]]:
++    user_metadata = {
++        TURN_ID_METADATA_KEY: _TURN_ID,
++        MESSAGE_ID_METADATA_KEY: _USER_MESSAGE_ID,
++        USER_MESSAGE_ID_METADATA_KEY: _USER_MESSAGE_ID,
++        MESSAGE_KIND_METADATA_KEY: "user",
++        TURN_ORIGIN_METADATA_KEY: turn_origin,
++    }
++    if human_origin is not None:
++        user_metadata[PROFILE_MEMORY_HUMAN_ORIGIN_METADATA_KEY] = human_origin
++    if subject_id is not None:
++        user_metadata[PROFILE_MEMORY_SUBJECT_ID_METADATA_KEY] = subject_id
++    return [
++        {
++            "role": "user",
++            "content": user_text,
++            "_db_persisted": True,
++            "display_metadata": user_metadata,
++        },
++        {
++            "role": "assistant",
++            "content": assistant_text,
++            "_db_persisted": True,
++            "display_metadata": {
++                TURN_ID_METADATA_KEY: _TURN_ID,
++                MESSAGE_ID_METADATA_KEY: _ASSISTANT_MESSAGE_ID,
++                MESSAGE_KIND_METADATA_KEY: "primary",
++                TURN_ORIGIN_METADATA_KEY: turn_origin,
++            },
++        },
++    ]
++
++
+ 
+ 
+ 
+@@ -150,10 +211,7 @@ def test_typed_memory_seam_receives_final_terminal_payload_once(monkeypatch):
+     agent = FakeAgent()
+     manager = RecordingMemoryManager()
+     agent._memory_manager = manager
+-    messages = [
+-        {"role": "user", "content": "remember this", "_db_persisted": True},
+-        {"role": "assistant", "content": "I will.", "_db_persisted": True},
+-    ]
++    messages = _trusted_persisted_turn()
+ 
+     finalize_turn(
+         agent,
+@@ -164,7 +222,7 @@ def test_typed_memory_seam_receives_final_terminal_payload_once(monkeypatch):
+         messages=messages,
+         conversation_history=[],
+         effective_task_id="task",
+-        turn_id="turn-1",
++        turn_id=_TURN_ID,
+         user_message="remember this",
+         original_user_message="remember this",
+         _should_review_memory=False,
+@@ -174,7 +232,7 @@ def test_typed_memory_seam_receives_final_terminal_payload_once(monkeypatch):
+     assert len(manager.calls) == 1
+     assert manager.calls[0] == {
+         "session_id": "sess-test",
+-        "turn_id": "turn-1",
++        "turn_id": _TURN_ID,
+         "user_message": "remember this",
+         "assistant_response": "I will.",
+         "conversation_history": messages,
+@@ -183,7 +241,16 @@ def test_typed_memory_seam_receives_final_terminal_payload_once(monkeypatch):
+         "interrupted": False,
+         "turn_exit_reason": "text_response(stop)",
+         "model": "test-model",
+-        "platform": "test-platform",
++        "platform": "lilith-runtime",
++        "human_authored": True,
++        "input_origin": {
++            "schema_version": 1,
++            "kind": "human",
++            "surface": "lilith-runtime",
++            "authorization": "runtime-ingress",
++            "attestation": "lilith-runtime",
++            "subject_id": PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID,
++        },
+     }
+     # The generic observer bus remains intact for unrelated plugins, but the
+     # typed provider callback itself is not delivered through that registry.
+@@ -196,26 +263,10 @@ def test_typed_memory_seam_prefers_exact_persisted_primary_rows(monkeypatch):
+     agent = FakeAgent()
+     manager = RecordingMemoryManager()
+     agent._memory_manager = manager
+-    messages = [
+-        {
+-            "role": "user",
+-            "content": "durable user",
+-            "_db_persisted": True,
+-            "display_metadata": {
+-                "hermes_turn_id": "turn-1",
+-                "hermes_message_kind": "user",
+-            },
+-        },
+-        {
+-            "role": "assistant",
+-            "content": "durable assistant",
+-            "_db_persisted": True,
+-            "display_metadata": {
+-                "hermes_turn_id": "turn-1",
+-                "hermes_message_kind": "primary",
+-            },
+-        },
+-    ]
++    messages = _trusted_persisted_turn(
++        user_text="durable user",
++        assistant_text="durable assistant",
++    )
+ 
+     finalize_turn(
+         agent,
+@@ -226,7 +277,7 @@ def test_typed_memory_seam_prefers_exact_persisted_primary_rows(monkeypatch):
+         messages=messages,
+         conversation_history=[],
+         effective_task_id="task",
+-        turn_id="turn-1",
++        turn_id=_TURN_ID,
+         user_message="provider-facing user",
+         original_user_message="pre-persistence user",
+         _should_review_memory=False,
+@@ -237,6 +288,145 @@ def test_typed_memory_seam_prefers_exact_persisted_primary_rows(monkeypatch):
+     assert manager.calls[0]["assistant_response"] == "durable assistant"
+ 
+ 
++def test_typed_memory_seam_accepts_only_the_three_attested_human_surfaces(
++    monkeypatch,
++):
++    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
++    cases = (
++        (
++            "lilith-game",
++            PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME,
++            PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID,
++        ),
++        (
++            "lilith-runtime",
++            PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME,
++            PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID,
++        ),
++        ("telegram", PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED, "12345"),
++    )
++    for platform, origin, subject_id in cases:
++        agent = FakeAgent()
++        agent.platform = platform
++        manager = RecordingMemoryManager()
++        agent._memory_manager = manager
++
++        _finalize_memory_candidate(
++            agent,
++            _trusted_persisted_turn(
++                human_origin=origin,
++                subject_id=subject_id,
++            ),
++        )
++
++        assert len(manager.calls) == 1
++        assert manager.calls[0]["human_authored"] is True
++        assert manager.calls[0]["input_origin"]["attestation"] == origin
++        assert manager.calls[0]["input_origin"]["subject_id"] == subject_id
++
++
++def _finalize_memory_candidate(agent, messages):
++    finalize_turn(
++        agent,
++        final_response="I will.",
++        api_call_count=1,
++        interrupted=False,
++        failed=False,
++        messages=messages,
++        conversation_history=[],
++        effective_task_id="task",
++        turn_id=_TURN_ID,
++        user_message="remember this",
++        original_user_message="remember this",
++        _should_review_memory=False,
++        _turn_exit_reason="text_response(stop)",
++    )
++
++
++def test_typed_memory_seam_rejects_unattested_user_shaped_turn(monkeypatch):
++    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
++    agent = FakeAgent()
++    manager = RecordingMemoryManager()
++    agent._memory_manager = manager
++
++    _finalize_memory_candidate(
++        agent,
++        _trusted_persisted_turn(human_origin=None),
++    )
++
++    assert manager.calls == []
++
++
++def test_typed_memory_seam_rejects_missing_subject_id(monkeypatch):
++    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
++    agent = FakeAgent()
++    manager = RecordingMemoryManager()
++    agent._memory_manager = manager
++
++    _finalize_memory_candidate(
++        agent,
++        _trusted_persisted_turn(subject_id=None),
++    )
++
++    assert manager.calls == []
++
++
++def test_typed_memory_seam_rejects_synthetic_sources_even_with_forged_marker(
++    monkeypatch,
++):
++    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
++    for display_kind in (
++        "cron",
++        "proactive",
++        "async_delegation_complete",
++        "system",
++        "native_assistant_event",
++    ):
++        agent = FakeAgent()
++        manager = RecordingMemoryManager()
++        agent._memory_manager = manager
++        messages = _trusted_persisted_turn(
++            turn_origin=TURN_ORIGIN_SYNTHETIC
++        )
++        messages[0]["display_kind"] = display_kind
++        for message in messages:
++            message["display_metadata"][
++                TURN_ORIGIN_KIND_METADATA_KEY
++            ] = display_kind
++
++        _finalize_memory_candidate(agent, messages)
++
++        assert manager.calls == [], display_kind
++
++
++def test_typed_memory_seam_rejects_persist_failure(monkeypatch):
++    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
++    agent = FakeAgent()
++    manager = RecordingMemoryManager()
++    agent._memory_manager = manager
++    messages = _trusted_persisted_turn()
++    messages[0].pop("_db_persisted")
++
++    _finalize_memory_candidate(agent, messages)
++
++    assert manager.calls == []
++
++
++def test_typed_memory_seam_rejects_duplicate_persisted_identity(monkeypatch):
++    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
++    agent = FakeAgent()
++    manager = RecordingMemoryManager()
++    agent._memory_manager = manager
++    messages = _trusted_persisted_turn()
++    duplicate = dict(messages[0])
++    duplicate["display_metadata"] = dict(messages[0]["display_metadata"])
++    messages.append(duplicate)
++
++    _finalize_memory_candidate(agent, messages)
++
++    assert manager.calls == []
++
++
+ def test_final_response_fills_pure_tool_call_tail(monkeypatch):
+     """A tail assistant row that is a *pure tool-call turn* carries no answer.
+ 
+diff --git a/tests/gateway/test_internal_notification_marker_82888.py b/tests/gateway/test_internal_notification_marker_82888.py
+index d3f9301e31a3a351755c061fd71e29bb28a48d70..37ae5c2600527f2961b4603bd30520e6aeff0eea 100644
+--- a/tests/gateway/test_internal_notification_marker_82888.py
++++ b/tests/gateway/test_internal_notification_marker_82888.py
+@@ -25,6 +25,9 @@ from unittest.mock import AsyncMock, MagicMock
+ import pytest
+ 
+ import gateway.run as gateway_run
++from agent.turn_identity import (
++    PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED,
++)
+ from gateway.config import GatewayConfig, Platform
+ from gateway.platforms.base import MessageEvent
+ from gateway.session import SessionEntry, SessionSource
+@@ -135,6 +138,8 @@ async def test_internal_event_threads_marker_into_agent_run(monkeypatch, tmp_pat
+ 
+     kwargs = runner._run_agent.call_args.kwargs
+     assert kwargs["persist_user_display_kind"] == "internal_notification"
++    assert kwargs["persist_user_human_origin"] is None
++    assert kwargs["persist_user_human_subject_id"] is None
+ 
+ 
+ @pytest.mark.asyncio
+@@ -156,6 +161,40 @@ async def test_real_user_event_gets_no_marker(monkeypatch, tmp_path):
+ 
+     kwargs = runner._run_agent.call_args.kwargs
+     assert kwargs["persist_user_display_kind"] is None
++    assert kwargs["persist_user_human_origin"] is None
++    assert kwargs["persist_user_human_subject_id"] is None
++
++
++@pytest.mark.asyncio
++async def test_only_exact_paired_telegram_human_gets_profile_memory_origin(
++    monkeypatch, tmp_path
++):
++    runner = _bootstrap(monkeypatch, tmp_path)
++    runner.pairing_store = MagicMock()
++    runner.pairing_store.is_approved.return_value = True
++    runner._run_agent = AsyncMock(
++        return_value={
++            "final_response": "hi",
++            "messages": [],
++            "tools": [],
++            "history_offset": 0,
++            "last_prompt_tokens": 0,
++        }
++    )
++
++    await runner._handle_message_with_agent(
++        _event(internal=False), _source(), SESSION_KEY, 1,
++    )
++
++    kwargs = runner._run_agent.call_args.kwargs
++    assert (
++        kwargs["persist_user_human_origin"]
++        == PROFILE_MEMORY_HUMAN_ORIGIN_TELEGRAM_PAIRED
++    )
++    assert kwargs["persist_user_human_subject_id"] == "12345"
++    runner.pairing_store.is_approved.assert_called_once_with(
++        "telegram", "12345"
++    )
+ 
+ 
+ # ── 3: gateway-side fallback rows carry the marker for internal events ─────
+diff --git a/tests/hermes_cli/test_lilith_runtime_ws_attestation.py b/tests/hermes_cli/test_lilith_runtime_ws_attestation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..879ff410b2e2962906f62e36b662db1e014cf059
+--- /dev/null
++++ b/tests/hermes_cli/test_lilith_runtime_ws_attestation.py
+@@ -0,0 +1,119 @@
++"""Private Runtime WebSocket ingress attestation contracts."""
++
++from __future__ import annotations
++
++import asyncio
++from types import SimpleNamespace
++
++import pytest
++
++
++@pytest.mark.parametrize(
++    ("expected_nonce", "headers", "attested"),
++    [
++        pytest.param(
++            None,
++            {"x-lilith-runtime-trust": "runtime-only"},
++            False,
++            id="server-nonce-absent",
++        ),
++        pytest.param("runtime-only", {}, False, id="runtime-header-absent"),
++        pytest.param(
++            "runtime-only",
++            {"x-hermes-session-token": "dashboard-only"},
++            False,
++            id="dashboard-auth-is-not-runtime-authority",
++        ),
++        pytest.param(
++            "runtime-only",
++            {"x-lilith-runtime-trust": "wrong"},
++            False,
++            id="runtime-nonce-mismatch",
++        ),
++        pytest.param(
++            "runtime-only",
++            {"x-lilith-runtime-trust": "runtime-only"},
++            True,
++            id="exact-private-runtime-nonce",
++        ),
++    ],
++)
++def test_runtime_ws_attestation_is_separate_from_dashboard_auth(
++    monkeypatch,
++    expected_nonce,
++    headers,
++    attested,
++):
++    from hermes_cli import web_server
++
++    if expected_nonce is None:
++        monkeypatch.delenv(web_server._LILITH_RUNTIME_TRUST_ENV, raising=False)
++    else:
++        monkeypatch.setenv(web_server._LILITH_RUNTIME_TRUST_ENV, expected_nonce)
++
++    ws = SimpleNamespace(headers=headers)
++    assert web_server._lilith_runtime_ws_attested(ws) is attested
++
++
++@pytest.mark.parametrize(
++    ("headers", "attested"),
++    [
++        pytest.param(
++            {"x-hermes-session-token": "dashboard-only"},
++            False,
++            id="dashboard-client",
++        ),
++        pytest.param(
++            {"x-lilith-runtime-trust": "runtime-only"},
++            True,
++            id="runtime-client",
++        ),
++    ],
++)
++def test_gateway_passes_only_a_boolean_runtime_capability(
++    monkeypatch,
++    headers,
++    attested,
++):
++    from hermes_cli import web_server
++    from tui_gateway import ws as gateway_ws_module
++
++    monkeypatch.setenv(web_server._LILITH_RUNTIME_TRUST_ENV, "runtime-only")
++    monkeypatch.setattr(web_server, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
++    monkeypatch.setattr(web_server, "_ws_auth_ok", lambda _ws: True)
++    monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
++
++    captured = {}
++
++    async def fake_handle_ws(_ws, **kwargs):
++        captured.update(kwargs)
++
++    monkeypatch.setattr(gateway_ws_module, "handle_ws", fake_handle_ws)
++    asyncio.run(web_server.gateway_ws(SimpleNamespace(headers=headers)))
++
++    assert captured == {"lilith_runtime_attested": attested}
++    assert "runtime-only" not in repr(captured)
++
++
++def test_ws_transport_capability_defaults_closed():
++    from tui_gateway.ws import WSTransport
++
++    loop = asyncio.new_event_loop()
++    try:
++        untrusted = WSTransport(SimpleNamespace(), loop)
++        trusted = WSTransport(
++            SimpleNamespace(),
++            loop,
++            lilith_runtime_attested=True,
++        )
++        truthy_but_not_boolean = WSTransport(
++            SimpleNamespace(),
++            loop,
++            lilith_runtime_attested=1,
++        )
++    finally:
++        loop.close()
++
++    assert untrusted.lilith_runtime_attested is False
++    assert trusted.lilith_runtime_attested is True
++    assert truthy_but_not_boolean.lilith_runtime_attested is False
+diff --git a/tests/tools/test_hermes_subprocess_env.py b/tests/tools/test_hermes_subprocess_env.py
+index 9838f10cb590e5dc311af324973bc8ab3b3497ee..87a72e5a3f7e0a7d65501340556b93cea077647c 100644
+--- a/tests/tools/test_hermes_subprocess_env.py
++++ b/tests/tools/test_hermes_subprocess_env.py
+@@ -27,6 +27,7 @@ _TIER1_SAMPLE = {
+     "SLACK_APP_TOKEN": "xapp-secret",
+     "MODAL_TOKEN_SECRET": "modal-secret",
+     "HERMES_DASHBOARD_SESSION_TOKEN": "dash-secret",
++    "HERMES_LILITH_RUNTIME_TRUST_TOKEN": "runtime-trust-secret",
+ }
+ 
+ _PROVIDER_SAMPLE = {
+diff --git a/tests/tools/test_local_env_blocklist.py b/tests/tools/test_local_env_blocklist.py
+index 7a486bb367b613c88e2c079f102756449b9f3f39..cd330272ce261c08164afb4966156f2e35d810d8 100644
+--- a/tests/tools/test_local_env_blocklist.py
++++ b/tests/tools/test_local_env_blocklist.py
+@@ -201,6 +201,7 @@ class TestProviderEnvBlocklist:
+             "EMAIL_PASSWORD": "email-secret",
+             "FIRECRAWL_API_KEY": "fc-secret",
+             "HERMES_DASHBOARD_SESSION_TOKEN": "dashboard-session-secret",
++            "HERMES_LILITH_RUNTIME_TRUST_TOKEN": "runtime-trust-secret",
+             "BROWSERBASE_PROJECT_ID": "bb-project",
+             "ELEVENLABS_API_KEY": "el-secret",
+             "GITHUB_TOKEN": "ghp_secret",
+@@ -497,6 +498,7 @@ class TestBlocklistCoverage:
+             "EMAIL_HOME_ADDRESS",
+             "EMAIL_HOME_ADDRESS_NAME",
+             "HERMES_DASHBOARD_SESSION_TOKEN",
++            "HERMES_LILITH_RUNTIME_TRUST_TOKEN",
+             "GATEWAY_ALLOWED_USERS",
+             "GH_TOKEN",
+             "GITHUB_APP_ID",
+diff --git a/tests/tui_gateway/test_game_display_locale.py b/tests/tui_gateway/test_game_display_locale.py
+index 371ecdcafa91a2159a82e8d62b43a3bbcfd75dae..2d8ac16ce2ce4d1d5b96ed4ddc70b72152a8be17 100644
+--- a/tests/tui_gateway/test_game_display_locale.py
++++ b/tests/tui_gateway/test_game_display_locale.py
+@@ -8,6 +8,11 @@ from unittest.mock import MagicMock
+ 
+ import pytest
+ 
++from agent.turn_identity import (
++    PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME,
++    PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME,
++    PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID,
++)
+ from tui_gateway import server
+ 
+ 
+@@ -286,8 +291,163 @@ def test_compute_host_frame_carries_locale_but_keeps_accepted_text_exact():
+         session,
+         original_text,
+         display_locale="ja",
++        human_input_origin=PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME,
++        human_input_subject_id=PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID,
+     )
+ 
+     assert frame["display_locale"] == "ja"
+     assert frame["text"] == original_text
+     assert frame["accepted_text"] == original_text
++    assert (
++        frame["human_input_origin"]
++        == PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME
++    )
++    assert (
++        frame["human_input_subject_id"]
++        == PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID
++    )
++
++
++@pytest.mark.parametrize(
++    (
++        "source",
++        "archived",
++        "lineage_root",
++        "strict_marker",
++        "transport_attested",
++        "expected_origin",
++    ),
++    [
++        pytest.param(
++            "lilith-game",
++            True,
++            "game-root",
++            "1",
++            True,
++            PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME,
++            id="attested-durable-game",
++        ),
++        pytest.param(
++            "lilith-runtime",
++            False,
++            None,
++            "1",
++            True,
++            PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME,
++            id="attested-runtime",
++        ),
++        pytest.param(
++            "desktop", True, "game-root", "1", True, "", id="other-source"
++        ),
++        pytest.param(
++            "lilith-game",
++            True,
++            "game-root",
++            None,
++            True,
++            "",
++            id="strict-host-absent",
++        ),
++        pytest.param(
++            "lilith-runtime",
++            True,
++            "game-root",
++            "malformed",
++            True,
++            "",
++            id="strict-host-malformed",
++        ),
++        pytest.param(
++            "lilith-game",
++            True,
++            "game-root",
++            "1",
++            False,
++            "",
++            id="browser-resumes-durable-game",
++        ),
++        pytest.param(
++            "lilith-runtime",
++            True,
++            "game-root",
++            "1",
++            False,
++            "",
++            id="runtime-source-only",
++        ),
++        pytest.param(
++            "lilith-game",
++            False,
++            "game-root",
++            "1",
++            True,
++            "",
++            id="game-not-archived",
++        ),
++        pytest.param(
++            "lilith-game",
++            True,
++            None,
++            "1",
++            True,
++            "",
++            id="game-without-durable-lineage",
++        ),
++    ],
++)
++def test_prompt_submit_issues_human_origin_only_at_attested_runtime_boundary(
++    monkeypatch,
++    source,
++    archived,
++    lineage_root,
++    strict_marker,
++    transport_attested,
++    expected_origin,
++):
++    if strict_marker is None:
++        monkeypatch.delenv("HERMES_IDENTITY_REQUIRED", raising=False)
++    else:
++        monkeypatch.setenv("HERMES_IDENTITY_REQUIRED", strict_marker)
++
++    ingress = SimpleNamespace(lilith_runtime_attested=transport_attested)
++    session = _session(
++        running=False,
++        source=source,
++        archived=archived,
++        _durable_lineage_root=lineage_root,
++    )
++    server._sessions["origin-sid"] = session
++    dispatch = MagicMock(return_value={"result": {"status": "streaming"}})
++    monkeypatch.setattr(server, "current_transport", lambda: ingress)
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
++    monkeypatch.setattr(
++        server, "_native_authority_quarantine_rpc_error", lambda _rid: None
++    )
++    monkeypatch.setattr(
++        server, "_load_dashboard_process_isolation_config", lambda: {}
++    )
++    monkeypatch.setattr(
++        server, "_session_uses_compute_host", lambda *_args, **_kwargs: True
++    )
++    monkeypatch.setattr(server, "_submit_prompt_to_compute_host", dispatch)
++    try:
++        result = server._methods["prompt.submit"](
++            "origin",
++            {
++                "session_id": "origin-sid",
++                "text": "hello",
++                # These client fields are deliberately hostile.  The gateway
++                # must derive both values from its own transport/session
++                # contract and never accept them as RPC authority.
++                "human_input_origin": PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME,
++                "human_input_subject_id": "attacker-controlled-subject",
++            },
++        )
++    finally:
++        server._sessions.pop("origin-sid", None)
++
++    assert result["result"]["status"] == "streaming"
++    assert dispatch.call_args.kwargs["human_input_origin"] == expected_origin
++    assert dispatch.call_args.kwargs["human_input_subject_id"] == (
++        PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID if expected_origin else ""
++    )
+diff --git a/tests/tui_gateway/test_memory_provider_management_rpc.py b/tests/tui_gateway/test_memory_provider_management_rpc.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3126875449252d17241512aa5af06b20283e6c8b
+--- /dev/null
++++ b/tests/tui_gateway/test_memory_provider_management_rpc.py
+@@ -0,0 +1,158 @@
++"""Generic, profile-scoped memory-provider management RPC contract."""
++
++from pathlib import Path
++
++from agent.memory_provider import MemoryProvider
++from tui_gateway import server
++
++
++class _ManagedProvider(MemoryProvider):
++    def __init__(self, *, failure: Exception | None = None) -> None:
++        self.initialized: dict | None = None
++        self.calls: list[tuple[str, dict]] = []
++        self.shutdown_called = False
++        self.failure = failure
++
++    @property
++    def name(self) -> str:
++        return "managed-test"
++
++    def is_available(self) -> bool:
++        return True
++
++    def initialize(self, session_id: str, **kwargs) -> None:
++        self.initialized = {"session_id": session_id, **kwargs}
++
++    def get_tool_schemas(self) -> list[dict]:
++        return []
++
++    def handle_management_request(self, action: str, request: dict) -> dict:
++        self.calls.append((action, request))
++        if self.failure is not None:
++            raise self.failure
++        return {"schema_version": 1, "action": action, "request": request}
++
++    def shutdown(self) -> None:
++        self.shutdown_called = True
++
++
++def _call(params: dict) -> dict:
++    return server.handle_request(
++        {
++            "jsonrpc": "2.0",
++            "id": "memory-1",
++            "method": "memory.provider.manage",
++            "params": params,
++        }
++    )
++
++
++def test_management_rpc_uses_active_provider_in_non_review_context(monkeypatch, tmp_path):
++    provider = _ManagedProvider()
++    monkeypatch.setattr("plugins.memory._get_active_memory_provider", lambda: provider.name)
++    monkeypatch.setattr(
++        "plugins.memory.load_memory_provider",
++        lambda name, register_skills=False: provider,
++    )
++    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: Path(tmp_path))
++
++    response = _call(
++        {
++            "action": "catalog",
++            "request": {"limit": 20},
++        }
++    )
++
++    assert response["result"] == {
++        "schema_version": 1,
++        "action": "catalog",
++        "request": {"limit": 20},
++    }
++    assert provider.initialized == {
++        "session_id": "runtime-memory-management",
++        "hermes_home": str(tmp_path),
++        "platform": "runtime-control",
++        "agent_context": "management",
++    }
++    assert provider.calls == [("catalog", {"limit": 20})]
++    assert provider.shutdown_called is True
++
++
++def test_management_rpc_rejects_unshaped_request_before_loading_provider(monkeypatch):
++    loaded = []
++    monkeypatch.setattr(
++        "plugins.memory.load_memory_provider",
++        lambda *args, **kwargs: loaded.append((args, kwargs)),
++    )
++
++    response = _call({"action": "catalog", "request": {}, "extra": True})
++
++    assert response["error"]["code"] == 4001
++    assert loaded == []
++
++
++def test_management_rpc_rejects_non_ascii_action_before_loading_provider(monkeypatch):
++    loaded = []
++    monkeypatch.setattr(
++        "plugins.memory.load_memory_provider",
++        lambda *args, **kwargs: loaded.append((args, kwargs)),
++    )
++
++    for action in ("catalóg", "catalog١", "сatalog"):
++        response = _call({"action": action, "request": {}})
++        assert response["error"] == {
++            "code": 4001,
++            "message": "memory management request is invalid",
++        }
++
++    assert loaded == []
++
++
++def test_management_rpc_reports_missing_external_provider(monkeypatch):
++    monkeypatch.setattr("plugins.memory._get_active_memory_provider", lambda: "")
++
++    response = _call({"action": "catalog", "request": {}})
++
++    assert response["error"]["code"] == 4045
++
++
++def test_management_rpc_shuts_provider_down_after_failure(monkeypatch, tmp_path):
++    provider = _ManagedProvider(
++        failure=RuntimeError(
++            r"provider-fault at C:\Users\player\private-memory secret-token"
++        )
++    )
++    monkeypatch.setattr("plugins.memory._get_active_memory_provider", lambda: provider.name)
++    monkeypatch.setattr(
++        "plugins.memory.load_memory_provider",
++        lambda name, register_skills=False: provider,
++    )
++    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: Path(tmp_path))
++
++    response = _call({"action": "catalog", "request": {}})
++
++    assert response["error"]["code"] == 5000
++    assert response["error"]["message"] == "memory provider management failed"
++    assert "private-memory" not in response["error"]["message"]
++    assert "secret-token" not in response["error"]["message"]
++    assert provider.shutdown_called is True
++
++
++def test_management_rpc_sanitizes_provider_validation_exception(monkeypatch, tmp_path):
++    provider = _ManagedProvider(
++        failure=ValueError(r"invalid C:\Users\player\profile-memory.sqlite3")
++    )
++    monkeypatch.setattr("plugins.memory._get_active_memory_provider", lambda: provider.name)
++    monkeypatch.setattr(
++        "plugins.memory.load_memory_provider",
++        lambda name, register_skills=False: provider,
++    )
++    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: Path(tmp_path))
++
++    response = _call({"action": "entry.add", "request": {}})
++
++    assert response["error"] == {
++        "code": 4001,
++        "message": "memory provider rejected the management request",
++    }
++    assert provider.shutdown_called is True
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index 1d48b5c2db001848fc919065a1106a7d62fb041d..4d23959289822256e4477bea9ae2ee855afc1f82 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -305,6 +305,7 @@ def _build_provider_env_blocklist() -> frozenset:
+         "EMAIL_HOME_ADDRESS",
+         "EMAIL_HOME_ADDRESS_NAME",
+         "HERMES_DASHBOARD_SESSION_TOKEN",
++        "HERMES_LILITH_RUNTIME_TRUST_TOKEN",
+         "GATEWAY_ALLOWED_USERS",
+         "GH_TOKEN",
+         "GITHUB_APP_ID",
+@@ -564,6 +565,7 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
+     "HASS_TOKEN",
+     "EMAIL_PASSWORD",
+     "HERMES_DASHBOARD_SESSION_TOKEN",
++    "HERMES_LILITH_RUNTIME_TRUST_TOKEN",
+     # Remote-compute / infrastructure secrets
+     "MODAL_TOKEN_ID",
+     "MODAL_TOKEN_SECRET",
+diff --git a/tui_gateway/compute_host.py b/tui_gateway/compute_host.py
+index 1a41eccd4bfc8c5e7e716acee551ad4d5f174233..b4e1c288370ca1e6203ae908906b72acd670ebeb 100644
+--- a/tui_gateway/compute_host.py
++++ b/tui_gateway/compute_host.py
+@@ -710,6 +710,16 @@ class ComputeHost:
+                     if frame.get("display_locale")
+                     else None
+                 ),
++                human_input_origin=(
++                    str(frame.get("human_input_origin"))
++                    if frame.get("human_input_origin")
++                    else None
++                ),
++                human_input_subject_id=(
++                    str(frame.get("human_input_subject_id"))
++                    if frame.get("human_input_subject_id")
++                    else None
++                ),
+             )
+             run_thread = session.get("_run_thread")
+             if run_thread is not None and hasattr(run_thread, "join"):
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 517844e3d64e5919ca22128cff3c60a3db37b9ca..1e0c38783275d3a09e97b92990e828ce1a87a11e 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -308,6 +308,42 @@ def _(rid, params: dict) -> dict:
+     session, err = _sess_nowait(params, rid)
+     if err:
+         return err
++    # This handler is the accepted human-text boundary.  A client-controlled
++    # session source is not authority: issue an origin only when the current
++    # request arrived over the private Runtime-attested transport while the
++    # host identity lock is active.  The capability never enters session
++    # state, queued payloads, responses, or SQLite.
++    from agent.turn_identity import (
++        PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME,
++        PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME,
++        PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID,
++    )
++
++    try:
++        from agent.identity_policy import identity_lock_required_by_host
++
++        ingress = current_transport()
++        runtime_ingress_attested = (
++            identity_lock_required_by_host()
++            and getattr(ingress, "lilith_runtime_attested", False) is True
++        )
++    except Exception:
++        runtime_ingress_attested = False
++    source = str(session.get("source") or "")
++    game_lineage_attested = (
++        source == "lilith-game"
++        and session.get("archived") is True
++        and isinstance(session.get("_durable_lineage_root"), str)
++        and bool(session.get("_durable_lineage_root"))
++    )
++    human_input_origin = ""
++    if runtime_ingress_attested and source == "lilith-runtime":
++        human_input_origin = PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME
++    elif runtime_ingress_attested and game_lineage_attested:
++        human_input_origin = PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_GAME
++    human_input_subject_id = (
++        PROFILE_MEMORY_LOCAL_OWNER_SUBJECT_ID if human_input_origin else ""
++    )
+     display_locale = None
+     if "display_locale" in params:
+         display_locale = params.get("display_locale")
+@@ -381,6 +417,8 @@ def _(rid, params: dict) -> dict:
+             rid, sid, session, text, busy_transport,
+             queued=bool(params.get("queued")) or reconcile_queue_gate,
+             display_locale=display_locale,
++            human_input_origin=human_input_origin,
++            human_input_subject_id=human_input_subject_id,
+         )
+         if busy_response is not None:
+             return busy_response
+@@ -425,6 +463,8 @@ def _(rid, params: dict) -> dict:
+                     session.get(_COMPUTE_HOST_RECONCILE_QUEUE_GATE)
+                 ),
+                 display_locale=display_locale,
++                human_input_origin=human_input_origin,
++                human_input_subject_id=human_input_subject_id,
+             )
+             session["last_active"] = time.time()
+             return _ok(rid, {"status": "queued"})
+@@ -698,6 +738,8 @@ def _(rid, params: dict) -> dict:
+             session,
+             text,
+             display_locale=display_locale,
++            human_input_origin=human_input_origin,
++            human_input_subject_id=human_input_subject_id,
+         )
+         if not isolated_response.get("error"):
+             if survivor_user_row_ids is not None:
+@@ -805,6 +847,8 @@ def _(rid, params: dict) -> dict:
+             session,
+             text,
+             display_locale=display_locale,
++            human_input_origin=human_input_origin,
++            human_input_subject_id=human_input_subject_id,
+         )
+ 
+     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 4f081c589b1c309c1b27af940bdbb117e01a07ad..82d696d50962582db761e160704572dcd90e42f8 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -2345,6 +2345,74 @@ def _(rid, params: dict) -> dict:
+         return _err(rid, 5000, f"learning.edit failed: {exc}")
+ 
+ 
++@method("memory.provider.manage")
++def _(rid, params: dict) -> dict:
++    """Route one authenticated control-plane call to the active provider.
++
++    This is deliberately not a model tool.  The provider owns its typed
++    actions, revision/idempotency checks, data schema and player-data path;
++    the generic gateway only resolves the exact active provider and supplies
++    the active profile home.  A fresh management-context instance avoids
++    borrowing a conversation agent or starting provider review workers.
++    """
++    if not isinstance(params, dict) or set(params) != {"action", "request"}:
++        return _err(rid, 4001, "memory management parameters are invalid")
++    action = params.get("action")
++    request = params.get("request")
++    if (
++        not isinstance(action, str)
++        or not action
++        or action != action.strip()
++        or len(action) > 80
++        or not all(
++            ch in "abcdefghijklmnopqrstuvwxyz0123456789._-" for ch in action
++        )
++        or not isinstance(request, dict)
++    ):
++        return _err(rid, 4001, "memory management request is invalid")
++
++    provider = None
++    initialized = False
++    try:
++        from agent.memory_provider import MemoryProvider
++        from hermes_constants import get_hermes_home
++        from plugins.memory import _get_active_memory_provider, load_memory_provider
++
++        provider_name = str(_get_active_memory_provider() or "").strip()
++        if not provider_name or provider_name == "built-in":
++            return _err(rid, 4045, "no external memory provider is active")
++        provider = load_memory_provider(provider_name, register_skills=False)
++        if provider is None or not provider.is_available():
++            return _err(rid, 4045, "the active memory provider is unavailable")
++        if type(provider).handle_management_request is MemoryProvider.handle_management_request:
++            return _err(rid, 4045, "the active memory provider has no management surface")
++
++        provider.initialize(
++            session_id="runtime-memory-management",
++            hermes_home=str(get_hermes_home()),
++            platform="runtime-control",
++            agent_context="management",
++        )
++        initialized = True
++        result = provider.handle_management_request(action, dict(request))
++        if not isinstance(result, dict):
++            return _err(rid, 5000, "memory provider returned an invalid management result")
++        return _ok(rid, result)
++    except (TypeError, ValueError):
++        # Provider exceptions may contain player data, absolute paths, or
++        # credential-bearing values.  The provider's normal typed response is
++        # the only channel allowed to carry detailed management errors.
++        return _err(rid, 4001, "memory provider rejected the management request")
++    except Exception:  # noqa: BLE001
++        return _err(rid, 5000, "memory provider management failed")
++    finally:
++        if initialized and provider is not None:
++            try:
++                provider.shutdown()
++            except Exception:
++                pass
++
++
+ @method("skills.manage")
+ def _(rid, params: dict) -> dict:
+     action, query = params.get("action", "list"), params.get("query", "")
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 22ca0dcdd89c94e5dc8bd66e065777e0b850564d..883c28d7788ecc0b77946785a90b6ce568839bdd 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -282,6 +282,7 @@ _LONG_HANDLERS = frozenset(
+         "pet.select",
+         "pet.thumb",
+         "learning.frames",
++        "memory.provider.manage",
+         "messaging.telegram.status",
+         "messaging.telegram.replace",
+         "messaging.telegram.remove",
+@@ -2137,6 +2138,8 @@ def _compute_host_turn_frame(
+     image_paths: list[str] | None = None,
+     queued_prompt_generation: int | None = None,
+     display_locale: str | None = None,
++    human_input_origin: str | None = None,
++    human_input_subject_id: str | None = None,
+ ) -> dict:
+     with session["history_lock"]:
+         history = list(session.get("history", []))
+@@ -2173,6 +2176,8 @@ def _compute_host_turn_frame(
+         "attached_images": attached_images,
+         "queued_prompt_generation": queued_prompt_generation,
+         "display_locale": display_locale or "",
++        "human_input_origin": human_input_origin or "",
++        "human_input_subject_id": human_input_subject_id or "",
+     }
+ 
+ 
+@@ -2598,6 +2603,8 @@ def _submit_prompt_to_compute_host(
+     image_paths: list[str] | None = None,
+     queued_prompt_generation: int | None = None,
+     display_locale: str | None = None,
++    human_input_origin: str | None = None,
++    human_input_subject_id: str | None = None,
+ ) -> dict:
+     from tui_gateway.host_supervisor import ComputeHostTurnCommitError
+ 
+@@ -2610,6 +2617,8 @@ def _submit_prompt_to_compute_host(
+         image_paths=image_paths,
+         queued_prompt_generation=queued_prompt_generation,
+         display_locale=display_locale,
++        human_input_origin=human_input_origin,
++        human_input_subject_id=human_input_subject_id,
+     )
+     # Freeze the accepted identity before handing work to another process. A
+     # very fast host can complete and clear the parent inflight snapshot before
+@@ -11078,6 +11087,8 @@ def _enqueue_prompt(
+     *,
+     merge_text: bool = True,
+     display_locale: str | None = None,
++    human_input_origin: str | None = None,
++    human_input_subject_id: str | None = None,
+ ) -> None:
+     """Stash a message to run as the very next turn once the live one ends.
+ 
+@@ -11094,6 +11105,10 @@ def _enqueue_prompt(
+         queued["image_paths"] = image_paths
+     if display_locale:
+         queued["display_locale"] = display_locale
++    if human_input_origin:
++        queued["human_input_origin"] = human_input_origin
++    if human_input_subject_id:
++        queued["human_input_subject_id"] = human_input_subject_id
+     existing = session.get("queued_prompt")
+     if (
+         merge_text
+@@ -11103,6 +11118,8 @@ def _enqueue_prompt(
+         and not existing.get("image_paths")
+         and not image_paths
+         and existing.get("display_locale") == display_locale
++        and existing.get("human_input_origin") == human_input_origin
++        and existing.get("human_input_subject_id") == human_input_subject_id
+         and not session.get("queued_prompts")
+     ):
+         prev = existing["text"]
+@@ -11157,6 +11174,8 @@ def _handle_busy_submit(
+     transport: Any,
+     queued: bool = False,
+     display_locale: str | None = None,
++    human_input_origin: str | None = None,
++    human_input_subject_id: str | None = None,
+ ) -> dict | None:
+     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
+     a turn is in flight, instead of rejecting it with ``session busy``.
+@@ -11270,6 +11289,8 @@ def _handle_busy_submit(
+             image_paths=image_paths,
+             merge_text=not queue_gate,
+             display_locale=display_locale,
++            human_input_origin=human_input_origin,
++            human_input_subject_id=human_input_subject_id,
+         )
+         if mode != "queue":
+             # Re-read the owner at the queue transaction, rather than trusting
+@@ -11471,6 +11492,8 @@ def _drain_queued_prompt(
+                     image_paths=queued["image_paths"],
+                     queued_prompt_generation=queue_generation,
+                     display_locale=queued.get("display_locale"),
++                    human_input_origin=queued.get("human_input_origin"),
++                    human_input_subject_id=queued.get("human_input_subject_id"),
+                 )
+             else:
+                 resp = _submit_prompt_to_compute_host(
+@@ -11480,6 +11503,8 @@ def _drain_queued_prompt(
+                     queued["text"],
+                     queued_prompt_generation=queue_generation,
+                     display_locale=queued.get("display_locale"),
++                    human_input_origin=queued.get("human_input_origin"),
++                    human_input_subject_id=queued.get("human_input_subject_id"),
+                 )
+             if resp.get("error"):
+                 message = _safe_turn_error(
+@@ -11526,6 +11551,8 @@ def _drain_queued_prompt(
+                     image_paths=queued["image_paths"],
+                     queued_prompt_generation=queue_generation,
+                     display_locale=queued.get("display_locale"),
++                    human_input_origin=queued.get("human_input_origin"),
++                    human_input_subject_id=queued.get("human_input_subject_id"),
+                 )
+             else:
+                 _run_prompt_submit(
+@@ -11535,6 +11562,8 @@ def _drain_queued_prompt(
+                     queued["text"],
+                     queued_prompt_generation=queue_generation,
+                     display_locale=queued.get("display_locale"),
++                    human_input_origin=queued.get("human_input_origin"),
++                    human_input_subject_id=queued.get("human_input_subject_id"),
+                 )
+     except Exception as exc:
+         safe_error = _safe_turn_error(session.get("agent"), exc)
+@@ -14843,6 +14872,8 @@ def _run_prompt_submit(
+     image_paths: list[str] | None = None,
+     queued_prompt_generation: int | None = None,
+     display_locale: str | None = None,
++    human_input_origin: str | None = None,
++    human_input_subject_id: str | None = None,
+ ) -> None:
+     quarantine_error = _native_authority_quarantine_rpc_error(rid)
+     if quarantine_error is not None:
+@@ -15262,6 +15293,18 @@ def _run_prompt_submit(
+             if display_kind and "persist_user_display_kind" in _run_params:
+                 run_kwargs["persist_user_display_kind"] = display_kind
+                 run_kwargs["persist_user_display_metadata"] = display_metadata
++            if (
++                human_input_origin
++                and "persist_user_human_origin" in _run_params
++            ):
++                run_kwargs["persist_user_human_origin"] = human_input_origin
++            if (
++                human_input_subject_id
++                and "persist_user_human_subject_id" in _run_params
++            ):
++                run_kwargs["persist_user_human_subject_id"] = (
++                    human_input_subject_id
++                )
+             # Auto-titling now fires inside the turn prologue (shared by every
+             # surface). Hand the agent this session's live-rename hook so the
+             # sidebar repaints the moment a title lands, rather than waiting
+diff --git a/tui_gateway/ws.py b/tui_gateway/ws.py
+index 073c4ac1497c7a266209169176ebfff673ecbbcb..d53f39d4b3b13b366b598d4d4b6e054df7f2f97c 100644
+--- a/tui_gateway/ws.py
++++ b/tui_gateway/ws.py
+@@ -89,10 +89,12 @@ class WSTransport:
+         loop: asyncio.AbstractEventLoop,
+         *,
+         peer: str = "unknown",
++        lilith_runtime_attested: bool = False,
+     ) -> None:
+         self._ws = ws
+         self._loop = loop
+         self._peer = peer
++        self._lilith_runtime_attested = lilith_runtime_attested is True
+         self._closed = False
+         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
+         # short timer flushes the batch. The lock guards the buffer + the
+@@ -107,6 +109,12 @@ class WSTransport:
+         # the owning loop while it recovers from a stall.
+         self._send_lock = asyncio.Lock()
+ 
++    @property
++    def lilith_runtime_attested(self) -> bool:
++        """Server-created capability for the current Runtime WS peer."""
++
++        return self._lilith_runtime_attested
++
+     @staticmethod
+     def _is_streaming_frame(obj: dict) -> bool:
+         """True for high-frequency per-token frames eligible for coalescing."""
+@@ -283,7 +291,11 @@ def _disable_nagle(ws: Any) -> None:
+         _log.debug("ws TCP_NODELAY skip: %s", exc)
+ 
+ 
+-async def handle_ws(ws: Any) -> None:
++async def handle_ws(
++    ws: Any,
++    *,
++    lilith_runtime_attested: bool = False,
++) -> None:
+     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``."""
+     peer = _ws_peer_label(ws)
+     transport: WSTransport | None = None
+@@ -301,7 +313,12 @@ async def handle_ws(ws: Any) -> None:
+         _disable_nagle(ws)
+         _log.info("ws accepted peer=%s", peer)
+ 
+-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
++        transport = WSTransport(
++            ws,
++            asyncio.get_running_loop(),
++            peer=peer,
++            lilith_runtime_attested=lilith_runtime_attested,
++        )
+ 
+         # resolve_skin() reads config + initializes the skin engine —
+         # synchronous I/O + CPU work that should not block the event loop

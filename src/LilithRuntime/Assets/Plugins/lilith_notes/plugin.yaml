@@ -1,0 +1,6 @@
+name: lilith_notes
+version: 1.0.0
+kind: standalone
+description: "Typed access to Lilith's official memo book through the Runtime-owned host bridge."
+provides_tools:
+  - lilith_notes

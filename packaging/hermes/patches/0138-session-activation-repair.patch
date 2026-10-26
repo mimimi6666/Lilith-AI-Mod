@@ -1,0 +1,269 @@
+diff --git a/tests/tui_gateway/test_game_resume_current_default.py b/tests/tui_gateway/test_game_resume_current_default.py
+new file mode 100644
+--- /dev/null
++++ b/tests/tui_gateway/test_game_resume_current_default.py
+@@ -0,0 +1,181 @@
++"""Real resume dispatcher and durable DB; no provider/network/player data."""
++import copy
++import json
++import threading
++import types
++
++import pytest
++from hermes_state import SessionDB
++from tui_gateway import server
++from tests.tui_gateway.test_runtime_authority_races import _Agent, _install_build_stubs
++
++ROUTE = {"model": "deepseek-flash", "provider": "deepseek"}
++
++
++def params():
++    return dict(session_id="game-root", source="lilith-game",
++                require_durable_lineage=True, expected_source="lilith-game",
++                expected_archived=True, close_on_disconnect=True,
++                game_model_route=dict(ROUTE))
++
++
++@pytest.fixture
++def fixture(tmp_path, monkeypatch):
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("game-root", source="lilith-game", archived=True,
++                      model="qwen-old", model_config={
++                          "provider": "alibaba", "base_url": "https://old.invalid/v1",
++                          "reasoning_config": {"effort": "high"}, "service_tier": "priority"})
++    db.append_messages_batch("game-root", [{"role": "user", "content": "stored question"},
++                                           {"role": "assistant", "content": "stored answer"}])
++    known = dict(server._sessions)
++    server._sessions.clear()
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(server, "_profile_home", lambda profile: None)
++    monkeypatch.setattr(server, "_profile_configured_cwd", lambda home: str(tmp_path))
++    monkeypatch.setattr(server, "_default_session_cwd", lambda: str(tmp_path))
++    monkeypatch.setattr(server, "_config_model_target", lambda: (ROUTE["model"], ROUTE["provider"]))
++    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
++    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a: None)
++    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
++    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a: None)
++    monkeypatch.setattr(server, "_child_run_active", lambda *a: False)
++    built = []
++
++    def make_agent(*args, **kwargs):
++        built.append(copy.deepcopy(kwargs))
++        if kwargs.get("provider_override") == "alibaba":
++            raise RuntimeError("synthetic missing old key")
++        return _Agent(kwargs)
++
++    _install_build_stubs(monkeypatch, make_agent)
++    try:
++        yield db, built
++    finally:
++        for session in server._sessions.values():
++            worker = session.get("_agent_build_thread")
++            if worker is not None:
++                worker.join(5)
++                assert not worker.is_alive()
++        server._sessions.clear()
++        server._sessions.update(known)
++        db.close()
++
++
++def resume(payload):
++    return server.handle_request({"id": "resume-test", "method": "session.resume", "params": payload})
++
++
++@pytest.mark.parametrize("omit", [False, True])
++def test_game_rebase_precedes_first_build_and_retains_history(fixture, omit):
++    db, built = fixture
++    before = db.get_messages_as_conversation("game-root")
++    payload = params()
++    payload["omit_messages"] = omit
++    result = resume(payload)
++    assert "error" not in result, result
++    sid = result["result"]["session_id"]
++    session = server._sessions[sid]
++    assert session["model_override"] == ROUTE
++    assert session["resume_runtime_overrides"] == {"model_override": ROUTE, "provider_override": "deepseek"}
++    assert result["result"]["durable_lineage"]["resolved_session_id"] == "game-root"
++    server._start_agent_build(sid, session)
++    assert session["agent_ready"].wait(5)
++    assert session.get("agent_error") is None
++    assert built and all(row["provider_override"] == "deepseek" for row in built)
++    assert db.get_messages_as_conversation("game-root") == before
++    assert db.get_session("game-root")["model"] == "qwen-old"
++
++
++def test_ordinary_chat_keeps_its_independent_model(fixture):
++    result = resume({"session_id": "game-root"})
++    assert "error" not in result, result
++    session = server._sessions[result["result"]["session_id"]]
++    assert session["model_override"]["provider"] == "alibaba"
++    assert session["model_override"]["model"] == "qwen-old"
++
++
++def test_failed_hot_game_builder_can_rebase_without_replacing_lineage(fixture):
++    previous_contract = params()
++    previous_contract.pop("game_model_route")
++    result = resume(previous_contract)
++    sid = result["result"]["session_id"]
++    session = server._sessions[sid]
++    server._start_agent_build(sid, session)
++    assert session["agent_ready"].wait(5)
++    session["_agent_build_thread"].join(5)
++    assert session["agent"] is None
++    result = resume(params())
++    assert "error" not in result, result
++    assert result["result"]["session_id"] == sid
++    assert session["agent_ready"].wait(5)
++    assert session["agent"] is not None
++    assert session["agent"].provider == "deepseek"
++
++
++def test_rebase_does_not_mutate_an_installed_agent():
++    old = types.SimpleNamespace(model="old", provider="old")
++    session = {"agent": old, "agent_runtime_revision": 7,
++               "model_override": {"model": "old", "provider": "old"}}
++    server._runtime_authority_lock(session)
++    before = copy.copy(session)
++    assert server._commit_runtime_desire(session, model_override=ROUTE, _only_if_unbuilt=True) == 7
++    assert session == before
++
++
++def test_inflight_old_builder_cannot_publish_after_rebase(fixture, monkeypatch):
++    entered, release = threading.Event(), threading.Event()
++    candidates = []
++
++    def build(*args, **kwargs):
++        agent = _Agent(kwargs)
++        candidates.append(agent)
++        if agent.provider == "alibaba":
++            entered.set()
++            assert release.wait(5)
++        return agent
++
++    monkeypatch.setattr(server, "_make_agent", build)
++    previous = params()
++    previous.pop("game_model_route")
++    result = resume(previous)
++    sid = result["result"]["session_id"]
++    session = server._sessions[sid]
++    server._start_agent_build(sid, session)
++    try:
++        assert entered.wait(5)
++        result = resume(params())
++        assert "error" not in result, result
++    finally:
++        release.set()
++    assert session["agent_ready"].wait(5)
++    assert session["agent"].provider == "deepseek"
++    assert candidates[0].closed
++
++
++@pytest.mark.parametrize("change", [
++    {"source": "lilith-runtime"}, {"expected_source": "telegram"},
++    {"expected_archived": False}, {"close_on_disconnect": False},
++    {"profile": "another"}, {"lazy": True}, {"eager_build": True},
++    {"game_model_route": None}, {"game_model_route": {}},
++    {"game_model_route": {"model": "wrong", "provider": "deepseek"}},
++    {"game_model_route": {"model": "deepseek-flash", "provider": "alibaba"}},
++    {"game_model_route": {**ROUTE, "base_url": "https://wrong.invalid"}},
++])
++def test_invalid_or_stale_game_route_is_rejected_before_materialization(fixture, change):
++    payload = params()
++    payload.update(change)
++    result = resume(payload)
++    assert "error" in result
++    assert not server._sessions
++    assert not fixture[1]
++
++
++def test_game_route_cannot_override_durable_source(fixture):
++    db, built = fixture
++    db.create_session("ordinary", source="cli", archived=True)
++    payload = params()
++    payload["session_id"] = "ordinary"
++    result = resume(payload)
++    assert result["error"]["code"] == 4094
++    assert not server._sessions and not built
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index fadea2a..6152f84 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -481,6 +481,28 @@ def _(rid, params: dict) -> dict:
+     # the caller explicitly requests it; other clients keep upstream behavior.
+     omit_messages = is_truthy_value(params.get("omit_messages", False))
+ 
++    # Host-only pair: Runtime holds the model authority lease across resume and
++    # verifies the resulting session.info. Ordinary chats keep their own route.
++    game_route = params.get("game_model_route")
++    if "game_model_route" in params:
++        if (
++            type(game_route) is not dict
++            or set(game_route) != {"model", "provider"}
++            or any(type(value) is not str or not value or value != value.strip()
++                   for value in game_route.values())
++            or params.get("source") != "lilith-game"
++            or not require_durable_lineage
++            or expected_source != "lilith-game"
++            or expected_archived is not True
++            or params.get("close_on_disconnect") is not True
++            or profile is not None or profile_home is not None
++            or is_truthy_value(params.get("lazy", False))
++            or is_truthy_value(params.get("eager_build", False))
++        ):
++            return _err(rid, 4004, "game resume route scope was rejected")
++        if (game_route["model"], game_route["provider"]) != _config_model_target():
++            return _err(rid, 4091, "game resume route differs from current default")
++
+     # In a profile scope this opens a DEDICATED handle we own until the agent
+     # takes it (see the ownership transfer at _init_session below); every path
+     # that returns before that transfer must close it. Otherwise reuse the
+@@ -636,6 +658,13 @@ def _(rid, params: dict) -> dict:
+             return payload
+ 
+         def _reuse_live_payload(sid: str, session: dict) -> dict:
++            if game_route is not None:
++                _bind_durable_lineage_session(session, durable_lineage)
++                _commit_runtime_desire(
++                    session, model_override=game_route,
++                    reasoning_override=None, service_tier_override=None,
++                    _only_if_unbuilt=True,
++                )
+             payload = _live_session_payload(
+                 sid,
+                 session,
+@@ -902,6 +931,11 @@ def _(rid, params: dict) -> dict:
+             # deferred build (and the info below) match the eager path — without them
+             # the build drops the provider ("No LLM provider configured").
+             overrides = _stored_session_runtime_overrides(found) or {}
++            if game_route is not None:
++                # No old endpoint, provider-specific effort/tier or credential
++                # override survives a hidden game route change. No DB rewrite.
++                overrides = {"model_override": dict(game_route),
++                             "provider_override": game_route["provider"]}
+             model_override = overrides.get("model_override") or {}
+             cwd = profile_resume_cwd or _default_session_cwd()
+             record = _deferred_session_record(
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 9c581f5..00e5d4e 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -3220,6 +3220,7 @@ def _commit_runtime_desire(
+     reasoning_override: Any = _RUNTIME_UNSET,
+     service_tier_override: Any = _RUNTIME_UNSET,
+     _capture_agent: bool = False,
++    _only_if_unbuilt: bool = False,
+ ) -> int | tuple[int, Any]:
+     """Atomically publish desired runtime fields and advance their revision.
+ 
+@@ -3229,6 +3230,11 @@ def _commit_runtime_desire(
+     """
+     lock = _runtime_authority_lock(session)
+     with lock:
++        # A game resume may rebase a failed/deferred builder, never an installed
++        # agent. Ready agents still use the ordinary attested model setter.
++        if _only_if_unbuilt and session.get("agent") is not None:
++            revision = _runtime_revision_locked(session)
++            return (revision, session["agent"]) if _capture_agent else revision
+         resume = session.get("resume_runtime_overrides")
+         resume = copy.deepcopy(resume) if isinstance(resume, dict) else {}
+         if model_override is not _RUNTIME_UNSET:

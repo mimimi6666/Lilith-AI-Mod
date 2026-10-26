@@ -1,0 +1,326 @@
+diff --git a/agent/aux_accounting.py b/agent/aux_accounting.py
+index 6f851a6..519ca9e 100644
+--- a/agent/aux_accounting.py
++++ b/agent/aux_accounting.py
+@@ -27,8 +27,15 @@ double-count (see ``_EXCLUDED_TASKS``).
+ from __future__ import annotations
+ 
+ import logging
++import sys
++from contextlib import contextmanager
++import contextlib
+ from contextvars import ContextVar
++from dataclasses import dataclass
++from pathlib import Path
++from threading import RLock
+ from typing import Any, Optional
++from weakref import WeakKeyDictionary
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -68,6 +75,157 @@ def get_accounting_context() -> Optional[tuple]:
+     return _accounting.get()
+ 
+ 
++# Unlike the legacy ambient (DB, session) pair, this capability has no public
++# fields and carries no arbitrary database or callback authority into plugins.
++# Its private registry grants only one fixed session/task usage writer. This is
++# an in-process host boundary, not a Python-reflection sandbox.
++_SINK_ISSUER = object()
++_LOCAL_SINK = ContextVar("local_captured_aux_usage", default=None)
++_SINKS = WeakKeyDictionary()
++_SINK_LOCK = RLock()
++
++
++class _LocalUsageSink:
++    __slots__ = ("__weakref__",)
++
++    def __new__(cls, issuer):
++        if issuer is not _SINK_ISSUER:
++            raise TypeError("auxiliary usage sinks are host-created")
++        return super().__new__(cls)
++
++    def __repr__(self):
++        return "<LocalAuxiliaryUsageSink>"
++
++    def __reduce_ex__(self, protocol):
++        raise TypeError("auxiliary usage sinks cannot be serialized")
++
++
++@dataclass(frozen=True)
++class _SinkState:
++    writer: Any
++    session_id: str
++    task: str
++    origin: Any
++    policy: Any
++    route: tuple
++
++
++def _route(runtime):
++    from agent.local_compatibility import _endpoint
++    return (runtime.get("provider"), runtime.get("model"),
++            _endpoint(runtime.get("base_url")), runtime.get("api_mode") or "chat_completions",
++            runtime.get("requested_provider") or "")
++
++
++def _native_caller(*names):
++    """Match actual native code/globals, not a caller-provided module label."""
++    from agent import auxiliary_client
++    frame = sys._getframe(2)
++    if frame.f_code is contextlib._GeneratorContextManager.__enter__.__code__:
++        frame = frame.f_back
++    return frame.f_globals is vars(auxiliary_client) and any(
++        frame.f_code is getattr(getattr(auxiliary_client, name), "__wrapped__",
++                               getattr(auxiliary_client, name)).__code__ for name in names)
++
++
++def capture_local_usage_sink(runtime, task, policy, origin):
++    """Mint only from a real local turn's matching host-owned accounting DB."""
++    if not _native_caller("capture_auxiliary_runtime_context"):
++        raise TypeError("local usage capture requires its native owner")
++    from agent.local_compatibility import matches
++    from agent.usage_budget_runtime import capture_origin
++    from hermes_state import SessionDB
++    ctx = _accounting.get()
++    if (ctx is None or origin is None or capture_origin() is not origin
++            or type(task) is not str or not task or task in _EXCLUDED_TASKS
++            or not matches(policy, provider=runtime.get("provider"), model=runtime.get("model"),
++                base_url=runtime.get("base_url"), api_mode=runtime.get("api_mode"),
++                requested_provider=runtime.get("requested_provider") or "")):
++        return None
++    db, session_id = ctx
++    if (type(db) is not SessionDB or not session_id or runtime.get("session_id") != session_id
++            or Path(db.db_path).absolute() != (origin._owner.store.profile_root / "state.db").absolute()):
++        return None
++    sink = _LocalUsageSink(_SINK_ISSUER)
++    with _SINK_LOCK:
++        _SINKS[sink] = _SinkState(db.record_auxiliary_usage, session_id, task, origin, policy, _route(runtime))
++    return sink
++
++
++def _sink_state(sink):
++    if type(sink) is not _LocalUsageSink:
++        raise TypeError("expected an opaque local usage sink")
++    with _SINK_LOCK:
++        state = _SINKS.get(sink)
++    if state is None:
++        raise ValueError("local usage sink is unavailable")
++    from agent.auxiliary_client import _RUNTIME_MAIN_CONTEXT, _AUXILIARY_TASK_CONFIG_CONTEXT
++    from agent.local_compatibility import current_policy
++    from agent.usage_budget import current_turn_budget
++    from agent.usage_budget_runtime import current_origin
++    runtime = _RUNTIME_MAIN_CONTEXT.get() or {}
++    task_binding = _AUXILIARY_TASK_CONFIG_CONTEXT.get()
++    if (current_origin() is not state.origin or current_turn_budget() is not state.origin.ledger
++            or current_policy() is not state.policy or _route(runtime) != state.route
++            or runtime.get("session_id") != state.session_id
++            or not task_binding or task_binding[0] != state.task):
++        raise ValueError("local usage sink ownership differs")
++    return state
++
++
++@contextmanager
++def bind_local_usage_sink(sink):
++    if not _native_caller("_scoped_auxiliary_runtime_context"):
++        raise TypeError("local usage binding requires its native owner")
++    _sink_state(sink)
++    token = _LOCAL_SINK.set(sink)
++    try:
++        yield
++    finally:
++        _LOCAL_SINK.reset(token)
++
++
++def record_local_physical_usage(response, client, request):
++    """Called once after the guarded SDK leaf, not on validator re-entry.
++
++    Recording known usage remains valid when a completed request races Stop.
++    No response/unknown usage creates no fabricated zero-valued DB row. The
++    existing budget ledger independently retains uncertain physical attempts.
++    """
++    sink = _LOCAL_SINK.get()
++    if sink is None:
++        return
++    if not _native_caller("_budget_aux_sync_create", "_budget_aux_async_create"):
++        raise TypeError("local usage recording requires its physical native leaf")
++    try:
++        from agent.local_compatibility import _endpoint
++        from agent.usage_budget_usage import read_usage
++        from agent.usage_pricing import normalize_usage
++        from agent.auxiliary_client import _RELAY_AUX_CALL_CONTEXT
++        state = _sink_state(sink)
++        call = _RELAY_AUX_CALL_CONTEXT.get() or {}
++        if (call.get("task") != state.task or request.get("model") != state.route[1]
++                or _endpoint(str(getattr(client, "base_url", ""))) != state.route[2]):
++            raise ValueError("local usage response route differs")
++        counts = read_usage(response, "chat_completions")
++        if counts.input_tokens is None or counts.output_tokens is None:
++            return
++        raw_usage = getattr(response, "usage", None)
++        if raw_usage is None:
++            return
++        usage = normalize_usage(raw_usage, provider=state.route[0])
++        # Local-only inference has no provider price here. Keep cost unknown.
++        state.writer(state.session_id, state.task,
++            model=str(getattr(response, "model", "") or state.route[1]),
++            billing_provider=state.route[0], billing_base_url=str(getattr(client, "base_url", "")),
++            input_tokens=counts.input_tokens, output_tokens=counts.output_tokens,
++            cache_read_tokens=usage.cache_read_tokens, cache_write_tokens=usage.cache_write_tokens,
++            reasoning_tokens=usage.reasoning_tokens, estimated_cost_usd=None)
++    except Exception:
++        # Never expose endpoint, DB paths, response bodies or exception text.
++        logger.debug("Local auxiliary usage recording unavailable (non-fatal)")
++
++
+ def record_aux_usage(
+     response: Any,
+     task: Optional[str],
+@@ -90,6 +248,10 @@ def record_aux_usage(
+     originally-resolved route and are best-effort.
+     """
+     try:
++        if _LOCAL_SINK.get() is not None:
++            # The captured local task records once at its guarded physical leaf.
++            # A later validator/recovery or unrelated ambient pair cannot bill it twice.
++            return
+         if not task or task in _EXCLUDED_TASKS:
+             return
+         ctx = _accounting.get()
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index cb4129b..51d48b0 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -3356,18 +3356,24 @@ def _relay_auxiliary_metadata(
+ def _budget_aux_sync_create(client: Any, request: dict[str, Any]) -> Any:
+     from agent.usage_budget_native_dispatch import native_chat_dispatch_sync
+     from agent.speech_recovery import active as speech_recovery_active
+-    return native_chat_dispatch_sync(
++    response = native_chat_dispatch_sync(
+         client, request, lambda wire: client.chat.completions.create(**wire),
+         category="speech_recovery" if speech_recovery_active() else "auxiliary",
+     )
++    from agent.aux_accounting import record_local_physical_usage
++    record_local_physical_usage(response, client, request)
++    return response
+ 
+ 
+ async def _budget_aux_async_create(client: Any, request: dict[str, Any]) -> Any:
+     from agent.usage_budget_native_dispatch import native_chat_dispatch_async
+-    return await native_chat_dispatch_async(
++    response = await native_chat_dispatch_async(
+         client, request, lambda wire: client.chat.completions.create(**wire),
+         category="auxiliary",
+     )
++    from agent.aux_accounting import record_local_physical_usage
++    record_local_physical_usage(response, client, request)
++    return response
+ 
+ 
+ def _relay_sync_completion(
+@@ -4278,12 +4284,13 @@ class _AuxiliaryRuntimeContext:
+     trusted in-process plugin API, not a sandbox against a plugin deliberately
+     using Python reflection.  It is also not a general ``Context``: approval,
+     gateway, secret-scope, Relay, and legacy accounting ContextVars are deliberately
+-    absent. Only a narrowly typed economic origin handle is carried separately;
++    absent. Local opt-in may carry an opaque fixed-task usage writer, never the
++    legacy DB context. A narrowly typed economic origin handle is carried separately;
+     it grants no permissions. ``session_id`` is retained solely as explicit prompt-cache routing
+     metadata already owned by the main runtime.
+     """
+ 
+-    __slots__ = ("__task_client", "__task_config", "__task_name", "__values", "__usage_origin", "__local_compatibility")
++    __slots__ = ("__task_client", "__task_config", "__task_name", "__values", "__usage_origin", "__local_compatibility", "__local_usage_sink")
+ 
+     def __init__(
+         self,
+@@ -4295,12 +4302,14 @@ class _AuxiliaryRuntimeContext:
+         task_client: Optional[_FrozenAuxiliaryTaskClient] = None,
+         usage_origin: Any = None,
+         local_compatibility=None,
++        local_usage_sink=None,
+     ) -> None:
+         if constructor is not _AUXILIARY_RUNTIME_CONTEXT_CONSTRUCTOR:
+             raise TypeError("auxiliary runtime contexts are host-created")
+         object.__setattr__(self, "_AuxiliaryRuntimeContext__values", values)
+         object.__setattr__(self, "_AuxiliaryRuntimeContext__usage_origin", usage_origin)
+         object.__setattr__(self, "_AuxiliaryRuntimeContext__local_compatibility", local_compatibility)
++        object.__setattr__(self, "_AuxiliaryRuntimeContext__local_usage_sink", local_usage_sink)
+         object.__setattr__(self, "_AuxiliaryRuntimeContext__task_name", task_name)
+         object.__setattr__(
+             self,
+@@ -4345,6 +4354,9 @@ class _AuxiliaryRuntimeContext:
+     def _materialize_local_compatibility_for_host(self):
+         return self.__local_compatibility
+ 
++    def _materialize_local_usage_sink_for_host(self):
++        return self.__local_usage_sink
++
+ 
+ def _auxiliary_runtime_is_concrete(runtime: Any) -> bool:
+     """Return whether *runtime* is a self-contained provider wire route."""
+@@ -4711,14 +4723,24 @@ def capture_auxiliary_runtime_context(*, task: Optional[str] = None) -> object:
+                        api_mode=target.get("api_mode", runtime.get("api_mode", "")),
+                        requested_provider=runtime.get("requested_provider", "")):
+             local_policy = None
++    if local_policy is not None:
++        # Preserve this local-only identity dimension in the opaque snapshot;
++        # legacy/cloud snapshots retain their original field set.
++        values += (("requested_provider", runtime.get("requested_provider", "")),)
++    usage_origin = capture_origin()
++    local_usage_sink = None
++    if local_policy is not None:
++        from agent.aux_accounting import capture_local_usage_sink
++        local_usage_sink = capture_local_usage_sink(runtime, task_name, local_policy, usage_origin)
+     return _AuxiliaryRuntimeContext(
+         _AUXILIARY_RUNTIME_CONTEXT_CONSTRUCTOR,
+         values,
+         task_name=task_name,
+         task_config=task_config,
+         task_client=task_client,
+-        usage_origin=capture_origin(),
++        usage_origin=usage_origin,
+         local_compatibility=local_policy,
++        local_usage_sink=local_usage_sink,
+     )
+ 
+ 
+@@ -4737,7 +4759,13 @@ def _scoped_auxiliary_runtime_context(snapshot: object):
+         from agent.local_compatibility import bind_policy
+         origin = snapshot._materialize_usage_origin_for_host()
+         with (bind_origin(origin) if origin is not None else contextlib.nullcontext()), bind_policy(snapshot._materialize_local_compatibility_for_host()):
+-            yield
++            sink = snapshot._materialize_local_usage_sink_for_host()
++            if sink is None:
++                yield
++            else:
++                from agent.aux_accounting import bind_local_usage_sink
++                with bind_local_usage_sink(sink):
++                    yield
+     finally:
+         _AUXILIARY_TASK_CLIENT_CONTEXT.reset(client_token)
+         _AUXILIARY_TASK_CONFIG_CONTEXT.reset(task_token)
+@@ -9328,6 +9356,23 @@ def _resolve_task_provider_model(
+         if not api_key:
+             api_key = cfg_api_key
+ 
++    if base_url and provider and str(provider).startswith("custom:"):
++        # Compression passes the owning strict agent's concrete route. The
++        # legacy generic base-url resolver deliberately erases custom IDs;
++        # doing so for an already-frozen local turn breaks its exact guard.
++        # Preserve only that exact original provider, never alias `custom`
++        # or another managed entry to it. Final client/SDK guards still run.
++        from agent.local_compatibility import current_policy, matches
++        local_policy = current_policy()
++        local_runtime = _RUNTIME_MAIN_CONTEXT.get() or {}
++        if local_policy is not None and matches(local_policy,
++                provider=local_runtime.get("provider"), model=local_runtime.get("model"),
++                base_url=local_runtime.get("base_url"), api_mode=local_runtime.get("api_mode"),
++                requested_provider=local_runtime.get("requested_provider", "")) and matches(local_policy,
++                provider=provider, model=resolved_model, base_url=base_url,
++                api_mode=resolved_api_mode or local_runtime.get("api_mode")):
++            return provider, resolved_model, base_url, api_key, resolved_api_mode
++
+     if base_url and _preserve_provider_with_base_url(provider):
+         return provider, resolved_model, base_url, api_key, resolved_api_mode
+     if base_url:

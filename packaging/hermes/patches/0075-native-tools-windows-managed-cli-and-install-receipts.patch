@@ -1,0 +1,281 @@
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 6007452..cf9b2a8 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -97,7 +97,8 @@ from hermes_cli import _startup_fast  # noqa: E402
+ from hermes_cli import _early_recovery as _early_recovery_mod
+ 
+ try:
+-    _early_recovery_mod.recover_if_needed()
++    if not os.environ.get("HERMES_LILITH_BOUND_HOME"):
++        _early_recovery_mod.recover_if_needed()
+ except Exception:
+     pass
+ 
+@@ -623,6 +624,17 @@ def _apply_profile_override() -> None:
+             consume = 0
+             profile_index = None
+ 
++    # A product-supervised portable CLI is bound to exactly one home. Reuse
++    # native argument parsing above, but do not follow sticky active_profile.
++    bound_home = os.environ.get("HERMES_LILITH_BOUND_HOME")
++    if bound_home:
++        actual_home = os.environ.get("HERMES_HOME", "")
++        if (profile_name is not None or not actual_home
++                or not os.path.isabs(bound_home) or not os.path.isabs(actual_home)
++                or os.path.normcase(os.path.realpath(bound_home)) != os.path.normcase(os.path.realpath(actual_home))):
++            raise SystemExit("The supervised Hermes CLI cannot change its bound profile.")
++        return
++
+     # 1.5 If HERMES_HOME is already set and no explicit flag was given, trust it
+     # only when it already points to a specific profile directory.  The
+     # distinguishing heuristic: a profile path has "profiles" as its immediate
+@@ -5119,6 +5131,8 @@ def cmd_version(args):
+ 
+ def cmd_uninstall(args):
+     """Uninstall Hermes Agent (or just the Chat GUI with --gui)."""
++    if os.environ.get("HERMES_LILITH_BOUND_HOME"):
++        raise SystemExit("This Hermes component is managed by Lilith; use the product's maintenance flow.")
+     # Machine-readable install snapshot for the desktop app's uninstall UI.
+     # Must run before any TTY gate — it's called from a non-interactive child.
+     if getattr(args, "gui_summary", False):
+@@ -8046,6 +8060,8 @@ def _recover_from_interrupted_install() -> None:
+     protocol stream (``hermes acp`` speaks JSON-RPC on stdout) must never get
+     install noise on stdout.
+     """
++    if os.environ.get("HERMES_LILITH_BOUND_HOME"):
++        return  # Sealed product files are maintained by Lilith, never here.
+     if _pytest_owns_live_checkout(PROJECT_ROOT):
+         return
+     core_marker = _update_marker_path().exists()
+@@ -9557,6 +9573,8 @@ def _coalesce_session_name_args(argv: list) -> list:
+ 
+ def cmd_profile(args):
+     """Profile management — create, delete, list, switch, alias."""
++    if os.environ.get("HERMES_LILITH_BOUND_HOME"):
++        raise SystemExit("This Hermes entry is bound to Lilith; profile management is unavailable here.")
+     from hermes_cli.profiles import (
+         list_profiles,
+         create_profile,
+diff --git a/hermes_cli/plugins_cmd.py b/hermes_cli/plugins_cmd.py
+index ecf14b2..593ba2d 100644
+--- a/hermes_cli/plugins_cmd.py
++++ b/hermes_cli/plugins_cmd.py
+@@ -726,6 +726,14 @@ def _install_plugin_core(
+                 ) from exc
+         else:
+             manifest = _read_manifest(tmp_target)
++        from agent.skill_utils import skill_matches_platform
++        if not skill_matches_platform(manifest):
++            # Check before replacement, metadata writes, env prompts or imports.
++            # --force changes overwrite consent, not OS compatibility.
++            raise PluginOperationError(
++                "Plugin platform requirements do not support this operating system. "
++                "The existing installation has not been changed."
++            )
+         plugin_name = manifest.get("name") or (
+             subdir.rstrip("/").rsplit("/", 1)[-1] if subdir else _repo_name_from_url(git_url)
+         )
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 5124516..d2abea6 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -1104,6 +1104,9 @@ class PluginManifest:
+     # (``hermes plugins show``); a plugin may emit/subscribe without declaring.
+     emits: List[str] = field(default_factory=list)
+     listens: List[str] = field(default_factory=list)
++    # Native OS compatibility metadata, separate from gateway "platform" kind.
++    # Absent/empty retains the upstream all-platforms default.
++    platforms: Any = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -3892,6 +3895,11 @@ class PluginManager:
+         for manifest in winners.values():
+             lookup_key = manifest.key or manifest.name
+ 
++            from agent.skill_utils import skill_matches_platform_list
++            if not skill_matches_platform_list(manifest.platforms):
++                logger.debug("Skipping platform-incompatible plugin '%s'", lookup_key)
++                continue
++
+             # Explicit disable always wins (matches on key or on legacy
+             # bare name for back-compat with existing user configs).
+             if lookup_key in disabled or manifest.name in disabled:
+@@ -4336,6 +4344,7 @@ class PluginManager:
+                 **v2_fields,
+                 emits=data.get("emits") or [],
+                 listens=data.get("listens") or [],
++                platforms=data.get("platforms"),
+             )
+         except Exception as exc:
+             logger.warning(
+@@ -4594,6 +4603,10 @@ class PluginManager:
+ 
+     def _load_plugin_scoped(self, manifest: PluginManifest) -> None:
+         """Load one plugin with the manager's home bound as current."""
++        from agent.skill_utils import skill_matches_platform_list
++        if not skill_matches_platform_list(manifest.platforms):
++            # Also guard direct loads/reloads before importing any plugin code.
++            return
+         loaded = LoadedPlugin(manifest=manifest)
+         logger.debug(
+             "Loading plugin '%s' (source=%s, kind=%s, path=%s)",
+diff --git a/hermes_cli/skills_hub.py b/hermes_cli/skills_hub.py
+index dd0aae4..aca85d0 100644
+--- a/hermes_cli/skills_hub.py
++++ b/hermes_cli/skills_hub.py
+@@ -491,7 +491,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
+                console: Optional[Console] = None, skip_confirm: bool = False,
+                invalidate_cache: bool = True,
+                name_override: str = "",
+-               source_id: Optional[str] = None) -> None:
++               source_id: Optional[str] = None) -> Optional[dict]:
+     """Fetch, quarantine, scan, confirm, and install a skill.
+ 
+     ``name_override`` lets non-interactive callers (slash commands, gateway,
+@@ -792,6 +792,11 @@ def do_install(identifier: str, category: str = "", force: bool = False,
+         c.print("[dim]Skill will be available in your next session.[/]")
+         c.print("[dim]Use /reset to start a new session now, or --now to activate immediately (invalidates prompt cache).[/]\n")
+ 
++    # Native management callers must not infer success from a non-raising call:
++    # validation, scanning and user cancellation intentionally return early.
++    return {"installed": True, "name": bundle.name,
++            "path": str(install_dir.relative_to(SKILLS_DIR))}
++
+ 
+ def do_inspect(identifier: str, console: Optional[Console] = None) -> None:
+     """Preview a skill's SKILL.md content without installing."""
+@@ -1732,9 +1737,11 @@ def skills_command(args) -> None:
+         do_search(args.query, source=args.source, limit=args.limit,
+                   as_json=getattr(args, "json", False))
+     elif action == "install":
+-        do_install(args.identifier, category=args.category, force=args.force,
++        receipt = do_install(args.identifier, category=args.category, force=args.force,
+                    skip_confirm=getattr(args, "yes", False),
+                    name_override=getattr(args, "name", "") or "")
++        if not receipt or receipt.get("installed") is not True:
++            raise SystemExit(1)
+     elif action == "inspect":
+         do_inspect(args.identifier)
+     elif action == "list":
+diff --git a/tools/skills_hub.py b/tools/skills_hub.py
+index b4bca1e..d887ead 100644
+--- a/tools/skills_hub.py
++++ b/tools/skills_hub.py
+@@ -3899,6 +3899,20 @@ def install_from_quarantine(
+     if not quarantine_resolved.is_relative_to(quarantine_root):
+         raise ValueError(f"Unsafe quarantine path: {quarantine_path}")
+ 
++    # Match the same native OS declaration used by skill discovery/view. Check
++    # the quarantined bytes, never remote summary metadata, before replacing
++    # an existing skill or committing the hub lock/audit receipt.
++    from agent.skill_utils import parse_frontmatter, skill_matches_platform
++    manifest_path = quarantine_resolved / "SKILL.md"
++    if _is_path_redirect(manifest_path):
++        raise ValueError("Skill manifest cannot be a symlink or path redirect.")
++    frontmatter, _ = parse_frontmatter(manifest_path.read_text(encoding="utf-8-sig"))
++    if not skill_matches_platform(frontmatter):
++        raise ValueError(
++            "Skill platform requirements do not support this operating system. "
++            "The existing installation has not been changed."
++        )
++
+     if safe_category:
+         install_rel_path = f"{safe_category}/{safe_skill_name}"
+     else:
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+index 58ea5e5..4480419 100644
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -1991,7 +1991,7 @@ if __name__ == "__main__":
+ 
+ SKILLS_LIST_SCHEMA = {
+     "name": "skills_list",
+-    "description": "List available skills (name + description). Use skill_view(name) to load full content.",
++    "description": "List available skills (name + description). Use skill_view(name) to load full content. To find or install a new community skill at the user's request, use the native terminal CLI: hermes skills search <query>, hermes skills inspect <identifier>, then hermes skills install <identifier> --yes after the user authorizes installation. The managed CLI already targets this app's active Hermes home; do not change profiles or install another Hermes. Keep native scanning and platform checks; never use --force to bypass a rejection. Verify successful exit plus skills_list/skill_view before reporting installation success. If dependencies, login or a new session are required, report that separately. Do not alter approval settings from chat.",
+     "parameters": {
+         "type": "object",
+         "properties": {
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index 4d23959..fe4310d 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -1092,6 +1092,17 @@ def _resolve_hermes_bin_dir() -> str | None:
+          venv ``bin``/``Scripts`` is where its console-scripts live.
+     """
+     global _HERMES_BIN_DIR
++    managed_root = os.environ.get("HERMES_LILITH_CLI_COMPONENT")
++    if managed_root:
++        managed_bin = os.path.join(managed_root, "cli")
++        if not os.path.isabs(managed_root) or not all(
++            os.path.isfile(os.path.join(managed_bin, name))
++            for name in ("hermes", "hermes.cmd", "entry.py")
++        ):
++            raise RuntimeError("The supervised Hermes CLI payload is unavailable.")
++        # A supervised component must precede both cwd and external PATH shims,
++        # including a previously cached resolver result from another context.
++        return managed_bin
+     if _HERMES_BIN_DIR is not _SENTINEL:
+         return _HERMES_BIN_DIR  # type: ignore[return-value]
+ 
+@@ -1538,6 +1549,24 @@ class LocalEnvironment(BaseEnvironment):
+     def _wrap_command(self, command: str, cwd: str) -> str:
+         """Add Windows shell compatibility helpers after snapshot restore."""
+         command = _prepend_windows_git_bash_start_shim(command)
++        if os.environ.get("HERMES_LILITH_CLI_COMPONENT"):
++            import shlex
++
++            managed_bin = self._quote_shell_path(_resolve_hermes_bin_dir())
++            bindings = "".join(
++                f"export {key}={shlex.quote(os.environ.get(key, ''))}\n"
++                for key in ("HERMES_LILITH_CLI_COMPONENT", "HERMES_LILITH_BOUND_HOME",
++                            "HERMES_LILITH_CLI_VOICE_SITE", "HERMES_HOME")
++            )
++            # BaseEnvironment restores the snapshot before evaluating command.
++            # Reassert only this product's command entry after that restore;
++            # the user's other commands and native approval remain unchanged.
++            command = (
++                "builtin unalias hermes 2>/dev/null || true\n"
++                "builtin unset -f hermes 2>/dev/null || true\n"
++                f"export PATH={managed_bin}:\"$PATH\"\n"
++                "builtin hash -r\n" + bindings + command
++            )
+         return super()._wrap_command(command, cwd)
+ 
+     def _run_bash(self, cmd_string: str, *, login: bool = False,
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 82d696d..0e69bd7 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -2455,8 +2455,10 @@ def _(rid, params: dict) -> dict:
+                 def print(self, *a, **k):
+                     pass
+ 
+-            do_install(query, skip_confirm=True, console=_Q())
+-            return _ok(rid, {"installed": True, "name": query})
++            receipt = do_install(query, skip_confirm=True, console=_Q())
++            if not isinstance(receipt, dict) or receipt.get("installed") is not True:
++                return _err(rid, 5024, "skill installation did not complete; inspect the source, platform support and scan result before retrying")
++            return _ok(rid, receipt)
+         if action == "browse":
+             from hermes_cli.skills_hub import browse_skills
+ 
+@@ -2526,12 +2528,17 @@ def _(rid, params: dict) -> dict:
+         )
+ 
+         def _rows():
++            from pathlib import Path
++            from agent.skill_utils import skill_matches_platform
++            from hermes_cli.plugins_cmd import _read_manifest
+             enabled = _get_enabled_set()
+             disabled = _get_disabled_set()
+             out = []
+             for name, version, desc, source, _dir, key in sorted(
+                 _discover_all_plugins()
+             ):
++                if not skill_matches_platform(_read_manifest(Path(_dir))):
++                    continue
+                 status = _plugin_status(name, enabled, disabled, key=key)
+                 # Bundled backends/platforms/providers are active without an
+                 # explicit enable (they "just work" — plugins.py). Reporting

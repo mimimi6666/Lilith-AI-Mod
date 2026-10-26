@@ -1,0 +1,306 @@
+diff --git a/tests/hermes_cli/test_voice_wrapper.py b/tests/hermes_cli/test_voice_wrapper.py
+index b926f12..d814007 100644
+--- a/tests/hermes_cli/test_voice_wrapper.py
++++ b/tests/hermes_cli/test_voice_wrapper.py
+@@ -432,6 +432,47 @@ class TestContinuousLoopSimulation:
+         assert transcripts == ["こんにちは"]
+         assert voice._continuous_language is None
+ 
++    def test_auto_detection_failure_releases_single_capture_and_reports_idle(
++        self,
++        fake_recorder,
++        monkeypatch,
++    ):
++        import hermes_cli.voice as voice
++
++        calls = []
++
++        def _transcribe(_path, **kwargs):
++            calls.append(kwargs)
++            return {
++                "success": False,
++                "transcript": "",
++                "error": "language detection failed",
++                "provider": "pinned_local",
++            }
++
++        monkeypatch.setattr(voice, "transcribe_recording", _transcribe)
++        statuses = []
++        transcripts = []
++        voice.start_continuous(
++            on_transcript=transcripts.append,
++            on_status=statuses.append,
++            auto_restart=False,
++            language=None,
++            pinned_local_model_path="/runtime/voice/model",
++        )
++
++        fake_recorder.last_callback()
++
++        assert calls == [
++            {"pinned_local_model_path": "/runtime/voice/model"}
++        ]
++        assert statuses == ["listening", "transcribing", "idle"]
++        assert transcripts == []
++        assert fake_recorder.is_recording is False
++        assert voice.is_continuous_active() is False
++        assert voice._continuous_language is None
++        assert voice._continuous_pinned_local_model_path is None
++
+     def test_forced_stop_uses_snapshotted_language_after_state_is_cleared(
+         self,
+         fake_recorder,
+diff --git a/tests/tools/test_transcription_tools.py b/tests/tools/test_transcription_tools.py
+index b893534..be59d2f 100644
+--- a/tests/tools/test_transcription_tools.py
++++ b/tests/tools/test_transcription_tools.py
+@@ -339,11 +339,13 @@ class TestTranscribeLocalCommand:
+ 
+ 
+ class TestPinnedLocalCapture:
++    @pytest.mark.parametrize("language", [None, "ja", "zh", "en"])
+     def test_cloud_config_hooks_commands_and_plugins_are_unreachable(
+         self,
+         sample_wav,
+         tmp_path,
+         monkeypatch,
++        language,
+     ):
+         import tools.transcription_tools as tt
+ 
+@@ -390,7 +392,7 @@ class TestPinnedLocalCapture:
+         result = tt.transcribe_pinned_local_capture(
+             str(sample_wav),
+             model_path=str(model_path),
+-            language="ja",
++            language=language,
+         )
+ 
+         assert result == {
+@@ -405,10 +407,46 @@ class TestPinnedLocalCapture:
+             compute_type="int8",
+         )
+         kwargs = model.transcribe.call_args.kwargs
+-        assert kwargs["language"] == "ja"
++        assert kwargs["language"] == language
++        assert kwargs["task"] == "transcribe"
+         assert kwargs["vad_filter"] is True
+         assert "initial_prompt" not in kwargs
+ 
++    def test_detection_failure_stays_local_and_returns_failure(
++        self,
++        sample_wav,
++        tmp_path,
++        monkeypatch,
++    ):
++        import tools.transcription_tools as tt
++
++        model_path = tmp_path / "runtime-voice-model"
++        model_path.mkdir()
++        model = MagicMock()
++        model.transcribe.side_effect = RuntimeError("language detection failed")
++        generic = MagicMock(side_effect=AssertionError("generic STT reached"))
++        lazy_install = MagicMock(side_effect=AssertionError("lazy install reached"))
++
++        monkeypatch.setattr(tt, "_HAS_FASTER_WHISPER", True)
++        monkeypatch.setattr(tt, "_local_model", model)
++        monkeypatch.setattr(tt, "_local_model_name", str(model_path.resolve()))
++        monkeypatch.setattr(tt, "_dispatch_stt_provider", generic)
++        monkeypatch.setattr(tt, "_try_lazy_install_stt", lazy_install)
++
++        result = tt.transcribe_pinned_local_capture(
++            str(sample_wav),
++            model_path=str(model_path),
++            language=None,
++        )
++
++        assert result["success"] is False
++        assert result["provider"] == "pinned_local"
++        assert "language detection failed" in result["error"]
++        assert model.transcribe.call_args.kwargs["language"] is None
++        assert model.transcribe.call_args.kwargs["task"] == "transcribe"
++        generic.assert_not_called()
++        lazy_install.assert_not_called()
++
+     def test_missing_runtime_dependency_fails_without_lazy_install(
+         self,
+         sample_wav,
+diff --git a/tests/tools/test_voice_mode.py b/tests/tools/test_voice_mode.py
+index 4f7fc78..66046c8 100644
+--- a/tests/tools/test_voice_mode.py
++++ b/tests/tools/test_voice_mode.py
+@@ -556,7 +556,8 @@ class TestTranscribeRecording:
+             language="ja",
+         )
+ 
+-    def test_pinned_capture_bypasses_generic_stt_dispatch(self):
++    @pytest.mark.parametrize("language", [None, "ja", "zh", "en"])
++    def test_pinned_capture_bypasses_generic_stt_dispatch(self, language):
+         pinned = MagicMock(
+             return_value={
+                 "success": True,
+@@ -574,7 +575,7 @@ class TestTranscribeRecording:
+ 
+             result = transcribe_recording(
+                 "/tmp/test.wav",
+-                language="ja",
++                language=language,
+                 pinned_local_model_path="/runtime/voice/model",
+             )
+ 
+@@ -582,7 +583,7 @@ class TestTranscribeRecording:
+         pinned.assert_called_once_with(
+             "/tmp/test.wav",
+             model_path="/runtime/voice/model",
+-            language="ja",
++            language=language,
+         )
+         generic.assert_not_called()
+ 
+diff --git a/tests/tui_gateway/test_voice_capture_contract.py b/tests/tui_gateway/test_voice_capture_contract.py
+index 823efcf..203c735 100644
+--- a/tests/tui_gateway/test_voice_capture_contract.py
++++ b/tests/tui_gateway/test_voice_capture_contract.py
+@@ -284,15 +284,21 @@ def test_voice_toggle_off_unproven_retirement_requires_runtime_recovery(
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("language", "duration"),
+-    [("ja", 5_000), ("zh", 90_000)],
++    ("language", "duration", "forwarded_language"),
++    [
++        ("auto", 5_000, None),
++        ("ja", 5_000, "ja"),
++        ("zh", 90_000, "zh"),
++        ("en", 90_000, "en"),
++    ],
+ )
+ def test_scoped_capture_accepts_only_inclusive_contract_bounds(
+     monkeypatch,
+     language,
+     duration,
++    forwarded_language,
+ ):
+-    _install_voice_wrapper(monkeypatch)
++    wrapper = _install_voice_wrapper(monkeypatch)
+ 
+     response = server._methods["voice.record"](
+         "start-bounds",
+@@ -301,13 +307,14 @@ def test_scoped_capture_accepts_only_inclusive_contract_bounds(
+ 
+     assert response["result"]["status"] == "recording"
+     assert response["result"]["capture_id"] == "capture-1"
++    assert wrapper["callbacks"]["language"] == forwarded_language
+ 
+ 
+ @pytest.mark.parametrize(
+     "changes",
+     [
+         {"language": "zh-TW"},
+-        {"language": "en"},
++        {"language": "fr"},
+         {"maximum_duration_ms": 4_999},
+         {"maximum_duration_ms": 90_001},
+         {"maximum_duration_ms": True},
+diff --git a/tools/transcription_tools.py b/tools/transcription_tools.py
+index e4b9284..08ed574 100644
+--- a/tools/transcription_tools.py
++++ b/tools/transcription_tools.py
+@@ -1999,7 +1999,7 @@ def transcribe_pinned_local_capture(
+     file_path: str,
+     *,
+     model_path: str,
+-    language: str,
++    language: Optional[str],
+ ) -> Dict[str, Any]:
+     """Transcribe one Runtime-owned capture with pinned local faster-whisper.
+ 
+@@ -2008,16 +2008,18 @@ def transcribe_pinned_local_capture(
+     ``pre_transcription`` hooks, credentials and lazy dependency installer are
+     therefore unreachable.  LilithRuntime injects an already-attested absolute
+     model directory into its Hermes child; this function fixes inference to
+-    CPU/int8 and accepts only the two per-capture language tokens used by the
+-    game bridge.
++    CPU/int8 and accepts only automatic detection or the three explicit
++    per-capture language hints used by the game bridge.
+     """
+     global _local_model, _local_model_name
+ 
+-    if language not in {"ja", "zh"}:
++    if language not in {None, "ja", "zh", "en"}:
+         return {
+             "success": False,
+             "transcript": "",
+-            "error": "Pinned local capture language must be ja or zh.",
++            "error": (
++                "Pinned local capture language must be automatic, ja, zh, or en."
++            ),
+         }
+     if not isinstance(model_path, str) or not model_path.strip():
+         return {
+@@ -2093,6 +2095,9 @@ def transcribe_pinned_local_capture(
+             "no_speech_threshold": _NO_SPEECH_PROB_THRESHOLD_DEFAULT,
+             "log_prob_threshold": _LOGPROB_THRESHOLD_DEFAULT,
+             "language": language,
++            # Never translate auto-detected speech into English. The captured
++            # language must be preserved for the hidden Hermes conversation.
++            "task": "transcribe",
+         }
+         segments, info = model.transcribe(file_path, **transcribe_kwargs)
+         transcript = _join_confident_segments(segments, {})
+@@ -2100,7 +2105,7 @@ def transcribe_pinned_local_capture(
+             "Transcribed %s via pinned local whisper (%s, lang=%s, %.1fs audio)",
+             Path(file_path).name,
+             model_identity,
+-            language,
++            language or "auto",
+             getattr(info, "duration", 0.0),
+         )
+         return {
+diff --git a/tools/voice_mode.py b/tools/voice_mode.py
+index abf2885..4c6951a 100644
+--- a/tools/voice_mode.py
++++ b/tools/voice_mode.py
+@@ -1455,7 +1455,7 @@ def transcribe_recording(
+         result = transcribe_pinned_local_capture(
+             wav_path,
+             model_path=pinned_local_model_path,
+-            language=language or "",
++            language=language,
+         )
+     else:
+         from tools.transcription_tools import transcribe_audio
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index b8199de..a0e9f01 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -15474,7 +15474,7 @@ _voice_full_duplex_recovery_required: bool = False
+ _voice_wake_start_pending: bool = False
+ _voice_wake_recovery_required: bool = False
+ 
+-_VOICE_CAPTURE_LANGUAGES = frozenset({"ja", "zh"})
++_VOICE_CAPTURE_LANGUAGES = frozenset({"auto", "ja", "zh", "en"})
+ _VOICE_CAPTURE_DISPOSITIONS = frozenset({"transcribe", "cancel"})
+ _VOICE_CAPTURE_MIN_DURATION_MS = 5_000
+ _VOICE_CAPTURE_MAX_DURATION_MS = 90_000
+@@ -17335,7 +17335,7 @@ def _(rid, params: dict) -> dict:
+             language = params.get("language")
+             maximum_duration_ms = params.get("maximum_duration_ms")
+             if language not in _VOICE_CAPTURE_LANGUAGES:
+-                return _err(rid, 4021, "language must be ja or zh")
++                return _err(rid, 4021, "language must be auto, ja, zh, or en")
+             if (
+                 not isinstance(maximum_duration_ms, int)
+                 or isinstance(maximum_duration_ms, bool)
+@@ -17634,7 +17634,10 @@ def _(rid, params: dict) -> dict:
+                 "max_recording_seconds": safe_max_rec,
+             }
+             if scoped_capture:
+-                start_kwargs["language"] = language
++                # ``auto`` is a bounded wire token. The strict pinned local
++                # branch receives None so faster-whisper performs multilingual
++                # language detection without changing task=transcribe.
++                start_kwargs["language"] = None if language == "auto" else language
+                 start_kwargs["pinned_local_model_path"] = pinned_local_model_path
+                 # F6 is bounded push-to-talk, not continuous voice chat.
+                 # Spoken stop words are ordinary content and must never turn

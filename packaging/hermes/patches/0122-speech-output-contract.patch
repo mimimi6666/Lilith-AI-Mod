@@ -1,0 +1,336 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index f47c0bb..d2ab25c 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -26,6 +26,7 @@ import time
+ from typing import Any, Dict, List, Optional
+ 
+ from agent.usage_budget import BudgetError
++from agent.paired_speech import with_paired_delivery_guidance
+ from agent.usage_budget_entrypoints import budgeted_conversation
+ from agent.usage_budget_context import (
+     capture_budget_history,
+@@ -1502,6 +1503,7 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
+         if agent.ephemeral_system_prompt:
+             effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
+         effective = with_efficiency_guidance(effective)
++        effective = with_paired_delivery_guidance(agent, effective)
+         if not _rewrite_system_content_blocks(api_messages[0], effective):
+             api_messages[0]["content"] = effective
+     return sp
+@@ -2422,6 +2424,7 @@ def run_conversation(
+         # Common guidance applies to every mode; this stable request-only suffix
+         # does not modify the cached identity prompt or persisted conversation.
+         effective_system = with_efficiency_guidance(effective_system)
++        effective_system = with_paired_delivery_guidance(agent, effective_system)
+         if effective_system:
+             api_messages = [{"role": "system", "content": effective_system}] + api_messages
+ 
+diff --git a/agent/paired_speech.py b/agent/paired_speech.py
+index c1e5636..61ffbaa 100644
+--- a/agent/paired_speech.py
++++ b/agent/paired_speech.py
+@@ -15,6 +15,26 @@ _KEY = "_lilith_paired_speech"
+ logger = logging.getLogger(__name__)
+ EMOTIONS = frozenset({"calm", "gentle", "playful", "affectionate", "excited", "relieved", "surprised"})
+ 
++# Stable host-owned presentation guidance, not identity or action authority.
++# The current nonce and selected locales stay in the current user API copy.
++# Never interpolate per-turn values here: this suffix precedes cache planning.
++SYSTEM_OUTPUT_CONTRACT = (
++    "[Host paired reply delivery]\n"
++    "This turn requires one final assistant message with two serialized parts in its content: "
++    "the visible reply first, then the hidden Japanese speech rendition specified by the "
++    "current turn's host presentation contract. Display-language and brevity guidance "
++    "apply to the visible reply, not to removing its required speech rendition. Completing "
++    "a short visible reply does not complete this output format: include exactly one "
++    "complete speech suffix before ending the final response. Use the current host "
++    "contract's exact delimiter and id, never an id from history. Put the suffix in "
++    "final message content, not reasoning, tool arguments or interim commentary. "
++    "It renders the same answer for audio, not another conversational answer or a second "
++    "identity/locale supplement. Preserve meaning, persona and emotion without adding "
++    "advice or facts. Continue normal tool use when needed, but do not make an extra "
++    "model or translation-tool call to produce this rendition. This presentation format "
++    "does not change identity, permissions, safety, cancellation or tool authority."
++)
++
+ 
+ @dataclass(frozen=True)
+ class PairedSpeechResult:
+@@ -180,6 +200,20 @@ def state_for(agent):
+     return None
+ 
+ 
++def with_paired_delivery_guidance(agent, system_prompt):
++    """Append a fixed format suffix only for the exact active host-owned pair.
++
++    Call in the effective-system composer before identity checks, budget and
++    cache planning, including failover rebuilds. Do not mutate cached identity
++    bytes, historical rows, provider kwargs or the paired acceptance rules.
++    """
++    if state_for(agent) is None or type(system_prompt) is not str:
++        return system_prompt
++    if system_prompt.endswith(SYSTEM_OUTPUT_CONTRACT):
++        return system_prompt
++    return (system_prompt + "\n\n" if system_prompt else "") + SYSTEM_OUTPUT_CONTRACT
++
++
+ def display_only(agent, text):
+     state = state_for(agent)
+     return state.display(text) if state is not None else text
+diff --git a/tests/test_speech_output_contract.py b/tests/test_speech_output_contract.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_speech_output_contract.py
+@@ -0,0 +1,202 @@
++"""Pure effective-system composition; no provider calls or mutable profile."""
++import ast
++import copy
++from pathlib import Path
++import types
++import unittest
++
++from agent.paired_speech import (
++    PairedSpeech, SYSTEM_OUTPUT_CONTRACT, accept_response,
++    state_for, with_current_reminder, with_paired_delivery_guidance,
++)
++
++
++class SpeechOutputContractTests(unittest.TestCase):
++    def setUp(self):
++        self.pair = PairedSpeech("a" * 32, "zh-Hant")
++        self.base = "Frozen SOUL.\n\nFrozen personality.\n\nNative guidance."
++        self.agent = types.SimpleNamespace(_lilith_paired_speech=self.pair,
++                                          _current_turn_id=self.pair.turn_id,
++                                          _cached_system_prompt=self.base,
++                                          _cached_system_prompt_static="Frozen SOUL.\n\nFrozen personality.",
++                                          ephemeral_system_prompt="Ephemeral fixture.")
++
++    def loop_functions(self):
++        path = Path(__file__).parents[1] / "agent/conversation_loop.py"
++        tree = ast.parse(path.read_text(encoding="utf-8"))
++        names = {"_rewrite_system_content_blocks", "_sync_failover_system_message"}
++        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
++        self.assertEqual(len(nodes), 2)
++        namespace = {
++            "with_efficiency_guidance": lambda text: text + "\n\nEfficiency fixture.",
++            "with_paired_delivery_guidance": with_paired_delivery_guidance,
++        }
++        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
++        return namespace
++
++    def test_active_pair_appends_only_fixed_contract_preserving_prefix(self):
++        before = copy.deepcopy(vars(self.agent))
++        original = self.agent._cached_system_prompt
++        result = with_paired_delivery_guidance(self.agent, original)
++        self.assertEqual(result, original + "\n\n" + SYSTEM_OUTPUT_CONTRACT)
++        self.assertIs(self.agent._cached_system_prompt, original)
++        self.assertEqual(self.agent._cached_system_prompt_static, before["_cached_system_prompt_static"])
++        self.assertEqual(self.agent.ephemeral_system_prompt, before["ephemeral_system_prompt"])
++        self.assertEqual(set(vars(self.agent)), set(before))
++        self.assertIsNone(self.pair.result)
++
++    def test_nonce_locale_provider_and_model_do_not_enter_system_suffix(self):
++        expected = with_paired_delivery_guidance(self.agent, self.base)
++        for locale in ("zh-Hant", "zh-Hans", "en", "ja"):
++            for provider in ("deepseek", "gemini", "openai"):
++                pair = PairedSpeech("b" * 32, locale)
++                agent = types.SimpleNamespace(_lilith_paired_speech=pair, _current_turn_id=pair.turn_id,
++                                              provider=provider, model="private-model-fixture")
++                actual = with_paired_delivery_guidance(agent, self.base)
++                self.assertEqual(actual, expected)
++                for private_value in (pair.nonce, pair.turn_id, "private-model-fixture"):
++                    self.assertNotIn(private_value, actual)
++                self.assertNotIn(pair.open_tag, actual)
++
++    def test_inactive_and_stale_pair_are_exact_no_ops(self):
++        for agent in (types.SimpleNamespace(),
++                      types.SimpleNamespace(_lilith_paired_speech=None),
++                      types.SimpleNamespace(_lilith_paired_speech=self.pair, _current_turn_id="b" * 32)):
++            self.assertIs(with_paired_delivery_guidance(agent, self.base), self.base)
++        self.assertNotIn(SYSTEM_OUTPUT_CONTRACT, self.base)
++
++    def test_restored_prompt_and_paired_to_unpaired_do_not_persist_contract(self):
++        original_cached = self.agent._cached_system_prompt
++        original_static = self.agent._cached_system_prompt_static
++        active = with_paired_delivery_guidance(self.agent, original_cached)
++        self.assertTrue(active.endswith(SYSTEM_OUTPUT_CONTRACT))
++        self.agent._lilith_paired_speech = None
++        inactive = with_paired_delivery_guidance(self.agent, self.agent._cached_system_prompt)
++        self.assertIs(inactive, original_cached)
++        self.assertIs(self.agent._cached_system_prompt_static, original_static)
++        self.assertNotIn(SYSTEM_OUTPUT_CONTRACT, inactive)
++
++    def test_lookalike_and_subclass_cannot_enable_output_contract(self):
++        class FakePair(PairedSpeech):
++            pass
++        for state in (types.SimpleNamespace(turn_id=self.pair.turn_id), FakePair(self.pair.turn_id, "ja")):
++            agent = types.SimpleNamespace(_lilith_paired_speech=state, _current_turn_id=self.pair.turn_id)
++            self.assertIsNone(state_for(agent))
++            self.assertIs(with_paired_delivery_guidance(agent, self.base), self.base)
++
++    def test_composer_idempotent_and_empty_system_well_formed(self):
++        once = with_paired_delivery_guidance(self.agent, self.base)
++        self.assertIs(with_paired_delivery_guidance(self.agent, once), once)
++        self.assertEqual(once.count(SYSTEM_OUTPUT_CONTRACT), 1)
++        self.assertEqual(with_paired_delivery_guidance(self.agent, ""), SYSTEM_OUTPUT_CONTRACT)
++
++    def test_unknown_system_type_is_not_stringified_or_mutated(self):
++        class Hostile:
++            def __str__(self):
++                raise AssertionError("must not stringify system input")
++        value = Hostile()
++        self.assertIs(with_paired_delivery_guidance(self.agent, value), value)
++        rows = [{"type": "text", "text": self.base}]
++        self.assertIs(with_paired_delivery_guidance(self.agent, rows), rows)
++        self.assertEqual(rows, [{"type": "text", "text": self.base}])
++
++    def test_no_history_or_current_user_rewrite(self):
++        history = [{"role": "user", "content": "historic user fixture", "api_content": "stable sidecar"},
++                   {"role": "assistant", "content": "historic answer fixture"}]
++        before = copy.deepcopy(history)
++        current = self.pair.instruction() + "\ncurrent fixture"
++        with_paired_delivery_guidance(self.agent, self.base)
++        outgoing = with_current_reminder(self.agent, current)
++        self.assertEqual(history, before)
++        self.assertEqual(current, self.pair.instruction() + "\ncurrent fixture")
++        self.assertEqual(outgoing.count(self.pair.open_tag), 2)
++        self.assertNotIn(SYSTEM_OUTPUT_CONTRACT, outgoing)
++
++    def test_failover_rebuild_includes_contract_after_efficiency(self):
++        sync = self.loop_functions()["_sync_failover_system_message"]
++        messages = [{"role": "system", "content": "previous provider prompt"},
++                    {"role": "user", "content": "current fixture"}]
++        previous_user = messages[1].copy()
++        returned = sync(self.agent, messages, "old active prompt")
++        expected = self.base + "\n\nEphemeral fixture.\n\nEfficiency fixture.\n\n" + SYSTEM_OUTPUT_CONTRACT
++        self.assertIs(returned, self.agent._cached_system_prompt)
++        self.assertEqual(messages[0]["content"], expected)
++        self.assertEqual(messages[1], previous_user)
++        self.assertEqual(self.agent._cached_system_prompt, self.base)
++
++    def test_failover_preserves_cache_blocks_and_static_prefix(self):
++        sync = self.loop_functions()["_sync_failover_system_message"]
++        static = self.agent._cached_system_prompt_static
++        cache_marker = {"type": "ephemeral"}
++        head = {"type": "text", "text": static, "cache_control": cache_marker}
++        tail = {"type": "text", "text": " old volatile tail", "cache_control": {"type": "ephemeral"}}
++        content = [head, tail]
++        messages = [{"role": "system", "content": content}]
++        head_before = copy.deepcopy(head)
++        sync(self.agent, messages, self.base)
++        self.assertIs(messages[0]["content"], content)
++        self.assertEqual(head, head_before)
++        self.assertIs(head["cache_control"], cache_marker)
++        combined = "".join(part["text"] for part in content)
++        self.assertEqual(combined, self.base + "\n\nEphemeral fixture.\n\nEfficiency fixture.\n\n" + SYSTEM_OUTPUT_CONTRACT)
++        self.assertEqual(tail["cache_control"], {"type": "ephemeral"})
++        self.assertEqual(self.agent._cached_system_prompt_static, static)
++
++    def test_failover_one_block_and_invalid_cache_shape_follow_native_path(self):
++        sync = self.loop_functions()["_sync_failover_system_message"]
++        for content in ([{"type": "text", "text": "old", "cache_control": {"type": "ephemeral"}}],
++                        [{"type": "unknown", "text": "old"}]):
++            messages = [{"role": "system", "content": content}]
++            sync(self.agent, messages, self.base)
++            actual = messages[0]["content"]
++            text = actual[0]["text"] if isinstance(actual, list) else actual
++            self.assertEqual(text, self.base + "\n\nEphemeral fixture.\n\nEfficiency fixture.\n\n" + SYSTEM_OUTPUT_CONTRACT)
++            if isinstance(actual, list):
++                self.assertEqual(actual[0]["cache_control"], {"type": "ephemeral"})
++
++    def test_failover_inactive_keeps_original_unpaired_composition(self):
++        sync = self.loop_functions()["_sync_failover_system_message"]
++        self.agent._lilith_paired_speech = None
++        messages = [{"role": "system", "content": "old"}]
++        sync(self.agent, messages, self.base)
++        self.assertEqual(messages[0]["content"], self.base + "\n\nEphemeral fixture.\n\nEfficiency fixture.")
++        self.assertNotIn(SYSTEM_OUTPUT_CONTRACT, messages[0]["content"])
++
++    def test_guard_and_cache_order_use_official_effective_system_composer(self):
++        path = Path(__file__).parents[1] / "agent/conversation_loop.py"
++        tree = ast.parse(path.read_text(encoding="utf-8"))
++        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
++                 and isinstance(node.func, ast.Name) and node.func.id == "with_paired_delivery_guidance"]
++        self.assertEqual(len(calls), 2)
++        top_functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
++        for name, result_name in (("_sync_failover_system_message", "effective"), ("run_conversation", "effective_system")):
++            function = top_functions[name]
++            owned = [node for node in ast.walk(function) if isinstance(node, ast.Call)
++                     and isinstance(node.func, ast.Name) and node.func.id == "with_paired_delivery_guidance"]
++            self.assertEqual(len(owned), 1)
++            observed = owned[0]
++            self.assertEqual([arg.id for arg in observed.args], ["agent", result_name])
++            efficiency = [node for node in ast.walk(function) if isinstance(node, ast.Call)
++                          and isinstance(node.func, ast.Name) and node.func.id == "with_efficiency_guidance"]
++            self.assertEqual(len(efficiency), 1)
++            self.assertLess(efficiency[0].lineno, observed.lineno)
++            if name == "run_conversation":
++                downstream = [node for node in ast.walk(function) if isinstance(node, ast.Call)
++                              and isinstance(node.func, ast.Name) and node.func.id in {
++                                  "prepare_budget_context", "build_prompt_cache_plan", "assert_scoped_identity_provider_request"}]
++                self.assertTrue(downstream)
++                self.assertTrue(all(node.lineno > observed.lineno for node in downstream))
++
++    def test_missing_or_reasoning_only_suffix_still_rejected_without_new_call(self):
++        self.agent._strip_think_blocks = lambda text: text
++        with_paired_delivery_guidance(self.agent, self.base)
++        msg = types.SimpleNamespace(content="fixture answer", tool_calls=[],
++                                    reasoning_content=self.pair.open_tag + "fixture" + self.pair.close_tag)
++        accept_response(self.agent, msg, "stop")
++        self.assertEqual(msg.content, "fixture answer")
++        self.assertEqual(self.pair.outcome, "missing_suffix")
++        self.assertIsNone(self.pair.result)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 73886e3..acb2d5d 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -14222,7 +14222,7 @@ def _hud_surface_note(session: dict) -> str:
+     return hud_surface_note(getattr(session.get("agent"), "valid_tool_names", None))
+ 
+ 
+-def _game_display_locale_note(display_locale: str | None) -> str:
++def _game_display_locale_note(display_locale: str | None, *, paired_speech: bool = False) -> str:
+     """Return host-owned reply-language guidance for one hidden game turn."""
+ 
+     labels = {
+@@ -14234,6 +14234,14 @@ def _game_display_locale_note(display_locale: str | None) -> str:
+     label = labels.get(display_locale or "")
+     if not label:
+         return ""
++    if paired_speech:
++        return (
++            f"[Host presentation metadata: write this turn's visible chat answer in {label}. "
++            "This display-language choice applies only to the visible answer, not the "
++            "separate hidden Japanese speech rendition required by the host delivery contract. "
++            "Keep the same Lilith identity, personality, relationship tone, and meaning. "
++            "This language setting is not part of the user's message.]"
++        )
+     return (
+         f"[Host presentation metadata: write this turn's assistant reply in {label}. "
+         "Keep the same Lilith identity, personality, relationship tone, and meaning. "
+@@ -15612,13 +15620,16 @@ def _run_prompt_submit(
+             # This note is model-only: persist_user_message below remains the
+             # exact user text (and image refs), so F10/history never contains
+             # presentation scaffolding.
++            _paired_delivery_requested = (
++                _budget_is_human and session.get("source") == "lilith-game"
++                and (session.get("inflight_turn") or {}).get("speech_locale") == "ja"
++                and display_locale in {"zh-Hant", "zh-Hans", "en", "ja"}
++            )
+             run_message = _prepend_note(
+                 run_message,
+-                _game_display_locale_note(display_locale),
++                _game_display_locale_note(display_locale, paired_speech=bool(_paired_delivery_requested)),
+             )
+-            if (_budget_is_human and session.get("source") == "lilith-game"
+-                    and (session.get("inflight_turn") or {}).get("speech_locale") == "ja"
+-                    and display_locale in {"zh-Hant", "zh-Hans", "en", "ja"}):
++            if _paired_delivery_requested:
+                 from agent.paired_speech import PairedSpeech
+                 paired_speech = PairedSpeech(turn_id, display_locale)
+                 agent._lilith_paired_speech = paired_speech

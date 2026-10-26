@@ -1,0 +1,634 @@
+diff --git a/tests/tui_gateway/test_native_model_transition_recovery.py b/tests/tui_gateway/test_native_model_transition_recovery.py
+new file mode 100644
+--- /dev/null
++++ b/tests/tui_gateway/test_native_model_transition_recovery.py
+@@ -0,0 +1,220 @@
++"""Actual handler/config/identity tests; transports and host attestation are synthetic."""
++import hashlib
++import json
++import threading
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import agent.identity_policy as identity
++import hermes_cli.model_switch as model_switch
++import tui_gateway.server as server
++from tests.tui_gateway.test_tools_policy_rpc import (
++    _attest_strict_host, _clean_gateway_sessions, _home, _new_strict_agent,
++    _strict_config, _write_config,
++)
++
++
++class SessionDb:
++    def __init__(self, agent):
++        self.row = {"model_config": json.dumps(agent._session_init_model_config)}
++        self.writes = 0
++
++    def get_session(self, _key):
++        return dict(self.row)
++
++    def update_session_meta(self, _key, model_config, model=None):
++        self.writes += 1
++        self.row["model_config"] = model_config
++
++
++@pytest.fixture
++def strict_session(monkeypatch):
++    from hermes_cli.env_loader import load_hermes_dotenv
++    soul, personality = "Synthetic Lilith soul.\n", "Synthetic Lilith personality.\n"
++    config = _strict_config(personality)
++    # These fixture profiles have explicitly declined unrelated shipped tools;
++    # otherwise auto-discovery would make an approval-only edit a tool edit.
++    config["agent"]["disabled_toolsets"] = ["kanban", "bfl"]
++    config["model"] = {"default": "model-old", "provider": "provider-old"}
++    raw = _write_config(config)
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, raw, soul, personality)
++    load_hermes_dotenv(hermes_home=_home())
++    agent = _new_strict_agent()
++    db = SessionDb(agent)
++    agent._session_db = db
++    session = dict(session_key="synthetic-live-key", agent=agent,
++                   history_lock=threading.RLock(), running=False, tool_started_at={})
++    server._sessions["synthetic-live"] = session
++    yield SimpleNamespace(session=session, agent=agent, db=db,
++                          raw=raw, soul=soul, personality=personality)
++    # The synthetic database is deliberately not an actual AIAgent-owned DB.
++    agent._session_db = None
++    agent.close()
++
++
++def rpc(method, params):
++    return server.handle_request({"jsonrpc": "2.0", "id": "fixture", "method": method, "params": params})
++
++
++def persist_receipt(fixture, source, previous, current):
++    """Synthetic Runtime boundary: actual native code independently verifies it."""
++    from tools.approval import _capture_native_approval_policy
++    path = _home() / "runtime" / "native-config-receipt.v1.json"
++    prior = json.loads(path.read_bytes()) if path.exists() else None
++    mode, toolsets = _capture_native_approval_policy()
++    receipt = dict(schema_version=1, source=source,
++        sequence=prior["sequence"] + 1 if prior else 1,
++        canonical_base_sha256=prior["canonical_base_sha256"] if prior else previous,
++        previous_config_sha256=previous, config_sha256=current,
++        identity_fingerprint_sha256="a" * 64,
++        soul_sha256=hashlib.sha256(fixture.soul.encode()).hexdigest(),
++        personality_sha256=hashlib.sha256(fixture.personality.encode()).hexdigest(),
++        approval_mode=mode, enabled_toolsets=list(toolsets))
++    raw = json.dumps(receipt, separators=(",", ":")).encode()
++    path.write_bytes(raw)
++    return hashlib.sha256(raw).hexdigest()
++
++
++def save_tools(fixture, **changes):
++    previous = hashlib.sha256((_home() / "config.yaml").read_bytes()).hexdigest()
++    response = rpc("tools.set", changes)
++    assert "error" not in response, response
++    current = response["result"]["config_sha256"]
++    persist_receipt(fixture, "hermes.tools.set", previous, current)
++    return current
++
++
++def select_model(monkeypatch, model="model-new", provider="provider-new"):
++    # Replace only external provider resolution. Actual parsing, strict session
++    # guards, config writes, pending ownership and phase-two receipt remain real.
++    monkeypatch.setattr(model_switch, "switch_model", lambda **kwargs: SimpleNamespace(
++        success=True, new_model=model, target_provider=provider, base_url=None,
++        api_key="synthetic", api_mode="chat_completions", warning_message=""))
++    return rpc("config.set", dict(key="model", value=f"{model} --provider {provider} --global",
++                                  confirm_expensive_model=True))
++
++
++def finish_model(fixture, previous):
++    current = hashlib.sha256((_home() / "config.yaml").read_bytes()).hexdigest()
++    digest = persist_receipt(fixture, "hermes.model.default.set", previous, current)
++    response = rpc("model.default.commit", dict(authority="lilith-runtime-native-config.v1",
++        previous_config_sha256=previous, config_sha256=current, receipt_sha256=digest))
++    assert response.get("result") == {"committed": 1}, response
++    assert identity.native_authority_pending_transition_state() is None
++    assert identity.native_authority_quarantine_state() is None
++    return current
++
++
++def test_real_tools_then_global_model_keeps_old_session_retired(monkeypatch, strict_session):
++    fixture = strict_session
++    tools_digest = save_tools(fixture, enabled_toolsets=["file", "terminal"], approval_mode="smart")
++    original_row = fixture.db.row.copy()
++    result = select_model(monkeypatch)
++    assert "error" not in result, result
++    assert identity.native_authority_pending_transition_state() is not None
++    model_digest = finish_model(fixture, tools_digest)
++    assert fixture.db.row == original_row and fixture.db.writes == 0
++    assert fixture.agent._identity_config_sha256 == hashlib.sha256(fixture.raw).hexdigest()
++    assert fixture.session["_native_model_retirement"].current == model_digest
++    assert "_native_approval_resume_digest" not in fixture.session
++    with pytest.raises(identity.IdentityPolicyError):
++        identity.enforce_scoped_turn_identity(fixture.agent)
++    result = select_model(monkeypatch, "model-third", "provider-third")
++    assert "error" not in result, result
++    finish_model(fixture, model_digest)
++    assert fixture.db.row == original_row
++
++
++@pytest.mark.parametrize("changed_tools", [False, True])
++def test_only_approval_chain_can_resume_after_model_commit(monkeypatch, strict_session, changed_tools):
++    fixture = strict_session
++    old = hashlib.sha256(fixture.raw).hexdigest()
++    from hermes_cli.config import load_config
++    from hermes_cli.tools_config import _get_platform_tools
++    unchanged_tools = sorted(_get_platform_tools(load_config(), "cli", include_default_mcp_servers=False))
++    current = save_tools(fixture, enabled_toolsets=unchanged_tools, approval_mode="smart")
++    assert fixture.session["_native_approval_resume_digest"] == {"previous": old, "current": current}
++    if changed_tools:
++        current = save_tools(fixture, enabled_toolsets=["file"], approval_mode="manual")
++        assert "_native_approval_resume_digest" not in fixture.session
++    result = select_model(monkeypatch)
++    assert "error" not in result, result
++    current = finish_model(fixture, current)
++    if changed_tools:
++        assert "_native_approval_resume_digest" not in fixture.session
++    else:
++        assert fixture.session["_native_approval_resume_digest"] == {"previous": old, "current": current}
++
++
++@pytest.mark.parametrize("provider", ["deepseek", "gemini", "custom:fixture-local"])
++def test_explicit_resolution_failure_never_enters_pending_or_mutates(monkeypatch, strict_session, provider):
++    before = (_home() / "config.yaml").read_bytes()
++    monkeypatch.setattr(model_switch, "switch_model", lambda **kwargs: SimpleNamespace(
++        success=False, error_message="secret-provider-error-must-not-escape"))
++    persist = Mock(side_effect=AssertionError("persistence called"))
++    begin = Mock(side_effect=AssertionError("pending called"))
++    desire = Mock(side_effect=AssertionError("desire called"))
++    monkeypatch.setattr(server, "_persist_model_switch", persist)
++    monkeypatch.setattr(server, "_commit_runtime_desire", desire)
++    monkeypatch.setattr(identity, "begin_native_authority_commit_pending", begin)
++    result = rpc("config.set", dict(key="model", value=f"model-new --provider {provider} --global",
++                                   confirm_expensive_model=True))
++    assert result.get("error", {}).get("code") == 4096, result
++    assert "secret-provider" not in str(result)
++    assert (_home() / "config.yaml").read_bytes() == before
++    assert identity.native_authority_pending_transition_state() is None
++    assert identity.native_authority_quarantine_state() is None
++    persist.assert_not_called(); begin.assert_not_called(); desire.assert_not_called()
++
++
++def test_failed_pending_release_cannot_masquerade_as_retryable_busy(monkeypatch, strict_session):
++    strict_session.session["running"] = True
++    before = (_home() / "config.yaml").read_bytes()
++    monkeypatch.setattr(identity, "clear_native_authority_commit_pending",
++        Mock(side_effect=RuntimeError("synthetic release failure")))
++    result = select_model(monkeypatch)
++    assert result.get("error", {}).get("code") == 5035, result
++    assert (_home() / "config.yaml").read_bytes() == before
++    assert identity.native_authority_quarantine_state() is not None
++
++
++def test_unknown_resolution_exception_is_not_proven_no_change(monkeypatch, strict_session):
++    monkeypatch.setattr(model_switch, "switch_model", Mock(side_effect=RuntimeError("synthetic unknown")))
++    result = rpc("config.set", dict(key="model", value="model-new --provider unknown --global",
++                                   confirm_expensive_model=True))
++    assert result.get("error", {}).get("code") == 5001, result
++
++
++def test_tools_authority_contention_is_prewrite_and_retry_is_safe(monkeypatch, strict_session):
++    fixture = strict_session
++    authority = server._runtime_authority_lock(fixture.session)
++    before = (_home() / "config.yaml").read_bytes()
++    params = dict(enabled_toolsets=["file", "terminal"], approval_mode="smart")
++    authority.acquire()
++    try:
++        response = rpc("tools.set", params)
++        assert response.get("error", {}).get("code") == 4090, response
++        assert (_home() / "config.yaml").read_bytes() == before
++        assert "_native_model_retirement" not in fixture.session
++        assert identity.native_authority_pending_transition_state() is None
++        assert identity.native_authority_quarantine_state() is None
++    finally:
++        authority.release()
++    current = save_tools(fixture, **params)
++    assert fixture.session["_native_model_retirement"].current == current
++    response = select_model(monkeypatch)
++    assert "error" not in response, response
++    finish_model(fixture, current)
++
++
++@pytest.mark.parametrize("busy", ["running", "tool_started_at", "agent_build_started", "queued_prompt", "queued_prompts"])
++def test_known_busy_before_persistence_has_no_pending_or_write(monkeypatch, strict_session, busy):
++    strict_session.session[busy] = True
++    before = (_home() / "config.yaml").read_bytes()
++    result = select_model(monkeypatch)
++    assert result.get("error", {}).get("code") == 4090, result
++    assert (_home() / "config.yaml").read_bytes() == before
++    assert identity.native_authority_pending_transition_state() is None
++    assert identity.native_authority_quarantine_state() is None
+diff --git a/tests/tui_gateway/test_tools_policy_rpc.py b/tests/tui_gateway/test_tools_policy_rpc.py
+index a110233..35cbc4e 100644
+--- a/tests/tui_gateway/test_tools_policy_rpc.py
++++ b/tests/tui_gateway/test_tools_policy_rpc.py
+@@ -1223,7 +1223,9 @@ def test_session_teardown_reservation_covers_pop_to_database_cleanup(monkeypatch
+     teardown_entered = threading.Event()
+     release_teardown = threading.Event()
+     closed = []
+-    server._sessions["closing"] = {"session_key": "closing-key"}
++    server._sessions["closing"] = {
++        "session_key": "closing-key", "history_lock": threading.RLock(),
++    }
+ 
+     def _blocking_teardown(session, *, end_reason):
+         teardown_entered.set()
+@@ -1258,7 +1260,7 @@ def test_sticky_quarantine_still_allows_session_teardown(monkeypatch):
+ 
+     torn_down = []
+     server._sessions["quarantined-close"] = {
+-        "session_key": "quarantined-close-key"
++        "session_key": "quarantined-close-key", "history_lock": threading.RLock(),
+     }
+     monkeypatch.setattr(
+         server,
+@@ -1309,6 +1311,7 @@ def test_deferred_failed_registration_keeps_database_open_until_teardown(
+     server._sessions["failed-registration"] = {
+         "session_key": "failed-registration-key",
+         "agent": agent,
++        "history_lock": threading.RLock(),
+     }
+ 
+     def _teardown(session, *, end_reason):
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 046f538..52b36a9 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -1940,6 +1940,7 @@ def _(rid, params: dict) -> dict:
+             )
+ 
+         acquired_history_locks = []
++        acquired_authority_locks = []
+         _tool_policy_mutation_lock.acquire()
+         _sessions_lock.acquire()
+         try:
+@@ -1959,6 +1960,18 @@ def _(rid, params: dict) -> dict:
+                         )
+                     acquired_history_locks.append(history_lock)
+ 
++            # A setter admitted earlier may own authority and need the registry
++            # on its way out. Fail before any mutation instead of waiting in
++            # reverse order or dropping retirement evidence after config save.
++            for session in list(_sessions.values()):
++                authority_lock = _runtime_authority_lock(session)
++                if id(authority_lock) in seen_locks:
++                    continue
++                seen_locks.add(id(authority_lock))
++                if not authority_lock.acquire(blocking=False):
++                    return _err(rid, 4090, "tool policy cannot change while session authority is busy")
++                acquired_authority_locks.append(authority_lock)
++
+             if any(
+                 session.get("running") or bool(session.get("tool_started_at"))
+                 for session in _sessions.values()
+@@ -2101,6 +2114,8 @@ def _(rid, params: dict) -> dict:
+                             ) from recovery_error
+                     raise mutation_error
+ 
++            _record_native_model_retirement(previous_sha256, config_sha256)
++
+             # Record only this exact trusted, idle approval-only transition.
+             # The Runtime must accept the receipt before a client can resume;
+             # resume re-proves the complete strict snapshot before adoption.
+@@ -2132,6 +2147,8 @@ def _(rid, params: dict) -> dict:
+                 },
+             )
+         finally:
++            for authority_lock in reversed(acquired_authority_locks):
++                authority_lock.release()
+             for history_lock in reversed(acquired_history_locks):
+                 history_lock.release()
+             _sessions_lock.release()
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index fb0cd0a..d5b4503 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -5695,7 +5695,9 @@ def _adopt_idle_approval_resume_digest(session: dict) -> None:
+ 
+     This is not a general stale-config escape hatch: tools.set creates the
+     marker only while all sessions are idle and the toolset is unchanged.
+-    Other config mutations cannot produce or widen the prepared digest chain.
++    A later verified model-only commit may extend this same proof without
++    changing toolsets. Tool/discovery/setup changes remove it in tools.set;
++    a retirement marker alone never authorizes resume or digest adoption.
+     """
+     pending = session.get("_native_approval_resume_digest")
+     if not isinstance(pending, dict):
+@@ -5746,6 +5748,7 @@ def _adopt_idle_approval_resume_digest(session: dict) -> None:
+                     agent, previous_config_sha256=previous, config_sha256=current,
+                 )
+         session.pop("_native_approval_resume_digest", None)
++        session.pop("_native_model_retirement", None)
+ 
+ 
+ def _persist_live_session_system_prompt(session: dict | None) -> None:
+@@ -6288,6 +6291,64 @@ class _NativeModelSessionBinding(NamedTuple):
+     session_key: str
+     db: Any
+     durable_row_existed: bool
++    retirement: Any = None
++
++
++class _NativeModelRetirementProof(NamedTuple):
++    session: dict
++    agent: Any
++    session_key: str
++    previous: str
++    current: str
++
++
++def _native_model_retirement(session: dict, current: str):
++    proof = session.get("_native_model_retirement")
++    if not isinstance(proof, _NativeModelRetirementProof):
++        return None
++    if (proof.session is not session
++            or proof.session_key != str(session.get("session_key") or "").strip()
++            or not hmac.compare_digest(proof.current, current)):
++        raise RuntimeError("retired strict session ownership changed")
++    if proof.agent is not session.get("agent"):
++        # A new, independently constructed strict agent may replace the old
++        # object. It must already attest the current digest; this does not
++        # rebind a stale instance or authorize a deferred candidate.
++        _assert_native_model_agent_digest(session.get("agent"), current)
++        session.pop("_native_model_retirement", None)
++        return None
++    if proof.agent is not None:
++        _assert_native_model_agent_digest(proof.agent, proof.previous)
++    return proof
++
++
++def _record_native_model_retirement(previous: str, current: str) -> None:
++    """Remember only a host-owned tools.set invalidation, never a new grant.
++
++    The old agent and durable row keep their old digest and remain unusable.
++    This proof only prevents an intentionally invalidated session from being
++    mistaken for a current session when an independent global model is saved.
++    The tools.set owner holds all registry/history/authority locks, acquired
++    non-blockingly before its config write; do not reacquire non-reentrant locks.
++    """
++    if not previous or not current or hmac.compare_digest(previous, current):
++        return
++    for session in _sessions.values():
++        agent = session.get("agent")
++        key = str(session.get("session_key") or "").strip()
++        if not key:
++            continue
++        try:
++            old = _native_model_retirement(session, previous)
++            first = old.previous if old is not None else previous
++            if agent is not None:
++                _assert_native_model_agent_digest(agent, first)
++        except RuntimeError:
++            # Unknown stale state is not adopted or blessed by this marker.
++            continue
++        session["_native_model_retirement"] = _NativeModelRetirementProof(
++            session, agent, key, first, current,
++        )
+ 
+ 
+ class _PreparedNativeModelDefaultCommit:
+@@ -6452,6 +6513,8 @@ def _paused_live_strict_sessions_for_native_model(previous_sha256: str):
+             session.get("running")
+             or bool(session.get("tool_started_at"))
+             or bool(session.get("agent_build_started"))
++            or bool(session.get("queued_prompt"))
++            or bool(session.get("queued_prompts"))
+             for session in _sessions.values()
+         ):
+             raise NativeAuthorityTransitionBusyError(
+@@ -6474,6 +6537,8 @@ def _paused_live_strict_sessions_for_native_model(previous_sha256: str):
+             session.get("running")
+             or bool(session.get("tool_started_at"))
+             or bool(session.get("agent_build_started"))
++            or bool(session.get("queued_prompt"))
++            or bool(session.get("queued_prompts"))
+             for session in _sessions.values()
+         ):
+             raise NativeAuthorityTransitionBusyError(
+@@ -6486,6 +6551,18 @@ def _paused_live_strict_sessions_for_native_model(previous_sha256: str):
+         for sid, session in list(_sessions.items()):
+             agent = session.get("agent")
+             if agent is None:
++                retirement = _native_model_retirement(session, previous_sha256)
++                if retirement is not None:
++                    with _session_db(session) as db:
++                        row = db.get_session(retirement.session_key) if db is not None else None
++                        if row is not None:
++                            value = _native_model_row_config(row, label="retired dormant strict session")
++                            if value.get("_identity_config_sha256") != retirement.previous:
++                                raise RuntimeError("retired dormant strict durable digest changed")
++                    bindings.append(_NativeModelSessionBinding(
++                        str(sid), session, None, retirement.session_key,
++                        None, False, retirement,
++                    ))
+                 continue
+             if id(session) in seen_sessions:
+                 continue
+@@ -6500,7 +6577,9 @@ def _paused_live_strict_sessions_for_native_model(previous_sha256: str):
+             existing_key = agent_session_keys.setdefault(id(agent), session_key)
+             if existing_key != session_key:
+                 raise RuntimeError("live strict agent had ambiguous durable sessions")
+-            _assert_native_model_agent_digest(agent, previous_sha256)
++            retirement = _native_model_retirement(session, previous_sha256)
++            expected_digest = retirement.previous if retirement else previous_sha256
++            _assert_native_model_agent_digest(agent, expected_digest)
+ 
+             db = getattr(agent, "_session_db", None) or _get_db()
+             row = None
+@@ -6516,7 +6595,7 @@ def _paused_live_strict_sessions_for_native_model(previous_sha256: str):
+                 durable_digest = str(
+                     durable_config.get("_identity_config_sha256") or ""
+                 ).strip().lower()
+-                if not hmac.compare_digest(durable_digest, previous_sha256):
++                if not hmac.compare_digest(durable_digest, expected_digest):
+                     raise RuntimeError("live strict durable session digest changed")
+                 if not hasattr(db, "update_session_meta"):
+                     raise RuntimeError(
+@@ -6533,6 +6612,7 @@ def _paused_live_strict_sessions_for_native_model(previous_sha256: str):
+                     session_key=session_key,
+                     db=db,
+                     durable_row_existed=row is not None,
++                    retirement=retirement,
+                 )
+             )
+         yield tuple(bindings)
+@@ -6636,6 +6716,7 @@ def _locked_prepared_native_model_sessions(
+     try:
+         if any(
+             session.get("running") or bool(session.get("tool_started_at"))
++            or bool(session.get("queued_prompt")) or bool(session.get("queued_prompts"))
+             for session in _sessions.values()
+         ):
+             raise RuntimeError(
+@@ -6666,6 +6747,10 @@ def _locked_prepared_native_model_sessions(
+                 != binding.session_key
+             ):
+                 raise RuntimeError("prepared strict session mapping changed")
++            if binding.retirement is not None:
++                if (_native_model_retirement(binding.session, prepared.previous_config_sha256)
++                        is not binding.retirement):
++                    raise RuntimeError("prepared strict retirement proof changed")
+ 
+         current_bindings = []
+         seen_sessions = set()
+@@ -6687,11 +6772,16 @@ def _locked_prepared_native_model_sessions(
+             existing_key = agent_session_keys.setdefault(id(agent), session_key)
+             if existing_key != session_key:
+                 raise RuntimeError("live strict agent had ambiguous durable sessions")
+-            state = _native_model_agent_digest_state(
+-                agent,
+-                prepared.previous_config_sha256,
+-                prepared.config_sha256,
+-            )
++            retirement = _native_model_retirement(session, prepared.previous_config_sha256)
++            if retirement is not None:
++                if (str(sid) not in prepared_by_sid
++                        or prepared_by_sid[str(sid)].retirement is not retirement):
++                    raise RuntimeError("unprepared strict retirement proof")
++                state = "retired"
++            else:
++                state = _native_model_agent_digest_state(
++                    agent, prepared.previous_config_sha256, prepared.config_sha256,
++                )
+ 
+             db = getattr(agent, "_session_db", None) or _get_db()
+             phase_one = prepared_by_sid.get(str(sid))
+@@ -6716,6 +6806,7 @@ def _locked_prepared_native_model_sessions(
+                     durable_config.get("_identity_config_sha256") or ""
+                 ).strip().lower()
+                 expected = (
++                    retirement.previous if retirement is not None else
+                     prepared.previous_config_sha256
+                     if state == "old"
+                     else prepared.config_sha256
+@@ -6740,6 +6831,7 @@ def _locked_prepared_native_model_sessions(
+                         session_key=session_key,
+                         db=db,
+                         durable_row_existed=row is not None,
++                        retirement=retirement,
+                     ),
+                     state,
+                 )
+@@ -6762,6 +6854,10 @@ def _rebind_prepared_native_model_sessions(
+         current_bindings, dormant_sessions = locked_state
+         staged = []
+         for binding, state in current_bindings:
++            if state == "retired":
++                # Phase two already re-proved identity, inactivity and both old
++                # pins. Do not give an invalidated agent a current digest.
++                continue
+             live_db = getattr(binding.agent, "_session_db", None) or _get_db()
+             if live_db is not binding.db:
+                 raise RuntimeError("prepared strict session database changed")
+@@ -6803,6 +6899,10 @@ def _rebind_prepared_native_model_sessions(
+         # existing durable row directly; the runtime revision bump above makes
+         # any in-flight candidate stale before it can publish.
+         for session in dormant_sessions:
++            retirement = _native_model_retirement(session, previous)
++            if retirement is not None:
++                if not any(binding.retirement is retirement for binding in prepared.bindings):
++                    raise RuntimeError("unprepared dormant retirement proof")
+             session_key = str(session.get("session_key") or "").strip()
+             if not session_key:
+                 raise RuntimeError("dormant strict session key was missing")
+@@ -6821,6 +6921,10 @@ def _rebind_prepared_native_model_sessions(
+                 durable_digest = str(
+                     model_config.get("_identity_config_sha256") or ""
+                 ).strip().lower()
++                if retirement is not None:
++                    if not hmac.compare_digest(durable_digest, retirement.previous):
++                        raise RuntimeError("retired dormant strict durable digest changed")
++                    continue
+                 if hmac.compare_digest(durable_digest, current):
+                     continue
+                 if not hmac.compare_digest(durable_digest, previous):
+@@ -6869,13 +6973,25 @@ def _rebind_prepared_native_model_sessions(
+                 raise RuntimeError("strict session model rebind changed metadata")
+ 
+         for binding, state in current_bindings:
+-            if state == "new":
++            if state in {"new", "retired"}:
+                 continue
+             adopt_verified_native_config_digest(
+                 binding.agent,
+                 previous_config_sha256=previous,
+                 config_sha256=current,
+             )
++        for binding in prepared.bindings:
++            proof = binding.retirement
++            if proof is None:
++                continue
++            # This advances only the exclusion chain, never agent/DB authority.
++            binding.session["_native_model_retirement"] = proof._replace(current=current)
++            approval = binding.session.get("_native_approval_resume_digest")
++            if (isinstance(approval, dict) and approval.get("previous") == proof.previous
++                    and approval.get("current") == previous):
++                binding.session["_native_approval_resume_digest"] = {
++                    "previous": proof.previous, "current": current,
++                }
+ 
+ 
+ def _persist_model_switch(result) -> None:
+@@ -7055,11 +7171,13 @@ def _persist_model_switch(result) -> None:
+             try:
+                 clear_native_authority_commit_pending(commit_nonce)
+             except Exception:
+-                if mutation_attempted:
+-                    latch_native_authority_quarantine(
+-                        "global model pending transition could not be retired",
+-                        drifted_labels=("config.yaml",),
+-                    )
++                # Even before a config write, a failed pending-owner release
++                # is not the ordinary recoverable busy result. Do not claim
++                # that clients can retry while process authority is uncertain.
++                latch_native_authority_quarantine(
++                    "global model pending transition could not be retired",
++                    drifted_labels=("config.yaml",),
++                )
+             raise mutation_error
+ 
+ 
+@@ -7103,6 +7221,10 @@ class _ExactGlobalModelSelectionRequired(ValueError):
+     """A host picker resolution changed the selected pair before persistence."""
+ 
+ 
++class _NativeGlobalModelResolutionRejected(ValueError):
++    """Resolver refusal before any session desire or config/pending mutation."""
++
++
+ def _apply_model_switch(
+     sid: str,
+     session: dict,
+@@ -7210,6 +7332,12 @@ def _apply_model_switch(
+         custom_providers=custom_provs,
+     )
+     if not result.success:
++        if persist_global and not sid and session.get("agent") is None:
++            from agent.identity_policy import identity_lock_required_by_host
++            if identity_lock_required_by_host():
++                raise _NativeGlobalModelResolutionRejected(
++                    "Native global model resolution was rejected before mutation."
++                )
+         raise ValueError(result.error_message or "model switch failed")
+ 
+     # The Runtime picker attests an exact provider/model pair. Aliases and
+@@ -17129,9 +17257,14 @@ def _(rid, params: dict) -> dict:
+                     ),
+                 },
+             )
++        except _NativeGlobalModelResolutionRejected as e:
++            return _err(rid, 4096, str(e))
+         except _ExactGlobalModelSelectionRequired as e:
+             return _err(rid, 4094, str(e))
+         except NativeAuthorityTransitionBusyError as e:
++            quarantine_error = _native_authority_quarantine_rpc_error(rid)
++            if quarantine_error is not None:
++                return quarantine_error
+             return _err(rid, 4090, str(e))
+         except Exception as e:
+             return _err(rid, 5001, str(e))

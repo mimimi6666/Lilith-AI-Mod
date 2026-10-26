@@ -1,0 +1,119 @@
+diff --git a/tests/tui_gateway/test_exact_global_model_selection.py b/tests/tui_gateway/test_exact_global_model_selection.py
+new file mode 100644
+index 0000000..3352c14
+--- /dev/null
++++ b/tests/tui_gateway/test_exact_global_model_selection.py
+@@ -0,0 +1,65 @@
++"""A picker selection must not persist an automatically substituted pair."""
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import tui_gateway.server as server
++import hermes_cli.model_switch as model_switch
++import agent.identity_policy as identity
++
++
++@pytest.mark.parametrize("selected,resolved", [
++    ("catalog-model-old", "catalog-model-new"),
++    ("deepseek-v4-flash", "deepseek-flash"),
++    ("Exact.Case", "exact.case"),
++])
++def test_strict_global_substitution_is_rejected_before_any_mutation(monkeypatch, selected, resolved):
++    monkeypatch.setattr(identity, "identity_lock_required_by_host", lambda: True)
++    monkeypatch.setattr(model_switch, "switch_model", lambda **kwargs: SimpleNamespace(
++        success=True, new_model=resolved, target_provider="provider-a",
++        base_url=None, api_key="fixture", api_mode="chat_completions", warning_message=""))
++    persist = Mock()
++    desire = Mock(return_value=(1, None))
++    monkeypatch.setattr(server, "_persist_model_switch", persist)
++    monkeypatch.setattr(server, "_commit_runtime_desire", desire)
++    result = server.handle_request({"id": "exact-selection", "method": "config.set", "params": {
++        "key": "model", "value": f"{selected} --provider provider-a --global",
++        "confirm_expensive_model": True}})
++    assert result.get("error", {}).get("code") == 4094, result
++    persist.assert_not_called()
++    desire.assert_not_called()
++
++
++@pytest.mark.parametrize("strict,global_switch,provider", [
++    (True, True, "provider-a"),
++    (False, True, "provider-a"),
++    (True, False, "provider-a"),
++])
++def test_exact_pair_and_unmanaged_alias_behavior_remain_supported(monkeypatch, strict, global_switch, provider):
++    monkeypatch.setattr(identity, "identity_lock_required_by_host", lambda: strict)
++    selected = "model-a"
++    resolved = selected if strict and global_switch else "alias-resolved"
++    monkeypatch.setattr(model_switch, "switch_model", lambda **kwargs: SimpleNamespace(
++        success=True, new_model=resolved, target_provider=provider,
++        base_url=None, api_key="fixture", api_mode="chat_completions", warning_message=""))
++    persist = Mock()
++    monkeypatch.setattr(server, "_persist_model_switch", persist)
++    result = server._apply_model_switch("", {"agent": None},
++        f"{selected} --provider {provider} --{'global' if global_switch else 'session'}",
++        confirm_expensive_model=True)
++    assert result["value"] == resolved
++    assert persist.call_count == int(global_switch)
++
++
++def test_strict_global_provider_substitution_is_also_rejected(monkeypatch):
++    monkeypatch.setattr(identity, "identity_lock_required_by_host", lambda: True)
++    monkeypatch.setattr(model_switch, "switch_model", lambda **kwargs: SimpleNamespace(
++        success=True, new_model="model-a", target_provider="provider-b",
++        base_url=None, api_key="fixture", api_mode="chat_completions", warning_message=""))
++    persist = Mock()
++    monkeypatch.setattr(server, "_persist_model_switch", persist)
++    result = server.handle_request({"id": "provider", "method": "config.set", "params": {
++        "key": "model", "value": "model-a --provider provider-a --global",
++        "confirm_expensive_model": True}})
++    assert result.get("error", {}).get("code") == 4094, result
++    persist.assert_not_called()
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 27f8b45..9b8341b 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -6991,6 +6991,10 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
+         )
+ 
+ 
++class _ExactGlobalModelSelectionRequired(ValueError):
++    """A host picker resolution changed the selected pair before persistence."""
++
++
+ def _apply_model_switch(
+     sid: str,
+     session: dict,
+@@ -7100,6 +7104,23 @@ def _apply_model_switch(
+     if not result.success:
+         raise ValueError(result.error_message or "model switch failed")
+ 
++    # The Runtime picker attests an exact provider/model pair. Aliases and
++    # remote validation can resolve a different pair; rejecting that only in
++    # the host's post-read is too late: config.yaml has already changed while
++    # its durable receipt still describes the previous configuration.
++    # Check before BOTH session desire publication and global persistence.
++    if persist_global:
++        from agent.identity_policy import identity_lock_required_by_host
++
++        if identity_lock_required_by_host() and (
++            result.new_model != model_input
++            or result.target_provider != explicit_provider
++        ):
++            raise _ExactGlobalModelSelectionRequired(
++                "The selected model resolved to a different provider/model pair; "
++                "nothing was saved. Refresh the model list and select the exact model."
++            )
++
+     # Resolution may overlap a deferred build. Re-read for preflight only;
+     # the desired-revision commit below captures the published agent under the
+     # authority lock, closing the final candidate-publication race.
+@@ -16777,6 +16798,8 @@ def _(rid, params: dict) -> dict:
+                     ),
+                 },
+             )
++        except _ExactGlobalModelSelectionRequired as e:
++            return _err(rid, 4094, str(e))
+         except NativeAuthorityTransitionBusyError as e:
+             return _err(rid, 4090, str(e))
+         except Exception as e:

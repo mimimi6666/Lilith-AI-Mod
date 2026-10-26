@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup>
+    <LILITH_GAME_DIR>C:\Path\To\SteamGame</LILITH_GAME_DIR>
+    <LILITH_INTEROP_DIR>C:\Path\To\SteamGame\BepInEx\interop</LILITH_INTEROP_DIR>
+    <LILITH_DOTNET_ROOT>C:\Path\To\dotnet-sdk</LILITH_DOTNET_ROOT>
+    <LILITH_VOICE_RUNTIME_DIR>C:\Path\To\voice-runtime</LILITH_VOICE_RUNTIME_DIR>
+    <LILITH_ARTIFACTS_DIR>C:\Path\To\Lilith\repo\artifacts</LILITH_ARTIFACTS_DIR>
+    <LILITH_DEPLOY_DIR>C:\Path\To\SteamGame\BepInEx\plugins</LILITH_DEPLOY_DIR>
+    <LILITH_EXTERNAL_ROOT>C:\Path\To\Lilith\external</LILITH_EXTERNAL_ROOT>
+    <LILITH_BEPINEX_CORE_DIR>C:\Path\To\Lilith\external\bepinex\BepInEx\core</LILITH_BEPINEX_CORE_DIR>
+    <LILITH_CODEX_HOOK_PATH>C:\Path\To\Lilith\repo\tools\LilithCodexBridge\LilithCodexHook.ps1</LILITH_CODEX_HOOK_PATH>
+  </PropertyGroup>
+</Project>
+

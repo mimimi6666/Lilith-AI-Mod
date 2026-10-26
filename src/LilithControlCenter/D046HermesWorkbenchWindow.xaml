@@ -1,0 +1,1522 @@
+<Window x:Class="LilithControlCenter.D046HermesWorkbenchWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:LilithControlCenter"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
+        Title="{local:UiText ui.lilith.workbench}"
+        Width="1240" Height="800" MinWidth="980" MinHeight="640"
+        MaxWidth="{Binding Source={x:Static SystemParameters.WorkArea}, Path=Width}"
+        MaxHeight="{Binding Source={x:Static SystemParameters.WorkArea}, Path=Height}"
+        WindowStartupLocation="CenterOwner"
+        WindowStyle="None" ResizeMode="CanResize"
+        Background="{DynamicResource WindowBrush}"
+        Icon="Assets/lilith-control-center-icon.ico">
+    <shell:WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="58"
+                            ResizeBorderThickness="7"
+                            CornerRadius="18"
+                            GlassFrameThickness="0"
+                            UseAeroCaptionButtons="False"/>
+    </shell:WindowChrome.WindowChrome>
+
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter"/>
+        <local:D046HermesImagePreviewConverter x:Key="HermesImagePreviewConverter"/>
+
+        <Style x:Key="ComposerToolButtonStyle" TargetType="Button" BasedOn="{StaticResource SecondaryButtonStyle}">
+            <Setter Property="Padding" Value="10,7"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="MinHeight" Value="36"/>
+            <Setter Property="Margin" Value="0,0,6,6"/>
+            <Setter Property="VerticalAlignment" Value="Top"/>
+        </Style>
+        <Style x:Key="ComposerSendButtonStyle" TargetType="Button" BasedOn="{StaticResource PrimaryButtonStyle}">
+            <Setter Property="Padding" Value="14,7"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="MinHeight" Value="36"/>
+        </Style>
+        <ContextMenu x:Key="HermesTaskContextMenu"
+                     x:Shared="False"
+                     Style="{StaticResource DarkContextMenuStyle}"
+                     DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
+            <MenuItem Style="{StaticResource DarkMenuItemStyle}"
+                      Header="{Binding PinLabel}"
+                      Click="PinTaskMenuItem_Click"/>
+            <Separator Style="{StaticResource DarkMenuSeparatorStyle}"/>
+            <MenuItem Style="{StaticResource DarkMenuItemStyle}"
+                      Header="{local:UiText ui.rename}"
+                      IsEnabled="{Binding CanManage}"
+                      Click="RenameTaskMenuItem_Click"/>
+            <Separator Style="{StaticResource DarkMenuSeparatorStyle}"/>
+            <MenuItem Style="{StaticResource DarkMenuItemStyle}"
+                      Header="{local:UiText ui.delete.chat}"
+                      Foreground="{DynamicResource DangerBrush}"
+                      IsEnabled="{Binding CanManage}"
+                      Click="DeleteTaskMenuItem_Click"/>
+        </ContextMenu>
+
+        <Style x:Key="HermesListStyle" TargetType="ListBox">
+            <Setter Property="Background" Value="{DynamicResource RailBrush}"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+            <Setter Property="ScrollViewer.CanContentScroll" Value="False"/>
+            <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled"/>
+            <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Auto"/>
+            <Setter Property="VirtualizingPanel.IsVirtualizing" Value="True"/>
+            <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling"/>
+            <Setter Property="VirtualizingPanel.ScrollUnit" Value="Pixel"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ListBox">
+                        <Border x:Name="ListSurface"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                SnapsToDevicePixels="True">
+                            <ScrollViewer x:Name="PART_ScrollViewer"
+                                          Padding="{TemplateBinding Padding}"
+                                          Focusable="False">
+                                <ItemsPresenter SnapsToDevicePixels="{TemplateBinding SnapsToDevicePixels}"/>
+                            </ScrollViewer>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="ListSurface" Property="Background" Value="{DynamicResource RailBrush}"/>
+                                <Setter TargetName="ListSurface" Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="HermesTaskItemStyle" TargetType="ListBoxItem">
+            <EventSetter Event="PreviewMouseRightButtonDown" Handler="TaskItem_PreviewMouseRightButtonDown"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Margin" Value="0,3"/>
+            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+            <Setter Property="Background" Value="{DynamicResource PanelBrush}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+            <Setter Property="ContextMenu" Value="{StaticResource HermesTaskContextMenu}"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ListBoxItem">
+                        <Border x:Name="TaskSurface"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{DynamicResource BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="12"
+                                Padding="12,10">
+                            <ContentPresenter/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="TaskSurface" Property="Background" Value="{DynamicResource PanelRaisedBrush}"/>
+                                <Setter TargetName="TaskSurface" Property="BorderBrush" Value="{DynamicResource WindowBorderBrush}"/>
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="TaskSurface" Property="Background" Value="{DynamicResource SelectedBrush}"/>
+                                <Setter TargetName="TaskSurface" Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="TaskSurface" Property="Background" Value="{DynamicResource PanelBrush}"/>
+                                <Setter TargetName="TaskSurface" Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
+                                <Setter TargetName="TaskSurface" Property="Opacity" Value="0.68"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <Border Background="{DynamicResource WindowBrush}"
+            BorderBrush="{DynamicResource WindowBorderBrush}"
+            BorderThickness="1"
+            CornerRadius="18"
+            ClipToBounds="True">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="58"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+
+            <Grid Background="{DynamicResource TitleBarBrush}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal"
+                            VerticalAlignment="Center"
+                            Margin="18,0,0,0">
+                    <Image Source="Assets/lilith-control-center-icon.png"
+                           Width="32" Height="32" Stretch="Uniform"
+                           RenderOptions.BitmapScalingMode="HighQuality"/>
+                    <StackPanel Margin="10,0,0,0" VerticalAlignment="Center">
+                        <TextBlock Text="{local:UiText ui.lilith.workbench}"
+                                   FontSize="15" FontWeight="SemiBold"/>
+                        <TextBlock Text="{local:UiText ui.lilith.sessions.projected.by.lilith.runtime}"
+                                   FontSize="11"
+                                   Foreground="{DynamicResource MutedBrush}"
+                                   Margin="0,2,0,0"/>
+                    </StackPanel>
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                    <Button Style="{StaticResource WindowButtonStyle}" ToolTip="{local:UiText common.minimize}"
+                            shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                            Click="MinimizeButton_Click">
+                        <Path Data="M 0,5 L 10,5" Width="10" Height="10" Stretch="None"
+                              Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.3"/>
+                    </Button>
+                    <Button Style="{StaticResource WindowButtonStyle}" ToolTip="{local:UiText common.close}"
+                            shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                            Click="CloseButton_Click">
+                        <Path Data="M 0,0 L 10,10 M 10,0 L 0,10" Width="10" Height="10" Stretch="None"
+                              Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.3"/>
+                    </Button>
+                </StackPanel>
+            </Grid>
+
+            <Border x:Name="HermesConnectionRecoveryPanel"
+                    AutomationProperties.AutomationId="HermesConnectionRecoveryPanel"
+                    AutomationProperties.LiveSetting="Polite"
+                    Grid.Row="1" Margin="16,8,16,0" Padding="12,9"
+                    Background="{DynamicResource PanelRaisedBrush}"
+                    BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1"
+                    CornerRadius="10" Visibility="Collapsed">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel>
+                        <TextBlock Text="{local:UiText chat.reconnect.title}" FontWeight="SemiBold"/>
+                        <TextBlock x:Name="HermesConnectionRecoveryStatusText"
+                                   AutomationProperties.AutomationId="HermesConnectionRecoveryStatusText"
+                                   TextWrapping="Wrap" Margin="0,4,12,0"
+                                   Foreground="{DynamicResource MutedBrush}"/>
+                        <TextBlock Text="{Binding ConnectionRecoveryBlockText}"
+                                   TextWrapping="Wrap" Margin="0,3,12,0"
+                                   Foreground="{DynamicResource WarningBrush}"/>
+                    </StackPanel>
+                    <Button x:Name="HermesConnectionRecoveryButton"
+                            AutomationProperties.AutomationId="HermesConnectionRecoveryButton"
+                            Grid.Column="1" VerticalAlignment="Center"
+                            Content="{local:UiText chat.reconnect.button}"
+                            Style="{StaticResource SecondaryButtonStyle}"
+                            Click="ConnectionRecoveryButton_Click"/>
+                </Grid>
+            </Border>
+
+            <Grid x:Name="HermesConnectedContent" Grid.Row="2">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="27*" MinWidth="230"/>
+                    <ColumnDefinition Width="5"/>
+                    <ColumnDefinition Width="68*" MinWidth="450"/>
+                    <ColumnDefinition Width="5"/>
+                    <ColumnDefinition Width="28*" MinWidth="240"/>
+                </Grid.ColumnDefinitions>
+
+                <Border Grid.Column="0"
+                        Background="{DynamicResource RailBrush}"
+                        BorderBrush="{DynamicResource BorderBrush}"
+                        BorderThickness="0,0,1,0"
+                        Padding="14">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+                        <Button x:Name="HermesNewSessionButton"
+                                AutomationProperties.AutomationId="HermesNewSessionButton"
+                                Content="{local:UiText chat.new}"
+                                Style="{StaticResource PrimaryButtonStyle}"
+                                IsEnabled="{Binding CanCreateTask}"
+                                HorizontalContentAlignment="Center"
+                                Click="NewSessionButton_Click"/>
+                        <TextBlock Grid.Row="1"
+                                   Text="{local:UiText ui.tasks.and.sessions}"
+                                   FontWeight="SemiBold"
+                                   Margin="2,16,0,7"/>
+                        <ListBox x:Name="HermesTaskList"
+                                 Grid.Row="2"
+                                 AutomationProperties.AutomationId="HermesTaskList"
+                                 Style="{StaticResource HermesListStyle}"
+                                 ItemContainerStyle="{StaticResource HermesTaskItemStyle}"
+                                 ItemsSource="{Binding Tasks}"
+                                 IsEnabled="{Binding CanOpenTaskMenu}"
+                                 ToolTip="{local:UiText chat.navigationHint}"
+                                 ToolTipService.ShowOnDisabled="True"
+                                 SelectedItem="{Binding SelectedTask, Mode=OneWay}"
+                                 PreviewMouseWheel="BoundedPixelScroll_PreviewMouseWheel"
+                                 SelectionChanged="TaskList_SelectionChanged">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel>
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Text="{Binding Title}"
+                                                       FontWeight="SemiBold"
+                                                       TextTrimming="CharacterEllipsis"/>
+                                            <TextBlock Grid.Column="1"
+                                                       Text="{Binding PinMark}"
+                                                       Margin="8,0,0,0"
+                                                       FontSize="11"
+                                                       Foreground="{DynamicResource AccentStrongBrush}"
+                                                       VerticalAlignment="Center"/>
+                                        </Grid>
+                                        <TextBlock Text="{Binding SessionDisplay}"
+                                                   Margin="0,5,0,0"
+                                                   FontSize="11"
+                                                   Foreground="{DynamicResource MutedBrush}"
+                                                   TextTrimming="CharacterEllipsis"/>
+                                        <TextBlock Text="{Binding StateText}"
+                                                   Margin="0,3,0,0"
+                                                   FontSize="11"
+                                                   Foreground="{DynamicResource AccentStrongBrush}"/>
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </Grid>
+                </Border>
+
+                <GridSplitter Grid.Column="1"
+                              Width="5"
+                              HorizontalAlignment="Stretch"
+                              Background="Transparent"/>
+
+                <Grid Grid.Column="2" Margin="16,14">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <Border Style="{StaticResource CardStyle}"
+                            Padding="16,13"
+                            CornerRadius="14">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <StackPanel>
+                                <TextBlock Text="{Binding SelectedTaskTitle}"
+                                           FontSize="18"
+                                           FontWeight="SemiBold"/>
+                                <TextBlock x:Name="HermesModelDisplay"
+                                           AutomationProperties.AutomationId="HermesModelDisplay"
+                                           Text="{Binding ModelDisplayName}"
+                                           Foreground="{DynamicResource AccentStrongBrush}"
+                                           Margin="0,4,0,0"/>
+                                <ComboBox x:Name="HermesModelSelector"
+                                          AutomationProperties.AutomationId="HermesModelSelector"
+                                          Style="{StaticResource DarkComboBoxStyle}"
+                                          ItemsSource="{Binding ModelOptions}"
+                                          SelectedItem="{Binding SelectedModelOption, Mode=TwoWay}"
+                                          DisplayMemberPath="DisplayName"
+                                          IsEnabled="{Binding CanSelectModel}"
+                                          SelectionChanged="ModelSelector_SelectionChanged"
+                                          Width="320"
+                                          HorizontalAlignment="Left"
+                                          Margin="0,8,0,0"/>
+                            </StackPanel>
+                            <Border Grid.Row="1"
+                                    Style="{StaticResource PillStyle}"
+                                    HorizontalAlignment="Left"
+                                    Margin="0,10,0,0">
+                                <TextBlock Text="{Binding StatusText}"
+                                           FontSize="11"
+                                           TextWrapping="Wrap"
+                                           Foreground="{DynamicResource GoodBrush}"/>
+                            </Border>
+                        </Grid>
+                    </Border>
+
+                    <Border Grid.Row="1"
+                            Style="{StaticResource CardStyle}"
+                            Margin="0,12"
+                            Padding="0">
+                        <Grid>
+                            <TextBlock Text="{Binding TimelinePlaceholderText}"
+                                       Visibility="{Binding IsTimelinePlaceholderVisible, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                       Foreground="{DynamicResource MutedBrush}"
+                                       HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"/>
+                            <ListBox x:Name="HermesTimeline"
+                                     AutomationProperties.AutomationId="HermesTimeline"
+                                     Style="{StaticResource HermesListStyle}"
+                                     ItemsSource="{Binding Turns}"
+                                     Visibility="{Binding IsTimelineScopeCurrent, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                     PreviewMouseWheel="BoundedPixelScroll_PreviewMouseWheel"
+                                     ScrollViewer.ScrollChanged="Timeline_ScrollChanged"
+                                     Padding="16,12">
+                                <ListBox.ItemContainerStyle>
+                                    <Style TargetType="ListBoxItem">
+                                        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                                        <Setter Property="Focusable" Value="False"/>
+                                        <Setter Property="Template">
+                                            <Setter.Value>
+                                                <ControlTemplate TargetType="ListBoxItem">
+                                                    <ContentPresenter/>
+                                                </ControlTemplate>
+                                            </Setter.Value>
+                                        </Setter>
+                                    </Style>
+                                </ListBox.ItemContainerStyle>
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <StackPanel Margin="0,5">
+                                            <!-- A turn always renders in semantic order. Late
+                                                 activity mutates this middle layer instead of
+                                                 appending below the assistant answer. -->
+                                            <ItemsControl ItemsSource="{Binding UserMessages}"
+                                                          Visibility="{Binding HasUserMessages, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <Border MaxWidth="640"
+                                                                HorizontalAlignment="Right"
+                                                                Margin="0,0,0,5"
+                                                                Padding="14,11"
+                                                                Background="{DynamicResource SelectedBrush}"
+                                                                BorderBrush="{DynamicResource BorderBrush}"
+                                                                BorderThickness="1"
+                                                                CornerRadius="15,15,4,15">
+                                                            <StackPanel>
+                                                                <Grid>
+                                                                    <Grid.ColumnDefinitions>
+                                                                        <ColumnDefinition Width="*"/>
+                                                                        <ColumnDefinition Width="Auto"/>
+                                                                    </Grid.ColumnDefinitions>
+                                                                    <TextBlock Text="{Binding Heading}"
+                                                                               FontSize="11"
+                                                                               FontWeight="SemiBold"
+                                                                               Foreground="{DynamicResource TextBrush}"/>
+                                                                    <TextBlock Grid.Column="1"
+                                                                               Text="{Binding TimeText}"
+                                                                               Margin="10,0,0,0"
+                                                                               FontSize="11"
+                                                                               Foreground="{DynamicResource MutedBrush}"/>
+                                                                </Grid>
+                                                                <TextBlock Text="{local:UiText workbench.clarification.answerLabel}"
+                                                                           Visibility="{Binding IsClarificationAnswer, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                                                           Foreground="{DynamicResource MutedBrush}" FontSize="11" Margin="0,5,0,0"/>
+                                                                <ItemsControl ItemsSource="{Binding Images}"
+                                                                              Visibility="{Binding HasImages, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                                                    <ItemsControl.ItemTemplate>
+                                                                        <DataTemplate>
+                                                                            <Button Click="SentImagePreview_Click" ToolTip="{local:UiText chat.image.view}"
+                                                                                    Style="{StaticResource SecondaryButtonStyle}" Padding="6" Margin="0,8,0,0"
+                                                                                    HorizontalAlignment="Right" AutomationProperties.AutomationId="HermesSentImagePreview">
+                                                                                <StackPanel Width="220">
+                                                                                    <Grid Height="160">
+                                                                                        <Border Background="{DynamicResource InputBrush}">
+                                                                                            <Image x:Name="HistoryImageThumbnail" Source="{Binding Converter={StaticResource HermesImagePreviewConverter}}" Stretch="Uniform"/>
+                                                                                        </Border>
+                                                                                        <TextBlock Text="{local:UiText chat.image.unavailable}" TextWrapping="Wrap"
+                                                                                                   Foreground="{DynamicResource MutedBrush}" VerticalAlignment="Center">
+                                                                                            <TextBlock.Style><Style TargetType="TextBlock">
+                                                                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                                                                                <Style.Triggers><DataTrigger Binding="{Binding Source, ElementName=HistoryImageThumbnail}" Value="{x:Null}">
+                                                                                                    <Setter Property="Visibility" Value="Visible"/>
+                                                                                                </DataTrigger></Style.Triggers>
+                                                                                            </Style></TextBlock.Style>
+                                                                                        </TextBlock>
+                                                                                    </Grid>
+                                                                                    <TextBlock Text="{Binding FileName}" TextTrimming="CharacterEllipsis" Margin="0,5,0,0" FontSize="11"/>
+                                                                                </StackPanel>
+                                                                            </Button>
+                                                                        </DataTemplate>
+                                                                    </ItemsControl.ItemTemplate>
+                                                                </ItemsControl>
+                                                                <TextBlock Text="{Binding ImageDisplayText}"
+                                                                           TextWrapping="Wrap"
+                                                                           Margin="0,6,0,0"/>
+                                                            </StackPanel>
+                                                        </Border>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+
+                                            <Expander Style="{StaticResource DarkDisclosureExpanderStyle}"
+                                                      HorizontalAlignment="Stretch"
+                                                      IsExpanded="{Binding IsActivityExpanded, Mode=TwoWay}"
+                                                      Visibility="{Binding HasActivity, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                                <Expander.Header>
+                                                    <Grid MinHeight="24">
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="*"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                        </Grid.ColumnDefinitions>
+                                                        <StackPanel Orientation="Horizontal"
+                                                                    VerticalAlignment="Center">
+                                                            <TextBlock Text="{Binding ActivitySummary}"
+                                                                       FontSize="11"
+                                                                       FontWeight="SemiBold"
+                                                                       Foreground="{DynamicResource AccentStrongBrush}"/>
+                                                            <TextBlock Text="{local:UiText ui.streaming}"
+                                                                       Visibility="{Binding IsActivityStreaming, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                                                       FontSize="11"
+                                                                       Foreground="{DynamicResource AccentStrongBrush}"/>
+                                                        </StackPanel>
+                                                        <TextBlock Grid.Column="1"
+                                                                   Text="{Binding ActivityTimeText}"
+                                                                   Margin="10,0,0,0"
+                                                                   FontSize="11"
+                                                                   Foreground="{DynamicResource MutedBrush}"
+                                                                   VerticalAlignment="Center"/>
+                                                    </Grid>
+                                                </Expander.Header>
+                                                <ItemsControl ItemsSource="{Binding ActivityRows}">
+                                                    <ItemsControl.ItemTemplate>
+                                                        <DataTemplate>
+                                                            <Grid Margin="0,5">
+                                                                <Grid.RowDefinitions>
+                                                                    <RowDefinition Height="Auto"/>
+                                                                    <RowDefinition Height="Auto"/>
+                                                                    <RowDefinition Height="Auto"/>
+                                                                </Grid.RowDefinitions>
+                                                                <Grid.ColumnDefinitions>
+                                                                    <ColumnDefinition Width="*"/>
+                                                                    <ColumnDefinition Width="Auto"/>
+                                                                </Grid.ColumnDefinitions>
+                                                                <TextBlock Text="{Binding Heading}"
+                                                                           FontSize="11"
+                                                                           FontWeight="SemiBold"
+                                                                           Foreground="{DynamicResource AccentStrongBrush}"/>
+                                                                <TextBlock Grid.Column="1"
+                                                                           Text="{Binding TimeText}"
+                                                                           Margin="10,0,0,0"
+                                                                           FontSize="11"
+                                                                           Foreground="{DynamicResource MutedBrush}"/>
+                                                                <TextBlock Grid.Row="1"
+                                                                           Grid.ColumnSpan="2"
+                                                                           Text="{Binding Text}"
+                                                                           TextWrapping="Wrap"
+                                                                           Margin="0,4,0,0"/>
+                                                                <TextBlock Grid.Row="2"
+                                                                           Grid.ColumnSpan="2"
+                                                                           Text="{Binding Detail}"
+                                                                           TextWrapping="Wrap"
+                                                                           Margin="0,4,0,0"
+                                                                           FontSize="11"
+                                                                           Foreground="{DynamicResource MutedBrush}"/>
+                                                            </Grid>
+                                                        </DataTemplate>
+                                                    </ItemsControl.ItemTemplate>
+                                                </ItemsControl>
+                                            </Expander>
+
+                                            <ItemsControl ItemsSource="{Binding AssistantMessages}"
+                                                          Visibility="{Binding HasAssistantMessages, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <Border MaxWidth="640"
+                                                                HorizontalAlignment="Left"
+                                                                Margin="0,5,0,0"
+                                                                Padding="14,11"
+                                                                Background="{DynamicResource PanelRaisedBrush}"
+                                                                BorderBrush="{DynamicResource BorderBrush}"
+                                                                BorderThickness="1"
+                                                                CornerRadius="15,15,15,4"
+                                                                Visibility="{Binding HasGeneratedImageDisplayContent, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                                            <StackPanel>
+                                                                <Grid>
+                                                                    <Grid.ColumnDefinitions>
+                                                                        <ColumnDefinition Width="*"/>
+                                                                        <ColumnDefinition Width="Auto"/>
+                                                                    </Grid.ColumnDefinitions>
+                                                                    <TextBlock Text="{Binding Heading}"
+                                                                               FontSize="11"
+                                                                               FontWeight="SemiBold"
+                                                                               Foreground="{DynamicResource AccentStrongBrush}"/>
+                                                                    <TextBlock Grid.Column="1"
+                                                                               Text="{Binding TimeText}"
+                                                                               Margin="10,0,0,0"
+                                                                               FontSize="11"
+                                                                               Foreground="{DynamicResource MutedBrush}"/>
+                                                                </Grid>
+                                                                <TextBlock Text="{Binding GeneratedImageDisplayText}"
+                                                                           TextWrapping="Wrap"
+                                                                           Margin="0,6,0,0"/>
+                                                                <TextBlock Text="{local:UiText ui.streaming.137}"
+                                                                           Visibility="{Binding IsStreaming, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                                                           Margin="0,5,0,0"
+                                                                           FontSize="11"
+                                                                           Foreground="{DynamicResource AccentStrongBrush}"/>
+                                                            </StackPanel>
+                                                        </Border>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+
+                                            <ItemsControl ItemsSource="{Binding GeneratedImages}"
+                                                          Visibility="{Binding HasGeneratedImages, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <StackPanel MaxWidth="640" HorizontalAlignment="Left" Margin="0,8,0,0">
+                                                            <Button Click="GeneratedImagePreview_Click" Unloaded="GeneratedImagePreview_Unloaded" ToolTip="{local:UiText chat.image.view}"
+                                                                    Padding="6" HorizontalAlignment="Left" IsEnabled="{Binding IsDelivered}"
+                                                                    AutomationProperties.AutomationId="HermesGeneratedImagePreview">
+                                                                <Button.Style><Style TargetType="Button" BasedOn="{StaticResource SecondaryButtonStyle}">
+                                                                    <Style.Triggers><DataTrigger Binding="{Binding IsFailed}" Value="True">
+                                                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                                                    </DataTrigger></Style.Triggers>
+                                                                </Style></Button.Style>
+                                                                <Grid Width="256" Height="190">
+                                                                    <Border Background="{DynamicResource InputBrush}">
+                                                                        <Image x:Name="GeneratedImageThumbnail" Loaded="GeneratedImage_Loaded"
+                                                                               Unloaded="GeneratedImage_Unloaded" Stretch="Uniform"/>
+                                                                    </Border>
+                                                                    <TextBlock Text="{local:UiText chat.image.generated.loading}" TextWrapping="Wrap"
+                                                                               Visibility="{Binding IsLoading, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                                                               Foreground="{DynamicResource MutedBrush}" VerticalAlignment="Center"/>
+                                                                </Grid>
+                                                            </Button>
+                                                            <Border Padding="12" CornerRadius="10" Background="{DynamicResource PanelRaisedBrush}"
+                                                                    Visibility="{Binding IsFailed, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                                                <StackPanel>
+                                                                    <TextBlock Text="{Binding FailureText}" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"/>
+                                                                    <TextBlock Text="{Binding FallbackPath}" TextWrapping="Wrap" Margin="0,6,0,0"
+                                                                               AutomationProperties.AutomationId="HermesGeneratedImageFallbackPath"/>
+                                                                </StackPanel>
+                                                            </Border>
+                                                        </StackPanel>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+
+                                            <ItemsControl ItemsSource="{Binding AudioAttachments}"
+                                                          Visibility="{Binding HasAudioAttachments, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <Border MaxWidth="640"
+                                                                HorizontalAlignment="Left"
+                                                                Margin="0,7,0,0"
+                                                                Padding="12,9"
+                                                                Background="{DynamicResource PanelRaisedBrush}"
+                                                                BorderBrush="{DynamicResource WindowBorderBrush}"
+                                                                BorderThickness="1"
+                                                                CornerRadius="11">
+                                                            <Grid>
+                                                                <Grid.ColumnDefinitions>
+                                                                    <ColumnDefinition Width="*"/>
+                                                                    <ColumnDefinition Width="Auto"/>
+                                                                    <ColumnDefinition Width="Auto"/>
+                                                                    <ColumnDefinition Width="Auto"/>
+                                                                </Grid.ColumnDefinitions>
+                                                                <StackPanel VerticalAlignment="Center">
+                                                                    <TextBlock Text="{Binding DisplayText}"
+                                                                               FontSize="11"
+                                                                               FontWeight="SemiBold"
+                                                                               TextTrimming="CharacterEllipsis"/>
+                                                                    <TextBlock Text="{local:UiText ui.generated.by.native.hermes.tts}"
+                                                                               Margin="0,3,0,0"
+                                                                               FontSize="11"
+                                                                               Foreground="{DynamicResource MutedBrush}"/>
+                                                                </StackPanel>
+                                                                <Button Grid.Column="1"
+                                                                        AutomationProperties.AutomationId="HermesAudioPlayButton"
+                                                                        Content="{local:UiText ui.play}"
+                                                                        Margin="12,0,0,0"
+                                                                        Padding="12,6"
+                                                                        Style="{StaticResource SecondaryButtonStyle}"
+                                                                        Click="PlayHermesAudioButton_Click"/>
+                                                                <Button Grid.Column="2"
+                                                                        AutomationProperties.AutomationId="HermesAudioStopButton"
+                                                                        Content="{local:UiText ui.stop}"
+                                                                        Margin="7,0,0,0"
+                                                                        Padding="12,6"
+                                                                        Style="{StaticResource SecondaryButtonStyle}"
+                                                                        Click="StopHermesAudioButton_Click"/>
+                                                                <Button Grid.Column="3"
+                                                                        AutomationProperties.AutomationId="HermesAudioSaveButton"
+                                                                        Content="{local:UiText ui.save.as}"
+                                                                        Margin="7,0,0,0"
+                                                                        Padding="12,6"
+                                                                        Style="{StaticResource SecondaryButtonStyle}"
+                                                                        Click="SaveHermesAudioButton_Click"/>
+                                                            </Grid>
+                                                        </Border>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                        </Grid>
+                    </Border>
+
+                    <Border Grid.Row="2"
+                            x:Name="HermesNativeApprovalCard"
+                            AutomationProperties.AutomationId="HermesNativeApprovalCard"
+                            AutomationProperties.LiveSetting="Assertive"
+                            Margin="0,0,0,10"
+                            Padding="12"
+                            Background="{DynamicResource WarningSurfaceBrush}"
+                            BorderBrush="{DynamicResource BorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="12"
+                            Visibility="{Binding HasApprovalAttention, Converter={StaticResource BooleanToVisibilityConverter}}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Margin="0,0,14,0">
+                                <TextBlock Text="{local:UiText ui.your.permission}"
+                                           FontSize="11"
+                                           FontWeight="SemiBold"
+                                           Foreground="{DynamicResource AccentStrongBrush}"/>
+                                 <TextBlock Text="{Binding ApprovalSummaryText}"
+                                           TextWrapping="Wrap"
+                                           Margin="0,5,0,0"/>
+                                <TextBlock Text="{Binding ApprovalDescriptionText}"
+                                           Visibility="{Binding HasApprovalDescription, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                           TextWrapping="Wrap"
+                                           Margin="0,5,0,0"/>
+                                <Expander Header="{local:UiText ui.view.the.command.to.be.executed}"
+                                          Style="{StaticResource DarkDisclosureExpanderStyle}"
+                                          Visibility="{Binding HasApprovalCommand, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                          Margin="0,6,0,0"
+                                          Foreground="{DynamicResource MutedBrush}">
+                                    <TextBox Text="{Binding ApprovalCommandText, Mode=OneWay}"
+                                             IsReadOnly="True"
+                                             TextWrapping="Wrap"
+                                             MaxHeight="110"
+                                             VerticalScrollBarVisibility="Auto"
+                                             Margin="0,5,0,0"
+                                             Padding="8"
+                                             Background="{DynamicResource DisabledBrush}"
+                                             Foreground="{DynamicResource TextBrush}"/>
+                                </Expander>
+                                <TextBlock Text="{Binding ApprovalScopeWarningText}"
+                                           Visibility="{Binding HasApprovalScopeWarning, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                           TextWrapping="Wrap"
+                                           FontSize="11"
+                                           Foreground="{DynamicResource WarningBrush}"
+                                           Margin="0,5,0,0"/>
+                                <TextBlock Text="{Binding ApprovalStatusText}"
+                                           TextWrapping="Wrap"
+                                           FontSize="11"
+                                           Foreground="{DynamicResource MutedBrush}"
+                                           Margin="0,4,0,0"/>
+                            </StackPanel>
+                            <UniformGrid Grid.Column="1" Columns="2" VerticalAlignment="Center">
+                                <Button x:Name="HermesApprovalDenyButton"
+                                        AutomationProperties.AutomationId="HermesApprovalDenyButton"
+                                        Content="{local:UiText ui.deny}"
+                                        Style="{StaticResource SecondaryButtonStyle}"
+                                        IsEnabled="{Binding CanRespondApproval}"
+                                        Visibility="{Binding HasApprovalDeny, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                        Margin="0,0,4,4"
+                                        Click="ApprovalDenyButton_Click"/>
+                                <Button x:Name="HermesApprovalAllowOnceButton"
+                                        AutomationProperties.AutomationId="HermesApprovalAllowOnceButton"
+                                        Content="{local:UiText ui.allow.once}"
+                                        Style="{StaticResource PrimaryButtonStyle}"
+                                        IsEnabled="{Binding CanRespondApproval}"
+                                        Visibility="{Binding HasApprovalAllowOnce, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                        Margin="4,0,0,4"
+                                        Click="ApprovalAllowOnceButton_Click"/>
+                                <Button x:Name="HermesApprovalAllowSessionButton"
+                                        AutomationProperties.AutomationId="HermesApprovalAllowSessionButton"
+                                        Content="{local:UiText ui.allow.this.session}"
+                                        Style="{StaticResource SecondaryButtonStyle}"
+                                        IsEnabled="{Binding CanRespondApproval}"
+                                        Visibility="{Binding HasApprovalAllowSession, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                        Margin="0,4,4,0"
+                                        Click="ApprovalAllowSessionButton_Click"/>
+                                <Button x:Name="HermesApprovalAllowAlwaysButton"
+                                        AutomationProperties.AutomationId="HermesApprovalAllowAlwaysButton"
+                                        Content="{local:UiText ui.always.permit}"
+                                        Style="{StaticResource SecondaryButtonStyle}"
+                                        IsEnabled="{Binding CanRespondApproval}"
+                                        Visibility="{Binding HasApprovalAllowAlways, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                        Margin="4,4,0,0"
+                                        Click="ApprovalAllowAlwaysButton_Click"/>
+                            </UniformGrid>
+                        </Grid>
+                    </Border>
+
+                    <Border Grid.Row="2"
+                            x:Name="HermesClarificationCard"
+                            AutomationProperties.AutomationId="HermesClarificationCard"
+                            AutomationProperties.LiveSetting="Assertive"
+                            Margin="0,0,0,10"
+                            Padding="12"
+                            Background="{DynamicResource PanelRaisedBrush}"
+                            BorderBrush="{DynamicResource BorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="12"
+                            Visibility="{Binding HasPendingClarification, Converter={StaticResource BooleanToVisibilityConverter}}">
+                        <StackPanel>
+                            <TextBlock Text="{local:UiText ui.lilith.would.like.to.clarify}"
+                                       FontSize="11"
+                                       FontWeight="SemiBold"
+                                       Foreground="{DynamicResource AccentStrongBrush}"/>
+                            <TextBlock Text="{Binding ClarificationPrompt}"
+                                       TextWrapping="Wrap"
+                                       Margin="0,5,0,0"/>
+                            <ItemsControl ItemsSource="{Binding ClarificationChoices}"
+                                          Visibility="{Binding IsClarificationSingleSelect, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                          Margin="0,8,0,0">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Button Content="{Binding Text}"
+                                                Tag="{Binding Text}"
+                                                IsEnabled="{Binding DataContext.CanRespondClarification, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                                Style="{StaticResource SecondaryButtonStyle}"
+                                                Margin="0,0,6,6"
+                                                Click="ClarificationChoiceButton_Click"/>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                            <StackPanel Visibility="{Binding IsClarificationMultiSelect, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                        Margin="0,8,0,0">
+                                <ItemsControl ItemsSource="{Binding ClarificationChoices}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <CheckBox Content="{Binding Text}"
+                                                      IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                                      Margin="0,0,0,5"/>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                                <Button Content="{local:UiText ui.submit.selected.options}"
+                                        HorizontalAlignment="Left"
+                                        Style="{StaticResource PrimaryButtonStyle}"
+                                        IsEnabled="{Binding CanSubmitClarificationSelection}"
+                                        Click="ClarificationMultiSubmitButton_Click"/>
+                            </StackPanel>
+                            <TextBlock Text="{local:UiText ui.you.can.also.type.a.response.below}"
+                                       FontSize="11"
+                                       Foreground="{DynamicResource MutedBrush}"
+                                       Margin="0,5,0,0"/>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Grid.Row="2"
+                            x:Name="HermesSecureInputCard"
+                            AutomationProperties.AutomationId="HermesSecureInputCard"
+                            AutomationProperties.LiveSetting="Assertive"
+                            Margin="0,0,0,10"
+                            Padding="12"
+                            Background="{DynamicResource DangerSurfaceBrush}"
+                            BorderBrush="{DynamicResource DangerBrush}"
+                            BorderThickness="1"
+                            CornerRadius="12"
+                            Visibility="{Binding HasPendingSecureInput, Converter={StaticResource BooleanToVisibilityConverter}}">
+                        <StackPanel>
+                            <TextBlock Text="{Binding SecureInputTitle}"
+                                       FontSize="11"
+                                       FontWeight="SemiBold"
+                                       Foreground="{DynamicResource DangerBrush}"/>
+                            <TextBlock Text="{Binding SecureInputPrompt}"
+                                       TextWrapping="Wrap"
+                                       Margin="0,5,0,0"/>
+                            <TextBlock Text="{Binding SecureInputEnvironmentVariable}"
+                                       Visibility="{Binding HasSecureInputEnvironmentVariable, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                       FontSize="11"
+                                       Foreground="{DynamicResource MutedBrush}"
+                                       Margin="0,3,0,0"/>
+                            <PasswordBox x:Name="HermesSecureInputPasswordBox"
+                                         AutomationProperties.AutomationId="HermesSecureInputPasswordBox"
+                                         IsEnabled="{Binding CanRespondSecureInput}"
+                                         Margin="0,8,0,0"
+                                         Padding="9,7"
+                                         Background="{DynamicResource DisabledBrush}"
+                                         Foreground="{DynamicResource TextBrush}"
+                                         BorderBrush="{DynamicResource BorderBrush}"/>
+                            <TextBlock Text="{local:UiText ui.sent.directly.to.hermes.without.adding.the.content.to}"
+                                       FontSize="11"
+                                       Foreground="{DynamicResource MutedBrush}"
+                                       Margin="0,5,0,0"/>
+                            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                <Button Content="{local:UiText ui.cancel}"
+                                        Style="{StaticResource SecondaryButtonStyle}"
+                                        IsEnabled="{Binding CanRespondSecureInput}"
+                                        Click="SecureInputCancelButton_Click"/>
+                                <Button Content="{local:UiText ui.submit.securely}"
+                                        Margin="8,0,0,0"
+                                        Style="{StaticResource PrimaryButtonStyle}"
+                                        IsEnabled="{Binding CanRespondSecureInput}"
+                                        Click="SecureInputSubmitButton_Click"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Grid.Row="3" x:Name="HermesComposerCard"
+                            AutomationProperties.AutomationId="HermesComposerCard"
+                            Style="{StaticResource CardStyle}" Padding="12" CornerRadius="14">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <TextBox x:Name="HermesMessageInput"
+                                     AutomationProperties.AutomationId="HermesMessageInput"
+                                     Text="{Binding DraftText, UpdateSourceTrigger=PropertyChanged}"
+                                     IsReadOnly="{Binding IsFaultRecoveryDraftBlockingCurrentTask}"
+                                     AcceptsReturn="True"
+                                     TextWrapping="Wrap"
+                                     MinHeight="72"
+                                     MaxHeight="150"
+                                     VerticalScrollBarVisibility="Auto"
+                                     Padding="12,10"
+                                     Foreground="{DynamicResource TextBrush}"
+                                     Background="{DynamicResource DisabledBrush}"
+                                     BorderBrush="{DynamicResource BorderBrush}"
+                                     BorderThickness="1"
+                                     AllowDrop="True"
+                                     PreviewDragOver="ImageComposer_PreviewDragOver"
+                                     PreviewDrop="ImageComposer_Drop"
+                                     KeyDown="MessageInput_KeyDown"/>
+                            <Border Grid.Row="1"
+                                        Margin="0,8,0,0"
+                                        Padding="7"
+                                        Background="{DynamicResource PanelRaisedBrush}"
+                                        BorderBrush="{DynamicResource BorderBrush}"
+                                        BorderThickness="1"
+                                        CornerRadius="9"
+                                        Visibility="{Binding HasPendingImage, Converter={StaticResource BooleanToVisibilityConverter}}">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="112"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Button AutomationProperties.AutomationId="HermesPendingImagePreview"
+                                                Width="112" Height="100" Padding="0"
+                                                Style="{StaticResource SecondaryButtonStyle}"
+                                                Click="PendingImagePreview_Click"
+                                                ToolTip="{local:UiText chat.image.view}"
+                                                Background="{DynamicResource InputBrush}"
+                                                BorderBrush="{DynamicResource WindowBorderBrush}"
+                                                BorderThickness="1"
+                                                ClipToBounds="True">
+                                            <Grid>
+                                                <TextBlock Text="{Binding PendingImage.PreviewLabel}"
+                                                           HorizontalAlignment="Center"
+                                                           VerticalAlignment="Center"
+                                                           Foreground="{DynamicResource MutedBrush}"
+                                                           FontSize="11"/>
+                                                <Image Source="{Binding PendingImage.Preview}"
+                                                       Stretch="Uniform"/>
+                                            </Grid>
+                                        </Button>
+                                        <StackPanel Grid.Column="1"
+                                                    Margin="9,0,8,0"
+                                                    VerticalAlignment="Center">
+                                            <TextBlock AutomationProperties.AutomationId="HermesPendingImageName"
+                                                       Text="{Binding PendingImage.FileName}"
+                                                       FontWeight="SemiBold"
+                                                       TextTrimming="CharacterEllipsis"/>
+                                            <TextBlock Text="{Binding PendingImage.Detail}"
+                                                       Margin="0,3,0,0"
+                                                       FontSize="11"
+                                                       Foreground="{DynamicResource MutedBrush}"/>
+                                        </StackPanel>
+                                        <Button x:Name="HermesRemoveImageButton"
+                                                Grid.Column="2"
+                                                AutomationProperties.AutomationId="HermesRemoveImageButton"
+                                                Content="×"
+                                                Padding="7,2"
+                                                VerticalAlignment="Center"
+                                                Style="{StaticResource SecondaryButtonStyle}"
+                                                IsEnabled="{Binding CanRemoveImage}"
+                                                Click="RemoveImageButton_Click"/>
+                                    </Grid>
+                                </Border>
+                            <Grid x:Name="HermesComposerActionBar" Grid.Row="2" Margin="0,8,0,0"
+                                       AutomationProperties.AutomationId="HermesComposerActionBar">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <WrapPanel>
+                                    <Button x:Name="HermesAddImageButton"
+                                        AutomationProperties.AutomationId="HermesAddImageButton"
+                                        Content="{local:UiText ui.add.image}"
+                                        Style="{StaticResource ComposerToolButtonStyle}"
+                                        IsEnabled="{Binding CanAddImage}"
+                                        Click="AddImageButton_Click"/>
+                                    <Button x:Name="HermesChatApprovalModeButton"
+                                        AutomationProperties.AutomationId="HermesChatApprovalModeButton"
+                                        Content="{Binding ChatApprovalModeText}"
+                                        IsEnabled="{Binding CanChangeChatApprovalMode}"
+                                        Style="{StaticResource ComposerToolButtonStyle}"
+                                        ToolTip="{local:UiText ui.shares.native.approval.settings.with.control.center.cannot.change}"
+                                        Click="ChatApprovalMenu_Click">
+                                    <Button.ContextMenu>
+                                        <ContextMenu Style="{StaticResource DarkContextMenuStyle}">
+                                            <MenuItem Header="{local:UiText ui.ask.for.approval}" Tag="manual"
+                                                      AutomationProperties.AutomationId="HermesApprovalModeManual"
+                                                      IsEnabled="{Binding CanChangeChatApprovalMode}"
+                                                      IsCheckable="True" IsChecked="{Binding IsChatApprovalManual, Mode=OneWay}"
+                                                      ToolTip="{local:UiText ui.asks.when.native.safety.checks.require.approval.harmless.operations}"
+                                                      Style="{StaticResource DarkMenuItemStyle}" Click="ChatApprovalMode_Click"/>
+                                            <MenuItem Header="{local:UiText ui.approve.for.me}" Tag="smart"
+                                                      AutomationProperties.AutomationId="HermesApprovalModeSmart"
+                                                      IsEnabled="{Binding CanChangeChatApprovalMode}"
+                                                      IsCheckable="True" IsChecked="{Binding IsChatApprovalSmart, Mode=OneWay}"
+                                                      ToolTip="{local:UiText ui.hermes.evaluates.risk.low.risk.operations.may.proceed.automatically}"
+                                                      Style="{StaticResource DarkMenuItemStyle}" Click="ChatApprovalMode_Click"/>
+                                            <MenuItem Header="{local:UiText ui.full.access}" Tag="off"
+                                                      AutomationProperties.AutomationId="HermesApprovalModeOff"
+                                                      IsEnabled="{Binding CanChangeChatApprovalMode}"
+                                                      IsCheckable="True" IsChecked="{Binding IsChatApprovalOff, Mode=OneWay}"
+                                                      ToolTip="{local:UiText ui.enabled.tools.no.longer.prompt.for.each.operation.native}"
+                                                      Foreground="{DynamicResource WarningBrush}"
+                                                      Style="{StaticResource DarkMenuItemStyle}" Click="ChatApprovalMode_Click"/>
+                                        </ContextMenu>
+                                    </Button.ContextMenu>
+                                </Button>
+                                    <Button x:Name="HermesPushToTalkButton"
+                                         AutomationProperties.AutomationId="HermesPushToTalkButton"
+                                         AutomationProperties.Name="{local:UiText ui.repair.44}"
+                                         Content="{local:UiText ui.hold.to.speak}"
+                                         ToolTip="{local:UiText ui.hold.the.left.mouse.button.or.space.to.speak}"
+                                         Style="{StaticResource ComposerToolButtonStyle}"
+                                         IsEnabled="{Binding CanUsePushToTalk}"
+                                         PreviewMouseLeftButtonDown="PushToTalkButton_PreviewMouseLeftButtonDown"
+                                         PreviewMouseLeftButtonUp="PushToTalkButton_PreviewMouseLeftButtonUp"
+                                         LostMouseCapture="PushToTalkButton_LostMouseCapture"
+                                         PreviewKeyDown="PushToTalkButton_PreviewKeyDown"
+                                         PreviewKeyUp="PushToTalkButton_PreviewKeyUp"
+                                         LostKeyboardFocus="PushToTalkButton_LostKeyboardFocus"/>
+                                    <Button x:Name="HermesCompressButton"
+                                         AutomationProperties.AutomationId="HermesCompressButton"
+                                         Content="{local:UiText ui.compress.context}"
+                                         Style="{StaticResource ComposerToolButtonStyle}"
+                                         IsEnabled="{Binding CanCompress}"
+                                         Click="CompressButton_Click"/>
+                                    <Button x:Name="HermesStopButton"
+                                         AutomationProperties.AutomationId="HermesStopButton"
+                                        Content="{local:UiText ui.stop}"
+                                        Style="{StaticResource ComposerToolButtonStyle}"
+                                        IsEnabled="{Binding CanStop}"
+                                        Click="StopButton_Click"/>
+                                    <Button x:Name="HermesDiscardFaultRecoveryDraftButton"
+                                        AutomationProperties.AutomationId="HermesDiscardFaultRecoveryDraftButton"
+                                        Content="{local:UiText ui.discard.recovered.draft}"
+                                        Style="{StaticResource ComposerToolButtonStyle}"
+                                        IsEnabled="{Binding CanDiscardFaultRecoveryDraft}"
+                                        Visibility="{Binding IsFaultRecoveryDraftPending, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                        Click="DiscardFaultRecoveryDraftButton_Click"/>
+                                </WrapPanel>
+                                <Button x:Name="HermesSendButton" Grid.Column="1"
+                                        AutomationProperties.AutomationId="HermesSendButton"
+                                        Content="{local:UiText chat.send}"
+                                        Style="{StaticResource ComposerSendButtonStyle}"
+                                        VerticalAlignment="Top" Margin="8,0,0,6"
+                                        IsEnabled="{Binding CanSend}"
+                                        Click="SendButton_Click"/>
+                            </Grid>
+                            <Grid x:Name="HermesComposerStatusBar" Grid.Row="3" Margin="0,2,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="{local:UiText ui.ctrl.enter.to.send.messages.are.projected.from.the}"
+                                               FontSize="11"
+                                               TextWrapping="Wrap"
+                                               Foreground="{DynamicResource MutedBrush}"/>
+                                <TextBlock Grid.Column="1" AutomationProperties.AutomationId="HermesVoiceStatus"
+                                               Text="{Binding VoiceStatusText}"
+                                               Margin="12,0,0,0" TextAlignment="Right"
+                                               FontSize="11"
+                                               TextWrapping="Wrap"
+                                               Foreground="{DynamicResource AccentStrongBrush}"/>
+                            </Grid>
+                        </Grid>
+                    </Border>
+                </Grid>
+                <GridSplitter Grid.Column="3"
+                              Width="5"
+                              HorizontalAlignment="Stretch"
+                              Background="Transparent"/>
+
+                <Border Grid.Column="4"
+                        Background="{DynamicResource RailBrush}"
+                        BorderBrush="{DynamicResource BorderBrush}"
+                        BorderThickness="1,0,0,0"
+                        Padding="14">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel>
+                        <TextBlock Text="{local:UiText ui.runtime.projection}"
+                                   FontSize="16"
+                                   FontWeight="SemiBold"/>
+
+                        <Border x:Name="HermesNativeToolsAttention"
+                                AutomationProperties.AutomationId="HermesNativeToolsAttention"
+                                Margin="0,14,0,0"
+                                Padding="11"
+                                Background="{DynamicResource SuccessSurfaceBrush}"
+                                BorderBrush="{DynamicResource GoodBrush}"
+                                BorderThickness="1"
+                                CornerRadius="12"
+                                Visibility="{Binding HasNativeToolsAttention, Converter={StaticResource BooleanToVisibilityConverter}}">
+                            <StackPanel>
+                                <TextBlock Text="{local:UiText ui.tools.and.approvals.need.attention}"
+                                           FontSize="11"
+                                           FontWeight="SemiBold"
+                                           Foreground="{DynamicResource GoodBrush}"/>
+                                <TextBlock Text="{Binding NativeToolsActivationText}"
+                                           TextWrapping="Wrap"
+                                           FontSize="11"
+                                           Foreground="{DynamicResource MutedBrush}"
+                                           Margin="0,5,0,0"/>
+                                <Button Content="{local:UiText ui.manage.in.control.center}"
+                                        Style="{StaticResource SecondaryButtonStyle}"
+                                        HorizontalAlignment="Left"
+                                        Padding="9,5"
+                                        Margin="0,8,0,0"
+                                        Click="OpenNativeToolsSettingsButton_Click"/>
+                            </StackPanel>
+                        </Border>
+                         <Border x:Name="HermesDelegationPanel"
+                                 AutomationProperties.AutomationId="HermesDelegationPanel"
+                                 Margin="0,10,0,0"
+                                 Padding="12"
+                                 Background="{DynamicResource PanelBrush}"
+                                 BorderBrush="{DynamicResource BorderBrush}"
+                                 BorderThickness="1"
+                                 CornerRadius="12">
+                             <StackPanel>
+                                 <Grid>
+                                     <Grid.ColumnDefinitions>
+                                         <ColumnDefinition Width="*"/>
+                                         <ColumnDefinition Width="Auto"/>
+                                     </Grid.ColumnDefinitions>
+                                     <TextBlock Text="{local:UiText ui.delegated.tasks}"
+                                                FontSize="11"
+                                                FontWeight="SemiBold"
+                                                Foreground="{DynamicResource AccentStrongBrush}"
+                                                VerticalAlignment="Center"/>
+                                     <Button Grid.Column="1"
+                                             x:Name="HermesDelegationRefreshButton"
+                                             AutomationProperties.AutomationId="HermesDelegationRefreshButton"
+                                             Content="{local:UiText ui.refresh}"
+                                             Style="{StaticResource SecondaryButtonStyle}"
+                                             IsEnabled="{Binding CanRefreshDelegation}"
+                                             Padding="8,4"
+                                             Click="DelegationRefreshButton_Click"/>
+                                 </Grid>
+                                 <TextBlock Text="{Binding DelegationStatusText}"
+                                            TextWrapping="Wrap"
+                                            FontSize="11"
+                                            Foreground="{DynamicResource MutedBrush}"
+                                            Margin="0,7,0,0"/>
+                                 <TextBlock Text="{local:UiText ui.no.delegated.tasks.to.display}"
+                                            TextWrapping="Wrap"
+                                            Margin="0,8,0,0"
+                                            Visibility="{Binding IsDelegationEmpty, Converter={StaticResource BooleanToVisibilityConverter}}"/>
+                                 <ItemsControl x:Name="HermesSubagentList"
+                                               AutomationProperties.AutomationId="HermesSubagentList"
+                                               ItemsSource="{Binding Subagents}"
+                                               Margin="0,4,0,0">
+                                     <ItemsControl.ItemTemplate>
+                                         <DataTemplate>
+                                             <Border Margin="0,6,0,0"
+                                                     Padding="10"
+                                                     Background="{DynamicResource PanelRaisedBrush}"
+                                                     BorderBrush="{DynamicResource BorderBrush}"
+                                                     BorderThickness="1"
+                                                     CornerRadius="10">
+                                                 <StackPanel>
+                                                     <TextBlock Text="{local:UiText ui.delegated.tasks}"
+                                                                FontSize="11"
+                                                                FontWeight="SemiBold"
+                                                                Foreground="{DynamicResource AccentStrongBrush}"/>
+                                                     <TextBlock Text="{Binding Goal}"
+                                                                TextWrapping="Wrap"
+                                                                Margin="0,5,0,0"/>
+                                                     <Grid Margin="0,7,0,0">
+                                                         <Grid.ColumnDefinitions>
+                                                             <ColumnDefinition Width="*"/>
+                                                             <ColumnDefinition Width="Auto"/>
+                                                         </Grid.ColumnDefinitions>
+                                                         <TextBlock Text="{Binding StatusText}"
+                                                                    FontSize="11"
+                                                                    Foreground="{DynamicResource GoodBrush}"/>
+                                                         <TextBlock Grid.Column="1"
+                                                                    Text="{Binding DurationText}"
+                                                                    FontSize="11"
+                                                                    Foreground="{DynamicResource MutedBrush}"/>
+                                                     </Grid>
+                                                     <TextBlock AutomationProperties.AutomationId="HermesSubagentToolsets"
+                                                                Text="{Binding ToolsetsText}"
+                                                                TextWrapping="Wrap"
+                                                                FontSize="11"
+                                                                Foreground="{DynamicResource MutedBrush}"
+                                                                Margin="0,7,0,0"/>
+                                                     <TextBox AutomationProperties.AutomationId="HermesSubagentSteerInput"
+                                                              Text="{Binding SteerText, UpdateSourceTrigger=PropertyChanged}"
+                                                              IsEnabled="{Binding CanEdit}"
+                                                              AcceptsReturn="True"
+                                                              TextWrapping="Wrap"
+                                                              MinHeight="50"
+                                                              MaxHeight="100"
+                                                              VerticalScrollBarVisibility="Auto"
+                                                              Padding="8,6"
+                                                              Foreground="{DynamicResource TextBrush}"
+                                                              Background="{DynamicResource DisabledBrush}"
+                                                              BorderBrush="{DynamicResource BorderBrush}"
+                                                              BorderThickness="1"
+                                                              Margin="0,9,0,0"/>
+                                                     <Grid Margin="0,8,0,0">
+                                                         <Grid.ColumnDefinitions>
+                                                             <ColumnDefinition Width="*"/>
+                                                             <ColumnDefinition Width="8"/>
+                                                             <ColumnDefinition Width="Auto"/>
+                                                         </Grid.ColumnDefinitions>
+                                                         <Button AutomationProperties.AutomationId="HermesSubagentSteerButton"
+                                                                 Content="{local:UiText ui.add.guidance}"
+                                                                 Style="{StaticResource SecondaryButtonStyle}"
+                                                                 IsEnabled="{Binding CanSteer}"
+                                                                 Click="SubagentSteerButton_Click"/>
+                                                         <Button Grid.Column="2"
+                                                                 AutomationProperties.AutomationId="HermesSubagentInterruptButton"
+                                                                 Content="{local:UiText ui.stop}"
+                                                                 Style="{StaticResource SecondaryButtonStyle}"
+                                                                 IsEnabled="{Binding CanInterrupt}"
+                                                                 Click="SubagentInterruptButton_Click"/>
+                                                     </Grid>
+                                                 </StackPanel>
+                                             </Border>
+                                         </DataTemplate>
+                                     </ItemsControl.ItemTemplate>
+                                 </ItemsControl>
+                             </StackPanel>
+                         </Border>
+
+                         <Border x:Name="HermesCompressionStatus"
+                                 AutomationProperties.AutomationId="HermesCompressionStatus"
+                                 Margin="0,10,0,0"
+                                 Padding="12"
+                                 Background="{DynamicResource PanelBrush}"
+                                 BorderBrush="{DynamicResource BorderBrush}"
+                                 BorderThickness="1"
+                                 CornerRadius="12">
+                             <StackPanel>
+                                 <TextBlock Text="{local:UiText ui.native.context.compression}"
+                                            FontSize="11"
+                                            Foreground="{DynamicResource MutedBrush}"/>
+                                 <TextBlock Text="{Binding CompressionStatusText}"
+                                            TextWrapping="Wrap"
+                                            Margin="0,5,0,0"/>
+                                 <TextBlock Text="{local:UiText ui.message.token.counts.come.only.from.session.compress.responses}"
+                                            TextWrapping="Wrap"
+                                            FontSize="11"
+                                            Foreground="{DynamicResource MutedBrush}"
+                                            Margin="0,8,0,0"/>
+                              </StackPanel>
+                          </Border>
+
+                          <Expander x:Name="HermesRollbackPanel"
+                                    Style="{StaticResource DarkDisclosureExpanderStyle}"
+                                    AutomationProperties.AutomationId="HermesRollbackPanel"
+                                    Header="{local:UiText ui.workspace.checkpoints}"
+                                    IsExpanded="False"
+                                    Margin="0,10,0,0">
+                              <Border Padding="12"
+                                      Background="{DynamicResource PanelBrush}"
+                                      BorderBrush="{DynamicResource BorderBrush}"
+                                      BorderThickness="1"
+                                      CornerRadius="12">
+                                  <StackPanel>
+                                      <Button x:Name="HermesRollbackRefreshButton"
+                                              AutomationProperties.AutomationId="HermesRollbackRefreshButton"
+                                              Content="{local:UiText ui.load.checkpoints}"
+                                              Style="{StaticResource SecondaryButtonStyle}"
+                                              IsEnabled="{Binding CanRefreshRollback}"
+                                              HorizontalAlignment="Stretch"
+                                              Click="RollbackRefreshButton_Click"/>
+                                      <TextBlock x:Name="HermesRollbackStatus"
+                                                 AutomationProperties.AutomationId="HermesRollbackStatus"
+                                                 Text="{Binding RollbackStatusText}"
+                                                 TextWrapping="Wrap"
+                                                 FontSize="11"
+                                                 Foreground="{DynamicResource MutedBrush}"
+                                                 Margin="0,8,0,0"/>
+                                      <ComboBox x:Name="HermesRollbackCheckpointSelector"
+                                                AutomationProperties.AutomationId="HermesRollbackCheckpointSelector"
+                                      ItemsSource="{Binding RollbackCheckpoints}"
+                                      Style="{StaticResource DarkComboBoxStyle}"
+                                                SelectedItem="{Binding SelectedRollbackCheckpoint, Mode=TwoWay}"
+                                                DisplayMemberPath="DisplayText"
+                                                IsEnabled="{Binding CanSelectRollbackCheckpoint}"
+                                                Margin="0,10,0,0"/>
+                                      <Button x:Name="HermesRollbackDiffButton"
+                                              AutomationProperties.AutomationId="HermesRollbackDiffButton"
+                                              Content="{local:UiText ui.preview.full.workspace.changes}"
+                                              Style="{StaticResource SecondaryButtonStyle}"
+                                              IsEnabled="{Binding CanGetRollbackDiff}"
+                                              HorizontalAlignment="Stretch"
+                                              Margin="0,8,0,0"
+                                              Click="RollbackDiffButton_Click"/>
+                                      <TextBox x:Name="HermesRollbackDiffText"
+                                               AutomationProperties.AutomationId="HermesRollbackDiffText"
+                                               Text="{Binding RollbackDiffText, Mode=OneWay}"
+                                               IsReadOnly="True"
+                                               AcceptsReturn="True"
+                                               TextWrapping="NoWrap"
+                                               MinHeight="72"
+                                               MaxHeight="240"
+                                               VerticalScrollBarVisibility="Auto"
+                                               HorizontalScrollBarVisibility="Auto"
+                                               Padding="8,6"
+                                               Foreground="{DynamicResource TextBrush}"
+                                               Background="{DynamicResource DisabledBrush}"
+                                               BorderBrush="{DynamicResource BorderBrush}"
+                                               BorderThickness="1"
+                                               Margin="0,8,0,0"/>
+                                      <Button x:Name="HermesRollbackRestoreButton"
+                                              AutomationProperties.AutomationId="HermesRollbackRestoreButton"
+                                              Content="{local:UiText ui.restore.entire.workspace}"
+                                              Style="{StaticResource PrimaryButtonStyle}"
+                                              IsEnabled="{Binding CanRestoreRollback}"
+                                              HorizontalAlignment="Stretch"
+                                              Margin="0,8,0,0"
+                                              Click="RollbackRestoreButton_Click"/>
+                                  </StackPanel>
+                              </Border>
+                          </Expander>
+
+                          <Border Margin="0,10,0,0"
+                                 Padding="12"
+                                Background="{DynamicResource PanelBrush}"
+                                BorderBrush="{DynamicResource BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="12">
+                            <StackPanel>
+                                <TextBlock Text="{local:UiText ui.current.model}"
+                                           FontSize="11"
+                                           Foreground="{DynamicResource MutedBrush}"/>
+                                <TextBlock Text="{Binding ModelDisplayName}"
+                                           TextWrapping="Wrap"
+                                           Margin="0,4,0,0"/>
+                            </StackPanel>
+                        </Border>
+
+                        <Border x:Name="HermesNativeObservability"
+                                AutomationProperties.AutomationId="HermesNativeObservability"
+                                Margin="0,10,0,0"
+                                Padding="12"
+                                Background="{DynamicResource PanelBrush}"
+                                BorderBrush="{DynamicResource BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="12">
+                            <StackPanel>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="{local:UiText ui.native.runtime.observations}"
+                                               FontSize="11"
+                                               Foreground="{DynamicResource MutedBrush}"
+                                               VerticalAlignment="Center"/>
+                                    <Button Grid.Column="1"
+                                            x:Name="HermesObservabilityRefreshButton"
+                                            AutomationProperties.AutomationId="HermesObservabilityRefreshButton"
+                                            Content="{local:UiText ui.refresh}"
+                                            Style="{StaticResource SecondaryButtonStyle}"
+                                            IsEnabled="{Binding CanRefreshObservability}"
+                                            Padding="8,4"
+                                            Click="ObservabilityRefreshButton_Click"/>
+                                </Grid>
+                                <TextBlock AutomationProperties.AutomationId="HermesObservabilityStatus"
+                                           Text="{Binding ObservabilityStatusText}"
+                                           TextWrapping="Wrap"
+                                           Margin="0,8,0,0"/>
+                                <TextBlock AutomationProperties.AutomationId="HermesUsageStatus"
+                                           Text="{Binding UsageStatusText}"
+                                           TextWrapping="Wrap"
+                                           Margin="0,10,0,0"/>
+                                <TextBlock AutomationProperties.AutomationId="HermesContextStatus"
+                                           Text="{Binding ContextStatusText}"
+                                           TextWrapping="Wrap"
+                                           Margin="0,8,0,0"/>
+                                <TextBlock AutomationProperties.AutomationId="HermesCompressionCountStatus"
+                                           Text="{Binding CompressionCountStatusText}"
+                                           TextWrapping="Wrap"
+                                           Margin="0,8,0,0"/>
+                                <Expander x:Name="HermesLearningPanel"
+                                          Style="{StaticResource DarkDisclosureExpanderStyle}"
+                                          AutomationProperties.AutomationId="HermesLearningPanel"
+                                          Header="{local:UiText ui.learning.records}"
+                                          IsExpanded="False"
+                                          Margin="0,10,0,0">
+                                    <StackPanel>
+                                        <TextBlock Text="{Binding LearningStatusText}"
+                                                   TextWrapping="Wrap"
+                                                   Margin="0,6,0,0"/>
+                                        <ItemsControl ItemsSource="{Binding LearningItems}"
+                                                      Margin="0,6,0,0">
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate>
+                                                    <TextBlock Text="{Binding}"
+                                                               TextWrapping="Wrap"
+                                                               FontSize="11"
+                                                               Foreground="{DynamicResource MutedBrush}"
+                                                               Margin="0,2,0,0"/>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+                                    </StackPanel>
+                                </Expander>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Margin="0,10,0,0"
+                                Padding="12"
+                                Background="{DynamicResource PanelBrush}"
+                                BorderBrush="{DynamicResource BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="12">
+                            <StackPanel>
+                                <TextBlock Text="{local:UiText ui.native.events}"
+                                           FontSize="11"
+                                           Foreground="{DynamicResource MutedBrush}"/>
+                                <TextBlock Text="{Binding EventCountText}"
+                                           Margin="0,4,0,0"/>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                    </ScrollViewer>
+                </Border>
+            </Grid>
+
+            <Grid x:Name="HermesRenameTaskOverlay"
+                  AutomationProperties.AutomationId="HermesRenameTaskOverlay"
+                  Grid.RowSpan="3"
+                  Panel.ZIndex="100"
+                  FocusManager.IsFocusScope="True"
+                  KeyboardNavigation.TabNavigation="Cycle"
+                  PreviewKeyDown="RenameTaskOverlay_PreviewKeyDown"
+                  Visibility="Collapsed"
+                  Background="{DynamicResource OverlayBrush}">
+                <Border Width="480"
+                        Padding="22"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Background="{DynamicResource PanelBrush}"
+                        BorderBrush="{DynamicResource BorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="14">
+                    <StackPanel>
+                        <TextBlock Text="{local:UiText ui.rename.chat}" FontSize="18" FontWeight="SemiBold"/>
+                        <TextBlock Text="{local:UiText ui.only.the.title.changes.conversation.content.is.preserved}"
+                                   Foreground="{DynamicResource MutedBrush}"
+                                   TextWrapping="Wrap" Margin="0,7,0,0"/>
+                        <TextBox x:Name="HermesRenameTaskInput"
+                                 AutomationProperties.AutomationId="HermesRenameTaskInput"
+                                 MaxLength="160"
+                                 Padding="12,10"
+                                 Margin="0,18,0,0"
+                                 Background="{DynamicResource DisabledBrush}"
+                                 Foreground="{DynamicResource TextBrush}"
+                                 BorderBrush="{DynamicResource BorderBrush}"
+                                 BorderThickness="1"
+                                 KeyDown="RenameTaskInput_KeyDown"/>
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+                            <Button Content="{local:UiText ui.cancel}" Style="{StaticResource SecondaryButtonStyle}"
+                                    IsCancel="True"
+                                    Click="CancelRenameTaskButton_Click"/>
+                            <Button x:Name="HermesRenameTaskConfirmButton"
+                                    AutomationProperties.AutomationId="HermesRenameTaskConfirmButton"
+                                    Content="{local:UiText ui.save.name}" Style="{StaticResource PrimaryButtonStyle}"
+                                    Margin="10,0,0,0"
+                                    Click="ConfirmRenameTaskButton_Click"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <Grid x:Name="HermesDeleteTaskOverlay"
+                  AutomationProperties.AutomationId="HermesDeleteTaskOverlay"
+                  AutomationProperties.LiveSetting="Assertive"
+                  Grid.RowSpan="3"
+                  Panel.ZIndex="110"
+                  FocusManager.IsFocusScope="True"
+                  KeyboardNavigation.TabNavigation="Cycle"
+                  PreviewKeyDown="DeleteTaskOverlay_PreviewKeyDown"
+                  Visibility="Collapsed"
+                  Background="{DynamicResource OverlayBrush}">
+                <Border Width="500"
+                        Padding="22"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Background="{DynamicResource PanelBrush}"
+                        BorderBrush="{DynamicResource DangerBrush}"
+                        BorderThickness="1"
+                        CornerRadius="14">
+                    <StackPanel>
+                        <TextBlock Text="{local:UiText ui.permanently.delete.chat}"
+                                   FontSize="18"
+                                   FontWeight="SemiBold"
+                                   Foreground="{DynamicResource DangerBrush}"/>
+                        <TextBlock x:Name="HermesDeleteTaskTargetText"
+                                   AutomationProperties.AutomationId="HermesDeleteTaskTargetText"
+                                   Margin="0,9,0,0"
+                                   FontWeight="SemiBold"
+                                   TextWrapping="Wrap"/>
+                        <TextBlock Text="{local:UiText ui.hermes.permanently.deletes.the.conversation.it.cannot.be.restored}"
+                                   Foreground="{DynamicResource MutedBrush}"
+                                   TextWrapping="Wrap"
+                                   Margin="0,7,0,0"/>
+                        <TextBlock x:Name="HermesDeleteTaskBusyText"
+                                   AutomationProperties.AutomationId="HermesDeleteTaskBusyText"
+                                   Text="{local:UiText ui.safely.closing.voice.and.deleting.chat}"
+                                   Foreground="{DynamicResource AccentStrongBrush}"
+                                   TextWrapping="Wrap"
+                                   Visibility="Collapsed"
+                                   Margin="0,14,0,0"/>
+                        <TextBlock x:Name="HermesDeleteTaskResultText"
+                                   AutomationProperties.AutomationId="HermesDeleteTaskResultText"
+                                   Foreground="{DynamicResource WarningBrush}"
+                                   TextWrapping="Wrap"
+                                   Visibility="Collapsed"
+                                   Margin="0,14,0,0"/>
+                        <StackPanel Orientation="Horizontal"
+                                    HorizontalAlignment="Right"
+                                    Margin="0,18,0,0">
+                            <Button x:Name="HermesDeleteTaskCancelButton"
+                                    AutomationProperties.AutomationId="HermesDeleteTaskCancelButton"
+                                    Content="{local:UiText ui.cancel}"
+                                    Style="{StaticResource SecondaryButtonStyle}"
+                                    IsDefault="True"
+                                    IsCancel="True"
+                                    Click="CancelDeleteTaskButton_Click"/>
+                            <Button x:Name="HermesDeleteTaskConfirmButton"
+                                    AutomationProperties.AutomationId="HermesDeleteTaskConfirmButton"
+                                    Content="{local:UiText ui.delete.permanently}"
+                                    Style="{StaticResource DangerButtonStyle}"
+                                    Margin="10,0,0,0"
+                                    Click="ConfirmDeleteTaskButton_Click"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>

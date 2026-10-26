@@ -1,0 +1,23 @@
+<UserControl x:Class="LilithControlCenter.LocalCompatibilityPanel"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:LilithControlCenter">
+    <Border Style="{StaticResource CardStyle}" Padding="20">
+        <StackPanel x:Name="ContentRoot">
+            <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <CheckBox Content="{local:UiText local.compatibility.title}" FontSize="17"
+                          Style="{DynamicResource DarkCheckBoxStyle}" IsChecked="{Binding Enabled, Mode=TwoWay}"
+                          IsEnabled="{Binding CanEdit}" Click="Toggle_Click"
+                          AutomationProperties.AutomationId="LocalCompatibilityToggle"/>
+                <Button Grid.Column="1" Content="{local:UiText common.refresh}" Margin="12,0,0,0"
+                        Style="{DynamicResource SecondaryButtonStyle}" IsEnabled="{Binding CanRefresh}"
+                        Click="Refresh_Click"/>
+            </Grid>
+            <TextBlock Text="{local:UiText local.compatibility.help}" TextWrapping="Wrap"
+                       Foreground="{DynamicResource MutedBrush}" FontSize="12" Margin="0,12,0,0"/>
+            <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" Margin="0,9,0,0" FontSize="12"
+                       Foreground="{DynamicResource AccentStrongBrush}" AutomationProperties.LiveSetting="Polite"/>
+        </StackPanel>
+    </Border>
+</UserControl>

@@ -1,0 +1,420 @@
+diff --git a/tests/tools/test_skills_tool.py b/tests/tools/test_skills_tool.py
+index 656d02e3..9374abab 100644
+--- a/tests/tools/test_skills_tool.py
++++ b/tests/tools/test_skills_tool.py
+@@ -14,6 +14,7 @@ from tools.skills_tool import (
+     _parse_tags,
+     _get_category_from_path,
+     _find_all_skills,
++    get_skills_inventory,
+     skill_matches_platform,
+     skills_list,
+     skill_view,
+@@ -252,6 +253,81 @@ class TestFindAllSkills:
+         assert skills[0]["category"] == "linked"
+ 
+ 
++class TestSkillsInventory:
++    def test_classifies_installed_offered_and_excluded_without_sensitive_fields(
++        self, tmp_path
++    ):
++        with (
++            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
++            patch(
++                "agent.skill_utils.get_external_skills_dirs", return_value=[]
++            ),
++            patch(
++                "tools.skills_tool.skill_matches_platform",
++                side_effect=lambda fm: fm.get("test_gate") != "platform",
++            ),
++            patch(
++                "tools.skills_tool.skill_matches_environment",
++                side_effect=lambda fm: fm.get("test_gate") != "environment",
++            ),
++            patch(
++                "tools.skills_tool._get_disabled_skill_names",
++                return_value={"disabled-skill", "platform-first"},
++            ),
++        ):
++            _make_skill(tmp_path, "offered-skill", category="tools")
++            _make_skill(
++                tmp_path,
++                "platform-skill",
++                frontmatter_extra="test_gate: platform\n",
++            )
++            _make_skill(
++                tmp_path,
++                "environment-skill",
++                frontmatter_extra="test_gate: environment\n",
++            )
++            _make_skill(tmp_path, "disabled-skill")
++            _make_skill(
++                tmp_path,
++                "platform-first",
++                frontmatter_extra="test_gate: platform\n",
++            )
++
++            inventory = get_skills_inventory()
++
++        assert inventory["skills"] == {"tools": ["offered-skill"]}
++        assert {row["name"] for row in inventory["installed"]} == {
++            "offered-skill",
++            "platform-skill",
++            "environment-skill",
++            "disabled-skill",
++            "platform-first",
++        }
++        assert {row["name"]: row["reason"] for row in inventory["excluded"]} == {
++            "disabled-skill": "disabled",
++            "environment-skill": "environment_incompatible",
++            "platform-first": "platform_incompatible",
++            "platform-skill": "platform_incompatible",
++        }
++        assert inventory["counts"] == {
++            "installed": 5,
++            "offered": 1,
++            "excluded": 4,
++        }
++        assert inventory["counts"]["installed"] == (
++            inventory["counts"]["offered"] + inventory["counts"]["excluded"]
++        )
++        assert all(set(row) == {"name", "category"} for row in inventory["installed"])
++        assert all(
++            set(row) == {"name", "category", "reason"}
++            for row in inventory["excluded"]
++        )
++        serialized = json.dumps(inventory)
++        assert "description" not in serialized
++        assert "path" not in serialized
++
++
++
+ # ---------------------------------------------------------------------------
+ # skills_list
+ # ---------------------------------------------------------------------------
+diff --git a/tests/tui_gateway/test_protocol.py b/tests/tui_gateway/test_protocol.py
+index 531cad93..cf7aac5f 100644
+--- a/tests/tui_gateway/test_protocol.py
++++ b/tests/tui_gateway/test_protocol.py
+@@ -759,6 +759,54 @@ def test_skills_manage_search_uses_tools_hub_sources(server):
+     search.assert_called_once_with("showroom", ["source"], source_filter="all", limit=20)
+ 
+ 
++def test_skills_manage_list_keeps_legacy_skills_and_adds_safe_inventory(server):
++    inventory = {
++        "skills": {"general": ["offered-skill"]},
++        "installed": [
++            {"name": "offered-skill", "category": "general"},
++            {"name": "hidden-skill", "category": "general"},
++        ],
++        "excluded": [
++            {
++                "name": "hidden-skill",
++                "category": "general",
++                "reason": "platform_incompatible",
++            }
++        ],
++        "counts": {"installed": 2, "offered": 1, "excluded": 1},
++    }
++
++    with patch("tools.skills_tool.get_skills_inventory", return_value=inventory):
++        resp = server.handle_request(
++            {
++                "id": "skills-list",
++                "method": "skills.manage",
++                "params": {"action": "list"},
++            }
++        )
++
++    assert "error" not in resp
++    assert resp["result"] == inventory
++    assert resp["result"]["skills"] == {"general": ["offered-skill"]}
++
++
++def test_skills_manage_list_does_not_expose_inventory_exception(server):
++    with patch(
++        "tools.skills_tool.get_skills_inventory",
++        side_effect=RuntimeError("secret path and parser details"),
++    ):
++        resp = server.handle_request(
++            {
++                "id": "skills-list-failed",
++                "method": "skills.manage",
++                "params": {"action": "list"},
++            }
++        )
++
++    assert resp["error"]["code"] == 5024
++    assert resp["error"]["message"] == "skills inventory unavailable"
++
++
+ # ── dispatch(): pool routing for long handlers (#12546) ──────────────
+ 
+ 
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+index 44157ce1..58ea5e5b 100644
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -670,6 +670,141 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
+         return False
+ 
+ 
++_SKILL_PLATFORM_INCOMPATIBLE = "platform_incompatible"
++_SKILL_ENVIRONMENT_INCOMPATIBLE = "environment_incompatible"
++_SKILL_DISABLED = "disabled"
++
++
++def _skill_offer_exclusion_reason(
++    frontmatter: Dict[str, Any], name: str, disabled: Set[str]
++) -> str | None:
++    """Return the closed reason token that keeps a discovered skill unoffered.
++
++    Keep this ordering aligned with the historical ``_find_all_skills``
++    filters: platform first, then runtime environment, then user-disabled
++    state.  The helper is shared by the ordinary offer surface and the
++    read-only inventory so they cannot silently classify the same skill
++    differently.
++    """
++    if not skill_matches_platform(frontmatter):
++        return _SKILL_PLATFORM_INCOMPATIBLE
++    if not skill_matches_environment(frontmatter):
++        return _SKILL_ENVIRONMENT_INCOMPATIBLE
++    if name in disabled:
++        return _SKILL_DISABLED
++    return None
++
++
++def _skill_dirs_to_scan() -> List[Path]:
++    """Resolve the same local-first discovery roots for every skill listing."""
++    from agent.skill_utils import get_external_skills_dirs
++
++    dirs_to_scan: List[Path] = []
++    active_skills_dir = _skills_dir()
++    if active_skills_dir.exists():
++        dirs_to_scan.append(active_skills_dir)
++    dirs_to_scan.extend(get_external_skills_dirs())
++    return dirs_to_scan
++
++
++def _iter_discovered_skill_documents(dirs_to_scan: List[Path]):
++    """Yield parsed skill identity without exposing filesystem provenance.
++
++    The yielded tuple is internal-only.  Read and parse failures retain the
++    existing fail-closed listing behavior and are logged locally; callers
++    never receive paths or raw exception text.
++    """
++    from agent.skill_utils import iter_skill_index_files
++
++    for scan_dir in dirs_to_scan:
++        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
++            if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
++                continue
++
++            skill_dir = skill_md.parent
++            try:
++                content = skill_md.read_text(
++                    encoding="utf-8-sig", errors="replace"
++                )[:4000]
++                frontmatter, body = _parse_frontmatter(content)
++                name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
++                category = _get_category_from_path(skill_md)
++                yield frontmatter, body, name, category
++            except (UnicodeDecodeError, PermissionError) as e:
++                logger.debug("Failed to read skill file %s: %s", skill_md, e)
++            except Exception as e:
++                logger.debug(
++                    "Skipping skill at %s: failed to parse: %s",
++                    skill_md,
++                    e,
++                    exc_info=True,
++                )
++
++
++def get_skills_inventory() -> Dict[str, Any]:
++    """Return a safe, read-only inventory plus the legacy offered grouping.
++
++    ``skills`` intentionally retains the existing ``skills.manage`` list
++    contract.  The additive fields distinguish every discovered skill from
++    the subset currently offered and report only closed exclusion tokens.
++    Descriptions, source paths, and parser/read errors are deliberately not
++    part of this boundary.
++    """
++    disabled = _get_disabled_skill_names()
++    installed_by_name: Dict[str, Dict[str, str]] = {}
++    first_exclusion_by_name: Dict[str, str] = {}
++    offered_by_name: Dict[str, Dict[str, str]] = {}
++    skills_by_category: Dict[str, List[str]] = {}
++
++    for frontmatter, _body, name, raw_category in _iter_discovered_skill_documents(
++        _skill_dirs_to_scan()
++    ):
++        category = raw_category or "general"
++        safe_row = {"name": name, "category": category}
++        installed_by_name.setdefault(name, safe_row)
++
++        reason = _skill_offer_exclusion_reason(frontmatter, name, disabled)
++        if reason is not None:
++            first_exclusion_by_name.setdefault(name, reason)
++            continue
++        if name in offered_by_name:
++            continue
++
++        # Match _find_all_skills' eligible-first duplicate behavior while
++        # keeping installed/excluded logical names disjoint.
++        offered_by_name[name] = safe_row
++        installed_by_name[name] = safe_row
++        skills_by_category.setdefault(category, []).append(name)
++
++    installed = sorted(
++        installed_by_name.values(),
++        key=lambda row: (row["category"].casefold(), row["name"].casefold()),
++    )
++    excluded = sorted(
++        (
++            {
++                "name": row["name"],
++                "category": row["category"],
++                "reason": first_exclusion_by_name[row["name"]],
++            }
++            for row in installed
++            if row["name"] not in offered_by_name
++        ),
++        key=lambda row: (row["category"].casefold(), row["name"].casefold()),
++    )
++
++    return {
++        "skills": skills_by_category,
++        "installed": installed,
++        "excluded": excluded,
++        "counts": {
++            "installed": len(installed),
++            "offered": len(offered_by_name),
++            "excluded": len(excluded),
++        },
++    }
++
++
+ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
+ 
+@@ -685,8 +820,6 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+     signature changes (dir/category mtimes or the disabled-set) and expires
+     after a short TTL to bound staleness from in-place SKILL.md edits.
+     """
+-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+-
+     cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
+ 
+     # Load disabled set once (not per-skill). Part of the cache signature:
+@@ -696,11 +829,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+     # Collect directories to scan — same resolution as the scan loop below
+     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
+     # SKILLS_DIR can be stale in long-lived runtimes).
+-    dirs_to_scan: list = []
+-    active_skills_dir = _skills_dir()
+-    if active_skills_dir.exists():
+-        dirs_to_scan.append(active_skills_dir)
+-    dirs_to_scan.extend(get_external_skills_dirs())
++    dirs_to_scan = _skill_dirs_to_scan()
+ 
+     signature = _skills_scan_signature(dirs_to_scan, disabled)
+     now = time.monotonic()
+@@ -721,57 +850,31 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+ 
+     # Scan local dir first, then external dirs (local takes precedence) —
+     # dirs_to_scan already resolved above for the signature.
+-    for scan_dir in dirs_to_scan:
+-        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+-            if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+-                continue
+-
+-            skill_dir = skill_md.parent
+-
+-            try:
+-                content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
+-                frontmatter, body = _parse_frontmatter(content)
+-
+-                if not skill_matches_platform(frontmatter):
+-                    continue
+-
+-                if not skill_matches_environment(frontmatter):
+-                    continue
+-
+-                name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
+-                if name in seen_names:
+-                    continue
+-                if name in disabled:
+-                    continue
+-
+-                description = frontmatter.get("description", "")
+-                if not description:
+-                    for line in body.strip().split("\n"):
+-                        line = line.strip()
+-                        if line and not line.startswith("#"):
+-                            description = line
+-                            break
+-
+-                if len(description) > MAX_DESCRIPTION_LENGTH:
+-                    description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
++    for frontmatter, body, name, category in _iter_discovered_skill_documents(
++        dirs_to_scan
++    ):
++        if _skill_offer_exclusion_reason(frontmatter, name, disabled) is not None:
++            continue
++        if name in seen_names:
++            continue
+ 
+-                category = _get_category_from_path(skill_md)
++        description = frontmatter.get("description", "")
++        if not description:
++            for line in body.strip().split("\n"):
++                line = line.strip()
++                if line and not line.startswith("#"):
++                    description = line
++                    break
+ 
+-                seen_names.add(name)
+-                skills.append({
+-                    "name": name,
+-                    "description": description,
+-                    "category": category,
+-                })
++        if len(description) > MAX_DESCRIPTION_LENGTH:
++            description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
+ 
+-            except (UnicodeDecodeError, PermissionError) as e:
+-                logger.debug("Failed to read skill file %s: %s", skill_md, e)
+-                continue
+-            except Exception as e:
+-                logger.debug(
+-                    "Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True
+-                )
+-                continue
++        seen_names.add(name)
++        skills.append({
++            "name": name,
++            "description": description,
++            "category": category,
++        })
+ 
+     # Store in cache keyed by the scan signature computed BEFORE the scan
+     # (a write racing the scan changes the signature, so the next call
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 204c1111..160c9d0e 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -2326,9 +2326,12 @@ def _(rid, params: dict) -> dict:
+     action, query = params.get("action", "list"), params.get("query", "")
+     try:
+         if action == "list":
+-            from hermes_cli.banner import get_available_skills
++            from tools.skills_tool import get_skills_inventory
+ 
+-            return _ok(rid, {"skills": get_available_skills()})
++            try:
++                return _ok(rid, get_skills_inventory())
++            except Exception:
++                return _err(rid, 5024, "skills inventory unavailable")
+         if action == "search":
+             from tools.skills_hub import (
+                 GitHubAuth,

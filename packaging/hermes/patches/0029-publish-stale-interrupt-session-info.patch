@@ -1,0 +1,146 @@
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index f0672be..2761592 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -3169,11 +3169,19 @@ def _(rid, params: dict) -> dict:
+         from agent.interrupt_compat import request_hard_interrupt
+ 
+         request_hard_interrupt(session.get("agent"))
++    stale_running_repaired = False
+     if not run_thread_alive:
+         with session["history_lock"]:
+             if session.get("running"):
+                 session["running"] = False
+                 _clear_inflight_turn(session)
++                stale_running_repaired = True
++    if stale_running_repaired:
++        # No run thread remains to publish its normal terminal event. Emit the
++        # full authoritative session projection after releasing history_lock so
++        # every frontend can converge on running=false from this repair path.
++        sid = str(params.get("session_id") or "")
++        _emit("session.info", sid, _session_info(session.get("agent"), session))
+ 
+     # Stop = stop the TURN (cooperative interrupt above also kills the in-flight
+     # foreground subprocess). Background processes the agent started (dev servers,
+diff --git a/tests/tui_gateway/test_protocol.py b/tests/tui_gateway/test_protocol.py
+index 8f0705f..531cad9 100644
+--- a/tests/tui_gateway/test_protocol.py
++++ b/tests/tui_gateway/test_protocol.py
+@@ -180,3 +180,117 @@ def test_write_json(capture):
++def test_session_interrupt_emits_authoritative_info_after_stale_running_repair(
++    server, monkeypatch
++):
++    interrupted = []
++
++    class _Agent:
++        def interrupt(self):
++            interrupted.append(True)
++
++    session = {
++        "agent": _Agent(),
++        "history_lock": threading.Lock(),
++        "running": True,
++        "queued_prompt": "later",
++        "session_key": "session-key",
++        "inflight_turn": {"turn_id": "stale-turn"},
++        "_run_thread": None,
++    }
++    emitted = []
++    monkeypatch.setattr(server, "_tts_stream_stop", lambda: None)
++    monkeypatch.setattr(server, "_thinking_sound_stop", lambda: None)
++    monkeypatch.setattr(server, "_sess_nowait", lambda _params, _rid: (session, None))
++    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
++    monkeypatch.setattr(server, "_clear_pending", lambda _sid: None)
++    monkeypatch.setattr(
++        server,
++        "_session_info",
++        lambda agent, current: {
++            "running": current["running"],
++            "stored_session_id": current["session_key"],
++            "agent_matches": agent is current["agent"],
++        },
++    )
++    monkeypatch.setattr(
++        server,
++        "_emit",
++        lambda event, sid, payload: emitted.append((event, sid, payload)),
++    )
++
++    response = server._methods["session.interrupt"](
++        "stop-stale", {"session_id": "ui-session"}
++    )
++
++    assert response["result"]["status"] == "interrupted"
++    assert interrupted == [True]
++    assert session["running"] is False
++    assert session["inflight_turn"] is None
++    assert emitted == [
++        (
++            "session.info",
++            "ui-session",
++            {
++                "running": False,
++                "stored_session_id": "session-key",
++                "agent_matches": True,
++            },
++        )
++    ]
++
++
++def test_session_interrupt_does_not_emit_idle_info_for_live_run_thread(
++    server, monkeypatch
++):
++    interrupted = []
++
++    class _Agent:
++        def interrupt(self):
++            interrupted.append(True)
++
++    class _LiveThread:
++        @staticmethod
++        def is_alive():
++            return True
++
++    inflight_turn = {"turn_id": "active-turn"}
++    session = {
++        "agent": _Agent(),
++        "history_lock": threading.Lock(),
++        "running": True,
++        "queued_prompt": None,
++        "session_key": "session-key",
++        "inflight_turn": inflight_turn,
++        "_run_thread": _LiveThread(),
++    }
++    monkeypatch.setattr(server, "_tts_stream_stop", lambda: None)
++    monkeypatch.setattr(server, "_thinking_sound_stop", lambda: None)
++    monkeypatch.setattr(server, "_sess_nowait", lambda _params, _rid: (session, None))
++    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
++    monkeypatch.setattr(server, "_clear_pending", lambda _sid: None)
++    monkeypatch.setattr(
++        server,
++        "_session_info",
++        lambda *_args: (_ for _ in ()).throw(
++            AssertionError("live interrupt projected idle session.info")
++        ),
++    )
++    monkeypatch.setattr(
++        server,
++        "_emit",
++        lambda *_args: (_ for _ in ()).throw(
++            AssertionError("live interrupt emitted terminal session.info")
++        ),
++    )
++
++    response = server._methods["session.interrupt"](
++        "stop-live", {"session_id": "ui-session"}
++    )
++
++    assert response["result"]["status"] == "interrupted"
++    assert interrupted == [True]
++    assert session["running"] is True
++    assert session["inflight_turn"] is inflight_turn
++
++
+ def test_write_json(capture):
+     server, buf = capture
+     assert server.write_json({"test": True})

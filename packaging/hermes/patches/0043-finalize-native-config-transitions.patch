@@ -1,0 +1,3903 @@
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 6ab775a..a4c9c4a 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -677,8 +677,28 @@ def _run_review_in_thread(
+     """
+     # Local import to avoid a hard circular dep at module load.
+     from run_agent import AIAgent
++    from agent.identity_policy import (
++        NativeAuthorityTransitionBusyError,
++        release_native_authority_terminal_effect,
++        reserve_native_authority_terminal_effect,
++    )
+     from tools.terminal_tool import set_approval_callback as _set_approval_callback
+ 
++    # Reserve before constructing the fork.  The child is not registered on
++    # ``_active_children`` until after AIAgent initialization, which otherwise
++    # leaves a construction gap where a strict native config transition could
++    # begin and bless a new digest underneath the unpublished child.  The
++    # process-global terminal reservation closes that gap and remains held for
++    # the review's complete effect lifetime.  A transition already pending is
++    # expected: skip this best-effort review without constructing a child.
++    try:
++        native_effect_token = reserve_native_authority_terminal_effect()
++    except NativeAuthorityTransitionBusyError:
++        logger.debug(
++            "Background review skipped during native config transition"
++        )
++        return
++
+     # Install a non-interactive approval callback on this worker
+     # thread so any dangerous-command guard the review agent trips
+     # resolves to "deny" instead of falling back to input() -- which
+@@ -1142,6 +1162,12 @@ def _run_review_in_thread(
+             _set_approval_callback(None)
+         except Exception:
+             pass
++        try:
++            release_native_authority_terminal_effect(native_effect_token)
++        except Exception:
++            logger.exception(
++                "Background review could not release native effect reservation"
++            )
+ 
+ 
+ def spawn_background_review_thread(
+diff --git a/agent/identity_policy.py b/agent/identity_policy.py
+index 525cf56..eb11a7e 100644
+--- a/agent/identity_policy.py
++++ b/agent/identity_policy.py
+@@ -84,6 +84,17 @@ _STRICT_AUTHORITY_RELATIVE_PATHS = (
+ _NATIVE_RECEIPT_MAX_BYTES = 64 * 1024
+ _NATIVE_RECEIPT_SOURCE_TOOLS_SET = "hermes.tools.set"
+ _NATIVE_RECEIPT_SOURCE_APPROVAL_ALWAYS = "hermes.approval.respond.always"
++_NATIVE_RECEIPT_SOURCE_MODEL_DEFAULT_SET = "hermes.model.default.set"
++_NATIVE_RECEIPT_SOURCE_CANONICAL_PROFILE_MIGRATION = (
++    "canonical.profile_migration"
++)
++_NATIVE_RECEIPT_SOURCES_WITHOUT_OPERATION_NONCE = frozenset(
++    {
++        _NATIVE_RECEIPT_SOURCE_TOOLS_SET,
++        _NATIVE_RECEIPT_SOURCE_MODEL_DEFAULT_SET,
++        _NATIVE_RECEIPT_SOURCE_CANONICAL_PROFILE_MIGRATION,
++    }
++)
+ _NATIVE_RECEIPT_KEYS = (
+     "schema_version",
+     "source",
+@@ -340,15 +351,22 @@ def native_authority_dispatch_block_state() -> Optional[Dict[str, Any]]:
+         mutation_active = _native_authority_config_mutation_token is not None
+     if pending is None and not mutation_active:
+         return None
++    if pending is not None:
++        pending_source = str(pending.get("source") or "")
++        if pending_source == _NATIVE_RECEIPT_SOURCE_MODEL_DEFAULT_SET:
++            pending_detail = "only model.default.commit may run"
++        elif pending_source == _NATIVE_RECEIPT_SOURCE_APPROVAL_ALWAYS:
++            pending_detail = "only approval.commit or approval.abort may run"
++        else:
++            # Legacy approval transitions did not carry a source marker.
++            pending_detail = "only approval.commit or approval.abort may run"
++    else:
++        pending_detail = "an internal native config mutation is in progress"
+     return {
+         "code": NATIVE_AUTHORITY_QUARANTINE_CODE,
+         "reason": NATIVE_AUTHORITY_TRANSITION_PENDING_REASON,
+         "message": NATIVE_AUTHORITY_TRANSITION_PENDING_MESSAGE,
+-        "detail": (
+-            "only approval.commit or approval.abort may run"
+-            if pending is not None
+-            else "an internal native config mutation is in progress"
+-        ),
++        "detail": pending_detail,
+         "restart_required": True,
+         "recovery_verified": False,
+         "drifted_labels": [],
+@@ -1167,7 +1185,7 @@ def _decode_native_config_receipt(raw: bytes) -> Dict[str, Any]:
+     source = value.get("source")
+     if source == _NATIVE_RECEIPT_SOURCE_APPROVAL_ALWAYS:
+         expected_keys = _NATIVE_APPROVAL_RECEIPT_KEYS
+-    elif source == _NATIVE_RECEIPT_SOURCE_TOOLS_SET:
++    elif source in _NATIVE_RECEIPT_SOURCES_WITHOUT_OPERATION_NONCE:
+         expected_keys = _NATIVE_RECEIPT_KEYS
+     else:
+         raise IdentityPolicyError("native config receipt source was invalid")
+@@ -1343,6 +1361,77 @@ def verify_native_approval_commit_receipt(
+         )
+ 
+ 
++def verify_native_model_default_commit_receipt(
++    base: NativeConfigReceiptBase,
++    *,
++    previous_config_sha256: str,
++    config_sha256: str,
++    receipt_sha256: str,
++) -> None:
++    """Verify Runtime's durable global-model receipt before session rebind.
++
++    Model persistence has no user approval nonce on the Runtime wire.  Its
++    compare-and-swap identity is the exact previous/new config digest pair;
++    the process-local pending gate prevents another native mutation from
++    preparing the same pair concurrently.
++    """
++
++    require_native_runtime_parent_authority()
++    previous = _native_receipt_digest(
++        previous_config_sha256, "previous config digest"
++    )
++    current = _native_receipt_digest(config_sha256, "config digest")
++    raw_digest = _native_receipt_digest(receipt_sha256, "raw receipt digest")
++    if not hmac.compare_digest(base.config_sha256, previous):
++        raise IdentityPolicyError("native model receipt base digest changed")
++
++    snapshot = capture_strict_authority_snapshot()
++    if snapshot is None or not hmac.compare_digest(snapshot.config_sha256, current):
++        raise IdentityPolicyError("native model receipt live config changed")
++    receipt = next(
++        item
++        for item in snapshot.files
++        if item.label == "runtime/native-config-receipt.v1.json"
++    )
++    if not receipt.existed or receipt.raw is None:
++        raise IdentityPolicyError("native model durable receipt was missing")
++    if not hmac.compare_digest(hashlib.sha256(receipt.raw).hexdigest(), raw_digest):
++        raise IdentityPolicyError("native model durable receipt hash mismatched")
++    value = _decode_native_config_receipt(receipt.raw)
++    expected: Dict[str, Any] = {
++        "schema_version": 1,
++        "source": _NATIVE_RECEIPT_SOURCE_MODEL_DEFAULT_SET,
++        "sequence": base.sequence + 1,
++        "canonical_base_sha256": base.canonical_base_sha256,
++        "previous_config_sha256": previous,
++        "config_sha256": current,
++        "identity_fingerprint_sha256": base.identity_fingerprint_sha256,
++        "soul_sha256": base.soul_sha256,
++        "personality_sha256": base.personality_sha256,
++        "approval_mode": base.approval_mode,
++        "enabled_toolsets": list(base.enabled_toolsets),
++    }
++    if value != expected:
++        raise IdentityPolicyError(
++            "native model durable receipt did not match the prepared transition"
++        )
++    preflight = preflight_aia_agent_identity(request_overrides={})
++    if (
++        not hmac.compare_digest(
++            preflight.policy.fingerprint,
++            base.identity_fingerprint_sha256,
++        )
++        or not hmac.compare_digest(preflight.soul_sha256, base.soul_sha256)
++        or not hmac.compare_digest(
++            preflight.personality_sha256,
++            base.personality_sha256,
++        )
++    ):
++        raise IdentityPolicyError(
++            "native model durable receipt no longer matched live identity pins"
++        )
++
++
+ def _authority_parent_matches(snapshot: StrictAuthorityFileSnapshot) -> bool:
+     try:
+         realpath, device, inode = _strict_authority_parent_identity(
+@@ -2492,6 +2581,60 @@ def scoped_identity_metadata(agent: Any) -> Dict[str, str]:
+     }
+ 
+ 
++def adopt_verified_native_config_digest(
++    agent: Any,
++    *,
++    previous_config_sha256: str,
++    config_sha256: str,
++) -> None:
++    """Rebind one blocked strict agent after a verified native approval.
++
++    A strict ``always`` choice rewrites only the native command allowlist while
++    the requesting tool call is paused. Runtime verifies and durably receipts
++    that exact rewrite before the waiter is released. Adopt the new whole-file
++    digest only after that proof so the same turn can report the tool's real
++    outcome instead of failing its next model iteration against the old pin.
++    """
++
++    policy = policy_for_agent(agent)
++    if not policy.enabled:
++        raise IdentityPolicyError(
++            "native config digest adoption requires a strict agent"
++        )
++    previous = _native_receipt_digest(
++        previous_config_sha256, "previous config digest"
++    )
++    current = _native_receipt_digest(config_sha256, "config digest")
++    from hermes_cli.env_loader import assert_trusted_identity_config_digest
++
++    assert_trusted_identity_config_digest(current)
++    preflight = preflight_aia_agent_identity(request_overrides={})
++    if not hmac.compare_digest(preflight.config_sha256, current):
++        raise IdentityPolicyError(
++            "native approval config digest did not match live identity"
++        )
++    agent_digest = str(
++        getattr(agent, "_identity_config_sha256", "") or ""
++    ).strip().lower()
++    model_config = getattr(agent, "_session_init_model_config", None)
++    stored_digest = (
++        str(model_config.get("_identity_config_sha256") or "")
++        .strip()
++        .lower()
++        if isinstance(model_config, dict)
++        else ""
++    )
++    if not hmac.compare_digest(agent_digest, previous) or not hmac.compare_digest(
++        stored_digest, previous
++    ):
++        raise IdentityPolicyError(
++            "native approval agent did not retain the prepared config digest"
++        )
++
++    agent._identity_config_sha256 = current
++    model_config["_identity_config_sha256"] = current
++
++
+ def scoped_identity_persistence_metadata(agent: Any) -> Dict[str, Any]:
+     """Return core attestation plus any durable strict-history migration."""
+ 
+diff --git a/tests/run_agent/test_background_review.py b/tests/run_agent/test_background_review.py
+index de3b4eb..5331c66 100644
+--- a/tests/run_agent/test_background_review.py
++++ b/tests/run_agent/test_background_review.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import run_agent as run_agent_module
++import pytest
+ from run_agent import AIAgent
+ 
+ 
+@@ -221,6 +222,46 @@ def test_background_review_registers_on_active_children_for_interrupt(monkeypatc
+     assert agent._active_children == []
+ 
+ 
++def test_background_review_reserves_native_effect_before_child_construction(
++    monkeypatch,
++):
++    import threading
++    import agent.identity_policy as identity_policy
++    from agent.background_review import _run_review_in_thread
++
++    identity_policy._reset_native_authority_quarantine_for_tests()
++    constructor_entered = threading.Event()
++    release_constructor = threading.Event()
++
++    class BlockingReviewAgent:
++        def __init__(self, **_kwargs):
++            constructor_entered.set()
++            release_constructor.wait(timeout=2)
++            raise RuntimeError("stop after construction gap")
++
++    monkeypatch.setattr(run_agent_module, "AIAgent", BlockingReviewAgent)
++    agent = _bare_agent()
++    agent._emit_auxiliary_failure = lambda *_args, **_kwargs: None
++    worker = threading.Thread(
++        target=_run_review_in_thread,
++        args=(agent, [{"role": "user", "content": "hello"}], "review"),
++    )
++    worker.start()
++    assert constructor_entered.wait(timeout=1)
++    with pytest.raises(identity_policy.NativeAuthorityTransitionBusyError):
++        identity_policy.begin_native_authority_commit_pending(
++            {"session_key": "model", "commit_nonce": "f" * 64}
++        )
++    release_constructor.set()
++    worker.join(timeout=1)
++
++    assert not worker.is_alive()
++    identity_policy.begin_native_authority_commit_pending(
++        {"session_key": "model", "commit_nonce": "1" * 64}
++    )
++    identity_policy.clear_native_authority_commit_pending("1" * 64)
++
++
+ def test_new_live_turn_cancels_still_running_background_review(monkeypatch):
+     """conversation_loop.run_conversation() must proactively interrupt a
+     background review still in flight from a prior turn, rather than let the
+diff --git a/tests/tools/test_strict_authority_postflight.py b/tests/tools/test_strict_authority_postflight.py
+index 7e4bf7b..ee31ab7 100644
+--- a/tests/tools/test_strict_authority_postflight.py
++++ b/tests/tools/test_strict_authority_postflight.py
+@@ -199,6 +199,47 @@ def test_native_receipt_decoder_matches_runtime_integer_and_toolset_bounds(
+         identity._decode_native_config_receipt(raw)
+ 
+ 
++@pytest.mark.parametrize(
++    "source",
++    ("hermes.model.default.set", "canonical.profile_migration"),
++)
++def test_permanent_approval_accepts_prior_runtime_native_receipt_sources(
++    strict_profile,
++    source,
++):
++    import agent.identity_policy as identity
++
++    config_sha256 = hashlib.sha256(
++        (strict_profile / "config.yaml").read_bytes()
++    ).hexdigest()
++    preflight = identity.preflight_aia_agent_identity(request_overrides={})
++    receipt = {
++        "schema_version": 1,
++        "source": source,
++        "sequence": 7,
++        "canonical_base_sha256": config_sha256,
++        "previous_config_sha256": "1" * 64,
++        "config_sha256": config_sha256,
++        "identity_fingerprint_sha256": FINGERPRINT,
++        "soul_sha256": preflight.soul_sha256,
++        "personality_sha256": preflight.personality_sha256,
++        "approval_mode": "manual",
++        "enabled_toolsets": ["memory", "terminal"],
++    }
++    (strict_profile / "runtime" / "native-config-receipt.v1.json").write_bytes(
++        json.dumps(receipt, separators=(",", ":")).encode("utf-8")
++    )
++
++    base = identity.capture_native_config_receipt_base(
++        config_sha256,
++        approval_mode="manual",
++        enabled_toolsets=("memory", "terminal"),
++    )
++
++    assert base.sequence == 7
++    assert base.config_sha256 == config_sha256
++
++
+ def test_verifier_exception_still_stops_background_child(
+     strict_profile,
+     monkeypatch,
+diff --git a/tests/tui_gateway/test_tools_policy_rpc.py b/tests/tui_gateway/test_tools_policy_rpc.py
+index 23f7f19..c35cc09 100644
+--- a/tests/tui_gateway/test_tools_policy_rpc.py
++++ b/tests/tui_gateway/test_tools_policy_rpc.py
+@@ -23,6 +23,8 @@ def _clean_gateway_sessions(monkeypatch):
+     import tools.approval as approval
+ 
+     server._sessions.clear()
++    with server._native_model_default_commit_lock:
++        server._native_model_default_prepared_commit = None
+     identity_policy._reset_native_authority_quarantine_for_tests()
+     with approval._lock:
+         for entries in approval._gateway_queues.values():
+@@ -35,6 +37,8 @@ def _clean_gateway_sessions(monkeypatch):
+     monkeypatch.setattr(env_loader, "_TRUSTED_IDENTITY_ENV_SNAPSHOT", None)
+     yield
+     server._sessions.clear()
++    with server._native_model_default_commit_lock:
++        server._native_model_default_prepared_commit = None
+     identity_policy._reset_native_authority_quarantine_for_tests()
+ 
+ 
+@@ -403,6 +407,1180 @@ def test_tools_set_rotates_strict_config_pin_only_after_verified_native_save(
+         enforce_scoped_turn_identity(old_agent)
+ 
+ 
++def test_global_model_persistence_commits_receipt_and_rebinds_live_session(
++    monkeypatch,
++):
++    import types
++    from agent.identity_policy import (
++        enforce_scoped_turn_identity,
++        native_authority_dispatch_block_state,
++        native_authority_pending_transition_state,
++        preflight_aia_agent_identity,
++    )
++    from hermes_cli.env_loader import load_hermes_dotenv
++    from tools.approval import _capture_native_approval_policy
++
++    class SessionDb:
++        def __init__(self, model_config):
++            self.row = {"model_config": json.dumps(model_config)}
++            self.on_update = None
++
++        def get_session(self, _session_id):
++            return dict(self.row)
++
++        def update_session_meta(self, _session_id, model_config, model=None):
++            if self.on_update is not None:
++                self.on_update()
++            self.row["model_config"] = model_config
++
++    soul = "Lilith soul.\n"
++    personality = "You are Lilith.\n"
++    config = _strict_config(personality)
++    config["model"] = {
++        "default": "deepseek-v4-flash",
++        "provider": "deepseek",
++        "model_slots": {"fast": "keep-me"},
++    }
++    raw = _write_config(config)
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, raw, soul, personality)
++    load_hermes_dotenv(hermes_home=_home())
++    old_digest = hashlib.sha256(raw).hexdigest()
++    agent = _new_strict_agent()
++    db = SessionDb(agent._session_init_model_config)
++    agent._session_db = db
++    live_session = {
++        "session_key": "model-live-key",
++        "agent": agent,
++        "history_lock": threading.RLock(),
++        "running": False,
++        "tool_started_at": {},
++    }
++    server._sessions["model-live"] = live_session
++    approval_mode, enabled_toolsets = _capture_native_approval_policy()
++
++    result = types.SimpleNamespace(
++        new_model="gemini-3-flash-preview",
++        target_provider="gemini",
++        base_url=None,
++    )
++    digest = server._persist_model_switch(result)
++
++    assert digest == hashlib.sha256(
++        (_home() / "config.yaml").read_bytes()
++    ).hexdigest()
++    assert os.environ["HERMES_IDENTITY_EXPECTED_CONFIG_SHA256"] == digest
++    assert preflight_aia_agent_identity(
++        request_overrides={}
++    ).config_sha256 == digest
++    assert native_authority_pending_transition_state() == {
++        "session_key": "__runtime_model_default__",
++        "commit_nonce": server._native_model_default_prepared_commit.commit_nonce,
++        "source": "hermes.model.default.set",
++        "previous_config_sha256": old_digest,
++        "config_sha256": digest,
++    }
++    assert native_authority_dispatch_block_state()["detail"] == (
++        "only model.default.commit may run"
++    )
++    blocked_setter = server._set_fast_runtime(
++        "blocked-fast",
++        "fast",
++        "normal",
++        {"session_id": "model-live"},
++        live_session,
++    )
++    assert blocked_setter["error"]["code"] == 4090
++    with pytest.raises(Exception):
++        enforce_scoped_turn_identity(agent)
++    saved = yaml.safe_load((_home() / "config.yaml").read_text("utf-8"))
++    assert saved["model"]["default"] == "gemini-3-flash-preview"
++    assert saved["model"]["provider"] == "gemini"
++    assert saved["model"]["model_slots"] == {"fast": "keep-me"}
++
++    receipt = {
++        "schema_version": 1,
++        "source": "hermes.model.default.set",
++        "sequence": 1,
++        "canonical_base_sha256": old_digest,
++        "previous_config_sha256": old_digest,
++        "config_sha256": digest,
++        "identity_fingerprint_sha256": "a" * 64,
++        "soul_sha256": hashlib.sha256(soul.encode("utf-8")).hexdigest(),
++        "personality_sha256": hashlib.sha256(
++            personality.encode("utf-8")
++        ).hexdigest(),
++        "approval_mode": approval_mode,
++        "enabled_toolsets": list(enabled_toolsets),
++    }
++    receipt_raw = json.dumps(receipt, separators=(",", ":")).encode("utf-8")
++    (_home() / "runtime" / "native-config-receipt.v1.json").write_bytes(
++        receipt_raw
++    )
++    setter_lock = server._runtime_setter_lock(live_session)
++    setter_lock_probe = []
++    setter_holder_ready = threading.Event()
++    release_setter_holder = threading.Event()
++    setter_registry_drain = threading.Event()
++
++    def _hold_pre_admission_setter():
++        with setter_lock:
++            setter_holder_ready.set()
++            release_setter_holder.wait(timeout=2)
++            # A real setter may publish/attach under the registry lock before
++            # releasing its setter lock. Phase two must release _sessions_lock
++            # between retries or these two contenders deadlock.
++            with server._sessions_lock:
++                setter_registry_drain.set()
++
++    setter_holder = threading.Thread(target=_hold_pre_admission_setter)
++    setter_holder.start()
++    assert setter_holder_ready.wait(timeout=1)
++
++    def _probe_setter_lock():
++        acquired = setter_lock.acquire(blocking=False)
++        setter_lock_probe.append(acquired)
++        if acquired:
++            setter_lock.release()
++
++    db.on_update = _probe_setter_lock
++    drain_timer = threading.Timer(0.05, release_setter_holder.set)
++    drain_timer.start()
++    committed = server._methods["model.default.commit"](
++        "model-commit",
++        {
++            "authority": "lilith-runtime-native-config.v1",
++            "previous_config_sha256": old_digest,
++            "config_sha256": digest,
++            "receipt_sha256": hashlib.sha256(receipt_raw).hexdigest(),
++        },
++    )
++    setter_holder.join(timeout=1)
++    drain_timer.join(timeout=1)
++
++    assert committed == {
++        "jsonrpc": "2.0",
++        "id": "model-commit",
++        "result": {"committed": 1},
++    }
++    assert native_authority_pending_transition_state() is None
++    assert server._native_model_default_prepared_commit is None
++    assert not setter_holder.is_alive()
++    assert setter_registry_drain.is_set()
++    assert setter_lock_probe == [False]
++    enforce_scoped_turn_identity(agent)
++    assert agent._identity_config_sha256 == digest
++    assert agent._session_init_model_config["_identity_config_sha256"] == digest
++    assert json.loads(db.row["model_config"])["_identity_config_sha256"] == digest
++
++
++def test_config_set_model_maps_native_transition_busy_to_4090(monkeypatch):
++    from agent.identity_policy import NativeAuthorityTransitionBusyError
++
++    monkeypatch.setattr(
++        server,
++        "_apply_model_switch",
++        lambda *args, **kwargs: (_ for _ in ()).throw(
++            NativeAuthorityTransitionBusyError("model receipt pending")
++        ),
++    )
++
++    response = server._methods["config.set"](
++        "model-busy",
++        {"key": "model", "value": "gemini-3-flash-preview"},
++    )
++
++    assert response["error"] == {
++        "code": 4090,
++        "message": "model receipt pending",
++    }
++
++
++def test_strict_durable_agentless_create_is_pinned_and_rebound_atomically(
++    monkeypatch,
++):
++    import types
++    from agent.identity_policy import (
++        NativeAuthorityTransitionBusyError,
++        native_authority_pending_transition_state,
++    )
++    from hermes_cli.env_loader import load_hermes_dotenv
++    from tools.approval import _capture_native_approval_policy
++
++    class BlockingSessionDb:
++        def __init__(self):
++            self.rows = {}
++            self.create_entered = threading.Event()
++            self.release_create = threading.Event()
++
++        def create_session(
++            self,
++            key,
++            *,
++            source,
++            model,
++            model_config,
++            parent_session_id=None,
++            cwd=None,
++            profile_name=None,
++            archived=False,
++        ):
++            self.create_entered.set()
++            self.release_create.wait(timeout=2)
++            self.rows[key] = {
++                "id": key,
++                "source": source,
++                "archived": int(bool(archived)),
++                "model": model,
++                "model_config": json.dumps(model_config),
++            }
++
++        def get_session(self, key):
++            row = self.rows.get(key)
++            return dict(row) if row is not None else None
++
++        def update_session_meta(self, key, model_config, model=None):
++            self.rows[key]["model_config"] = model_config
++            if model is not None:
++                self.rows[key]["model"] = model
++
++        def attest_resume_session_lineage(
++            self,
++            requested,
++            resolved=None,
++            *,
++            expected_source,
++            expected_archived,
++        ):
++            target = resolved or requested
++            return {
++                "requested_session_id": requested,
++                "resolved_session_id": target,
++                "session_ids": [target],
++                "source": expected_source,
++                "archived": expected_archived,
++            }
++
++    soul = "Lilith soul.\n"
++    personality = "You are Lilith.\n"
++    config = _strict_config(personality)
++    config["model"] = {
++        "default": "deepseek-v4-flash",
++        "provider": "deepseek",
++    }
++    raw = _write_config(config)
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, raw, soul, personality)
++    load_hermes_dotenv(hermes_home=_home())
++    old_digest = hashlib.sha256(raw).hexdigest()
++    db = BlockingSessionDb()
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(
++        server,
++        "_resolve_session_create_model_pair",
++        lambda **_kwargs: ("deepseek-v4-flash", "deepseek"),
++    )
++    monkeypatch.setattr(server, "_register_session_cwd", lambda *_: None)
++    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_: None)
++    monkeypatch.setattr(
++        server,
++        "_schedule_session_cap_enforcement",
++        lambda *_: None,
++    )
++    created = []
++    creator = threading.Thread(
++        target=lambda: created.append(
++            server._methods["session.create"](
++                "durable-create",
++                {
++                    "archived": True,
++                    "durable": True,
++                    "source": "lilith-game",
++                },
++            )
++        )
++    )
++    creator.start()
++    assert db.create_entered.wait(timeout=1)
++
++    result = types.SimpleNamespace(
++        new_model="gemini-3-flash-preview",
++        target_provider="gemini",
++        base_url=None,
++    )
++    with pytest.raises(NativeAuthorityTransitionBusyError):
++        server._persist_model_switch(result)
++    assert (_home() / "config.yaml").read_bytes() == raw
++    assert native_authority_pending_transition_state() is None
++
++    db.release_create.set()
++    creator.join(timeout=1)
++    assert not creator.is_alive()
++    assert "error" not in created[0], created[0]
++    create_result = created[0]["result"]
++    row = db.get_session(create_result["stored_session_id"])
++    row_config = json.loads(row["model_config"])
++    assert row_config["_identity_config_sha256"] == old_digest
++    assert row_config["_identity_fingerprint"] == "a" * 64
++    assert server._sessions[create_result["session_id"]]["agent"] is None
++
++    digest = server._persist_model_switch(result)
++    approval_mode, enabled_toolsets = _capture_native_approval_policy()
++    receipt = {
++        "schema_version": 1,
++        "source": "hermes.model.default.set",
++        "sequence": 1,
++        "canonical_base_sha256": old_digest,
++        "previous_config_sha256": old_digest,
++        "config_sha256": digest,
++        "identity_fingerprint_sha256": "a" * 64,
++        "soul_sha256": hashlib.sha256(soul.encode("utf-8")).hexdigest(),
++        "personality_sha256": hashlib.sha256(
++            personality.encode("utf-8")
++        ).hexdigest(),
++        "approval_mode": approval_mode,
++        "enabled_toolsets": list(enabled_toolsets),
++    }
++    receipt_raw = json.dumps(receipt, separators=(",", ":")).encode("utf-8")
++    (_home() / "runtime" / "native-config-receipt.v1.json").write_bytes(
++        receipt_raw
++    )
++    committed = server._methods["model.default.commit"](
++        "durable-commit",
++        {
++            "authority": "lilith-runtime-native-config.v1",
++            "previous_config_sha256": old_digest,
++            "config_sha256": digest,
++            "receipt_sha256": hashlib.sha256(receipt_raw).hexdigest(),
++        },
++    )
++
++    assert committed["result"] == {"committed": 1}
++    rebound = json.loads(
++        db.get_session(create_result["stored_session_id"])["model_config"]
++    )
++    assert rebound["_identity_config_sha256"] == digest
++
++
++def test_model_default_commit_without_phase_one_is_rejected_without_quarantine():
++    from agent.identity_policy import native_authority_quarantine_state
++
++    response = server._methods["model.default.commit"]("unsolicited", {})
++
++    assert response["error"] == {
++        "code": -32602,
++        "message": "native model transition was not pending",
++    }
++    assert native_authority_quarantine_state() is None
++
++
++def test_strict_branch_publishes_identity_row_before_model_phase(monkeypatch):
++    import types
++    from hermes_cli.env_loader import load_hermes_dotenv
++    from tools.approval import _capture_native_approval_policy
++
++    class BranchDb:
++        def __init__(self):
++            self.rows = {}
++
++        def get_session(self, key):
++            row = self.rows.get(key)
++            return dict(row) if row is not None else None
++
++        def get_session_title(self, _key):
++            return "Parent"
++
++        def get_next_title_in_lineage(self, title):
++            return f"{title} (branch)"
++
++        def create_session(
++            self,
++            key,
++            *,
++            source,
++            model,
++            model_config,
++            parent_session_id=None,
++            cwd=None,
++            profile_name=None,
++            archived=False,
++        ):
++            self.rows[key] = {
++                "id": key,
++                "source": source,
++                "archived": int(bool(archived)),
++                "model": model,
++                "model_config": json.dumps(model_config),
++            }
++
++        def append_messages_batch(self, *_args, **_kwargs):
++            return None
++
++        def set_session_title(self, key, title):
++            self.rows[key]["title"] = title
++
++        def update_session_meta(self, key, model_config, model=None):
++            self.rows[key]["model_config"] = model_config
++            if model is not None:
++                self.rows[key]["model"] = model
++
++    soul = "Lilith soul.\n"
++    personality = "You are Lilith.\n"
++    config = _strict_config(personality)
++    config["model"] = {
++        "default": "deepseek-v4-flash",
++        "provider": "deepseek",
++    }
++    raw = _write_config(config)
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, raw, soul, personality)
++    load_hermes_dotenv(hermes_home=_home())
++    old_digest = hashlib.sha256(raw).hexdigest()
++    db = BranchDb()
++    parent_agent = _new_strict_agent()
++    child_agent = _new_strict_agent()
++    parent_agent._session_db = db
++    child_agent._session_db = db
++    db.rows["parent-key"] = {
++        "id": "parent-key",
++        "source": "desktop",
++        "archived": 0,
++        "model": parent_agent.model,
++        "model_config": json.dumps(parent_agent._session_init_model_config),
++    }
++    server._sessions["parent"] = {
++        "agent": parent_agent,
++        "session_key": "parent-key",
++        "history": [
++            {"role": "user", "content": "hello"},
++            {"role": "assistant", "content": "hi"},
++        ],
++        "history_lock": threading.RLock(),
++        "history_version": 0,
++        "running": False,
++        "tool_started_at": {},
++        "cols": 80,
++        "cwd": str(_home()),
++        "source": "desktop",
++        "profile_home": None,
++        "transport": None,
++    }
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(server, "_make_agent", lambda *_args, **_kwargs: child_agent)
++    monkeypatch.setattr(server, "_register_session_cwd", lambda *_: None)
++    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *_: None)
++
++    branched = server._methods["session.branch"](
++        "strict-branch",
++        {"session_id": "parent", "name": "Child"},
++    )
++
++    assert "error" not in branched, branched
++    child_sid = branched["result"]["session_id"]
++    child_key = branched["result"]["stored_session_id"]
++    child_config = json.loads(db.get_session(child_key)["model_config"])
++    assert child_config["_branched_from"] == "parent-key"
++    assert child_config["_identity_config_sha256"] == old_digest
++    assert child_config["_identity_fingerprint"] == "a" * 64
++    assert server._sessions[child_sid]["agent"] is child_agent
++
++    # Start a second branch build under A, then hold it outside every
++    # lifecycle lock while the complete A -> B phase-one/receipt transaction
++    # runs.  The resumed builder must reject its stale candidate before it can
++    # overwrite the already-created child row with A metadata.
++    stale_racing_agent = _new_strict_agent()
++    branch_build_entered = threading.Event()
++    release_branch_build = threading.Event()
++    racing_branch = []
++
++    def _blocked_branch_build(*_args, **_kwargs):
++        branch_build_entered.set()
++        release_branch_build.wait(timeout=2)
++        return stale_racing_agent
++
++    monkeypatch.setattr(server, "_make_agent", _blocked_branch_build)
++    branch_thread = threading.Thread(
++        target=lambda: racing_branch.append(
++            server._methods["session.branch"](
++                "strict-racing-branch",
++                {"session_id": "parent", "name": "Racing child"},
++            )
++        )
++    )
++    branch_thread.start()
++    assert branch_build_entered.wait(timeout=1)
++    racing_keys = set(db.rows) - {"parent-key", child_key}
++    assert len(racing_keys) == 1
++    racing_key = next(iter(racing_keys))
++    racing_row_before_commit = dict(db.get_session(racing_key))
++
++    switched = types.SimpleNamespace(
++        new_model="gemini-3-flash-preview",
++        target_provider="gemini",
++        base_url=None,
++    )
++    digest = server._persist_model_switch(switched)
++    approval_mode, enabled_toolsets = _capture_native_approval_policy()
++    receipt = {
++        "schema_version": 1,
++        "source": "hermes.model.default.set",
++        "sequence": 1,
++        "canonical_base_sha256": old_digest,
++        "previous_config_sha256": old_digest,
++        "config_sha256": digest,
++        "identity_fingerprint_sha256": "a" * 64,
++        "soul_sha256": hashlib.sha256(soul.encode("utf-8")).hexdigest(),
++        "personality_sha256": hashlib.sha256(
++            personality.encode("utf-8")
++        ).hexdigest(),
++        "approval_mode": approval_mode,
++        "enabled_toolsets": list(enabled_toolsets),
++    }
++    receipt_raw = json.dumps(receipt, separators=(",", ":")).encode("utf-8")
++    (_home() / "runtime" / "native-config-receipt.v1.json").write_bytes(
++        receipt_raw
++    )
++    committed = server._methods["model.default.commit"](
++        "branch-commit",
++        {
++            "authority": "lilith-runtime-native-config.v1",
++            "previous_config_sha256": old_digest,
++            "config_sha256": digest,
++            "receipt_sha256": hashlib.sha256(receipt_raw).hexdigest(),
++        },
++    )
++
++    assert committed["result"] == {"committed": 1}
++    assert json.loads(db.get_session(child_key)["model_config"])[
++        "_identity_config_sha256"
++    ] == digest
++    release_branch_build.set()
++    branch_thread.join(timeout=1)
++    assert not branch_thread.is_alive()
++    assert racing_branch[0]["error"]["code"] == 4090
++    assert "stale native config" in racing_branch[0]["error"]["message"]
++    assert db.get_session(racing_key) == racing_row_before_commit
++    assert "_identity_config_sha256" not in json.loads(
++        db.get_session(racing_key)["model_config"]
++    )
++
++
++def test_strict_deferred_resume_repairs_legacy_row_before_live_publication(
++    monkeypatch,
++):
++    from hermes_cli.env_loader import load_hermes_dotenv
++
++    class LegacyResumeDb:
++        def __init__(self):
++            self.row = {
++                "id": "legacy-key",
++                "model": "deepseek-v4-flash",
++                "model_config": json.dumps(
++                    {
++                        "_branched_from": "failed-parent",
++                        "reasoning_effort": "high",
++                    }
++                ),
++            }
++
++        def get_session(self, key):
++            assert key == "legacy-key"
++            return dict(self.row)
++
++        def update_session_meta(self, key, model_config, model=None):
++            assert key == "legacy-key"
++            # Publication is the commit point.  The durable repair must have
++            # completed (and later be attested) before the record is visible.
++            assert "legacy-resume" not in server._sessions
++            self.row["model_config"] = model_config
++            if model is not None:
++                self.row["model"] = model
++
++    soul = "Lilith soul.\n"
++    personality = "You are Lilith.\n"
++    config = _strict_config(personality)
++    config["model"] = {
++        "default": "deepseek-v4-flash",
++        "provider": "deepseek",
++    }
++    raw = _write_config(config)
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, raw, soul, personality)
++    load_hermes_dotenv(hermes_home=_home())
++    expected_digest = hashlib.sha256(raw).hexdigest()
++    db = LegacyResumeDb()
++    record = {
++        "session_key": "legacy-key",
++        "agent": None,
++        "history_lock": threading.RLock(),
++        "running": False,
++        "tool_started_at": {},
++    }
++    monkeypatch.setattr(server, "_register_session_cwd", lambda *_: None)
++
++    winner = server._claim_or_reuse_live(
++        "legacy-resume",
++        "legacy-key",
++        record,
++        None,
++        prepare_registration=lambda: (
++            server._bind_existing_session_row_to_current_host_identity(
++                db,
++                "legacy-key",
++            )
++        ),
++    )
++
++    assert winner is None
++    assert server._sessions["legacy-resume"] is record
++    rebound = json.loads(db.row["model_config"])
++    assert rebound["_branched_from"] == "failed-parent"
++    assert rebound["reasoning_effort"] == "high"
++    assert rebound["_identity_fingerprint"] == "a" * 64
++    assert rebound["_identity_config_sha256"] == expected_digest
++    assert rebound["_identity_soul_sha256"] == hashlib.sha256(
++        soul.encode("utf-8")
++    ).hexdigest()
++    assert rebound["_identity_personality_sha256"] == hashlib.sha256(
++        personality.encode("utf-8")
++    ).hexdigest()
++
++
++def test_model_phase_one_refuses_a_live_runtime_setter_without_waiting():
++    from agent.identity_policy import NativeAuthorityTransitionBusyError
++
++    session = {
++        "session_key": "setter-busy-key",
++        "agent": None,
++        "history_lock": threading.RLock(),
++        "running": False,
++        "tool_started_at": {},
++    }
++    server._sessions["setter-busy"] = session
++    setter_lock = server._runtime_setter_lock(session)
++    holder_ready = threading.Event()
++    release_holder = threading.Event()
++
++    def _hold_setter():
++        with setter_lock:
++            holder_ready.set()
++            release_holder.wait(timeout=2)
++
++    holder = threading.Thread(target=_hold_setter)
++    holder.start()
++    assert holder_ready.wait(timeout=1)
++    try:
++        with pytest.raises(
++            NativeAuthorityTransitionBusyError,
++            match="session runtime setter",
++        ):
++            with server._paused_live_strict_sessions_for_native_model("a" * 64):
++                pass
++    finally:
++        release_holder.set()
++        holder.join(timeout=1)
++    assert not holder.is_alive()
++
++
++def test_slash_model_rechecks_pending_transition_inside_setter_lock(monkeypatch):
++    import agent.identity_policy as identity_policy
++
++    session = {
++        "session_key": "slash-model-key",
++        "agent": object(),
++        "history_lock": threading.RLock(),
++        "running": False,
++        "tool_started_at": {},
++    }
++    applied = []
++    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_: False)
++    monkeypatch.setattr(
++        server,
++        "_apply_model_switch",
++        lambda *args, **kwargs: applied.append((args, kwargs)),
++    )
++    nonce = "b" * 64
++    identity_policy.begin_native_authority_commit_pending(
++        {
++            "session_key": "__runtime_model_default__",
++            "commit_nonce": nonce,
++            "source": "hermes.model.default.set",
++        }
++    )
++    try:
++        output = server._mirror_slash_side_effects(
++            "slash-model",
++            session,
++            "/model gemini-3-flash-preview",
++        )
++    finally:
++        identity_policy.clear_native_authority_commit_pending(nonce)
++
++    assert "durable Runtime receipt" in output
++    assert applied == []
++
++
++def test_session_teardown_reservation_covers_pop_to_database_cleanup(monkeypatch):
++    import agent.identity_policy as identity_policy
++
++    teardown_entered = threading.Event()
++    release_teardown = threading.Event()
++    closed = []
++    server._sessions["closing"] = {"session_key": "closing-key"}
++
++    def _blocking_teardown(session, *, end_reason):
++        teardown_entered.set()
++        release_teardown.wait(timeout=2)
++
++    monkeypatch.setattr(server, "_teardown_session", _blocking_teardown)
++    closer = threading.Thread(
++        target=lambda: closed.append(
++            server._close_session_by_id("closing", end_reason="idle_timeout")
++        )
++    )
++    closer.start()
++    assert teardown_entered.wait(timeout=1)
++    assert "closing" not in server._sessions
++    with pytest.raises(identity_policy.NativeAuthorityTransitionBusyError):
++        identity_policy.begin_native_authority_commit_pending(
++            {"session_key": "phase-one", "commit_nonce": "c" * 64}
++        )
++    release_teardown.set()
++    closer.join(timeout=1)
++
++    assert closed == [True]
++    assert not closer.is_alive()
++    identity_policy.begin_native_authority_commit_pending(
++        {"session_key": "phase-one", "commit_nonce": "d" * 64}
++    )
++    identity_policy.clear_native_authority_commit_pending("d" * 64)
++
++
++def test_sticky_quarantine_still_allows_session_teardown(monkeypatch):
++    import agent.identity_policy as identity_policy
++
++    torn_down = []
++    server._sessions["quarantined-close"] = {
++        "session_key": "quarantined-close-key"
++    }
++    monkeypatch.setattr(
++        server,
++        "_teardown_session",
++        lambda session, *, end_reason: torn_down.append(
++            (session["session_key"], end_reason)
++        ),
++    )
++    identity_policy.latch_native_authority_quarantine("test quarantine")
++
++    assert server._close_session_by_id(
++        "quarantined-close",
++        end_reason="tui_shutdown",
++    ) is True
++    assert torn_down == [("quarantined-close-key", "tui_shutdown")]
++
++
++def test_deferred_failed_registration_keeps_database_open_until_teardown(
++    monkeypatch,
++):
++    import agent.identity_policy as identity_policy
++
++    class RecordingDb:
++        def __init__(self):
++            self.close_count = 0
++
++        def get_session(self, session_id):
++            if self.close_count:
++                raise RuntimeError("database is closed")
++            return {"id": session_id}
++
++        def close(self):
++            self.close_count += 1
++
++    class RecordingAgent:
++        def __init__(self, db):
++            self._session_db = db
++            self._owns_session_db = False
++
++        def close(self):
++            if self._owns_session_db:
++                self._owns_session_db = False
++                self._session_db.close()
++
++    db = RecordingDb()
++    agent = RecordingAgent(db)
++    teardown_done = threading.Event()
++    server._sessions["failed-registration"] = {
++        "session_key": "failed-registration-key",
++        "agent": agent,
++    }
++
++    def _teardown(session, *, end_reason):
++        session["agent"].close()
++        teardown_done.set()
++
++    monkeypatch.setattr(server, "_teardown_session", _teardown)
++    nonce = "2" * 64
++    identity_policy.begin_native_authority_commit_pending(
++        {
++            "session_key": "__runtime_model_default__",
++            "commit_nonce": nonce,
++            "source": "hermes.model.default.set",
++        }
++    )
++    assert server._discard_failed_session_registration(
++        "failed-registration",
++        end_reason="resume_init_failed",
++    ) is None
++    assert server._preserve_deferred_session_db(
++        "failed-registration",
++        agent,
++        db,
++    ) is True
++    assert db.get_session("failed-registration-key")["id"] == (
++        "failed-registration-key"
++    )
++    assert "failed-registration" in server._sessions
++
++    identity_policy.clear_native_authority_commit_pending(nonce)
++    assert teardown_done.wait(timeout=1)
++    assert "failed-registration" not in server._sessions
++    assert db.close_count == 1
++
++
++def test_prompt_submit_rechecks_pending_after_optimistic_entry_gate(monkeypatch):
++    import agent.identity_policy as identity_policy
++
++    session = {
++        "session_key": "prompt-race-key",
++        "history": [],
++        "history_lock": threading.RLock(),
++        "attached_images": [],
++        "running": False,
++        "tool_started_at": {},
++        "transport": None,
++    }
++    reached_after_entry_gate = threading.Event()
++    release_submit = threading.Event()
++    responses = []
++
++    def _paused_session_lookup(_params, _rid):
++        reached_after_entry_gate.set()
++        release_submit.wait(timeout=2)
++        return session, None
++
++    monkeypatch.setattr(server, "_sess_nowait", _paused_session_lookup)
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_: None)
++    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
++    monkeypatch.setattr(
++        server,
++        "_compute_host_turn_uncertain_rpc_error",
++        lambda *_: None,
++    )
++    monkeypatch.setattr(
++        server,
++        "_load_dashboard_process_isolation_config",
++        lambda: {},
++    )
++    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_: False)
++    monkeypatch.setattr(server, "current_transport", lambda: None)
++    submitter = threading.Thread(
++        target=lambda: responses.append(
++            server._methods["prompt.submit"](
++                "prompt-race",
++                {"session_id": "prompt-race", "text": "hello"},
++            )
++        )
++    )
++    submitter.start()
++    assert reached_after_entry_gate.wait(timeout=1)
++    nonce = "e" * 64
++    identity_policy.begin_native_authority_commit_pending(
++        {
++            "session_key": "__runtime_model_default__",
++            "commit_nonce": nonce,
++            "source": "hermes.model.default.set",
++        }
++    )
++    release_submit.set()
++    submitter.join(timeout=1)
++    identity_policy.clear_native_authority_commit_pending(nonce)
++
++    assert not submitter.is_alive()
++    assert responses[0]["error"]["code"] == 4090
++    assert responses[0]["error"]["data"]["pending_transition"] is True
++    assert responses[0]["error"]["data"]["restart_required"] is False
++    assert session.get("running") is False
++    assert session.get("inflight_turn") is None
++
++
++def test_model_commit_reenumerates_late_agent_and_invalidates_deferred_build(
++    monkeypatch,
++):
++    import types
++    from agent.identity_policy import (
++        NativeAuthorityTransitionBusyError,
++        enforce_scoped_turn_identity,
++    )
++    from hermes_cli.env_loader import load_hermes_dotenv
++    from tools.approval import _capture_native_approval_policy
++
++    class SessionDb:
++        def __init__(self, model_config):
++            self.row = {"model_config": json.dumps(model_config)}
++
++        def get_session(self, _session_id):
++            return dict(self.row)
++
++        def update_session_meta(self, _session_id, model_config, model=None):
++            self.row["model_config"] = model_config
++
++    soul = "Lilith soul.\n"
++    personality = "You are Lilith.\n"
++    config = _strict_config(personality)
++    config["model"] = {
++        "default": "deepseek-v4-flash",
++        "provider": "deepseek",
++    }
++    raw = _write_config(config)
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, raw, soul, personality)
++    load_hermes_dotenv(hermes_home=_home())
++    old_digest = hashlib.sha256(raw).hexdigest()
++    # Simulates an eager resume/branch whose constructor starts before phase
++    # one but does not reach the registry publication boundary until after the
++    # durable receipt commit has completed.
++    stale_eager_candidate = _new_strict_agent()
++    approval_mode, enabled_toolsets = _capture_native_approval_policy()
++
++    digest = server._persist_model_switch(
++        types.SimpleNamespace(
++            new_model="gemini-3-flash-preview",
++            target_provider="gemini",
++            base_url=None,
++        )
++    )
++
++    # Both sessions appeared after phase one. The already-new agent must be
++    # verified rather than rebound; the dormant session's old state.db row
++    # must be rebound and its in-flight candidate made stale by revision.
++    late_agent = _new_strict_agent()
++    late_db = SessionDb(late_agent._session_init_model_config)
++    late_agent._session_db = late_db
++    server._sessions["late-agent"] = {
++        "session_key": "late-agent-key",
++        "agent": late_agent,
++        "history_lock": threading.RLock(),
++        "running": False,
++        "tool_started_at": {},
++    }
++    dormant_db = SessionDb({"_identity_config_sha256": old_digest})
++    monkeypatch.setattr(server, "_get_db", lambda: dormant_db)
++    server._sessions["late-build"] = {
++        "session_key": "late-build-key",
++        "agent": None,
++        "history_lock": threading.RLock(),
++        "running": False,
++        "tool_started_at": {},
++        "agent_build_started": True,
++        "agent_runtime_revision": 7,
++    }
++
++    receipt = {
++        "schema_version": 1,
++        "source": "hermes.model.default.set",
++        "sequence": 1,
++        "canonical_base_sha256": old_digest,
++        "previous_config_sha256": old_digest,
++        "config_sha256": digest,
++        "identity_fingerprint_sha256": "a" * 64,
++        "soul_sha256": hashlib.sha256(soul.encode("utf-8")).hexdigest(),
++        "personality_sha256": hashlib.sha256(
++            personality.encode("utf-8")
++        ).hexdigest(),
++        "approval_mode": approval_mode,
++        "enabled_toolsets": list(enabled_toolsets),
++    }
++    receipt_raw = json.dumps(receipt, separators=(",", ":")).encode("utf-8")
++    (_home() / "runtime" / "native-config-receipt.v1.json").write_bytes(
++        receipt_raw
++    )
++    response = server._methods["model.default.commit"](
++        "late-commit",
++        {
++            "authority": "lilith-runtime-native-config.v1",
++            "previous_config_sha256": old_digest,
++            "config_sha256": digest,
++            "receipt_sha256": hashlib.sha256(receipt_raw).hexdigest(),
++        },
++    )
++
++    assert response["result"] == {"committed": 1}
++    assert server._sessions["late-build"]["agent_runtime_revision"] == 8
++    assert json.loads(dormant_db.row["model_config"])[
++        "_identity_config_sha256"
++    ] == digest
++    assert json.loads(late_db.row["model_config"])[
++        "_identity_config_sha256"
++    ] == digest
++    enforce_scoped_turn_identity(late_agent)
++    try:
++        with pytest.raises(
++            NativeAuthorityTransitionBusyError,
++            match="stale native config",
++        ):
++            server._init_session(
++                "stale-eager",
++                "stale-eager-key",
++                stale_eager_candidate,
++                [],
++            )
++    finally:
++        stale_eager_candidate.close()
++    assert "stale-eager" not in server._sessions
++
++
++def test_model_commit_quarantines_wrong_durable_receipt(monkeypatch):
++    import types
++    from agent.identity_policy import (
++        native_authority_pending_transition_state,
++        native_authority_quarantine_state,
++    )
++    from hermes_cli.env_loader import load_hermes_dotenv
++    from tools.approval import _capture_native_approval_policy
++
++    soul = "Lilith soul.\n"
++    personality = "You are Lilith.\n"
++    config = _strict_config(personality)
++    config["model"] = {
++        "default": "deepseek-v4-flash",
++        "provider": "deepseek",
++    }
++    raw = _write_config(config)
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, raw, soul, personality)
++    load_hermes_dotenv(hermes_home=_home())
++    old_digest = hashlib.sha256(raw).hexdigest()
++    approval_mode, enabled_toolsets = _capture_native_approval_policy()
++    digest = server._persist_model_switch(
++        types.SimpleNamespace(
++            new_model="gemini-3-flash-preview",
++            target_provider="gemini",
++            base_url=None,
++        )
++    )
++
++    receipt = {
++        "schema_version": 1,
++        # Structurally valid, but not the prepared model authority.
++        "source": "hermes.tools.set",
++        "sequence": 1,
++        "canonical_base_sha256": old_digest,
++        "previous_config_sha256": old_digest,
++        "config_sha256": digest,
++        "identity_fingerprint_sha256": "a" * 64,
++        "soul_sha256": hashlib.sha256(soul.encode("utf-8")).hexdigest(),
++        "personality_sha256": hashlib.sha256(
++            personality.encode("utf-8")
++        ).hexdigest(),
++        "approval_mode": approval_mode,
++        "enabled_toolsets": list(enabled_toolsets),
++    }
++    receipt_raw = json.dumps(receipt, separators=(",", ":")).encode("utf-8")
++    (_home() / "runtime" / "native-config-receipt.v1.json").write_bytes(
++        receipt_raw
++    )
++    response = server._methods["model.default.commit"](
++        "wrong-model-receipt",
++        {
++            "authority": "lilith-runtime-native-config.v1",
++            "previous_config_sha256": old_digest,
++            "config_sha256": digest,
++            "receipt_sha256": hashlib.sha256(receipt_raw).hexdigest(),
++        },
++    )
++
++    assert response["error"]["code"] == 5035
++    assert native_authority_quarantine_state() is not None
++    assert native_authority_pending_transition_state() is None
++    assert server._native_model_default_prepared_commit is None
++
++
++def test_permanent_approval_rebinds_live_strict_agent_before_release(
++    monkeypatch,
++):
++    from agent.identity_policy import enforce_scoped_turn_identity
++    from hermes_cli.env_loader import load_hermes_dotenv
++
++    class SessionDb:
++        def __init__(self, row):
++            self.row = dict(row)
++
++        def get_session(self, _session_id):
++            return dict(self.row)
++
++        def update_session_meta(self, _session_id, model_config, model=None):
++            self.row["model_config"] = model_config
++
++    soul = "Lilith soul.\n"
++    personality = "You are Lilith.\n"
++    old_raw = _write_config(_strict_config(personality))
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, old_raw, soul, personality)
++    load_hermes_dotenv(hermes_home=_home())
++    agent = _new_strict_agent()
++    db = SessionDb(
++        {"model_config": json.dumps(agent._session_init_model_config)}
++    )
++    agent._session_db = db
++    approval, session_id, _, entry = _pending_native_approval(monkeypatch)
++    server._sessions[session_id]["agent"] = agent
++
++    prepared = server._methods["approval.respond"](
++        "always-live",
++        {"session_id": session_id, "choice": "always"},
++    )["result"]["persistence"]
++    with pytest.raises(Exception, match="config snapshot"):
++        enforce_scoped_turn_identity(agent)
++
++    receipt = {
++        "schema_version": 1,
++        "source": "hermes.approval.respond.always",
++        "sequence": 1,
++        "canonical_base_sha256": prepared["previous_config_sha256"],
++        "previous_config_sha256": prepared["previous_config_sha256"],
++        "config_sha256": prepared["config_sha256"],
++        "operation_nonce": prepared["commit_nonce"],
++        "identity_fingerprint_sha256": "a" * 64,
++        "soul_sha256": hashlib.sha256(soul.encode("utf-8")).hexdigest(),
++        "personality_sha256": hashlib.sha256(
++            personality.encode("utf-8")
++        ).hexdigest(),
++        "approval_mode": prepared["approval_mode"],
++        "enabled_toolsets": prepared["enabled_toolsets"],
++    }
++    receipt_raw = json.dumps(receipt, separators=(",", ":")).encode("utf-8")
++    (_home() / "runtime" / "native-config-receipt.v1.json").write_bytes(
++        receipt_raw
++    )
++    committed = server._methods["approval.commit"](
++        "commit-live",
++        {
++            "session_id": session_id,
++            "authority": "lilith-runtime-native-config.v1",
++            "commit_nonce": prepared["commit_nonce"],
++            "receipt_sha256": hashlib.sha256(receipt_raw).hexdigest(),
++        },
++    )
++
++    assert "error" not in committed, committed
++    assert entry.event.is_set()
++    enforce_scoped_turn_identity(agent)
++    durable = json.loads(db.row["model_config"])
++    assert durable["_identity_config_sha256"] == prepared["config_sha256"]
++    with approval._lock:
++        approval._permanent_approved.discard("dangerous:test")
++
++
+ def test_failed_strict_candidate_does_not_rotate_expected_digest(monkeypatch):
+     from agent.identity_policy import (
+         IdentityPolicyError,
+@@ -459,7 +1637,8 @@ def test_tools_set_candidate_failure_restores_exact_old_bytes_and_pin(monkeypatc
+         },
+     )
+ 
+-    assert response["error"]["code"] == 5035
++    assert response["error"]["code"] == 4090
++    assert response["error"]["data"]["restart_required"] is False
+     assert calls >= 3
+     assert (_home() / "config.yaml").read_bytes() == old_raw
+     assert os.environ["HERMES_IDENTITY_EXPECTED_CONFIG_SHA256"] == old_digest
+diff --git a/tools/approval.py b/tools/approval.py
+index 15eaeac..59c807e 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -2947,6 +2947,7 @@ class _PreparedApprovalCommit:
+         "receipt_base",
+         "permanent_keys",
+         "session_keys",
++        "on_verified_config_commit",
+         "prepared_at",
+     )
+ 
+@@ -2960,6 +2961,7 @@ class _PreparedApprovalCommit:
+         receipt_base,
+         permanent_keys: set[str],
+         session_keys: set[str],
++        on_verified_config_commit=None,
+     ):
+         self.session_key = session_key
+         self.entries = entries
+@@ -2968,6 +2970,7 @@ class _PreparedApprovalCommit:
+         self.receipt_base = receipt_base
+         self.permanent_keys = frozenset(permanent_keys)
+         self.session_keys = frozenset(session_keys)
++        self.on_verified_config_commit = on_verified_config_commit
+         self.prepared_at = time.monotonic()
+ 
+ 
+@@ -3113,6 +3116,11 @@ def commit_gateway_approval(
+                 commit_nonce=prepared.commit_nonce,
+                 receipt_sha256=receipt_sha256,
+             )
++            if prepared.on_verified_config_commit is not None:
++                prepared.on_verified_config_commit(
++                    prepared.persistence["previous_config_sha256"],
++                    prepared.persistence["config_sha256"],
++                )
+             clear_native_authority_commit_pending(prepared.commit_nonce)
+         except BaseException:
+             if prepared is not None:
+@@ -3222,6 +3230,7 @@ def resolve_gateway_approval_with_persistence(
+     choice: str,
+     resolve_all: bool = False,
+     reason: Optional[str] = None,
++    on_verified_config_commit=None,
+ ) -> tuple[int, Optional[dict]]:
+     """Called by the gateway's /approve or /deny handler to unblock
+     waiting agent thread(s).
+@@ -3366,6 +3375,7 @@ def resolve_gateway_approval_with_persistence(
+                         receipt_base=receipt_base,
+                         permanent_keys=permanent_keys,
+                         session_keys=session_keys,
++                        on_verified_config_commit=on_verified_config_commit,
+                     )
+                     if _gateway_prepared_commit is not None:
+                         raise NativeAuthorityTransitionBusyError(
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index f48b2e1..ba79615 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -373,6 +373,13 @@ def _(rid, params: dict) -> dict:
+     # rowId rebinding (see comment at the assignment site).
+     survivor_user_row_ids = None
+     with session["history_lock"]:
++        # This is the final turn-claim boundary shared with native phase one.
++        # The optimistic entry check can precede phase-one admission while this
++        # submit waits for history_lock; recheck before queueing, truncating,
++        # touching durable history, or setting running/inflight state.
++        quarantine_error = _native_authority_quarantine_rpc_error(rid)
++        if quarantine_error is not None:
++            return quarantine_error
+         if session.get("running") or session.get(
+             _COMPUTE_HOST_RECONCILE_QUEUE_GATE
+         ):
+@@ -399,12 +406,6 @@ def _(rid, params: dict) -> dict:
+         )
+         if compute_uncertain_error is not None:
+             return compute_uncertain_error
+-        # Re-check under the same lock held by tools.set.  A submit that read
+-        # the process latch just before a failed mutation must not claim a turn
+-        # after the compensating write itself failed.
+-        quarantine_error = _native_authority_quarantine_rpc_error(rid)
+-        if quarantine_error is not None:
+-            return quarantine_error
+         # A watch session's run lives in the PARENT turn, so its own running
+         # flag is False — without this, typing mid-run builds a second agent
+         # racing the in-flight child on the same stored session (interleaved
+@@ -1398,10 +1399,22 @@ def _(rid, params: dict) -> dict:
+     try:
+         from tools.approval import resolve_gateway_approval_with_persistence
+ 
++        approval_agent = session.get("agent")
+         resolved, persistence = resolve_gateway_approval_with_persistence(
+             session["session_key"],
+             params.get("choice", "deny"),
+             resolve_all=params.get("all", False),
++            on_verified_config_commit=(
++                lambda previous_sha256, config_sha256:
++                    _adopt_verified_native_config_digest_for_session(
++                        session,
++                        approval_agent,
++                        previous_sha256,
++                        config_sha256,
++                    )
++                if approval_agent is not None
++                else None
++            ),
+         )
+         if persistence is not None and "commit_nonce" in persistence:
+             result = {"prepared": resolved, "persistence": persistence}
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index d5eb325..c054a04 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -112,9 +112,46 @@ def _(rid, params: dict) -> dict:
+     ready = threading.Event()
+     now = time.time()
+     lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
++    native_create_effect_token = ""
++    if durable:
++        from agent.identity_policy import (
++            NativeAuthorityTransitionBusyError,
++            identity_lock_required_by_host,
++            reserve_native_authority_terminal_effect,
++        )
+ 
+-    with _sessions_lock:
+-        _sessions[sid] = {
++        if identity_lock_required_by_host():
++            try:
++                native_create_effect_token = (
++                    reserve_native_authority_terminal_effect()
++                )
++            except NativeAuthorityTransitionBusyError:
++                blocked = _native_authority_quarantine_rpc_error(rid)
++                return blocked or _err(
++                    rid,
++                    4090,
++                    "durable session create is blocked by a native config transition",
++                )
++
++    def _release_native_create_effect() -> None:
++        nonlocal native_create_effect_token
++        if not native_create_effect_token:
++            return
++        from agent.identity_policy import release_native_authority_terminal_effect
++
++        release_native_authority_terminal_effect(native_create_effect_token)
++        native_create_effect_token = ""
++
++    with _session_resume_lock:
++        with _sessions_lock:
++            if _native_model_default_transition_pending():
++                _release_native_create_effect()
++                return _err(
++                    rid,
++                    4090,
++                    "session create is blocked by a pending global model commit",
++                )
++            _sessions[sid] = {
+             "agent": None,
+             "agent_error": None,
+             "agent_ready": ready,
+@@ -147,8 +184,8 @@ def _(rid, params: dict) -> dict:
+             "tool_progress_mode": _load_tool_progress_mode(),
+             "tool_started_at": {},
+             "transport": current_transport() or _stdio_transport,
+-        }
+-        _register_session_cwd(_sessions[sid])
++            }
++            _register_session_cwd(_sessions[sid])
+ 
+     durable_lineage = None
+     if durable:
+@@ -167,8 +204,11 @@ def _(rid, params: dict) -> dict:
+                     _sessions[sid], durable_lineage
+                 )
+         except Exception:
+-            with _sessions_lock:
+-                _sessions.pop(sid, None)
++            _discard_failed_session_registration(
++                sid,
++                end_reason="durable_create_failed",
++            )
++            _release_native_create_effect()
+             try:
+                 from tools.terminal_tool import clear_task_env_overrides
+ 
+@@ -177,6 +217,7 @@ def _(rid, params: dict) -> dict:
+                 pass
+             logger.warning("durable archived session creation failed")
+             return _err(rid, 5006, "durable session creation failed")
++        _release_native_create_effect()
+ 
+     # Ordinary drafts intentionally remain ephemeral until their first prompt.
+     # A caller that explicitly requested a durable archived draft was persisted
+@@ -392,6 +433,14 @@ def _(rid, params: dict) -> dict:
+     target = params.get("session_id", "")
+     if not target:
+         return _err(rid, 4006, "session_id required")
++    with _session_resume_lock:
++        with _sessions_lock:
++            if _native_model_default_transition_pending():
++                return _err(
++                    rid,
++                    4090,
++                    "session resume is blocked by a pending global model commit",
++                )
+     requested_target = target
+     require_durable_lineage = params.get("require_durable_lineage", False)
+     if type(require_durable_lineage) is not bool:
+@@ -465,20 +514,27 @@ def _(rid, params: dict) -> dict:
+             # it, accept a title match, or weaken the durable hidden-game path
+             # above.  The resume lock also excludes a concurrent session.close.
+             with _session_resume_lock:
+-                live_draft = _find_live_unpersisted_draft_by_key(
+-                    target, profile_home=profile_home
+-                )
+-                if live_draft is not None:
+-                    payload = _live_session_payload(
+-                        live_draft[0],
+-                        live_draft[1],
+-                        cols=cols,
+-                        touch=True,
+-                        transport=current_transport() or _stdio_transport,
+-                        omit_messages=omit_messages,
++                with _sessions_lock:
++                    if _native_model_default_transition_pending():
++                        return _err(
++                            rid,
++                            4090,
++                            "session resume is blocked by a pending global model commit",
++                        )
++                    live_draft = _find_live_unpersisted_draft_by_key(
++                        target, profile_home=profile_home
+                     )
+-                    payload["resumed"] = target
+-                    return _ok(rid, payload)
++                    if live_draft is not None:
++                        payload = _live_session_payload(
++                            live_draft[0],
++                            live_draft[1],
++                            cols=cols,
++                            touch=True,
++                            transport=current_transport() or _stdio_transport,
++                            omit_messages=omit_messages,
++                        )
++                        payload["resumed"] = target
++                        return _ok(rid, payload)
+             found = db.get_session_by_title(target)
+             if found:
+                 target = found["id"]
+@@ -633,6 +689,13 @@ def _(rid, params: dict) -> dict:
+             # replaced the tuple while SQLite was reading.
+             reconciled = None
+             with _session_resume_lock:
++                with _sessions_lock:
++                    if _native_model_default_transition_pending():
++                        return _err(
++                            rid,
++                            4090,
++                            "session resume is blocked by a pending global model commit",
++                        )
+                 rebound = _find_live_session_by_key(target)
+                 if rebound is not None and isinstance(
+                     rebound[1].get(_COMPUTE_HOST_TURN_UNCERTAIN), dict
+@@ -675,17 +738,24 @@ def _(rid, params: dict) -> dict:
+                         rebound[1],
+                     )
+                 with _session_resume_lock:
+-                    current = _find_live_session_by_key(target)
+-                    if current is not None:
+-                        # Rebind the caller's transport before a retry can emit
+-                        # session.info.  A prior deferred worker may have died
+-                        # outside the ordinary Exception rail and published a
+-                        # terminal initialization error; _start_agent_build's
+-                        # per-session authority lock makes ready/building agents
+-                        # no-ops while allowing that exact live record to retry.
+-                        payload = _attest_payload(_reuse_live_payload(*current))
+-                        _start_agent_build(*current)
+-                        return _ok(rid, payload)
++                    with _sessions_lock:
++                        if _native_model_default_transition_pending():
++                            return _err(
++                                rid,
++                                4090,
++                                "session resume is blocked by a pending global model commit",
++                            )
++                        current = _find_live_session_by_key(target)
++                        if current is not None:
++                            # Rebind the caller's transport before a retry can emit
++                            # session.info.  A prior deferred worker may have died
++                            # outside the ordinary Exception rail and published a
++                            # terminal initialization error; _start_agent_build's
++                            # per-session authority lock makes ready/building agents
++                            # no-ops while allowing that exact live record to retry.
++                            payload = _attest_payload(_reuse_live_payload(*current))
++                            _start_agent_build(*current)
++                            return _ok(rid, payload)
+ 
+         # Lazy/watch resume: register the live session WITHOUT building an agent.
+         # Used by the desktop's subagent windows — the child runs inside the
+@@ -725,7 +795,26 @@ def _(rid, params: dict) -> dict:
+                 profile_home=profile_home,
+                 lazy=True,
+             )
+-            if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
++            try:
++                live = _claim_or_reuse_live(
++                    sid,
++                    target,
++                    record,
++                    lease,
++                    prepare_registration=lambda: (
++                        _bind_existing_session_row_to_current_host_identity(
++                            db,
++                            target,
++                        )
++                    ),
++                )
++            except Exception as exc:
++                from agent.identity_policy import NativeAuthorityTransitionBusyError
++
++                if isinstance(exc, NativeAuthorityTransitionBusyError):
++                    return _err(rid, 4090, str(exc))
++                raise
++            if live is not None:
+                 return _ok(rid, _attest_payload(_reuse_live_payload(*live)))
+             # A delegated child mid-run emits no session events of its own — report
+             # its liveness from the relay registry so the window shows a busy turn.
+@@ -823,7 +912,26 @@ def _(rid, params: dict) -> dict:
+                 model_override=overrides.get("model_override"),
+                 resume_runtime_overrides=overrides or None,
+             )
+-            if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
++            try:
++                live = _claim_or_reuse_live(
++                    sid,
++                    target,
++                    record,
++                    lease,
++                    prepare_registration=lambda: (
++                        _bind_existing_session_row_to_current_host_identity(
++                            db,
++                            target,
++                        )
++                    ),
++                )
++            except Exception as exc:
++                from agent.identity_policy import NativeAuthorityTransitionBusyError
++
++                if isinstance(exc, NativeAuthorityTransitionBusyError):
++                    return _err(rid, 4090, str(exc))
++                raise
++            if live is not None:
+                 return _ok(rid, _attest_payload(_reuse_live_payload(*live)))
+ 
+             _schedule_agent_build(sid)
+@@ -925,7 +1033,21 @@ def _(rid, params: dict) -> dict:
+         # live session while we were building. Re-check under the lock; if it won,
+         # discard our just-built agent and reuse theirs (no worker/poller wired yet).
+         with _session_resume_lock:
+-            live = _find_live_session_by_key(target)
++            with _sessions_lock:
++                if _native_model_default_transition_pending():
++                    try:
++                        if hasattr(agent, "close"):
++                            agent.close()
++                    except Exception:
++                        pass
++                    if lease is not None:
++                        lease.release()
++                    return _err(
++                        rid,
++                        4090,
++                        "session resume is blocked by a pending global model commit",
++                    )
++                live = _find_live_session_by_key(target)
+             if live is not None:
+                 try:
+                     if hasattr(agent, "close"):
+@@ -957,6 +1079,12 @@ def _(rid, params: dict) -> dict:
+                     else None
+                 )
+                 try:
++                    _assert_session_candidate_native_identity_current(agent)
++                    _bind_new_session_row_to_agent_runtime(
++                        db,
++                        target,
++                        agent,
++                    )
+                     _init_session(
+                         sid,
+                         target,
+@@ -1018,10 +1146,26 @@ def _(rid, params: dict) -> dict:
+                 # owns_db still True means ownership never transferred, so the
+                 # registration is ours to undo.
+                 if owns_db:
+-                    with _sessions_lock:
+-                        _sessions.pop(sid, None)
++                    cleanup_disposition = _discard_failed_session_registration(
++                        sid,
++                        end_reason="resume_init_failed",
++                    )
++                    if (
++                        cleanup_disposition is None
++                        and _preserve_deferred_session_db(sid, agent, db)
++                    ):
++                        owns_db = False
+                 if lease is not None:
+                     lease.release()
++                from agent.identity_policy import NativeAuthorityTransitionBusyError
++
++                if isinstance(e, NativeAuthorityTransitionBusyError):
++                    try:
++                        if hasattr(agent, "close"):
++                            agent.close()
++                    except Exception:
++                        pass
++                    return _err(rid, 4090, str(e))
+                 return _err(rid, 5000, f"resume failed: {e}")
+             session = _sessions.get(sid) or {}
+     finally:
+@@ -3058,8 +3202,22 @@ def _(rid, params: dict) -> dict:
+     # Serialize only the ownership claim against session.resume / the orphan
+     # reaper. Finalization may run arbitrary plugin/agent cleanup and must not
+     # keep every unrelated session.resume waiting behind it.
+-    with _session_resume_lock:
+-        session = _pop_session_by_id(sid)
++    try:
++        with _session_resume_lock:
++            with _sessions_lock:
++                if _native_model_default_transition_pending():
++                    return _err(
++                        rid,
++                        4090,
++                        "session close is blocked by a pending global model commit",
++                    )
++                session = _pop_session_by_id(sid)
++    except Exception as exc:
++        from agent.identity_policy import NativeAuthorityTransitionBusyError
++
++        if isinstance(exc, NativeAuthorityTransitionBusyError):
++            return _err(rid, 4090, str(exc))
++        raise
+     closed = _teardown_popped_session(session, end_reason="tui_close")
+     return _ok(rid, {"closed": closed})
+ 
+@@ -3156,6 +3314,7 @@ def _(rid, params: dict) -> dict:
+     # unbound, whatever raises inside.
+     branch_db = None
+     branch_owns_db = False
++    agent = None
+     try:
+         # Bind the branched AGENT to the parent's profile, mirroring
+         # session.create/resume: home override so config/skills/memory resolve
+@@ -3198,17 +3357,45 @@ def _(rid, params: dict) -> dict:
+                 )
+             finally:
+                 _clear_session_context(tokens)
+-            _init_session(
+-                new_sid,
+-                new_key,
+-                agent,
+-                list(history),
+-                cols=session.get("cols", 80),
+-                cwd=_session_cwd(session),
+-                session_db=branch_db,
+-                source=source,
+-                profile_home=parent_home,
+-            )
++            branch_effect_token = ""
++            try:
++                from agent.identity_policy import (
++                    identity_lock_required_by_host,
++                    release_native_authority_terminal_effect,
++                    reserve_native_authority_terminal_effect,
++                )
++
++                if identity_lock_required_by_host():
++                    branch_effect_token = (
++                        reserve_native_authority_terminal_effect()
++                    )
++                # The branch candidate was built before the lifecycle
++                # reservation.  A complete A -> B global model transition may
++                # therefore have happened while its constructor was running.
++                # Re-prove the candidate against the current host pin before
++                # it is allowed to overwrite the durable child row.
++                _assert_session_candidate_native_identity_current(agent)
++                _bind_new_session_row_to_agent_runtime(
++                    branch_db or _get_db(),
++                    new_key,
++                    agent,
++                )
++                _init_session(
++                    new_sid,
++                    new_key,
++                    agent,
++                    list(history),
++                    cols=session.get("cols", 80),
++                    cwd=_session_cwd(session),
++                    session_db=branch_db,
++                    source=source,
++                    profile_home=parent_home,
++                )
++            finally:
++                if branch_effect_token:
++                    release_native_authority_terminal_effect(
++                        branch_effect_token
++                    )
+             # Ownership TRANSFER — the branched session's agent holds this
+             # handle for its whole life and closes it on teardown. Drop is
+             # unconditional for the same reason as session.resume: past
+@@ -3226,6 +3413,30 @@ def _(rid, params: dict) -> dict:
+     except Exception as e:
+         if lease is not None:
+             lease.release()
++        with _sessions_lock:
++            partial_branch = (
++                _sessions.get(new_sid, {}).get("agent") is agent
++            )
++        if partial_branch:
++            cleanup_disposition = _discard_failed_session_registration(
++                new_sid,
++                end_reason="branch_init_failed",
++            )
++            if (
++                cleanup_disposition is None
++                and branch_owns_db
++                and _preserve_deferred_session_db(new_sid, agent, branch_db)
++            ):
++                branch_owns_db = False
++        from agent.identity_policy import NativeAuthorityTransitionBusyError
++
++        if isinstance(e, NativeAuthorityTransitionBusyError):
++            try:
++                if agent is not None and hasattr(agent, "close"):
++                    agent.close()
++            except Exception:
++                pass
++            return _err(rid, 4090, str(e))
+         return _err(rid, 5000, f"agent init failed on branch: {e}")
+     finally:
+         if branch_owns_db and branch_db is not None:
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 977fa58..89d6fe1 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -4,12 +4,14 @@ import contextlib
+ import contextvars
+ import copy
+ import hashlib
++import hmac
+ import inspect
+ import json
+ import logging
+ import math
+ import os
+ import queue
++import secrets
+ import subprocess
+ import sys
+ import threading
+@@ -164,6 +166,12 @@ _tool_policy_terminal_error: str | None = None
+ _TOOL_POLICY_TERMINAL_MESSAGE = (
+     "tool policy mutation recovery failed; restart required"
+ )
++# A strict global model save remains prepared until Runtime durably receipts
++# that exact config digest transition.  This lock owns only the small
++# in-memory transaction record; the identity-policy transition gate owns
++# admission of turns, tools, and other native config mutations.
++_native_model_default_commit_lock = threading.RLock()
++_native_model_default_prepared_commit = None
+ _cfg_cache: dict | None = None
+ _cfg_mtime: float | None = None
+ _cfg_path = None
+@@ -963,15 +971,43 @@ def _pop_session_by_id(sid: str) -> dict | None:
+     and close agents/workers.  None of that slow external work belongs under
+     the global ``_session_resume_lock``.
+     """
+-    with _sessions_lock:
+-        session = _sessions.pop(sid, None)
+-    if session is None:
+-        return None
+-    # The session is already out of _sessions here, so downstream teardown
+-    # (e.g. _finalize_session's per-session async-delegation interrupt) can't
+-    # recover its live id by scanning the dict — stamp it on the record.
+-    session["_sid"] = sid
+-    return session
++    from agent.identity_policy import (
++        NativeAuthorityTransitionBusyError,
++        native_authority_quarantine_state,
++        release_native_authority_terminal_effect,
++        reserve_native_authority_terminal_effect,
++    )
++
++    # Reserve before detaching.  Phase one checks the same process-global gate,
++    # so it can neither snapshot the registry after this record disappeared nor
++    # rotate the digest while teardown is still flushing the old state.db row.
++    effect_token = ""
++    if native_authority_quarantine_state() is None:
++        try:
++            effect_token = reserve_native_authority_terminal_effect()
++        except NativeAuthorityTransitionBusyError:
++            # Sticky quarantine permanently forbids another phase one, so
++            # teardown is safe and must remain available for shutdown/restart.
++            # Recheck after the failed reservation to close the latch race.
++            if native_authority_quarantine_state() is None:
++                raise
++    try:
++        with _sessions_lock:
++            session = _sessions.pop(sid, None)
++        if session is None:
++            release_native_authority_terminal_effect(effect_token)
++            effect_token = ""
++            return None
++        # The session is already out of _sessions here, so downstream teardown
++        # (e.g. _finalize_session's per-session async-delegation interrupt) can't
++        # recover its live id by scanning the dict — stamp it on the record.
++        session["_sid"] = sid
++        session["_native_lifecycle_effect_token"] = effect_token
++        effect_token = ""
++        return session
++    finally:
++        if effect_token:
++            release_native_authority_terminal_effect(effect_token)
+ 
+ 
+ def _teardown_popped_session(
+@@ -980,8 +1016,80 @@ def _teardown_popped_session(
+     """Finish a close after the caller has atomically detached the session."""
+     if session is None:
+         return False
+-    _teardown_session(session, end_reason=end_reason)
+-    return True
++    effect_token = str(session.pop("_native_lifecycle_effect_token", "") or "")
++    deferred_db = session.pop("_native_deferred_cleanup_db", None)
++    try:
++        _teardown_session(session, end_reason=end_reason)
++        return True
++    finally:
++        try:
++            if deferred_db is not None:
++                deferred_db.close()
++        finally:
++            if effect_token:
++                from agent.identity_policy import (
++                    release_native_authority_terminal_effect,
++                )
++
++                release_native_authority_terminal_effect(effect_token)
++
++
++def _discard_failed_session_registration(
++    sid: str,
++    *,
++    end_reason: str,
++) -> bool | None:
++    """Retire a private failed registration without bypassing native phase two.
++
++    A failure can be discovered just after registration while a native
++    transition is prepared.  In that case the live mapping must remain stable
++    until receipt commit re-enumerates it; retry cleanup after the transient
++    gate clears.  Every eventual detach still goes through the central
++    pop-to-teardown terminal-effect reservation.
++    """
++
++    from agent.identity_policy import NativeAuthorityTransitionBusyError
++
++    try:
++        session = _pop_session_by_id(sid)
++    except NativeAuthorityTransitionBusyError:
++        def _retry() -> None:
++            if _close_session_by_id(sid, end_reason=end_reason):
++                return
++            with _sessions_lock:
++                still_live = sid in _sessions
++            if still_live:
++                timer = threading.Timer(0.05, _retry)
++                timer.daemon = True
++                timer.start()
++
++        timer = threading.Timer(0.05, _retry)
++        timer.daemon = True
++        timer.start()
++        return None
++    return _teardown_popped_session(session, end_reason=end_reason)
++
++
++def _preserve_deferred_session_db(
++    sid: str,
++    agent,
++    db,
++) -> bool:
++    """Transfer one caller-owned DB until a deferred failed-session teardown."""
++
++    with _sessions_lock:
++        current = _sessions.get(sid)
++        if current is None or current.get("agent") is not agent:
++            return False
++        # Retry-pop uses this same registry lock. Validate ownership and hand
++        # off the close responsibility in one critical section so teardown
++        # cannot close the agent between the check and the transfer.
++        if _transfer_db_to_agent(agent, db):
++            return True
++        if current.get("_native_deferred_cleanup_db") is not None:
++            return False
++        current["_native_deferred_cleanup_db"] = db
++        return True
+ 
+ 
+ def _close_session_by_id(
+@@ -1002,14 +1110,23 @@ def _close_session_by_id(
+     stale scan result from closing a session that reattached or gained active
+     delegated work before teardown.
+     """
+-    if predicate is None:
+-        session = _pop_session_by_id(sid)
+-    else:
+-        with _sessions_lock:
+-            current = _sessions.get(sid)
+-            if current is None or not predicate(current):
+-                return False
+-            session = _pop_session_by_id(sid)
++    try:
++        with _session_resume_lock:
++            with _sessions_lock:
++                if _native_model_default_transition_pending():
++                    return False
++                current = _sessions.get(sid)
++                if current is None or (
++                    predicate is not None and not predicate(current)
++                ):
++                    return False
++                session = _pop_session_by_id(sid)
++    except Exception as exc:
++        from agent.identity_policy import NativeAuthorityTransitionBusyError
++
++        if isinstance(exc, NativeAuthorityTransitionBusyError):
++            return False
++        raise
+     return _teardown_popped_session(session, end_reason=end_reason)
+ 
+ 
+@@ -1125,14 +1242,24 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
+         # ordering is always resume_lock -> sessions_lock, so nesting is safe.
+         reschedule = False
+         session = None
+-        with _session_resume_lock:
+-            current = _sessions.get(sid)
+-            if not _ws_session_is_orphaned(current):
+-                return
+-            if _session_has_active_delegations(sid, current):
+-                reschedule = True
+-            else:
+-                session = _pop_session_by_id(sid)
++        try:
++            with _session_resume_lock:
++                with _sessions_lock:
++                    current = _sessions.get(sid)
++                    if not _ws_session_is_orphaned(current):
++                        return
++                    if _native_model_default_transition_pending() or (
++                        _session_has_active_delegations(sid, current)
++                    ):
++                        reschedule = True
++                    else:
++                        session = _pop_session_by_id(sid)
++        except Exception as exc:
++            from agent.identity_policy import NativeAuthorityTransitionBusyError
++
++            if not isinstance(exc, NativeAuthorityTransitionBusyError):
++                raise
++            reschedule = True
+         if reschedule:
+             _schedule_ws_orphan_reap(sid)
+             return
+@@ -1167,6 +1294,9 @@ def _close_sessions_for_transport(
+     # exact transport ownership atomically in the established lock order.
+     with _session_resume_lock:
+         with _sessions_lock:
++            model_transition_pending = (
++                _native_model_default_transition_pending()
++            )
+             owned = [
+                 (sid, session)
+                 for sid, session in _sessions.items()
+@@ -1176,11 +1306,21 @@ def _close_sessions_for_transport(
+                 current = _sessions.get(sid)
+                 if current is not session or current.get("transport") is not transport:
+                     continue
+-                if current.get("close_on_disconnect"):
+-                    popped = _pop_session_by_id(sid)
++                if current.get("close_on_disconnect") and not model_transition_pending:
++                    try:
++                        popped = _pop_session_by_id(sid)
++                    except Exception as exc:
++                        from agent.identity_policy import (
++                            NativeAuthorityTransitionBusyError,
++                        )
++
++                        if not isinstance(exc, NativeAuthorityTransitionBusyError):
++                            raise
++                        popped = None
+                     if popped is not None:
+                         to_teardown.append(popped)
+-                else:
++                        continue
++                if _sessions.get(sid) is current:
+                     # Point detached sessions at the drop sentinel (NOT real
+                     # stdio) so the grace reaper recognizes the orphan.
+                     current["transport"] = _detached_ws_transport
+@@ -2659,31 +2799,60 @@ def _err(rid, code: int, msg: str, data: dict | None = None) -> dict:
+ 
+ 
+ def _native_authority_quarantine_rpc_error(rid) -> dict | None:
+-    """Return the dedicated Runtime-visible authority quarantine signal."""
++    """Return sticky quarantine or a transient native-transition Busy."""
+     from agent.identity_policy import (
+         NATIVE_AUTHORITY_QUARANTINE_CODE,
+         latch_native_authority_quarantine,
+         native_authority_dispatch_block_state,
++        native_authority_quarantine_state,
+     )
+ 
+-    state = native_authority_dispatch_block_state()
+-    if state is None and _tool_policy_terminal_error is not None:
+-        state = latch_native_authority_quarantine(
++    quarantined = native_authority_quarantine_state()
++    if quarantined is None and _tool_policy_terminal_error is not None:
++        quarantined = latch_native_authority_quarantine(
+             "native config mutation recovery could not be verified",
+             drifted_labels=("config.yaml",),
+         )
++    if quarantined is not None:
++        return _err(
++            rid,
++            NATIVE_AUTHORITY_QUARANTINE_CODE,
++            str(
++                quarantined.get("message")
++                or "native authority dispatch is quarantined"
++            ),
++            {
++                "reason": str(quarantined.get("reason") or ""),
++                "restart_required": True,
++                "recovery_verified": bool(
++                    quarantined.get("recovery_verified")
++                ),
++                "drifted_labels": list(
++                    quarantined.get("drifted_labels") or ()
++                ),
++                "pending_transition": False,
++            },
++        )
++
++    state = native_authority_dispatch_block_state()
+     if state is None:
+         return None
++    # A prepared receipt or an in-progress mutation is an ordinary admission
++    # conflict, not integrity loss. Runtime treats 5035 as a sticky native
++    # quarantine, so never use that code for this self-clearing gate.
+     return _err(
+         rid,
+-        NATIVE_AUTHORITY_QUARANTINE_CODE,
+-        str(state.get("message") or "native authority dispatch is quarantined"),
++        4090,
++        str(state.get("message") or "native config transition is busy"),
+         {
+             "reason": str(state.get("reason") or ""),
+-            "restart_required": bool(state.get("restart_required", True)),
+-            "recovery_verified": bool(state.get("recovery_verified")),
+-            "drifted_labels": list(state.get("drifted_labels") or ()),
++            "restart_required": False,
++            "recovery_verified": False,
++            "drifted_labels": [],
+             "pending_transition": bool(state.get("pending_transition")),
++            "config_mutation_in_progress": bool(
++                state.get("config_mutation_in_progress")
++            ),
+         },
+     )
+ 
+@@ -2814,6 +2983,19 @@ def _runtime_setter_lock(session: dict) -> threading.Lock:
+     return session.setdefault("agent_runtime_setter_lock", threading.Lock())
+ 
+ 
++def _assert_native_runtime_setter_admitted() -> None:
++    """Recheck the native transition gate after taking a session setter lock."""
++
++    from agent.identity_policy import (
++        NativeAuthorityTransitionBusyError,
++        native_authority_dispatch_block_state,
++    )
++
++    blocked = native_authority_dispatch_block_state()
++    if blocked is not None:
++        raise NativeAuthorityTransitionBusyError(str(blocked["message"]))
++
++
+ def _runtime_revision_locked(session: dict) -> int:
+     return int(session.get("agent_runtime_revision", 0) or 0)
+ 
+@@ -3246,11 +3428,6 @@ def _start_agent_build(sid: str, session: dict) -> None:
+                     )
+                 break
+ 
+-            if owns_db and session_db is not None:
+-                if not _transfer_db_to_agent(candidate, session_db):
+-                    with contextlib.suppress(Exception):
+-                        session_db.close()
+-
+             committed = False
+             attached = False
+             with _sessions_lock:
+@@ -3260,6 +3437,15 @@ def _start_agent_build(sid: str, session: dict) -> None:
+                         attached
+                         and _runtime_revision_locked(current) == build_revision
+                     ):
++                        # Transfer the dedicated handle only to the candidate
++                        # that actually wins publication.  A reaped or stale
++                        # candidate is unreachable by normal teardown and must
++                        # leave the handle with this worker to close below.
++                        if owns_db and session_db is not None:
++                            if not _transfer_db_to_agent(candidate, session_db):
++                                with contextlib.suppress(Exception):
++                                    session_db.close()
++                            owns_db = False
+                         current["agent"] = candidate
+                         current["agent_build_runtime_revision"] = build_revision
+                         current["agent_build_model_revision"] = int(
+@@ -3274,6 +3460,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
+ 
+             if not committed:
+                 _close_candidate_agent(candidate)
++                if owns_db and session_db is not None:
++                    with contextlib.suppress(Exception):
++                        session_db.close()
+                 if not attached:
+                     break
+                 # A setter committed a newer model/reasoning/tier while this
+@@ -3319,6 +3508,14 @@ def _start_agent_build(sid: str, session: dict) -> None:
+                 unregister_gateway_notify(key)
+             except Exception:
+                 pass
++        if replaced:
++            # The private record is no longer publishable, but callers already
++            # waiting on its build event still need a terminal wake-up.  The
++            # old one-shot builder did this when a reap won before publication;
++            # retain that contract across the revision-aware retry loop.
++            with lock:
++                session["agent_build_started"] = False
++                ready.set()
+ 
+     def _run_build_worker() -> None:
+         """Never leave an attached deferred session waiting on a dead worker.
+@@ -3806,6 +4003,22 @@ def _ensure_session_db_row(session: dict, *, strict: bool = False) -> bool:
+         if strict:
+             raise RuntimeError("durable session key is unavailable")
+         return False
++    strict_identity_metadata: dict[str, str] = {}
++    from agent.identity_policy import (
++        identity_lock_required_by_host,
++        preflight_aia_agent_identity,
++    )
++
++    if identity_lock_required_by_host():
++        preflight = preflight_aia_agent_identity(request_overrides={})
++        if not preflight.enabled:
++            raise RuntimeError("strict durable session identity was unavailable")
++        strict_identity_metadata = {
++            "_identity_fingerprint": preflight.policy.fingerprint,
++            "_identity_config_sha256": preflight.config_sha256,
++            "_identity_soul_sha256": preflight.soul_sha256,
++            "_identity_personality_sha256": preflight.personality_sha256,
++        }
+     # Persist into the session's own profile db (global remote mode), not the
+     # launch profile's — otherwise the row lands in the wrong state.db, the
+     # unified list mis-tags it, and resume 404s ("session not found").
+@@ -3887,6 +4100,8 @@ def _ensure_session_db_row(session: dict, *, strict: bool = False) -> bool:
+     parent_session_id = session.get("parent_session_id") or None
+     if parent_session_id:
+         model_config["_branched_from"] = parent_session_id
++    if strict_identity_metadata:
++        model_config.update(strict_identity_metadata)
+     try:
+         db.create_session(
+             key,
+@@ -3908,10 +4123,29 @@ def _ensure_session_db_row(session: dict, *, strict: bool = False) -> bool:
+             row = db.get_session(key)
+             expected_source = _session_source(session)
+             expected_archived = session.get("archived") is True
++            row_model_config = None
++            if isinstance(row, dict):
++                raw_model_config = row.get("model_config")
++                if isinstance(raw_model_config, dict):
++                    row_model_config = raw_model_config
++                elif isinstance(raw_model_config, str) and raw_model_config.strip():
++                    parsed_model_config = json.loads(raw_model_config)
++                    if isinstance(parsed_model_config, dict):
++                        row_model_config = parsed_model_config
+             if (
+                 not isinstance(row, dict)
+                 or str(row.get("source") or "") != expected_source
+                 or bool(int(row.get("archived") or 0)) is not expected_archived
++                or any(
++                    not isinstance(row_model_config, dict)
++                    or not hmac.compare_digest(
++                        str(row_model_config.get(name) or "")
++                        .strip()
++                        .lower(),
++                        value,
++                    )
++                    for name, value in strict_identity_metadata.items()
++                )
+             ):
+                 raise RuntimeError(
+                     "durable session row did not match its creation policy"
+@@ -5116,6 +5350,190 @@ def _persist_live_session_runtime(session: dict | None) -> None:
+         logger.debug("failed to persist live session runtime", exc_info=True)
+ 
+ 
++def _bind_new_session_row_to_agent_runtime(db, session_key: str, agent) -> None:
++    """Durably publish one strict row's exact candidate runtime before use."""
++
++    from agent.identity_policy import identity_lock_required_by_host
++
++    if not identity_lock_required_by_host():
++        return
++
++    if db is None or not hasattr(db, "get_session") or not hasattr(
++        db, "update_session_meta"
++    ):
++        raise RuntimeError("new session runtime metadata store is unavailable")
++    row = db.get_session(session_key)
++    if not isinstance(row, dict):
++        raise RuntimeError("new session runtime row is unavailable")
++    raw_config = row.get("model_config")
++    existing = {}
++    if isinstance(raw_config, dict):
++        existing = dict(raw_config)
++    elif isinstance(raw_config, str) and raw_config.strip():
++        parsed = json.loads(raw_config)
++        if not isinstance(parsed, dict):
++            raise RuntimeError("new session runtime metadata was malformed")
++        existing = parsed
++
++    candidate_config = dict(existing)
++    init_config = getattr(agent, "_session_init_model_config", None)
++    if isinstance(init_config, dict):
++        candidate_config.update(init_config)
++    candidate_config = _runtime_model_config(agent, candidate_config)
++    from agent.identity_policy import scoped_identity_persistence_metadata
++
++    candidate_config.update(scoped_identity_persistence_metadata(agent))
++    model = str(getattr(agent, "model", "") or "").strip()
++    encoded = json.dumps(
++        candidate_config,
++        separators=(",", ":"),
++        ensure_ascii=False,
++    )
++    db.update_session_meta(session_key, encoded, model or None)
++    verified = db.get_session(session_key)
++    if not isinstance(verified, dict):
++        raise RuntimeError("new session runtime metadata was not durable")
++    verified_raw = verified.get("model_config")
++    if isinstance(verified_raw, str):
++        verified_config = json.loads(verified_raw)
++    else:
++        verified_config = verified_raw
++    if not isinstance(verified_config, dict) or verified_config != candidate_config:
++        raise RuntimeError("new session runtime metadata changed while publishing")
++
++
++def _bind_existing_session_row_to_current_host_identity(
++    db,
++    session_key: str,
++) -> bool:
++    """Upgrade a resumed legacy row to the currently verified strict host pin."""
++
++    from agent.identity_policy import (
++        identity_lock_required_by_host,
++        preflight_aia_agent_identity,
++    )
++
++    if not identity_lock_required_by_host():
++        return False
++    if db is None or not hasattr(db, "get_session") or not hasattr(
++        db, "update_session_meta"
++    ):
++        raise RuntimeError("resumed strict session metadata store is unavailable")
++    preflight = preflight_aia_agent_identity(request_overrides={})
++    row = db.get_session(session_key)
++    if row is None:
++        # A lazy child watch may precede the child process' first durable row.
++        return False
++    if not isinstance(row, dict):
++        raise RuntimeError("resumed strict session row was malformed")
++    raw_config = row.get("model_config")
++    existing = {}
++    if isinstance(raw_config, dict):
++        existing = dict(raw_config)
++    elif isinstance(raw_config, str) and raw_config.strip():
++        parsed = json.loads(raw_config)
++        if not isinstance(parsed, dict):
++            raise RuntimeError("resumed strict session metadata was malformed")
++        existing = parsed
++    updated = dict(existing)
++    updated.update(
++        {
++            "_identity_fingerprint": preflight.policy.fingerprint,
++            "_identity_config_sha256": preflight.config_sha256,
++            "_identity_soul_sha256": preflight.soul_sha256,
++            "_identity_personality_sha256": preflight.personality_sha256,
++        }
++    )
++    encoded = json.dumps(updated, separators=(",", ":"), ensure_ascii=False)
++    db.update_session_meta(session_key, encoded, None)
++    verified = db.get_session(session_key)
++    if not isinstance(verified, dict):
++        raise RuntimeError("resumed strict session metadata was not durable")
++    verified_raw = verified.get("model_config")
++    if isinstance(verified_raw, str):
++        verified_config = json.loads(verified_raw)
++    else:
++        verified_config = verified_raw
++    if not isinstance(verified_config, dict) or verified_config != updated:
++        raise RuntimeError("resumed strict session metadata changed while publishing")
++    return True
++
++
++def _adopt_verified_native_config_digest_for_session(
++    session: dict,
++    expected_agent,
++    previous_config_sha256: str,
++    config_sha256: str,
++) -> None:
++    """Durably rebind the paused approval turn before its tool is released."""
++
++    agent = session.get("agent") if isinstance(session, dict) else None
++    session_key = str(
++        session.get("session_key") if isinstance(session, dict) else ""
++    ).strip()
++    if agent is None or agent is not expected_agent or not session_key:
++        raise RuntimeError("native approval lost its live strict session")
++    db = getattr(agent, "_session_db", None) or _get_db()
++    if db is None or not hasattr(db, "update_session_meta"):
++        raise RuntimeError("native approval session metadata is unavailable")
++
++    row = db.get_session(session_key)
++    if not isinstance(row, dict):
++        raise RuntimeError("native approval durable session row is unavailable")
++    raw_config = row.get("model_config")
++    if isinstance(raw_config, dict):
++        model_config = dict(raw_config)
++    elif isinstance(raw_config, str) and raw_config.strip():
++        parsed = json.loads(raw_config)
++        if not isinstance(parsed, dict):
++            raise RuntimeError("native approval session metadata was malformed")
++        model_config = parsed
++    else:
++        raise RuntimeError("native approval session identity metadata was missing")
++    if not hmac.compare_digest(
++        str(model_config.get("_identity_config_sha256") or "")
++        .strip()
++        .lower(),
++        str(previous_config_sha256 or "").strip().lower(),
++    ):
++        raise RuntimeError("native approval durable session digest changed")
++
++    updated = dict(model_config)
++    updated["_identity_config_sha256"] = config_sha256
++    db.update_session_meta(
++        session_key,
++        json.dumps(updated, separators=(",", ":"), ensure_ascii=False),
++        None,
++    )
++    verified = db.get_session(session_key)
++    if not isinstance(verified, dict):
++        raise RuntimeError("native approval session rebind was not durable")
++    verified_raw = verified.get("model_config")
++    if isinstance(verified_raw, str):
++        verified_config = json.loads(verified_raw)
++    else:
++        verified_config = verified_raw
++    if (
++        not isinstance(verified_config, dict)
++        or verified_config != updated
++        or not hmac.compare_digest(
++            str(verified_config.get("_identity_config_sha256") or "")
++            .strip()
++            .lower(),
++            str(config_sha256 or "").strip().lower(),
++        )
++    ):
++        raise RuntimeError("native approval session rebind could not be verified")
++
++    from agent.identity_policy import adopt_verified_native_config_digest
++
++    adopt_verified_native_config_digest(
++        agent,
++        previous_config_sha256=previous_config_sha256,
++        config_sha256=config_sha256,
++    )
++
++
+ def _persist_live_session_system_prompt(session: dict | None) -> None:
+     """Refresh the stored system prompt after a live runtime identity change."""
+     if not session:
+@@ -5626,24 +6044,809 @@ def _restart_slash_worker(sid: str, session: dict):
+     _attach_worker(sid, session, new_worker)
+ 
+ 
++_NATIVE_MODEL_DEFAULT_COMMIT_AUTHORITY = "lilith-runtime-native-config.v1"
++_NATIVE_MODEL_DEFAULT_PENDING_SESSION = "__runtime_model_default__"
++_NATIVE_MODEL_PHASE_TWO_LOCK_DRAIN_S = 2.0
++_NATIVE_MODEL_PHASE_TWO_LOCK_RETRY_S = 0.01
++
++
++def _native_model_default_transition_pending() -> bool:
++    """Whether the exact Runtime model-default transaction is prepared.
++
++    Lifecycle callers use this while holding ``_session_resume_lock`` and
++    ``_sessions_lock``.  Do not acquire the model commit lock here: phase two
++    owns that lock before it takes the lifecycle locks.
++    """
++
++    from agent.identity_policy import native_authority_pending_transition_state
++
++    pending = native_authority_pending_transition_state()
++    return bool(
++        isinstance(pending, dict)
++        and pending.get("source") == "hermes.model.default.set"
++    )
++
++
++class _NativeModelSessionBinding(NamedTuple):
++    sid: str
++    session: dict
++    agent: Any
++    session_key: str
++    db: Any
++    durable_row_existed: bool
++
++
++class _PreparedNativeModelDefaultCommit:
++    __slots__ = (
++        "commit_nonce",
++        "previous_config_sha256",
++        "config_sha256",
++        "receipt_base",
++        "bindings",
++    )
++
++    def __init__(
++        self,
++        *,
++        commit_nonce: str,
++        previous_config_sha256: str,
++        config_sha256: str,
++        receipt_base,
++        bindings: tuple[_NativeModelSessionBinding, ...],
++    ):
++        self.commit_nonce = commit_nonce
++        self.previous_config_sha256 = previous_config_sha256
++        self.config_sha256 = config_sha256
++        self.receipt_base = receipt_base
++        self.bindings = bindings
++
++
++def _native_model_row_config(row: dict, *, label: str) -> dict:
++    raw_config = row.get("model_config")
++    if isinstance(raw_config, dict):
++        return dict(raw_config)
++    if isinstance(raw_config, str) and raw_config.strip():
++        try:
++            parsed = json.loads(raw_config)
++        except Exception as exc:
++            raise RuntimeError(f"{label} model metadata was malformed") from exc
++        if isinstance(parsed, dict):
++            return parsed
++    raise RuntimeError(f"{label} identity metadata was missing")
++
++
++def _assert_native_model_agent_digest(agent, expected_sha256: str) -> None:
++    from agent.identity_policy import policy_for_agent
++
++    if not policy_for_agent(agent).enabled:
++        raise RuntimeError("strict Runtime contained a non-strict live agent")
++    agent_digest = str(
++        getattr(agent, "_identity_config_sha256", "") or ""
++    ).strip().lower()
++    model_config = getattr(agent, "_session_init_model_config", None)
++    stored_digest = (
++        str(model_config.get("_identity_config_sha256") or "")
++        .strip()
++        .lower()
++        if isinstance(model_config, dict)
++        else ""
++    )
++    if not hmac.compare_digest(agent_digest, expected_sha256) or not hmac.compare_digest(
++        stored_digest,
++        expected_sha256,
++    ):
++        raise RuntimeError("live strict session config digest changed")
++
++
++def _native_model_agent_digest_state(
++    agent,
++    previous_sha256: str,
++    config_sha256: str,
++) -> str:
++    """Return ``old`` or ``new`` only when both live agent pins agree."""
++
++    from agent.identity_policy import policy_for_agent
++
++    if not policy_for_agent(agent).enabled:
++        raise RuntimeError("strict Runtime contained a non-strict live agent")
++    agent_digest = str(
++        getattr(agent, "_identity_config_sha256", "") or ""
++    ).strip().lower()
++    model_config = getattr(agent, "_session_init_model_config", None)
++    stored_digest = (
++        str(model_config.get("_identity_config_sha256") or "")
++        .strip()
++        .lower()
++        if isinstance(model_config, dict)
++        else ""
++    )
++    if hmac.compare_digest(agent_digest, previous_sha256) and hmac.compare_digest(
++        stored_digest,
++        previous_sha256,
++    ):
++        return "old"
++    if hmac.compare_digest(agent_digest, config_sha256) and hmac.compare_digest(
++        stored_digest,
++        config_sha256,
++    ):
++        return "new"
++    raise RuntimeError("live strict session did not match either model digest")
++
++
++def _native_model_agent_has_active_children(agent) -> bool:
++    for value_name, lock_name in (
++        ("_background_review_agent", "_background_review_lock"),
++        ("_active_children", "_active_children_lock"),
++    ):
++        lock = getattr(agent, lock_name, None)
++        if lock is None:
++            if bool(getattr(agent, value_name, None)):
++                return True
++            continue
++        if not lock.acquire(blocking=False):
++            return True
++        try:
++            if bool(getattr(agent, value_name, None)):
++                return True
++        finally:
++            lock.release()
++    return False
++
++
++@contextlib.contextmanager
++def _paused_live_strict_sessions_for_native_model(previous_sha256: str):
++    """Freeze and attest every live strict session during model phase one."""
++
++    from agent.identity_policy import NativeAuthorityTransitionBusyError
++
++    acquired_history_locks = []
++    acquired_setter_locks = []
++    acquired_authority_locks = []
++    if not _session_resume_lock.acquire(blocking=False):
++        raise NativeAuthorityTransitionBusyError(
++            "global model cannot change during session lifecycle work"
++        )
++    sessions_locked = False
++    try:
++        _sessions_lock.acquire()
++        sessions_locked = True
++        seen_locks = set()
++        for session in list(_sessions.values()):
++            history_lock = session.get("history_lock")
++            if history_lock is None or id(history_lock) in seen_locks:
++                continue
++            seen_locks.add(id(history_lock))
++            if not history_lock.acquire(blocking=False):
++                raise NativeAuthorityTransitionBusyError(
++                    "global model cannot change while a session is active"
++                )
++            acquired_history_locks.append(history_lock)
++
++        seen_setter_locks = set()
++        for session in list(_sessions.values()):
++            setter_lock = _runtime_setter_lock(session)
++            if id(setter_lock) in seen_setter_locks:
++                continue
++            seen_setter_locks.add(id(setter_lock))
++            if not setter_lock.acquire(blocking=False):
++                raise NativeAuthorityTransitionBusyError(
++                    "global model cannot change during a session runtime setter"
++                )
++            acquired_setter_locks.append(setter_lock)
++
++        if any(
++            session.get("running")
++            or bool(session.get("tool_started_at"))
++            or bool(session.get("agent_build_started"))
++            for session in _sessions.values()
++        ):
++            raise NativeAuthorityTransitionBusyError(
++                "global model cannot change while a turn, tool, or agent build is active"
++            )
++
++        seen_authority_locks = set()
++        for session in list(_sessions.values()):
++            authority_lock = _runtime_authority_lock(session)
++            if id(authority_lock) in seen_authority_locks:
++                continue
++            seen_authority_locks.add(id(authority_lock))
++            if not authority_lock.acquire(blocking=False):
++                raise NativeAuthorityTransitionBusyError(
++                    "global model cannot change during runtime publication"
++                )
++            acquired_authority_locks.append(authority_lock)
++
++        if any(
++            session.get("running")
++            or bool(session.get("tool_started_at"))
++            or bool(session.get("agent_build_started"))
++            for session in _sessions.values()
++        ):
++            raise NativeAuthorityTransitionBusyError(
++                "global model cannot change while a turn, tool, or agent build is active"
++            )
++
++        bindings = []
++        seen_sessions = set()
++        agent_session_keys = {}
++        for sid, session in list(_sessions.items()):
++            agent = session.get("agent")
++            if agent is None:
++                continue
++            if id(session) in seen_sessions:
++                continue
++            seen_sessions.add(id(session))
++            if _native_model_agent_has_active_children(agent):
++                raise NativeAuthorityTransitionBusyError(
++                    "global model cannot change while a child agent is active"
++                )
++            session_key = str(session.get("session_key") or "").strip()
++            if not session_key:
++                raise RuntimeError("live strict session key was missing")
++            existing_key = agent_session_keys.setdefault(id(agent), session_key)
++            if existing_key != session_key:
++                raise RuntimeError("live strict agent had ambiguous durable sessions")
++            _assert_native_model_agent_digest(agent, previous_sha256)
++
++            db = getattr(agent, "_session_db", None) or _get_db()
++            row = None
++            if db is not None and hasattr(db, "get_session"):
++                row = db.get_session(session_key)
++            if row is not None:
++                if not isinstance(row, dict):
++                    raise RuntimeError("live strict durable session row was malformed")
++                durable_config = _native_model_row_config(
++                    row,
++                    label="live strict durable session",
++                )
++                durable_digest = str(
++                    durable_config.get("_identity_config_sha256") or ""
++                ).strip().lower()
++                if not hmac.compare_digest(durable_digest, previous_sha256):
++                    raise RuntimeError("live strict durable session digest changed")
++                if not hasattr(db, "update_session_meta"):
++                    raise RuntimeError(
++                        "live strict durable session cannot be rebound"
++                    )
++            elif bool(getattr(agent, "_session_db_created", False)):
++                raise RuntimeError("live strict durable session row was unavailable")
++
++            bindings.append(
++                _NativeModelSessionBinding(
++                    sid=str(sid),
++                    session=session,
++                    agent=agent,
++                    session_key=session_key,
++                    db=db,
++                    durable_row_existed=row is not None,
++                )
++            )
++        yield tuple(bindings)
++    finally:
++        for authority_lock in reversed(acquired_authority_locks):
++            authority_lock.release()
++        for setter_lock in reversed(acquired_setter_locks):
++            setter_lock.release()
++        for history_lock in reversed(acquired_history_locks):
++            history_lock.release()
++        if sessions_locked:
++            _sessions_lock.release()
++        _session_resume_lock.release()
++
++
++@contextlib.contextmanager
++def _locked_prepared_native_model_sessions(
++    prepared: _PreparedNativeModelDefaultCommit,
++):
++    """Lock and re-enumerate all live strict sessions for phase two."""
++
++    deadline = time.monotonic() + _NATIVE_MODEL_PHASE_TWO_LOCK_DRAIN_S
++    lock_contention = ""
++    while True:
++        acquired_history_locks = []
++        acquired_setter_locks = []
++        acquired_authority_locks = []
++        resume_locked = False
++        sessions_locked = False
++
++        def _release_attempt() -> None:
++            for authority_lock in reversed(acquired_authority_locks):
++                authority_lock.release()
++            for setter_lock in reversed(acquired_setter_locks):
++                setter_lock.release()
++            for history_lock in reversed(acquired_history_locks):
++                history_lock.release()
++            if sessions_locked:
++                _sessions_lock.release()
++            if resume_locked:
++                _session_resume_lock.release()
++
++        try:
++            resume_locked = _session_resume_lock.acquire(blocking=False)
++            if not resume_locked:
++                lock_contention = "session lifecycle work"
++            else:
++                sessions_locked = _sessions_lock.acquire(blocking=False)
++                if not sessions_locked:
++                    lock_contention = "session registry work"
++
++            if resume_locked and sessions_locked:
++                lock_contention = ""
++                seen_locks = set()
++                for session in list(_sessions.values()):
++                    history_lock = session.get("history_lock")
++                    if history_lock is None or id(history_lock) in seen_locks:
++                        continue
++                    seen_locks.add(id(history_lock))
++                    if not history_lock.acquire(blocking=False):
++                        lock_contention = "session history work"
++                        break
++                    acquired_history_locks.append(history_lock)
++
++                if not lock_contention:
++                    seen_setter_locks = set()
++                    for session in list(_sessions.values()):
++                        setter_lock = _runtime_setter_lock(session)
++                        if id(setter_lock) in seen_setter_locks:
++                            continue
++                        seen_setter_locks.add(id(setter_lock))
++                        if not setter_lock.acquire(blocking=False):
++                            lock_contention = "session runtime setter"
++                            break
++                        acquired_setter_locks.append(setter_lock)
++
++                if not lock_contention:
++                    seen_authority_locks = set()
++                    for session in list(_sessions.values()):
++                        authority_lock = _runtime_authority_lock(session)
++                        if id(authority_lock) in seen_authority_locks:
++                            continue
++                        seen_authority_locks.add(id(authority_lock))
++                        if not authority_lock.acquire(blocking=False):
++                            lock_contention = "runtime publication"
++                            break
++                        acquired_authority_locks.append(authority_lock)
++        except BaseException:
++            _release_attempt()
++            raise
++
++        if not lock_contention:
++            break
++        _release_attempt()
++        if time.monotonic() >= deadline:
++            raise RuntimeError(
++                f"{lock_contention} did not drain before prepared model commit"
++            )
++        time.sleep(_NATIVE_MODEL_PHASE_TWO_LOCK_RETRY_S)
++
++    try:
++        if any(
++            session.get("running") or bool(session.get("tool_started_at"))
++            for session in _sessions.values()
++        ):
++            raise RuntimeError(
++                "turn or tool raced the prepared model commit"
++            )
++
++        # A deferred builder does its expensive work outside this authority
++        # lock. Advance the desired revision while publication is excluded so
++        # any candidate spanning phase one can never publish its stale config
++        # snapshot; the worker will discard it and rebuild from the committed
++        # default after these locks are released.
++        dormant_sessions = []
++        for session in _sessions.values():
++            if session.get("agent") is None or session.get("agent_build_started"):
++                session["agent_runtime_revision"] = (
++                    _runtime_revision_locked(session) + 1
++                )
++                session["agent_error"] = None
++                session["agent_error_revision"] = None
++            if session.get("agent") is None:
++                dormant_sessions.append(session)
++
++        prepared_by_sid = {binding.sid: binding for binding in prepared.bindings}
++        for binding in prepared.bindings:
++            if (
++                _sessions.get(binding.sid) is not binding.session
++                or str(binding.session.get("session_key") or "").strip()
++                != binding.session_key
++            ):
++                raise RuntimeError("prepared strict session mapping changed")
++
++        current_bindings = []
++        seen_sessions = set()
++        agent_session_keys = {}
++        for sid, session in list(_sessions.items()):
++            agent = session.get("agent")
++            if agent is None:
++                continue
++            if id(session) in seen_sessions:
++                continue
++            seen_sessions.add(id(session))
++            if _native_model_agent_has_active_children(agent):
++                raise RuntimeError(
++                    "child agent raced the prepared model commit"
++                )
++            session_key = str(session.get("session_key") or "").strip()
++            if not session_key:
++                raise RuntimeError("live strict session key was missing")
++            existing_key = agent_session_keys.setdefault(id(agent), session_key)
++            if existing_key != session_key:
++                raise RuntimeError("live strict agent had ambiguous durable sessions")
++            state = _native_model_agent_digest_state(
++                agent,
++                prepared.previous_config_sha256,
++                prepared.config_sha256,
++            )
++
++            db = getattr(agent, "_session_db", None) or _get_db()
++            phase_one = prepared_by_sid.get(str(sid))
++            if phase_one is not None and (
++                phase_one.session is not session
++                or phase_one.agent is not agent
++                or phase_one.session_key != session_key
++                or phase_one.db is not db
++            ):
++                raise RuntimeError("prepared strict session ownership changed")
++            row = None
++            if db is not None and hasattr(db, "get_session"):
++                row = db.get_session(session_key)
++            if row is not None:
++                if not isinstance(row, dict):
++                    raise RuntimeError("live strict durable session row was malformed")
++                durable_config = _native_model_row_config(
++                    row,
++                    label="live strict durable session",
++                )
++                durable_digest = str(
++                    durable_config.get("_identity_config_sha256") or ""
++                ).strip().lower()
++                expected = (
++                    prepared.previous_config_sha256
++                    if state == "old"
++                    else prepared.config_sha256
++                )
++                if not hmac.compare_digest(durable_digest, expected):
++                    raise RuntimeError(
++                        "live and durable strict session digests disagreed"
++                    )
++                if state == "old" and not hasattr(db, "update_session_meta"):
++                    raise RuntimeError(
++                        "live strict durable session cannot be rebound"
++                    )
++            elif bool(getattr(agent, "_session_db_created", False)):
++                raise RuntimeError("live strict durable session row was unavailable")
++
++            current_bindings.append(
++                (
++                    _NativeModelSessionBinding(
++                        sid=str(sid),
++                        session=session,
++                        agent=agent,
++                        session_key=session_key,
++                        db=db,
++                        durable_row_existed=row is not None,
++                    ),
++                    state,
++                )
++            )
++        yield tuple(current_bindings), tuple(dormant_sessions)
++    finally:
++        _release_attempt()
++
++
++def _rebind_prepared_native_model_sessions(
++    prepared: _PreparedNativeModelDefaultCommit,
++) -> None:
++    """Persist every prepared session digest, then adopt it in live agents."""
++
++    from agent.identity_policy import adopt_verified_native_config_digest
++
++    previous = prepared.previous_config_sha256
++    current = prepared.config_sha256
++    with _locked_prepared_native_model_sessions(prepared) as locked_state:
++        current_bindings, dormant_sessions = locked_state
++        staged = []
++        for binding, state in current_bindings:
++            live_db = getattr(binding.agent, "_session_db", None) or _get_db()
++            if live_db is not binding.db:
++                raise RuntimeError("prepared strict session database changed")
++            row = None
++            if live_db is not None and hasattr(live_db, "get_session"):
++                row = live_db.get_session(binding.session_key)
++            if row is None:
++                if binding.durable_row_existed or bool(
++                    getattr(binding.agent, "_session_db_created", False)
++                ):
++                    raise RuntimeError(
++                        "prepared strict durable session row disappeared"
++                    )
++                staged.append((binding, None, None, state))
++                continue
++            if not isinstance(row, dict) or not hasattr(
++                live_db,
++                "update_session_meta",
++            ):
++                raise RuntimeError("prepared strict durable session was invalid")
++            model_config = _native_model_row_config(
++                row,
++                label="prepared strict durable session",
++            )
++            durable_digest = str(
++                model_config.get("_identity_config_sha256") or ""
++            ).strip().lower()
++            expected = previous if state == "old" else current
++            if not hmac.compare_digest(durable_digest, expected):
++                raise RuntimeError("prepared strict durable session digest changed")
++            if state == "new":
++                staged.append((binding, None, None, state))
++                continue
++            updated = dict(model_config)
++            updated["_identity_config_sha256"] = current
++            staged.append((binding, live_db, updated, state))
++
++        # A session may still be waiting for its deferred AIAgent. Rebind an
++        # existing durable row directly; the runtime revision bump above makes
++        # any in-flight candidate stale before it can publish.
++        for session in dormant_sessions:
++            session_key = str(session.get("session_key") or "").strip()
++            if not session_key:
++                raise RuntimeError("dormant strict session key was missing")
++            with _session_db(session) as db:
++                if db is None or not hasattr(db, "get_session"):
++                    continue
++                row = db.get_session(session_key)
++                if row is None:
++                    continue
++                if not isinstance(row, dict):
++                    raise RuntimeError("dormant strict durable row was malformed")
++                model_config = _native_model_row_config(
++                    row,
++                    label="dormant strict durable session",
++                )
++                durable_digest = str(
++                    model_config.get("_identity_config_sha256") or ""
++                ).strip().lower()
++                if hmac.compare_digest(durable_digest, current):
++                    continue
++                if not hmac.compare_digest(durable_digest, previous):
++                    raise RuntimeError("dormant strict durable digest changed")
++                if not hasattr(db, "update_session_meta"):
++                    raise RuntimeError("dormant strict session cannot be rebound")
++                updated = dict(model_config)
++                updated["_identity_config_sha256"] = current
++                db.update_session_meta(
++                    session_key,
++                    json.dumps(
++                        updated,
++                        separators=(",", ":"),
++                        ensure_ascii=False,
++                    ),
++                    None,
++                )
++                verified = db.get_session(session_key)
++                if not isinstance(verified, dict) or _native_model_row_config(
++                    verified,
++                    label="verified dormant strict durable session",
++                ) != updated:
++                    raise RuntimeError(
++                        "dormant strict session rebind was not durable"
++                    )
++
++        # Make every existing state.db row durable before changing any live
++        # agent.  A later failure is quarantined, so no partially rebound state
++        # can serve another turn.
++        for binding, db, updated, _state in staged:
++            if db is None:
++                continue
++            db.update_session_meta(
++                binding.session_key,
++                json.dumps(updated, separators=(",", ":"), ensure_ascii=False),
++                None,
++            )
++            verified = db.get_session(binding.session_key)
++            if not isinstance(verified, dict):
++                raise RuntimeError("strict session model rebind was not durable")
++            verified_config = _native_model_row_config(
++                verified,
++                label="verified strict durable session",
++            )
++            if verified_config != updated:
++                raise RuntimeError("strict session model rebind changed metadata")
++
++        for binding, state in current_bindings:
++            if state == "new":
++                continue
++            adopt_verified_native_config_digest(
++                binding.agent,
++                previous_config_sha256=previous,
++                config_sha256=current,
++            )
++
++
+ def _persist_model_switch(result) -> None:
++    """Persist a global model selection, two-phase under strict Runtime."""
++
+     # Use targeted, atomic key writes (comment/ordering-preserving) instead of
+     # rewriting the whole `model:` block. A full-block rewrite via save_config()
+     # destroys sibling keys the user set under `model:` — `model_slots`,
+     # `model_fallback`, etc. — when switching models from the TUI (#48305).
++    global _native_model_default_prepared_commit
+     from cli import save_config_value
++    from agent.identity_policy import (
++        NativeAuthorityTransitionBusyError,
++        begin_native_authority_commit_pending,
++        capture_native_config_receipt_base,
++        clear_native_authority_commit_pending,
++        commit_host_config_digest_rotation,
++        identity_lock_required_by_host,
++        latch_native_authority_quarantine,
++        prepare_host_config_digest_rotation,
++        require_native_runtime_parent_authority,
++        restore_host_config_snapshot,
++        update_native_authority_commit_pending,
++    )
+ 
+-    save_config_value("model.default", result.new_model)
+-    save_config_value("model.provider", result.target_provider)
+-    if result.base_url:
+-        save_config_value("model.base_url", result.base_url)
+-    else:
+-        # Clear any stale base_url when switching to a provider that doesn't use
+-        # one (e.g. custom endpoint -> native provider). Reads coalesce null to
+-        # absent (`model_cfg.get("base_url") or ""`), so a null is equivalent to
+-        # removal without needing a key-delete. Leaving the old value would
+-        # route the new model at the previous custom host (#48305).
+-        save_config_value("model.base_url", None)
++    updates = (
++        ("model.default", result.new_model),
++        ("model.provider", result.target_provider),
++        # Clear any stale base_url when switching away from a custom endpoint.
++        # Reads coalesce null to absent, so this preserves the historical shape.
++        ("model.base_url", result.base_url or None),
++    )
++    if not identity_lock_required_by_host():
++        for key, value in updates:
++            save_config_value(key, value)
++        return None
++
++    from hermes_cli.config import _CONFIG_LOCK, get_config_path, load_config
++    from tools.approval import _capture_native_approval_policy
++
++    require_native_runtime_parent_authority()
++    with _native_model_default_commit_lock:
++        if _native_model_default_prepared_commit is not None:
++            raise NativeAuthorityTransitionBusyError(
++                "another global model receipt commit is pending"
++            )
++        commit_nonce = secrets.token_hex(32)
++        begin_native_authority_commit_pending(
++            {
++                "session_key": _NATIVE_MODEL_DEFAULT_PENDING_SESSION,
++                "commit_nonce": commit_nonce,
++                "source": "hermes.model.default.set",
++            }
++        )
++        mutation_attempted = False
++        digest_rotated = False
++        old_raw = None
++        old_sha256 = ""
++        try:
++            previous_sha256 = prepare_host_config_digest_rotation()
++            if previous_sha256 is None:
++                raise RuntimeError(
++                    "strict config digest was unavailable for model persistence"
++                )
++            approval_mode, enabled_toolsets = _capture_native_approval_policy()
++            receipt_base = capture_native_config_receipt_base(
++                previous_sha256,
++                approval_mode=approval_mode,
++                enabled_toolsets=enabled_toolsets,
++            )
++
++            # Match the established native-policy lock order: sessions and
++            # their short authority locks precede the config writer lock.
++            with _paused_live_strict_sessions_for_native_model(
++                previous_sha256
++            ) as bindings:
++                with _CONFIG_LOCK:
++                    config_path = get_config_path()
++                    try:
++                        old_raw = config_path.read_bytes()
++                    except Exception as exc:
++                        raise RuntimeError(
++                            "native config must exist before global model persistence"
++                        ) from exc
++                    old_sha256 = hashlib.sha256(old_raw).hexdigest()
++                    if not hmac.compare_digest(old_sha256, previous_sha256):
++                        raise RuntimeError(
++                            "strict config snapshot changed before global model persistence"
++                        )
++                    mutation_attempted = True
++                    for key, value in updates:
++                        if save_config_value(key, value) is not True:
++                            raise RuntimeError(
++                                f"global model persistence failed while writing {key}"
++                            )
++
++                    saved = load_config()
++                    model_config = saved.get("model")
++                    if not isinstance(model_config, dict):
++                        raise RuntimeError(
++                            "global model persistence did not produce a model mapping"
++                        )
++                    saved_base_url = str(
++                        model_config.get("base_url") or ""
++                    ).strip()
++                    expected_base_url = str(result.base_url or "").strip()
++                    if (
++                        str(model_config.get("default") or "").strip()
++                        != result.new_model
++                        or str(model_config.get("provider") or "").strip()
++                        != result.target_provider
++                        or saved_base_url != expected_base_url
++                    ):
++                        raise RuntimeError(
++                            "global model persistence did not reproduce the selected pair"
++                        )
++
++                    config_sha256 = commit_host_config_digest_rotation(
++                        previous_sha256
++                    )
++                    digest_rotated = True
++                    prepared = _PreparedNativeModelDefaultCommit(
++                        commit_nonce=commit_nonce,
++                        previous_config_sha256=previous_sha256,
++                        config_sha256=config_sha256,
++                        receipt_base=receipt_base,
++                        bindings=bindings,
++                    )
++                    update_native_authority_commit_pending(
++                        commit_nonce,
++                        {
++                            "previous_config_sha256": previous_sha256,
++                            "config_sha256": config_sha256,
++                        },
++                    )
++                    _native_model_default_prepared_commit = prepared
++                    return config_sha256
++        except BaseException as mutation_error:
++            _native_model_default_prepared_commit = None
++            current_pin = str(
++                os.environ.get("HERMES_IDENTITY_EXPECTED_CONFIG_SHA256") or ""
++            ).strip().lower()
++            recoverable = bool(
++                mutation_attempted
++                and old_raw is not None
++                and hmac.compare_digest(current_pin, old_sha256)
++                and not digest_rotated
++            )
++            if recoverable:
++                try:
++                    restored_sha256 = restore_host_config_snapshot(
++                        old_raw,
++                        old_sha256,
++                        strict_required=True,
++                    )
++                    if not hmac.compare_digest(restored_sha256, old_sha256):
++                        raise RuntimeError(
++                            "global model rollback returned a different digest"
++                        )
++                except BaseException as recovery_error:
++                    latch_native_authority_quarantine(
++                        "global model config recovery could not be verified",
++                        drifted_labels=("config.yaml",),
++                    )
++                    try:
++                        clear_native_authority_commit_pending(commit_nonce)
++                    except Exception:
++                        pass
++                    raise RuntimeError(
++                        "global model persistence failed and recovery was not verified"
++                    ) from recovery_error
++            elif mutation_attempted:
++                latch_native_authority_quarantine(
++                    "global model phase one failed after config digest commit",
++                    drifted_labels=("config.yaml",),
++                )
++            try:
++                clear_native_authority_commit_pending(commit_nonce)
++            except Exception:
++                if mutation_attempted:
++                    latch_native_authority_quarantine(
++                        "global model pending transition could not be retired",
++                        drifted_labels=("config.yaml",),
++                    )
++            raise mutation_error
+ 
+ 
+ def _snapshot_agent_model_runtime(agent) -> dict:
+@@ -5989,6 +7192,7 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
+     raw = f"{model} --provider {provider}" if provider else model
+     try:
+         with _runtime_setter_lock(session):
++            _assert_native_runtime_setter_admitted()
+             _apply_model_switch(
+                 sid,
+                 session,
+@@ -6026,6 +7230,7 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
+         return
+     try:
+         with _runtime_setter_lock(session):
++            _assert_native_runtime_setter_admitted()
+             result = _apply_model_switch(
+                 sid,
+                 session,
+@@ -8418,6 +9623,26 @@ def _make_agent(
+     )
+ 
+ 
++def _assert_session_candidate_native_identity_current(agent) -> None:
++    """Reject an eager private candidate built under an obsolete host pin."""
++
++    from agent.identity_policy import (
++        IdentityPolicyError,
++        NativeAuthorityTransitionBusyError,
++        enforce_scoped_turn_identity,
++        identity_lock_required_by_host,
++    )
++
++    if not identity_lock_required_by_host():
++        return
++    try:
++        enforce_scoped_turn_identity(agent)
++    except IdentityPolicyError as exc:
++        raise NativeAuthorityTransitionBusyError(
++            "session candidate was built from a stale native config"
++        ) from exc
++
++
+ def _init_session(
+     sid: str,
+     key: str,
+@@ -8431,6 +9656,19 @@ def _init_session(
+ ):
+     now = time.time()
+     with _sessions_lock:
++        if _native_model_default_transition_pending():
++            from agent.identity_policy import NativeAuthorityTransitionBusyError
++
++            raise NativeAuthorityTransitionBusyError(
++                "session registration is blocked by a pending global model commit"
++            )
++        # An eager resume/branch builds outside the lifecycle lock. The entire
++        # model phase-one + receipt commit can finish while that constructor is
++        # paused, so pending-only admission is insufficient here: re-prove the
++        # candidate against the *current* host pin at the exact registry
++        # publication boundary. Deferred candidates use revision invalidation;
++        # eager private candidates are rejected for their caller to close.
++        _assert_session_candidate_native_identity_current(agent)
+         _sessions[sid] = {
+             "agent": agent,
+             "session_key": key,
+@@ -10545,18 +11783,35 @@ def _deferred_session_record(
+ 
+ 
+ def _claim_or_reuse_live(
+-    sid: str, session_key: str, record: dict, lease
++    sid: str,
++    session_key: str,
++    record: dict,
++    lease,
++    *,
++    prepare_registration: Callable[[], None] | None = None,
+ ) -> tuple[str, dict] | None:
+     """Register ``record`` as the live session for ``session_key`` under the
+     resume lock, or — if a concurrent resume already won — release ``lease`` and
+     return the winner for the caller to reuse."""
+     with _session_resume_lock:
+-        live = _find_live_session_by_key(session_key)
+-        if live is not None:
+-            if lease is not None:
+-                lease.release()
+-            return live
+         with _sessions_lock:
++            if _native_model_default_transition_pending():
++                if lease is not None:
++                    lease.release()
++                from agent.identity_policy import (
++                    NativeAuthorityTransitionBusyError,
++                )
++
++                raise NativeAuthorityTransitionBusyError(
++                    "session resume is blocked by a pending global model commit"
++                )
++            live = _find_live_session_by_key(session_key)
++            if live is not None:
++                if lease is not None:
++                    lease.release()
++                return live
++            if prepare_registration is not None:
++                prepare_registration()
+             _sessions[sid] = record
+             _register_session_cwd(_sessions[sid])
+     return None
+@@ -12897,6 +14152,7 @@ def _run_prompt_submit(
+                         )
+                         try:
+                             with _runtime_setter_lock(session):
++                                _assert_native_runtime_setter_admitted()
+                                 _apply_model_switch(
+                                     sid,
+                                     session,
+@@ -13777,6 +15033,17 @@ def _set_fast_runtime(rid: str, key: str, value: Any, params: dict, session) ->
+         else contextlib.nullcontext()
+     )
+     with transaction:
++        if session is not None:
++            try:
++                _assert_native_runtime_setter_admitted()
++            except Exception as exc:
++                from agent.identity_policy import (
++                    NativeAuthorityTransitionBusyError,
++                )
++
++                if isinstance(exc, NativeAuthorityTransitionBusyError):
++                    return _err(rid, 4090, str(exc))
++                raise
+         raw = str(value or "").strip().lower()
+         agent = session.get("agent") if session else None
+         if agent is not None:
+@@ -13875,11 +15142,132 @@ def _set_fast_runtime(rid: str, key: str, value: Any, params: dict, session) ->
+         )
+ 
+ 
++def _quarantine_native_model_default_commit(detail: str) -> None:
++    """Retire an uncertain model phase two and permanently fail closed."""
++
++    global _native_model_default_prepared_commit
++    from agent.identity_policy import (
++        clear_native_authority_commit_pending,
++        latch_native_authority_quarantine,
++    )
++
++    with _native_model_default_commit_lock:
++        prepared = _native_model_default_prepared_commit
++        latch_native_authority_quarantine(
++            detail,
++            drifted_labels=(
++                "config.yaml",
++                "runtime/native-config-receipt.v1.json",
++                "state.db",
++            ),
++        )
++        if prepared is not None:
++            try:
++                clear_native_authority_commit_pending(prepared.commit_nonce)
++            except Exception:
++                pass
++        _native_model_default_prepared_commit = None
++
++
++@method("model.default.commit")
++def _(rid, params: dict) -> dict:
++    """Verify Runtime's durable model receipt, then rebind live sessions."""
++
++    global _native_model_default_prepared_commit
++    from agent.identity_policy import native_authority_quarantine_state
++
++    if native_authority_quarantine_state() is not None:
++        return _native_authority_quarantine_rpc_error(rid)
++    required = {
++        "authority",
++        "previous_config_sha256",
++        "config_sha256",
++        "receipt_sha256",
++    }
++    with _native_model_default_commit_lock:
++        prepared = _native_model_default_prepared_commit
++        # An unsolicited/replayed phase-two call has no authority state to
++        # damage. Reject it as a conflict without poisoning an otherwise
++        # healthy process. Once phase one exists, malformed input is uncertain
++        # and remains a sticky quarantine event.
++        if prepared is None:
++            return _err(rid, -32602, "native model transition was not pending")
++        if not isinstance(params, dict) or set(params) != required:
++            _quarantine_native_model_default_commit(
++                "native model.default.commit parameters were malformed"
++            )
++            return _native_authority_quarantine_rpc_error(rid)
++        if any(not isinstance(params.get(key), str) for key in required):
++            _quarantine_native_model_default_commit(
++                "native model.default.commit values were malformed"
++            )
++            return _native_authority_quarantine_rpc_error(rid)
++        try:
++            from agent.identity_policy import (
++                clear_native_authority_commit_pending,
++                native_authority_pending_transition_state,
++                native_authority_quarantine_state,
++                require_native_runtime_parent_authority,
++                verify_native_model_default_commit_receipt,
++            )
++            from tools.approval import _capture_native_approval_policy
++
++            require_native_runtime_parent_authority()
++            if native_authority_quarantine_state() is not None:
++                raise RuntimeError(
++                    "native authority was quarantined before model commit"
++                )
++            if params["authority"] != _NATIVE_MODEL_DEFAULT_COMMIT_AUTHORITY:
++                raise ValueError("native model commit authority was rejected")
++            if not hmac.compare_digest(
++                params["previous_config_sha256"],
++                prepared.previous_config_sha256,
++            ) or not hmac.compare_digest(
++                params["config_sha256"],
++                prepared.config_sha256,
++            ):
++                raise ValueError("native model commit digest pair was rejected")
++            expected_pending = {
++                "session_key": _NATIVE_MODEL_DEFAULT_PENDING_SESSION,
++                "commit_nonce": prepared.commit_nonce,
++                "source": "hermes.model.default.set",
++                "previous_config_sha256": prepared.previous_config_sha256,
++                "config_sha256": prepared.config_sha256,
++            }
++            if native_authority_pending_transition_state() != expected_pending:
++                raise RuntimeError("native model pending transition changed")
++            live_mode, live_toolsets = _capture_native_approval_policy()
++            if (
++                live_mode != prepared.receipt_base.approval_mode
++                or live_toolsets != prepared.receipt_base.enabled_toolsets
++            ):
++                raise RuntimeError(
++                    "native approval policy changed during model commit"
++                )
++            verify_native_model_default_commit_receipt(
++                prepared.receipt_base,
++                previous_config_sha256=params["previous_config_sha256"],
++                config_sha256=params["config_sha256"],
++                receipt_sha256=params["receipt_sha256"],
++            )
++            _rebind_prepared_native_model_sessions(prepared)
++            clear_native_authority_commit_pending(prepared.commit_nonce)
++            _native_model_default_prepared_commit = None
++            return _ok(rid, {"committed": 1})
++        except BaseException:
++            _quarantine_native_model_default_commit(
++                "native model receipt commit could not be verified"
++            )
++            return _native_authority_quarantine_rpc_error(rid)
++
++
+ # NOTE: config.set intentionally stays in server.py for now — the in-flight
+ # opt/model-resolution-core PR touches its body; move it to methods_config.py
+ # in a follow-up once that PR lands.
+ @method("config.set")
+ def _(rid, params: dict) -> dict:
++    from agent.identity_policy import NativeAuthorityTransitionBusyError
++
+     key, value = params.get("key", ""), params.get("value", "")
+     session = _sessions.get(params.get("session_id", ""))
+ 
+@@ -13953,6 +15341,7 @@ def _(rid, params: dict) -> dict:
+                 # desired revision immediately; the old candidate can neither
+                 # publish nor poison the new revision, and rebuilds in place.
+                 with _runtime_setter_lock(session):
++                    _assert_native_runtime_setter_admitted()
+                     with _session_profile_runtime_scope(session):
+                         result = _apply_model_switch(
+                             params.get("session_id", ""),
+@@ -14013,6 +15402,8 @@ def _(rid, params: dict) -> dict:
+                     ),
+                 },
+             )
++        except NativeAuthorityTransitionBusyError as e:
++            return _err(rid, 4090, str(e))
+         except Exception as e:
+             return _err(rid, 5001, str(e))
+ 
+@@ -14306,6 +15697,7 @@ def _(rid, params: dict) -> dict:
+                 # authority lock, while no live-agent mutation can overtake a
+                 # paused model/client rebuild and later be overwritten by it.
+                 with _runtime_setter_lock(session):
++                    _assert_native_runtime_setter_admitted()
+                     if global_scope:
+                         _write_config_key("agent.reasoning_effort", arg)
+                         runtime_revision = _commit_runtime_desire(
+@@ -14342,6 +15734,8 @@ def _(rid, params: dict) -> dict:
+                     "runtime_ready": runtime_ready,
+                 },
+             )
++        except NativeAuthorityTransitionBusyError as e:
++            return _err(rid, 4090, str(e))
+         except Exception as e:
+             return _err(rid, 5001, str(e))
+ 
+@@ -15987,6 +17381,7 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
+     try:
+         if name == "model" and arg and agent:
+             with _runtime_setter_lock(session):
++                _assert_native_runtime_setter_admitted()
+                 result = _apply_model_switch(sid, session, arg)
+             return result.get("warning", "")
+         elif name == "personality" and arg and agent:

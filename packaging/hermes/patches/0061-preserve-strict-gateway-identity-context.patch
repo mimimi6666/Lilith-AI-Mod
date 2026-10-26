@@ -1,0 +1,173 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index e8d8855..f93cae9 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -59,7 +59,10 @@ from agent.conversation_compression import (
+ )
+ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+ from agent.i18n import t
+-from agent.identity_policy import strict_public_identity_by_host
++from agent.identity_policy import (
++    identity_lock_required_by_host,
++    strict_public_identity_by_host,
++)
+ from agent.interrupt_compat import request_hard_interrupt
+ from agent.turn_context import (
+     compression_made_progress,
+@@ -111,6 +114,48 @@ _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
+ _LILITH_SHARED_SESSION_EVENT_ATTRIBUTE = "_lilith_shared_session_id"
+ 
+ 
++def _compose_gateway_ephemeral_prompt(
++    *,
++    context_prompt: str,
++    event_channel_prompt: str,
++    configured_channel_prompt: str,
++    locked_profile_prompt: str,
++    strict_identity: bool,
++) -> tuple[str, tuple[str, ...]]:
++    """Resolve gateway prompt authority without composing over a strict identity.
++
++    Generic Hermes profiles retain the historical ephemeral-system composition.
++    A host-attested profile may pass only the exact locked personality bytes to
++    ``AIAgent``; mutable session/channel context is returned separately so the
++    caller can deliver it through the existing current-user ``api_content``
++    sidecar instead of creating a second system authority.
++    """
++
++    event_prompt = str(event_channel_prompt or "").strip()
++    configured_prompt = str(configured_channel_prompt or "")
++    if strict_identity:
++        context_parts = []
++        if str(context_prompt or "").strip():
++            context_parts.append(str(context_prompt))
++        if event_prompt:
++            context_parts.append(event_prompt)
++        # The global profile prompt is the already-attested identity and must
++        # not be duplicated as subordinate context.  A real channel override
++        # remains usable, but only as lower-authority turn context.
++        if configured_prompt and configured_prompt != str(locked_profile_prompt or ""):
++            context_parts.append(configured_prompt.strip())
++        return str(locked_profile_prompt or ""), tuple(
++            part for part in context_parts if part
++        )
++
++    combined = str(context_prompt or "")
++    if event_prompt:
++        combined = (combined + "\n\n" + event_prompt).strip()
++    if configured_prompt:
++        combined = (combined + "\n\n" + configured_prompt).strip()
++    return combined, ()
++
++
+ def _public_actor_name(default: str = "Hermes") -> str:
+     identity = strict_public_identity_by_host()
+     return identity.ascii_name if identity is not None else default
+@@ -5013,21 +5058,30 @@ class TurnRunner:
+         # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
+         platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
+         
+-        # Combine platform context, YAML channel_prompts hint for this chat,
+-        # channel_overrides system_prompt (or global ephemeral), and gateway
+-        # ephemeral prompt from _get_system_prompt_for_channel.
+-        combined_ephemeral = ctx.context_prompt or ""
++        # Generic profiles combine platform context, channel prompts, and the
++        # global personality in the historical ephemeral-system slot.  A
++        # host-attested identity cannot accept a composed second authority:
++        # preserve the exact locked personality bytes and relocate mutable
++        # gateway context to the current-user api_content sidecar below.
+         event_channel_prompt = (ctx.channel_prompt or "").strip()
+-        if event_channel_prompt:
+-            combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
+         cfg_channel_prompt = self._runner._get_system_prompt_for_channel(
+             ctx.source.platform,
+             ctx.source.chat_id or "",
+             thread_id=getattr(ctx.source, "thread_id", None),
+             parent_id=getattr(ctx.source, "parent_chat_id", None),
+         )
+-        if cfg_channel_prompt:
+-            combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
++        _strict_identity = identity_lock_required_by_host()
++        combined_ephemeral, _strict_gateway_context_parts = (
++            _compose_gateway_ephemeral_prompt(
++                context_prompt=ctx.context_prompt or "",
++                event_channel_prompt=event_channel_prompt,
++                configured_channel_prompt=cfg_channel_prompt or "",
++                locked_profile_prompt=(
++                    getattr(self._runner, "_ephemeral_system_prompt", None) or ""
++                ),
++                strict_identity=_strict_identity,
++            )
++        )
+ 
+         max_iterations = _current_max_iterations()
+ 
+@@ -5513,9 +5567,21 @@ class TurnRunner:
+         # _handle_message_with_agent (auto-reset note, first-contact
+         # intro, voice-channel change).  Assigned unconditionally so a
+         # reused cached agent never replays a stale note.
+-        agent._gateway_turn_context_notes = "\n\n".join(
++        _turn_context_notes = list(
+             self._runner._consume_pending_turn_sidecar_notes(ctx.session_key)
+         )
++        if _strict_identity:
++            _strict_gateway_context = "\n\n".join(_strict_gateway_context_parts)
++            # Session context is stable for a cached gateway agent.  Stamp it
++            # on the first user turn (and again only when metadata/overrides
++            # actually change), so replay remains exact without duplicating a
++            # full context block on every message.
++            if _strict_gateway_context and getattr(
++                agent, "_strict_gateway_context_sidecar", None
++            ) != _strict_gateway_context:
++                _turn_context_notes.insert(0, _strict_gateway_context)
++                agent._strict_gateway_context_sidecar = _strict_gateway_context
++        agent._gateway_turn_context_notes = "\n\n".join(_turn_context_notes)
+ 
+         _bg_review_release = threading.Event()
+         _bg_review_pending: list[str] = []
+diff --git a/tests/gateway/test_turn_context.py b/tests/gateway/test_turn_context.py
+index 48bfbf8..9610ae6 100644
+--- a/tests/gateway/test_turn_context.py
++++ b/tests/gateway/test_turn_context.py
+@@ -69,6 +69,41 @@ class TestTurnRunner:
+         runner = _make_runner(ctx)  # stub adapter resolver returns None
+         assert asyncio.run(runner.send_progress_messages()) is None
+ 
++    def test_strict_identity_preserves_locked_prompt_bytes_and_relocates_context(self):
++        from gateway.run import _compose_gateway_ephemeral_prompt
++
++        locked = "LOCKED LILITH PERSONALITY\n"
++        prompt, sidecar_parts = _compose_gateway_ephemeral_prompt(
++            context_prompt="## Current Session Context\nSource: Telegram",
++            event_channel_prompt="Keep replies concise.",
++            configured_channel_prompt=locked,
++            locked_profile_prompt=locked,
++            strict_identity=True,
++        )
++
++        assert prompt == locked
++        assert prompt.endswith("\n")
++        assert sidecar_parts == (
++            "## Current Session Context\nSource: Telegram",
++            "Keep replies concise.",
++        )
++
++    def test_generic_identity_retains_historical_prompt_composition(self):
++        from gateway.run import _compose_gateway_ephemeral_prompt
++
++        prompt, sidecar_parts = _compose_gateway_ephemeral_prompt(
++            context_prompt="session context",
++            event_channel_prompt="legacy channel prompt",
++            configured_channel_prompt="global prompt",
++            locked_profile_prompt="ignored",
++            strict_identity=False,
++        )
++
++        assert prompt == (
++            "session context\n\nlegacy channel prompt\n\nglobal prompt"
++        )
++        assert sidecar_parts == ()
++
+     def test_normal_response_preserves_compression_exhausted(self):
+         """A non-empty exhaustion response must still reach auto-reset consumers."""
+ 

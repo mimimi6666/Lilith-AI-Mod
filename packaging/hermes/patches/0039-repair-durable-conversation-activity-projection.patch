@@ -1,0 +1,1717 @@
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index df5735b4..7be94c48 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -7438,3 +7438,82 @@ def is_user_originated_turn(message: Any) -> bool:
+     if ContextCompressor._is_synthetic_compression_user_turn(message):
+         return False
+     return ContextCompressor._is_actionable_user_turn(message)
++
++
++def _visible_conversation_text(content: Any) -> str:
++    """Return only user-visible text carried by a durable message.
++
++    Structured provider payloads are accepted only through their explicit text
++    parts.  Images, reasoning blocks, tool payloads, and arbitrary objects are
++    not conversation text and therefore cannot move the durable recency
++    watermark by themselves.
++    """
++    if isinstance(content, str):
++        return content.strip()
++    if isinstance(content, dict):
++        if content.get("type") not in {"text", "input_text", "output_text"}:
++            return ""
++        value = content.get("text", content.get("content"))
++        return value.strip() if isinstance(value, str) else ""
++    if isinstance(content, list):
++        text_parts: list[str] = []
++        for part in content:
++            if not isinstance(part, dict) or part.get("type") not in {
++                "text",
++                "input_text",
++                "output_text",
++            }:
++                continue
++            value = part.get("text", part.get("content"))
++            if isinstance(value, str) and value.strip():
++                text_parts.append(value.strip())
++        return "\n".join(text_parts)
++    return ""
++
++
++def is_conversation_activity_message(message: Any) -> bool:
++    """Whether one durable row is genuine visible conversation activity.
++
++    This is the sole semantic predicate used by append, batch/rewrite, schema
++    migration, and live durable receipts.  It deliberately remains separate
++    from :func:`is_user_originated_turn`, whose callers need user-only turn
++    boundaries for retry/undo/compression.
++    """
++    if not isinstance(message, dict) or message.get("display_kind"):
++        return False
++
++    role = message.get("role")
++    if role == "user":
++        return is_user_originated_turn(message)
++    if role != "assistant":
++        return False
++    if is_compaction_summary_message(message):
++        return False
++    if message.get("tool_calls") or message.get("tool_call_id"):
++        return False
++
++    metadata = message.get("display_metadata")
++    metadata = metadata if isinstance(metadata, dict) else {}
++    # New turns carry an explicit origin.  Missing provenance is accepted only
++    # for legacy final rows written before the field existed; an explicit
++    # synthetic/internal origin is never guessed back into a user turn.
++    origin = metadata.get("hermes_turn_origin")
++    if origin not in {None, "", "user"}:
++        return False
++    kind = metadata.get("hermes_message_kind")
++    if kind not in {None, "", "primary"}:
++        return False
++    if metadata.get("terminal_error_turn_id"):
++        return False
++
++    finish_reason = message.get("finish_reason")
++    if isinstance(finish_reason, str) and finish_reason.strip().lower() in {
++        "error",
++        "failed",
++        "cancelled",
++        "canceled",
++        "timeout",
++        "aborted",
++    }:
++        return False
++    return bool(_visible_conversation_text(message.get("content")))
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index 97f688b9..ef71a86d 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -25,6 +25,7 @@ move-and-name refactor with no semantic change.
+ from __future__ import annotations
+ 
+ import logging
++import math
+ import threading
+ import time
+ import uuid
+@@ -1461,6 +1462,8 @@ def build_turn_context(
+     if callable(durable_turn_callback):
+         from agent.turn_identity import (
+             MESSAGE_ID_METADATA_KEY,
++            TURN_ORIGIN_KIND_METADATA_KEY,
++            TURN_ORIGIN_METADATA_KEY,
+             TURN_ID_METADATA_KEY,
+             USER_MESSAGE_ID_METADATA_KEY,
+             canonical_id,
+@@ -1473,11 +1476,28 @@ def build_turn_context(
+             metadata.get(USER_MESSAGE_ID_METADATA_KEY)
+         )
+         durable_message_id = canonical_id(metadata.get(MESSAGE_ID_METADATA_KEY))
++        durable_row_id = user_msg.get("_row_id")
++        durable_timestamp = user_msg.get("_durable_timestamp")
++        conversation_activity = user_msg.get(
++            "_durable_conversation_activity"
++        )
++        turn_origin = metadata.get(TURN_ORIGIN_METADATA_KEY)
++        turn_origin_kind = metadata.get(TURN_ORIGIN_KIND_METADATA_KEY)
+         if not (
+             user_msg.get("_db_persisted") is True
+             and durable_turn_id == canonical_turn_id
+             and durable_user_message_id == canonical_user_message_id
+             and durable_message_id == canonical_user_message_id
++            and isinstance(durable_row_id, int)
++            and not isinstance(durable_row_id, bool)
++            and durable_row_id > 0
++            and isinstance(durable_timestamp, (int, float))
++            and not isinstance(durable_timestamp, bool)
++            and math.isfinite(float(durable_timestamp))
++            and float(durable_timestamp) > 0
++            and isinstance(conversation_activity, bool)
++            and turn_origin in {"user", "synthetic"}
++            and isinstance(turn_origin_kind, (str, type(None)))
+         ):
+             raise RuntimeError(
+                 "compute-host turn user row did not durably commit exact identity"
+@@ -1491,6 +1511,14 @@ def build_turn_context(
+                 "turn_id": durable_turn_id,
+                 "user_message_id": durable_user_message_id,
+                 "assistant_message_id": canonical_assistant_message_id,
++                "durable": {
++                    "source": "state.db",
++                    "row_id": durable_row_id,
++                    "timestamp": float(durable_timestamp),
++                    "conversation_activity": conversation_activity,
++                    "turn_origin": turn_origin,
++                    "turn_origin_kind": str(turn_origin_kind or ""),
++                },
+             }
+         )
+ 
+diff --git a/agent/turn_identity.py b/agent/turn_identity.py
+index d802d4b3..d63dfc5b 100644
+--- a/agent/turn_identity.py
++++ b/agent/turn_identity.py
+@@ -18,6 +18,10 @@ TURN_ID_METADATA_KEY = "hermes_turn_id"
+ MESSAGE_ID_METADATA_KEY = "hermes_message_id"
+ MESSAGE_KIND_METADATA_KEY = "hermes_message_kind"
+ USER_MESSAGE_ID_METADATA_KEY = "hermes_user_message_id"
++TURN_ORIGIN_METADATA_KEY = "hermes_turn_origin"
++TURN_ORIGIN_KIND_METADATA_KEY = "hermes_turn_origin_kind"
++TURN_ORIGIN_USER = "user"
++TURN_ORIGIN_SYNTHETIC = "synthetic"
+ 
+ MESSAGE_KINDS = frozenset({"interim", "primary", "tool", "tool_call", "user"})
+ 
+@@ -169,6 +173,19 @@ def stamp_turn_messages(
+     if primary_assistant in {canonical_turn, initiating_message}:
+         primary_assistant = ""
+ 
++    # Provenance is derived once from the exact initiating row, then copied to
++    # every durable row in the turn.  This prevents an auto-continue/internal
++    # user-shaped prompt from later producing an apparently ordinary assistant
++    # row after reload.
++    from agent.context_compressor import is_user_originated_turn
++
++    initiating_row = messages[user_index]
++    user_origin = is_user_originated_turn(initiating_row)
++    turn_origin = TURN_ORIGIN_USER if user_origin else TURN_ORIGIN_SYNTHETIC
++    origin_kind = ""
++    if isinstance(initiating_row, dict):
++        origin_kind = str(initiating_row.get("display_kind") or "").strip()
++
+     # The accepted turn reserves one identity for its primary streaming/final
+     # assistant segment. Tool-call assistant rows are separate transcript
+     # records and keep their own ids. Prefer an already-stamped primary row on
+@@ -242,6 +259,11 @@ def stamp_turn_messages(
+         if existing_turn and existing_turn != canonical_turn:
+             continue
+         metadata[TURN_ID_METADATA_KEY] = canonical_turn
++        metadata[TURN_ORIGIN_METADATA_KEY] = turn_origin
++        if origin_kind:
++            metadata[TURN_ORIGIN_KIND_METADATA_KEY] = origin_kind
++        else:
++            metadata.pop(TURN_ORIGIN_KIND_METADATA_KEY, None)
+ 
+         is_initiating_user = index == user_index and message.get("role") == "user"
+         if is_initiating_user:
+@@ -273,6 +295,10 @@ __all__ = [
+     "MESSAGE_KIND_METADATA_KEY",
+     "MESSAGE_KINDS",
+     "TURN_ID_METADATA_KEY",
++    "TURN_ORIGIN_KIND_METADATA_KEY",
++    "TURN_ORIGIN_METADATA_KEY",
++    "TURN_ORIGIN_SYNTHETIC",
++    "TURN_ORIGIN_USER",
+     "USER_MESSAGE_ID_METADATA_KEY",
+     "canonical_id",
+     "durable_message_id",
+diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
+index 586292ad..9dd94cee 100644
+--- a/hermes_cli/inventory.py
++++ b/hermes_cli/inventory.py
+@@ -94,7 +94,11 @@ class AuthenticatedModelPairError(RuntimeError):
+         self.model = str(model or "").strip()
+ 
+ 
+-def _authenticated_pair_rows(rows: list[dict]) -> list[tuple[str, list[str], dict]]:
++def _authenticated_pair_rows(
++    rows: list[dict],
++    *,
++    require_authoritative_availability: bool = False,
++) -> list[tuple[str, list[str], dict]]:
+     """Normalize rows that can prove an executable provider/model pair."""
+     normalized: list[tuple[str, list[str], dict]] = []
+     for row in rows:
+@@ -103,11 +107,41 @@ def _authenticated_pair_rows(rows: list[dict]) -> list[tuple[str, list[str], dic
+         # explicit authenticated=True row.
+         if not isinstance(row, dict) or row.get("authenticated") is not True:
+             continue
++        if (
++            require_authoritative_availability
++            and row.get("availability_authoritative") is not True
++        ):
++            continue
+         slug = str(row.get("slug") or "").strip()
+         raw_models = row.get("models")
+         if not slug or not isinstance(raw_models, (list, tuple)):
+             continue
+         raw_unavailable = row.get("unavailable_models")
++        if require_authoritative_availability:
++            # ``availability_authoritative`` is meaningful only together with
++            # a canonical, closed availability set.  Treating a missing or
++            # malformed unavailable list as ``[]`` would turn corrupt runtime
++            # evidence into permission to dispatch every catalog model.
++            if (
++                not raw_models
++                or not isinstance(raw_unavailable, (list, tuple))
++                or any(
++                    not isinstance(item, str)
++                    or not item
++                    or item != item.strip()
++                    for item in raw_models
++                )
++                or len(set(raw_models)) != len(raw_models)
++                or any(
++                    not isinstance(item, str)
++                    or not item
++                    or item != item.strip()
++                    or item not in raw_models
++                    for item in raw_unavailable
++                )
++                or len(set(raw_unavailable)) != len(raw_unavailable)
++            ):
++                continue
+         unavailable = {
+             item
+             for item in (
+@@ -158,6 +192,7 @@ def select_authenticated_model_pair(
+     *,
+     requested_provider: Optional[str] = None,
+     requested_model: Optional[str] = None,
++    require_authoritative_availability: bool = False,
+ ) -> tuple[str, str]:
+     """Select one exact authenticated provider/model pair, or ``("", "")``.
+ 
+@@ -181,7 +216,10 @@ def select_authenticated_model_pair(
+         ctx.current_provider if requested_provider is None else requested_provider
+     ).strip()
+     model = str(ctx.current_model if requested_model is None else requested_model).strip()
+-    candidates = _authenticated_pair_rows(rows)
++    candidates = _authenticated_pair_rows(
++        rows,
++        require_authoritative_availability=require_authoritative_availability,
++    )
+ 
+     if provider and model:
+         key = provider.casefold()
+@@ -243,6 +281,39 @@ def require_authenticated_model_pair(
+     )
+ 
+ 
++def require_authenticated_runtime_model_pair(
++    rows: list[dict],
++    ctx: ConfigContext,
++    *,
++    requested_provider: Optional[str] = None,
++    requested_model: Optional[str] = None,
++) -> tuple[str, str]:
++    """Return a pair proven by strict runtime availability authority.
++
++    Interactive pickers intentionally remain best-effort.  Non-interactive
++    session construction must additionally prove that the account/catalog
++    availability pass completed authoritatively; an absent or unknown signal
++    is a typed selection requirement, never permission to attempt a build.
++    """
++    pair = select_authenticated_model_pair(
++        rows,
++        ctx,
++        requested_provider=requested_provider,
++        requested_model=requested_model,
++        require_authoritative_availability=True,
++    )
++    if pair[0] and pair[1]:
++        return pair
++    raise AuthenticatedModelPairError(
++        provider=(
++            ctx.current_provider
++            if requested_provider is None
++            else requested_provider
++        ),
++        model=ctx.current_model if requested_model is None else requested_model,
++    )
++
++
+ def load_picker_context() -> ConfigContext:
+     """Load the disk-config snapshot every consumer needs.
+ 
+@@ -920,18 +991,122 @@ def _apply_runtime_availability(
+     *,
+     force_fresh_nous_tier: bool = False,
+ ) -> dict[str, dict]:
+-    """Attach account-authoritative model availability to provider rows.
++    """Attach fail-closed availability authority for runtime dispatch.
++
++    Picker availability is deliberately best-effort and lives in
++    ``_apply_picker_nous_availability``.  This pass is stricter: every row gets
++    an explicit ``availability_authoritative`` verdict, and the runtime resolver
++    accepts only ``True``.  Nous additionally requires a positive account-tier
++    decision and a structurally valid pricing entry for each selectable model.
++    Missing or malformed price entries are unavailable; an entirely unknown
++    tier or catalog is non-authoritative.
++
++    The underlying account and pricing functions retain their existing process
++    caches, so this proof does not introduce a network request per session.
++    """
++    from decimal import Decimal, InvalidOperation
+ 
+-    Availability is a runtime contract, not presentation metadata.  Keep the
+-    network-bearing sources shared with the picker, though: both the Nous
+-    entitlement check and model catalog are already TTL/process cached in
+-    ``hermes_cli.models``.  Returning the raw catalog lets ``_apply_pricing``
+-    reuse the same fetch in its formatting pass.
++    from hermes_cli.models import get_pricing_for_provider
++    from hermes_cli.nous_account import get_nous_portal_account_info
+ 
+-    Unknown/error states deliberately fail open, matching the established
+-    picker behaviour; a positively identified free account, however, may only
+-    dispatch zero-cost models from the live catalog.
+-    """
++    def _catalog_models(row: dict) -> list[str] | None:
++        raw = row.get("models")
++        if not isinstance(raw, (list, tuple)) or not raw:
++            return None
++        models: list[str] = []
++        for item in raw:
++            if (
++                not isinstance(item, str)
++                or not item
++                or item != item.strip()
++            ):
++                return None
++            if item not in models:
++                models.append(item)
++        return models or None
++
++    def _price_pair(entry: object) -> tuple[Decimal, Decimal] | None:
++        if not isinstance(entry, dict):
++            return None
++        values: list[Decimal] = []
++        for key in ("prompt", "completion"):
++            raw = entry.get(key)
++            if isinstance(raw, bool) or raw is None or raw == "":
++                return None
++            try:
++                value = Decimal(str(raw))
++            except (InvalidOperation, TypeError, ValueError):
++                return None
++            if not value.is_finite() or value < 0:
++                return None
++            values.append(value)
++        return values[0], values[1]
++
++    pricing_by_provider: dict[str, dict] = {}
++    for row in rows:
++        row["availability_authoritative"] = False
++        models = _catalog_models(row)
++        row["unavailable_models"] = list(models or [])
++        if models is None:
++            continue
++
++        slug = str(row.get("slug") or "").strip().casefold()
++        if slug != "nous":
++            # Providers without a separate account-tier gate are executable
++            # when their authenticated inventory supplied a valid catalog.
++            row["availability_authoritative"] = True
++            row["unavailable_models"] = []
++            continue
++
++        try:
++            account = get_nous_portal_account_info(
++                force_fresh=force_fresh_nous_tier
++            )
++        except Exception:
++            continue
++        paid_access = getattr(account, "paid_service_access", None)
++        if (
++            getattr(account, "logged_in", None) is not True
++            or getattr(account, "error", None)
++            or not isinstance(paid_access, bool)
++        ):
++            continue
++
++        try:
++            raw_pricing = get_pricing_for_provider(slug)
++        except Exception:
++            continue
++        if not isinstance(raw_pricing, dict) or not raw_pricing:
++            continue
++        pricing_by_provider[slug] = raw_pricing
++
++        available: list[str] = []
++        classified = False
++        for model in models:
++            prices = _price_pair(raw_pricing.get(model))
++            if prices is None:
++                continue
++            classified = True
++            if paid_access is True or prices == (Decimal(0), Decimal(0)):
++                available.append(model)
++
++        # A non-empty but wholly unrelated/malformed pricing payload is not an
++        # authoritative model catalog.  A partial valid payload is authoritative
++        # for its known IDs; all omitted IDs remain fail-closed unavailable.
++        if not classified:
++            continue
++        row["free_tier"] = paid_access is False
++        row["unavailable_models"] = [m for m in models if m not in available]
++        row["availability_authoritative"] = True
++    return pricing_by_provider
++
++
++def _apply_picker_nous_availability(
++    rows: list[dict],
++    *,
++    force_fresh_nous_tier: bool = False,
++) -> dict[str, dict]:
++    """Preserve the interactive picker's established best-effort policy."""
+     from hermes_cli.models import (
+         check_nous_free_tier,
+         get_pricing_for_provider,
+@@ -995,7 +1170,7 @@ def _apply_pricing(
+         get_pricing_for_provider,
+     )
+ 
+-    availability_pricing = _apply_runtime_availability(
++    availability_pricing = _apply_picker_nous_availability(
+         rows, force_fresh_nous_tier=force_fresh_nous_tier
+     )
+ 
+diff --git a/hermes_state.py b/hermes_state.py
+index 1c42a624..413137d9 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -5132,7 +5132,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 ),
+             )
+             total_messages, total_tool_calls = self._insert_message_rows(
+-                conn, child_session_id, messages
++                conn,
++                child_session_id,
++                messages,
++                require_activity_timestamps=True,
+             )
+             conn.execute(
+                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+@@ -8171,6 +8174,64 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             return value
+         return json.dumps(value)
+ 
++    def _activity_message_from_row(self, row: Any) -> Dict[str, Any]:
++        """Decode one SQLite row for the canonical activity predicate."""
++        message = {
++            "role": row["role"],
++            "content": self._decode_content(row["content"]),
++            "tool_call_id": row["tool_call_id"],
++            "tool_name": row["tool_name"],
++            "finish_reason": row["finish_reason"],
++            "reasoning": row["reasoning"],
++            "reasoning_content": row["reasoning_content"],
++            "display_kind": row["display_kind"],
++            "display_metadata": self._decode_display_metadata(
++                row["display_metadata"]
++            ),
++        }
++        raw_tool_calls = row["tool_calls"]
++        if raw_tool_calls:
++            try:
++                message["tool_calls"] = (
++                    json.loads(raw_tool_calls)
++                    if isinstance(raw_tool_calls, str)
++                    else raw_tool_calls
++                )
++            except (json.JSONDecodeError, TypeError):
++                # Malformed tool provenance fails closed as a tool-bearing row.
++                message["tool_calls"] = [raw_tool_calls]
++        return message
++
++    def _recompute_session_conversation_activity(self, conn, session_id: str) -> None:
++        """Rebuild one exact watermark after a visibility/rewrite mutation.
++
++        Active rows are visible conversation. Compacted rows remain durable
++        conversation history and preserve recency across compression; rewound
++        rows (inactive and not compacted) are deliberately excluded.
++        """
++        from agent.context_compressor import is_conversation_activity_message
++
++        rows = conn.execute(
++            """SELECT role, content, tool_call_id, tool_calls, tool_name,
++                      timestamp, finish_reason, reasoning, reasoning_content,
++                      display_kind, display_metadata
++               FROM messages
++               WHERE session_id = ? AND (active = 1 OR compacted = 1)
++               ORDER BY timestamp DESC, id DESC""",
++            (session_id,),
++        ).fetchall()
++        watermark = None
++        for row in rows:
++            if is_conversation_activity_message(
++                self._activity_message_from_row(row)
++            ):
++                watermark = float(row["timestamp"])
++                break
++        conn.execute(
++            "UPDATE sessions SET last_conversation_at = ? WHERE id = ?",
++            (watermark, session_id),
++        )
++
+     def append_message(
+         self,
+         session_id: str,
+@@ -8245,18 +8306,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             except (TypeError, ValueError):
+                 logger.debug("Ignoring invalid explicit message timestamp: %r", timestamp)
+ 
+-        # Conversation recency is authored-turn recency, not operational DB
+-        # activity.  Reuse the compressor/undo truth so display-only user rows,
+-        # reasoning/tool scaffolding, and compaction handoffs can never move a
+-        # conversation in the sidebar.
++        # Conversation recency is durable visible content, not operational DB
++        # activity. One predicate is shared with batch/rewrite/migration and
++        # live receipts so assistant finals and user turns cannot diverge.
+         try:
+-            from agent.context_compressor import is_user_originated_turn
++            from agent.context_compressor import is_conversation_activity_message
+ 
+-            advances_conversation = is_user_originated_turn(
++            advances_conversation = is_conversation_activity_message(
+                 {
+                     "role": role,
+                     "content": content,
++                    "tool_name": tool_name,
++                    "tool_calls": tool_calls,
++                    "tool_call_id": tool_call_id,
++                    "finish_reason": finish_reason,
++                    "reasoning": reasoning,
++                    "reasoning_content": reasoning_content,
++                    "reasoning_details": reasoning_details,
++                    "codex_reasoning_items": codex_reasoning_items,
+                     "display_kind": display_kind,
++                    "display_metadata": display_metadata,
+                 }
+             )
+         except Exception:
+@@ -8440,6 +8509,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     row[0],
+                 ),
+             )
++            self._recompute_session_conversation_activity(conn, session_id)
+             return True
+ 
+         return bool(self._execute_write(_do))
+@@ -8652,7 +8722,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+ 
+         return row[0] if row else None
+ 
+-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
++    def _insert_message_rows(
++        self,
++        conn,
++        session_id: str,
++        messages: List[Dict[str, Any]],
++        *,
++        require_activity_timestamps: bool = False,
++    ) -> tuple[int, int]:
+         """Insert *messages* as fresh active rows for *session_id*.
+ 
+         Shared by :meth:`replace_messages` (delete-then-insert) and
+@@ -8665,7 +8742,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         inserted = 0
+         tool_calls_total = 0
+         last_conversation_at = None
+-        from agent.context_compressor import is_user_originated_turn
++        from agent.context_compressor import is_conversation_activity_message
+ 
+         for msg in messages:
+             role = msg.get("role", "unknown")
+@@ -8740,19 +8817,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             )
+             if isinstance(msg, dict) and cur.lastrowid is not None:
+                 msg["_row_id"] = cur.lastrowid
++                msg["_durable_timestamp"] = message_timestamp
+             inserted += 1
+             if tool_calls is not None:
+                 tool_calls_total += (
+                     len(tool_calls) if isinstance(tool_calls, list) else 1
+                 )
+             try:
+-                if is_user_originated_turn(msg):
++                advances_conversation = is_conversation_activity_message(msg)
++                if isinstance(msg, dict):
++                    msg["_durable_conversation_activity"] = bool(
++                        advances_conversation
++                    )
++                if advances_conversation and require_activity_timestamps and msg.get(
++                    "timestamp"
++                ) is None:
++                    raise ValueError(
++                        "conversation-bearing rewrite row requires its durable timestamp"
++                    )
++                if advances_conversation:
+                     last_conversation_at = max(
+                         float(last_conversation_at or message_timestamp),
+                         message_timestamp,
+                     )
+             except Exception:
+-                pass
++                if require_activity_timestamps:
++                    raise
+             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
+         if last_conversation_at is not None:
+             conn.execute(
+@@ -8843,12 +8933,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 (session_id,),
+             )
+             total_messages, total_tool_calls = self._insert_message_rows(
+-                conn, session_id, messages
++                conn,
++                session_id,
++                messages,
++                require_activity_timestamps=True,
+             )
+             conn.execute(
+                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                 (total_messages, total_tool_calls, session_id),
+             )
++            self._recompute_session_conversation_activity(conn, session_id)
+ 
+         self._execute_write(_do)
+ 
+@@ -8922,7 +9016,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 (session_id,),
+             )
+             inserted, tool_calls_total = self._insert_message_rows(
+-                conn, session_id, compacted_messages
++                conn,
++                session_id,
++                compacted_messages,
++                require_activity_timestamps=True,
+             )
+             # message_count / tool_call_count reflect the LIVE (active) set —
+             # the archived rows are still on disk but not part of the live count.
+@@ -8937,6 +9034,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     "model_config = ? WHERE id = ?",
+                     (inserted, tool_calls_total, patched_model_config, session_id),
+                 )
++            self._recompute_session_conversation_activity(conn, session_id)
+             return inserted
+ 
+         return self._execute_write(_do)
+@@ -9852,6 +9950,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                 "WHERE id = ?",
+                 (session_id,),
+             )
++            self._recompute_session_conversation_activity(conn, session_id)
+             return ids
+ 
+         rewound = self._execute_write(_do)
+@@ -9890,6 +9989,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                     f"UPDATE messages SET active = 1 WHERE id IN ({placeholders})",
+                     ids,
+                 )
++            self._recompute_session_conversation_activity(conn, session_id)
+             return len(ids)
+ 
+         return self._execute_write(_do)
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index 4d81be25..c9d8a6fc 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -216,7 +216,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
+     )
+ 
+ 
+-SCHEMA_VERSION = 26
++SCHEMA_VERSION = 27
+ 
+ 
+ # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index 05ed4cac..aa0ce626 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -922,6 +922,75 @@ class SessionSchemaMixin:
+                         "last_conversation_at backfill failed", exc_info=True
+                     )
+                     raise
++            if current_version < 27:
++                # v27: recency includes genuine visible assistant finals as
++                # well as user turns, and visibility rewrites may retract the
++                # prior maximum. Rebuild every watermark from durable rows;
++                # never seed from operational last_active_at or the v26 value.
++                try:
++                    from agent.context_compressor import (
++                        is_conversation_activity_message,
++                    )
++
++                    candidates = cursor.execute(
++                        """SELECT session_id, timestamp, role, content,
++                                  tool_call_id, tool_calls, tool_name,
++                                  finish_reason, reasoning, reasoning_content,
++                                  display_kind, display_metadata
++                           FROM messages
++                           WHERE active = 1 OR compacted = 1
++                           ORDER BY session_id, timestamp DESC, id DESC"""
++                    ).fetchall()
++                    latest = {}
++                    for message in candidates:
++                        session_id = message["session_id"]
++                        if session_id in latest:
++                            continue
++                        decoded_tool_calls = None
++                        if message["tool_calls"]:
++                            try:
++                                decoded_tool_calls = json.loads(
++                                    message["tool_calls"]
++                                )
++                            except (json.JSONDecodeError, TypeError):
++                                decoded_tool_calls = [message["tool_calls"]]
++                        activity_message = {
++                            "role": message["role"],
++                            "content": self._decode_content(message["content"]),
++                            "tool_call_id": message["tool_call_id"],
++                            "tool_calls": decoded_tool_calls,
++                            "tool_name": message["tool_name"],
++                            "finish_reason": message["finish_reason"],
++                            "reasoning": message["reasoning"],
++                            "reasoning_content": message["reasoning_content"],
++                            "display_kind": message["display_kind"],
++                            "display_metadata": self._decode_display_metadata(
++                                message["display_metadata"]
++                            ),
++                        }
++                        if is_conversation_activity_message(activity_message):
++                            latest[session_id] = float(message["timestamp"])
++
++                    # Clearing first is intentional: a v26 watermark may name
++                    # a row later rewound/hidden and must not survive merely
++                    # because the corrected maximum is older or absent.
++                    cursor.execute(
++                        "UPDATE sessions SET last_conversation_at = NULL"
++                    )
++                    if latest:
++                        cursor.executemany(
++                            "UPDATE sessions SET last_conversation_at = ? WHERE id = ?",
++                            [
++                                (timestamp, session_id)
++                                for session_id, timestamp in latest.items()
++                            ],
++                        )
++                except Exception:
++                    logger.exception(
++                        "v27 conversation activity rebuild failed",
++                        exc_info=True,
++                    )
++                    raise
+             if current_version < 10 and SCHEMA_VERSION == 10:
+                 # v10: trigram FTS5 table for CJK/substring search. The
+                 # virtual table + triggers are created unconditionally via
+diff --git a/run_agent.py b/run_agent.py
+index 228bbea3..09be3181 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -283,6 +283,9 @@ _MAX_TOOL_WORKERS = 8
+ # every top-level ``_``-prefixed key before the request leaves the process, so
+ # this never reaches a strict OpenAI-compatible gateway.
+ _DB_PERSISTED_MARKER = "_db_persisted"
++_DB_ROW_ID_MARKER = "_row_id"
++_DB_TIMESTAMP_MARKER = "_durable_timestamp"
++_DB_CONVERSATION_ACTIVITY_MARKER = "_durable_conversation_activity"
+ 
+ 
+ # Guard so the OpenRouter metadata pre-warm thread is only spawned once per
+@@ -2353,7 +2356,20 @@ class AIAgent:
+                         self, "_active_compression_lock_holder", None
+                     ),
+                 )
+-                for _written in _batch_msgs:
++                for _row, _written in zip(_batch_rows, _batch_msgs):
++                    # append_messages_batch mutates each row with the exact
++                    # committed SQLite identity/timestamp and the canonical
++                    # activity decision. Transfer that receipt to the live
++                    # message dict before declaring it durable; neither the
++                    # gateway nor Control Center may infer these values from a
++                    # session watermark or event-envelope clock.
++                    for _receipt_key in (
++                        _DB_ROW_ID_MARKER,
++                        _DB_TIMESTAMP_MARKER,
++                        _DB_CONVERSATION_ACTIVITY_MARKER,
++                    ):
++                        if _receipt_key in _row:
++                            _written[_receipt_key] = _row[_receipt_key]
+                     _written[_DB_PERSISTED_MARKER] = True
+             # The intrinsic markers are now the sole source of truth. Reset the
+             # one-shot seed so no id() outlives this flush to alias a message
+diff --git a/tests/test_session_conversation_activity.py b/tests/test_session_conversation_activity.py
+index 2ce432b6..def16703 100644
+--- a/tests/test_session_conversation_activity.py
++++ b/tests/test_session_conversation_activity.py
+@@ -39,7 +39,7 @@ def test_in_place_compression_and_heartbeat_do_not_advance_conversation(tmp_path
+     db.append_message("chat", "assistant", "answer", timestamp=11.0)
+ 
+     before = _listed(db, "chat")
+-    assert before["last_conversation_at"] == 10.0
++    assert before["last_conversation_at"] == 11.0
+ 
+     # A successful in-place compression persists a synthetic role=user
+     # handoff at a newer timestamp.  It is durable, but not human-authored.
+@@ -50,7 +50,7 @@ def test_in_place_compression_and_heartbeat_do_not_advance_conversation(tmp_path
+     db.touch_session_activity("chat", 60.0, description="compressing")
+     after = _listed(db, "chat")
+     assert after["last_active"] == 60.0
+-    assert after["last_conversation_at"] == 10.0
++    assert after["last_conversation_at"] == 11.0
+ 
+     # Reload/restart reads the durable watermark; it does not reconstruct it
+     # from the now-newer compressed handoff or heartbeat.
+@@ -59,7 +59,7 @@ def test_in_place_compression_and_heartbeat_do_not_advance_conversation(tmp_path
+     try:
+         reloaded = _listed(reopened, "chat")
+         assert reloaded["last_active"] == 60.0
+-        assert reloaded["last_conversation_at"] == 10.0
++        assert reloaded["last_conversation_at"] == 11.0
+     finally:
+         reopened.close()
+ 
+@@ -143,6 +143,7 @@ def test_nonconversation_durable_rows_and_metadata_never_advance(tmp_path):
+         "assistant",
+         "internal reasoning",
+         reasoning_content="reasoning sidecar",
++        display_kind="reasoning",
+         timestamp=20.0,
+     )
+     db.append_message(
+@@ -203,7 +204,7 @@ def test_v25_upgrade_backfills_from_real_durable_user_turns(tmp_path):
+         version = upgraded._conn.execute(
+             "SELECT version FROM schema_version LIMIT 1"
+         ).fetchone()[0]
+-        assert version == 26
++        assert version == 27
+     finally:
+         upgraded.close()
+ 
+@@ -265,3 +266,171 @@ def test_v25_backfill_failure_never_marks_schema_upgraded(tmp_path, monkeypatch)
+         assert conn.execute(
+             "SELECT last_conversation_at FROM sessions WHERE id = 'legacy'"
+         ).fetchone()[0] is None
++
++
++def test_visible_assistant_activity_is_shared_by_append_batch_and_rewrite(tmp_path):
++    db = SessionDB(tmp_path / "assistant.db")
++    try:
++        db.create_session("chat", source="cli", model="m")
++        db.append_message("chat", "user", "ask", timestamp=10.0)
++        db.append_message("chat", "assistant", "answer one", timestamp=11.0)
++        assert _listed(db, "chat")["last_conversation_at"] == 11.0
++
++        batch = [
++            {
++                "role": "assistant",
++                "content": "answer two",
++                "timestamp": 12.0,
++                "display_metadata": {
++                    "hermes_message_kind": "primary",
++                    "hermes_turn_origin": "user",
++                },
++            }
++        ]
++        db.append_messages_batch("chat", batch)
++        assert batch[0]["_durable_timestamp"] == 12.0
++        assert batch[0]["_durable_conversation_activity"] is True
++        assert _listed(db, "chat")["last_conversation_at"] == 12.0
++
++        replacement = [
++            {"role": "user", "content": "ask", "timestamp": 10.0},
++            {"role": "assistant", "content": "rewritten", "timestamp": 13.0},
++        ]
++        db.replace_messages("chat", replacement, archive_dropped=True)
++        assert _listed(db, "chat")["last_conversation_at"] == 13.0
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize(
++    "message",
++    [
++        {"role": "assistant", "content": "   ", "timestamp": 20.0},
++        {
++            "role": "assistant",
++            "content": "interim",
++            "timestamp": 21.0,
++            "display_metadata": {"hermes_message_kind": "interim"},
++        },
++        {
++            "role": "assistant",
++            "content": "tool narration",
++            "timestamp": 22.0,
++            "tool_calls": [{"name": "terminal", "arguments": {}}],
++        },
++        {
++            "role": "assistant",
++            "content": "auto continuation",
++            "timestamp": 23.0,
++            "display_metadata": {
++                "hermes_message_kind": "primary",
++                "hermes_turn_origin": "synthetic",
++                "hermes_turn_origin_kind": "auto_continue",
++            },
++        },
++        {
++            "role": "assistant",
++            "content": "terminal failure",
++            "timestamp": 24.0,
++            "display_metadata": {"terminal_error_turn_id": "turn"},
++        },
++    ],
++)
++def test_nonvisible_assistant_shapes_do_not_advance(tmp_path, message):
++    db = SessionDB(tmp_path / f"excluded-{message['timestamp']}.db")
++    try:
++        db.create_session("chat", source="cli", model="m")
++        db.append_message("chat", "user", "ask", timestamp=10.0)
++        db.append_messages_batch("chat", [message])
++        assert message["_durable_conversation_activity"] is False
++        assert _listed(db, "chat")["last_conversation_at"] == 10.0
++    finally:
++        db.close()
++
++
++def test_synthetic_turn_origin_propagates_to_assistant_rows():
++    from agent.turn_identity import stamp_turn_messages
++
++    messages = [
++        {"role": "user", "content": "continue", "display_kind": "auto_continue"},
++        {"role": "assistant", "content": "continued"},
++    ]
++    stamp_turn_messages(
++        messages,
++        user_index=0,
++        turn_id="a" * 32,
++        user_message_id="b" * 32,
++        assistant_message_id="c" * 32,
++    )
++    assert messages[1]["display_metadata"]["hermes_turn_origin"] == "synthetic"
++    assert (
++        messages[1]["display_metadata"]["hermes_turn_origin_kind"]
++        == "auto_continue"
++    )
++
++
++def test_late_visibility_stamp_retracts_and_rewind_restore_recomputes(tmp_path):
++    db = SessionDB(tmp_path / "visibility.db")
++    try:
++        db.create_session("chat", source="cli", model="m")
++        first = db.append_message("chat", "user", "first", timestamp=10.0)
++        second = db.append_message("chat", "user", "synthetic later", timestamp=20.0)
++        assert _listed(db, "chat")["last_conversation_at"] == 20.0
++
++        assert db.set_latest_matching_message_display_kind(
++            "chat",
++            role="user",
++            content="synthetic later",
++            display_kind="auto_continue",
++        )
++        assert _listed(db, "chat")["last_conversation_at"] == 10.0
++
++        third = db.append_message("chat", "user", "third", timestamp=25.0)
++        assistant = db.append_message(
++            "chat", "assistant", "visible answer", timestamp=30.0
++        )
++        assert _listed(db, "chat")["last_conversation_at"] == 30.0
++        db.rewind_to_message("chat", third)
++        assert _listed(db, "chat")["last_conversation_at"] == 10.0
++        assert db.restore_rewound("chat", third) == 2
++        assert _listed(db, "chat")["last_conversation_at"] == 30.0
++        assert first < second < third < assistant
++    finally:
++        db.close()
++
++
++def test_conversation_bearing_rewrite_without_timestamp_fails_closed(tmp_path):
++    db = SessionDB(tmp_path / "rewrite.db")
++    try:
++        db.create_session("chat", source="cli", model="m")
++        db.append_message("chat", "user", "original", timestamp=10.0)
++        with pytest.raises(ValueError, match="requires its durable timestamp"):
++            db.replace_messages(
++                "chat",
++                [{"role": "assistant", "content": "old but undated"}],
++                archive_dropped=True,
++            )
++        assert _listed(db, "chat")["last_conversation_at"] == 10.0
++    finally:
++        db.close()
++
++
++def test_v26_upgrade_rebuilds_existing_user_watermark_with_assistant(tmp_path):
++    path = tmp_path / "v26.db"
++    db = SessionDB(path)
++    db.create_session("legacy", source="cli", model="m")
++    db.append_message("legacy", "user", "ask", timestamp=10.0)
++    db.append_message("legacy", "assistant", "answer", timestamp=20.0)
++    db.close()
++    with sqlite3.connect(path) as conn:
++        conn.execute("UPDATE sessions SET last_conversation_at = 10")
++        conn.execute("UPDATE schema_version SET version = 26")
++
++    upgraded = SessionDB(path)
++    try:
++        assert _listed(upgraded, "legacy")["last_conversation_at"] == 20.0
++        assert upgraded._conn.execute(
++            "SELECT version FROM schema_version"
++        ).fetchone()[0] == 27
++    finally:
++        upgraded.close()
+diff --git a/tests/tui_gateway/test_authenticated_model_pairing.py b/tests/tui_gateway/test_authenticated_model_pairing.py
+index 357ebc56..bbe8bc33 100644
+--- a/tests/tui_gateway/test_authenticated_model_pairing.py
++++ b/tests/tui_gateway/test_authenticated_model_pairing.py
+@@ -8,8 +8,11 @@ import tui_gateway.server as server
+ from hermes_cli.inventory import (
+     AuthenticatedModelPairError,
+     ConfigContext,
++    _authenticated_pair_rows,
+     build_model_options_payload,
++    build_models_payload,
+ )
++from hermes_cli.nous_account import NousPortalAccountInfo
+ 
+ 
+ def _row(slug: str, *models: str) -> dict:
+@@ -25,6 +28,25 @@ def _row(slug: str, *models: str) -> dict:
+     }
+ 
+ 
++def _nous_account(paid_access: object) -> NousPortalAccountInfo:
++    return NousPortalAccountInfo(
++        logged_in=True,
++        source="account_api",
++        fresh=True,
++        paid_service_access=paid_access,
++    )
++
++
++def _empty_context() -> ConfigContext:
++    return ConfigContext(
++        current_provider="",
++        current_model="",
++        current_base_url="",
++        user_providers={},
++        custom_providers=[],
++    )
++
++
+ def _install_inventory(
+     monkeypatch,
+     *,
+@@ -170,6 +192,10 @@ def test_authenticated_pair_excludes_unavailable_models(monkeypatch):
+         monkeypatch, rows=[row], configured={"nous"}, stub_pricing=False
+     )
+     monkeypatch.setattr("hermes_cli.models.check_nous_free_tier", lambda **_k: True)
++    monkeypatch.setattr(
++        "hermes_cli.nous_account.get_nous_portal_account_info",
++        lambda **_k: _nous_account(False),
++    )
+     monkeypatch.setattr(
+         "hermes_cli.models.get_pricing_for_provider",
+         lambda _slug: {
+@@ -179,16 +205,11 @@ def test_authenticated_pair_excludes_unavailable_models(monkeypatch):
+     )
+ 
+     picker = build_model_options_payload(
+-        ConfigContext(
+-            current_provider="",
+-            current_model="",
+-            current_base_url="",
+-            user_providers={},
+-            custom_providers=[],
+-        ),
++        _empty_context(),
+         explicit_only=True,
+     )
+     assert picker["providers"][0]["unavailable_models"] == ["nous-default"]
++    assert "availability_authoritative" not in picker["providers"][0]
+ 
+     # The provider helper's nominal default is unavailable for this account;
+     # provider-only resolution deterministically selects the sole runnable id.
+@@ -211,6 +232,10 @@ def test_authenticated_pair_requires_selection_when_all_models_unavailable(monke
+         monkeypatch, rows=[row], configured={"nous"}, stub_pricing=False
+     )
+     monkeypatch.setattr("hermes_cli.models.check_nous_free_tier", lambda **_k: True)
++    monkeypatch.setattr(
++        "hermes_cli.nous_account.get_nous_portal_account_info",
++        lambda **_k: _nous_account(False),
++    )
+     monkeypatch.setattr(
+         "hermes_cli.models.get_pricing_for_provider",
+         lambda _slug: {
+@@ -221,3 +246,210 @@ def test_authenticated_pair_requires_selection_when_all_models_unavailable(monke
+     with pytest.raises(AuthenticatedModelPairError) as exc_info:
+         server._resolve_session_create_model_pair()
+     assert getattr(exc_info.value, "code", "") == "model_selection_required"
++
++
++@pytest.mark.parametrize("paid_access", [None, 1, "paid"])
++def test_runtime_availability_requires_explicit_boolean_entitlement(
++    monkeypatch, paid_access
++):
++    _install_inventory(
++        monkeypatch,
++        rows=[_row("nous", "nous-default")],
++        configured={"nous"},
++        stub_pricing=False,
++    )
++    monkeypatch.setattr(
++        "hermes_cli.nous_account.get_nous_portal_account_info",
++        lambda **_k: _nous_account(paid_access),
++    )
++    monkeypatch.setattr(
++        "hermes_cli.models.get_pricing_for_provider",
++        lambda _slug: {
++            "nous-default": {"prompt": "0.000001", "completion": "0.000001"}
++        },
++    )
++
++    payload = build_models_payload(
++        _empty_context(),
++        explicit_only=True,
++        picker_hints=True,
++        runtime_availability=True,
++    )
++    assert payload["providers"][0]["availability_authoritative"] is False
++    with pytest.raises(AuthenticatedModelPairError):
++        server._resolve_session_create_model_pair()
++
++
++@pytest.mark.parametrize("pricing_state", ["exception", "empty", "malformed"])
++def test_runtime_availability_rejects_unknown_pricing(monkeypatch, pricing_state):
++    _install_inventory(
++        monkeypatch,
++        rows=[_row("nous", "nous-default")],
++        configured={"nous"},
++        stub_pricing=False,
++    )
++    monkeypatch.setattr(
++        "hermes_cli.nous_account.get_nous_portal_account_info",
++        lambda **_k: _nous_account(True),
++    )
++
++    def pricing(_slug):
++        if pricing_state == "exception":
++            raise RuntimeError("pricing unavailable")
++        if pricing_state == "empty":
++            return {}
++        return {"nous-default": {"prompt": "NaN", "completion": "0"}}
++
++    monkeypatch.setattr("hermes_cli.models.get_pricing_for_provider", pricing)
++
++    payload = build_models_payload(
++        _empty_context(),
++        explicit_only=True,
++        picker_hints=True,
++        runtime_availability=True,
++    )
++    assert payload["providers"][0]["availability_authoritative"] is False
++    with pytest.raises(AuthenticatedModelPairError):
++        server._resolve_session_create_model_pair()
++
++
++@pytest.mark.parametrize("catalog", [[], "nous-default", ["nous-default", None]])
++def test_runtime_availability_rejects_empty_or_malformed_catalog(
++    monkeypatch, catalog
++):
++    row = _row("nous", "nous-default")
++    row["models"] = catalog
++    _install_inventory(
++        monkeypatch, rows=[row], configured={"nous"}, stub_pricing=False
++    )
++    monkeypatch.setattr(
++        "hermes_cli.nous_account.get_nous_portal_account_info",
++        lambda **_k: _nous_account(True),
++    )
++    monkeypatch.setattr(
++        "hermes_cli.models.get_pricing_for_provider",
++        lambda _slug: {
++            "nous-default": {"prompt": "0.000001", "completion": "0.000001"}
++        },
++    )
++
++    payload = build_models_payload(
++        _empty_context(),
++        explicit_only=True,
++        picker_hints=True,
++        runtime_availability=True,
++    )
++    assert payload["providers"][0]["availability_authoritative"] is False
++    with pytest.raises(AuthenticatedModelPairError):
++        server._resolve_session_create_model_pair()
++
++
++def test_runtime_free_tier_allows_only_explicit_zero_price_ids(monkeypatch):
++    _install_inventory(
++        monkeypatch,
++        rows=[_row("nous", "nous-paid", "nous-free", "nous-unpriced")],
++        configured={"nous"},
++        stub_pricing=False,
++    )
++    monkeypatch.setattr(
++        "hermes_cli.nous_account.get_nous_portal_account_info",
++        lambda **_k: _nous_account(False),
++    )
++    monkeypatch.setattr(
++        "hermes_cli.models.get_pricing_for_provider",
++        lambda _slug: {
++            "nous-paid": {"prompt": "0.000001", "completion": "0.000002"},
++            "nous-free": {"prompt": "0", "completion": 0},
++        },
++    )
++
++    payload = build_models_payload(
++        _empty_context(),
++        explicit_only=True,
++        picker_hints=True,
++        runtime_availability=True,
++    )
++    runtime_row = payload["providers"][0]
++    assert runtime_row["availability_authoritative"] is True
++    assert runtime_row["unavailable_models"] == ["nous-paid", "nous-unpriced"]
++    assert server._resolve_session_create_model_pair(
++        requested_provider="nous", requested_model="nous-free"
++    ) == ("nous-free", "nous")
++    for unavailable in ("nous-paid", "nous-unpriced"):
++        with pytest.raises(AuthenticatedModelPairError):
++            server._resolve_session_create_model_pair(
++                requested_provider="nous", requested_model=unavailable
++            )
++
++
++def test_runtime_paid_tier_requires_positive_entitlement(monkeypatch):
++    _install_inventory(
++        monkeypatch,
++        rows=[_row("nous", "nous-default")],
++        configured={"nous"},
++        stub_pricing=False,
++    )
++    monkeypatch.setattr(
++        "hermes_cli.nous_account.get_nous_portal_account_info",
++        lambda **_k: _nous_account(True),
++    )
++    monkeypatch.setattr(
++        "hermes_cli.models.get_pricing_for_provider",
++        lambda _slug: {
++            "nous-default": {"prompt": "0.000001", "completion": "0.000001"}
++        },
++    )
++
++    assert server._resolve_session_create_model_pair() == ("nous-default", "nous")
++
++
++def test_unknown_runtime_availability_never_allocates_or_builds(monkeypatch):
++    _install_inventory(
++        monkeypatch,
++        rows=[_row("nous", "nous-default")],
++        configured={"nous"},
++        stub_pricing=False,
++    )
++
++    def unavailable_account(**_kwargs):
++        raise RuntimeError("account lookup unavailable")
++
++    monkeypatch.setattr(
++        "hermes_cli.nous_account.get_nous_portal_account_info",
++        unavailable_account,
++    )
++    monkeypatch.setattr(
++        "hermes_cli.models.get_pricing_for_provider",
++        lambda _slug: {
++            "nous-default": {"prompt": "0.000001", "completion": "0.000001"}
++        },
++    )
++    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
++    monkeypatch.setattr(
++        server,
++        "_schedule_agent_build",
++        lambda _sid: pytest.fail("unknown availability must not start a candidate"),
++    )
++    before = set(server._sessions)
++
++    response = server._methods["session.create"](
++        "unknown-availability", {"provider": "nous", "model": "nous-default"}
++    )
++
++    assert response["error"]["code"] == 4091
++    assert response["error"]["data"]["type"] == "model_selection_required"
++    assert set(server._sessions) == before
++
++
++@pytest.mark.parametrize(
++    "unavailable",
++    [None, "nous-paid", [""], ["unknown-model"], ["nous-paid", "nous-paid"]],
++)
++def test_runtime_authority_rejects_malformed_unavailable_set(unavailable):
++    row = _row("nous", "nous-paid", "nous-free")
++    row["availability_authoritative"] = True
++    row["unavailable_models"] = unavailable
++
++    assert _authenticated_pair_rows(
++        [row], require_authoritative_availability=True
++    ) == []
+diff --git a/tests/tui_gateway/test_compute_host_phase1.py b/tests/tui_gateway/test_compute_host_phase1.py
+index f5f02989..6d2658ba 100644
+--- a/tests/tui_gateway/test_compute_host_phase1.py
++++ b/tests/tui_gateway/test_compute_host_phase1.py
+@@ -25,6 +25,17 @@ USER_MESSAGE_ID = "2" * 32
+ ASSISTANT_MESSAGE_ID = "3" * 32
+ 
+ 
++def _durable_receipt() -> dict:
++    return {
++        "source": "state.db",
++        "row_id": 17,
++        "timestamp": 1_700_000_001.25,
++        "conversation_activity": True,
++        "turn_origin": "user",
++        "turn_origin_kind": "",
++    }
++
++
+ def _turn_frame(request_id: str = "turn-request") -> dict:
+     return {
+         "type": "turn.start",
+@@ -436,7 +447,7 @@ def test_compute_child_prewrite_failure_emits_no_started_or_user_event(
+     monkeypatch.setattr(
+         server,
+         "_emit_accepted_user_message",
+-        lambda *args: user_events.append(args),
++        lambda *args, **kwargs: user_events.append((args, kwargs)),
+     )
+ 
+     try:
+@@ -502,7 +513,7 @@ def test_compute_child_keeps_raw_accepted_text_separate_from_model_text(
+     monkeypatch.setattr(
+         server,
+         "_emit_accepted_user_message",
+-        lambda _sid, current: (
++        lambda _sid, current, **_kwargs: (
+             order.append("message.user"),
+             accepted.append(server._inflight_snapshot(current)["user"]),
+         ),
+@@ -513,6 +524,7 @@ def test_compute_child_keeps_raw_accepted_text_separate_from_model_text(
+                 "turn_id": TURN_ID,
+                 "user_message_id": USER_MESSAGE_ID,
+                 "assistant_message_id": ASSISTANT_MESSAGE_ID,
++                "durable": _durable_receipt(),
+                 # A multimodal durable row may carry parts here. The commit
+                 # barrier proves metadata/marker identity, not display-text
+                 # equality against provider content.
+@@ -587,7 +599,7 @@ def test_compute_child_persist_failure_has_no_commit_or_visible_turn(monkeypatch
+     monkeypatch.setattr(
+         server,
+         "_emit_accepted_user_message",
+-        lambda *_args: visible.append("message.user"),
++        lambda *_args, **_kwargs: visible.append("message.user"),
+     )
+     monkeypatch.setattr(
+         server,
+@@ -1217,7 +1229,7 @@ def test_compute_child_without_commit_cannot_create_late_ghost_turn(monkeypatch)
+     monkeypatch.setattr(
+         server,
+         "_emit_accepted_user_message",
+-        lambda *_args: user_events.append("user"),
++        lambda *_args, **_kwargs: user_events.append("user"),
+     )
+     monkeypatch.setattr(
+         server,
+diff --git a/tests/tui_gateway/test_turn_scope_protocol.py b/tests/tui_gateway/test_turn_scope_protocol.py
+index 39850b68..b5a390eb 100644
+--- a/tests/tui_gateway/test_turn_scope_protocol.py
++++ b/tests/tui_gateway/test_turn_scope_protocol.py
+@@ -26,6 +26,24 @@ TOOL_MESSAGE = "5" * 32
+ ASSISTANT_FINAL_MESSAGE = "6" * 32
+ 
+ 
++def _durable(
++    *,
++    row_id: int = 17,
++    timestamp: float = 1_700_000_001.25,
++    activity: bool = True,
++    origin: str = "user",
++    origin_kind: str = "",
++) -> dict:
++    return {
++        "source": "state.db",
++        "row_id": row_id,
++        "timestamp": timestamp,
++        "conversation_activity": activity,
++        "turn_origin": origin,
++        "turn_origin_kind": origin_kind,
++    }
++
++
+ def _metadata(
+     turn_id: str,
+     message_id: str,
+@@ -125,7 +143,11 @@ def test_receipt_and_first_user_event_share_one_identity_and_exact_payload(monke
+     monkeypatch.setattr(server, "write_json", frames.append)
+ 
+     receipt = server._streaming_receipt_result(session)
+-    server._emit_accepted_user_message("sid", session)
++    server._emit_accepted_user_message(
++        "sid",
++        session,
++        durable=_durable(),
++    )
+     with server._turn_event_scope(TURN_1, ASSISTANT_FINAL_MESSAGE):
+         server._emit("message.start", "sid")
+         server._emit("message.delta", "sid", {"text": "a"})
+@@ -147,7 +169,11 @@ def test_receipt_and_first_user_event_share_one_identity_and_exact_payload(monke
+         "type": "message.user",
+         "session_id": "sid",
+         "turn_id": TURN_1,
+-        "payload": {"message_id": USER_MESSAGE, "text": accepted_text},
++        "payload": {
++            "message_id": USER_MESSAGE,
++            "text": accepted_text,
++            "durable": _durable(),
++        },
+     }
+     assert frames[1]["params"]["payload"] == {
+         "message_id": ASSISTANT_FINAL_MESSAGE
+diff --git a/tui_gateway/compute_host.py b/tui_gateway/compute_host.py
+index 1c50a1c1..67145841 100644
+--- a/tui_gateway/compute_host.py
++++ b/tui_gateway/compute_host.py
+@@ -682,10 +682,17 @@ class ComputeHost:
+                         "user_message_id": frame["user_message_id"],
+                         "assistant_message_id": frame["assistant_message_id"],
+                         "committed_ns": now_ns(),
++                        "durable": server._canonical_durable_message_receipt(
++                            receipt.get("durable")
++                        ),
+                     }
+                 )
+                 durable_ack_sent = True
+-                server._emit_accepted_user_message(sid, session)
++                server._emit_accepted_user_message(
++                    sid,
++                    session,
++                    durable=receipt.get("durable"),
++                )
+                 with server._turn_event_scope(
+                     frame["turn_id"], frame["assistant_message_id"]
+                 ):
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 8d3b9c2b..f48b2e1a 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -706,11 +706,10 @@ def _(rid, params: dict) -> dict:
+             5071,
+             f"session storage could not be written: {exc}",
+         )
+-    # First authoritative turn event. It is emitted only after the session
+-    # prewrite succeeded and before any agent worker can emit message.start.
+-    # The receipt below carries the same ids, so either arrival order dedupes
+-    # and a lost receipt is recoverable from this event.
+-    _emit_accepted_user_message(sid, session)
++    # The session row exists, but the initiating message does not yet. The
++    # durable user event is emitted by the turn-start persistence callback only
++    # after the exact message row commits; a receipt followed by a crash must
++    # not move conversation recency or fabricate a durable user message.
+     _start_agent_build(sid, session)
+ 
+     def run_after_agent_ready() -> None:
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 884dd13b..de5fb7c9 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -4673,7 +4673,7 @@ def _resolve_authenticated_runtime_pair(
+         from hermes_cli.inventory import (
+             build_models_payload,
+             load_picker_context,
+-            require_authenticated_model_pair,
++            require_authenticated_runtime_model_pair,
+         )
+ 
+         ctx = load_picker_context()
+@@ -4686,7 +4686,7 @@ def _resolve_authenticated_runtime_pair(
+             probe_custom_providers=False,
+             probe_current_custom_provider=True,
+         )
+-        provider, model = require_authenticated_model_pair(
++        provider, model = require_authenticated_runtime_model_pair(
+             payload.get("providers") or [],
+             ctx,
+             requested_provider=requested_provider,
+@@ -9325,11 +9325,115 @@ def _streaming_receipt_result(session: dict, **extras: Any) -> dict:
+     }
+ 
+ 
+-def _emit_accepted_user_message(sid: str, session: dict) -> None:
+-    """Emit the authoritative user echo before any worker activity event."""
++def _canonical_durable_message_receipt(value: Any) -> dict:
++    """Validate and copy an exact state.db insert receipt for live events."""
++    if not isinstance(value, dict) or set(value) != {
++        "source",
++        "row_id",
++        "timestamp",
++        "conversation_activity",
++        "turn_origin",
++        "turn_origin_kind",
++    }:
++        raise RuntimeError("durable message receipt was malformed")
++    row_id = value.get("row_id")
++    timestamp = value.get("timestamp")
++    if (
++        value.get("source") != "state.db"
++        or not isinstance(row_id, int)
++        or isinstance(row_id, bool)
++        or row_id <= 0
++        or not isinstance(timestamp, (int, float))
++        or isinstance(timestamp, bool)
++        or not math.isfinite(float(timestamp))
++        or float(timestamp) <= 0
++        or not isinstance(value.get("conversation_activity"), bool)
++        or value.get("turn_origin") not in {"user", "synthetic"}
++        or not isinstance(value.get("turn_origin_kind"), str)
++    ):
++        raise RuntimeError("durable message receipt was malformed")
++    return {
++        "source": "state.db",
++        "row_id": row_id,
++        "timestamp": float(timestamp),
++        "conversation_activity": value["conversation_activity"],
++        "turn_origin": value["turn_origin"],
++        "turn_origin_kind": value["turn_origin_kind"],
++    }
++
++
++def _durable_primary_assistant_receipt(
++    messages: Any,
++    *,
++    turn_id: str,
++    message_id: str,
++) -> dict | None:
++    """Return proof for one exact committed primary assistant row.
++
++    No session-level high-water mark or text/adjacency fallback is permitted:
++    concurrent turns may have newer rows, and attaching their timestamp to this
++    completion would make live ordering disagree with a restart.
++    """
++    if not isinstance(messages, list):
++        return None
++    from agent.turn_identity import (
++        MESSAGE_KIND_METADATA_KEY,
++        TURN_ORIGIN_METADATA_KEY,
++        durable_message_id,
++        message_turn_id,
++    )
++
++    candidates = []
++    for message in messages:
++        if (
++            not isinstance(message, dict)
++            or message.get("role") != "assistant"
++            or message.get("_db_persisted") is not True
++            or message_turn_id(message) != turn_id
++            or durable_message_id(message) != message_id
++        ):
++            continue
++        metadata = message.get("display_metadata")
++        if (
++            not isinstance(metadata, dict)
++            or metadata.get(MESSAGE_KIND_METADATA_KEY) != "primary"
++            or metadata.get(TURN_ORIGIN_METADATA_KEY) != "user"
++            or message.get("_durable_conversation_activity") is not True
++        ):
++            continue
++        candidates.append(message)
++    if len(candidates) != 1:
++        return None
++    message = candidates[0]
++    metadata = message["display_metadata"]
++    try:
++        return _canonical_durable_message_receipt(
++            {
++                "source": "state.db",
++                "row_id": message.get("_row_id"),
++                "timestamp": message.get("_durable_timestamp"),
++                "conversation_activity": True,
++                "turn_origin": "user",
++                "turn_origin_kind": str(
++                    metadata.get("hermes_turn_origin_kind") or ""
++                ),
++            }
++        )
++    except RuntimeError:
++        return None
++
++
++def _emit_accepted_user_message(
++    sid: str,
++    session: dict,
++    *,
++    durable: dict,
++) -> None:
++    """Emit the exact initiating row only after its SQLite commit barrier."""
+ 
+     turn_id, user_message_id = _inflight_turn_identity(session)
+     turn = session["inflight_turn"]
++    durable_receipt = _canonical_durable_message_receipt(durable)
+     with _turn_event_scope(turn_id):
+         _emit(
+             "message.user",
+@@ -9337,6 +9441,7 @@ def _emit_accepted_user_message(sid: str, session: dict) -> None:
+             {
+                 "message_id": user_message_id,
+                 "text": str(turn.get("user") or ""),
++                "durable": durable_receipt,
+             },
+         )
+ 
+@@ -12260,6 +12365,31 @@ def _run_prompt_submit(
+         agent._relay_pending_user_message_id = user_message_id
+         agent._relay_pending_assistant_message_id = assistant_message_id
+         _bind_agent_turn_callbacks(agent, sid, turn_id)
++        if not callable(getattr(agent, "_relay_turn_durable_callback", None)):
++            expected_identity = {
++                "turn_id": turn_id,
++                "user_message_id": user_message_id,
++                "assistant_message_id": assistant_message_id,
++            }
++
++            def _inline_turn_committed(receipt: dict[str, Any]) -> None:
++                receipt_identity = {
++                    key: receipt.get(key) for key in expected_identity
++                }
++                if receipt_identity != expected_identity:
++                    raise RuntimeError(
++                        "inline durable turn identity mismatch"
++                    )
++                _emit_accepted_user_message(
++                    sid,
++                    session,
++                    durable=receipt.get("durable"),
++                )
++                with _turn_event_scope(turn_id, assistant_message_id):
++                    _emit("message.start", sid)
++
++            agent._relay_turn_durable_callback = _inline_turn_committed
++            session["_defer_message_start_until_durable"] = True
+         if hasattr(agent, "clear_interrupt"):
+             try:
+                 agent.clear_interrupt()
+@@ -12801,6 +12931,14 @@ def _run_prompt_submit(
+                 )
+ 
+             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
++            if status == "complete" and isinstance(raw, str) and raw.strip():
++                durable_assistant = _durable_primary_assistant_receipt(
++                    result.get("messages") if isinstance(result, dict) else None,
++                    turn_id=turn_id,
++                    message_id=assistant_message_id,
++                )
++                if durable_assistant is not None:
++                    payload["durable"] = durable_assistant
+             if last_reasoning:
+                 payload["reasoning"] = last_reasoning
+             if status_note:
+@@ -13089,6 +13227,7 @@ def _run_prompt_submit(
+             # Clear the per-turn interim callback so a stale closure from
+             # this turn can't fire during a later turn on the same agent.
+             agent.interim_assistant_callback = None
++            agent._relay_turn_durable_callback = None
+             _clear_agent_turn_callbacks(agent, sid, turn_id)
+             with session["history_lock"]:
+                 session["running"] = False

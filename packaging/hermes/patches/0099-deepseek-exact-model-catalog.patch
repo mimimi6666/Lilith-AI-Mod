@@ -1,0 +1,570 @@
+diff --git a/hermes_cli/model_normalize.py b/hermes_cli/model_normalize.py
+index d2dfe13..c1b9ff1 100644
+--- a/hermes_cli/model_normalize.py
++++ b/hermes_cli/model_normalize.py
+@@ -12,14 +12,9 @@ Different LLM providers expect model identifiers in different formats:
+   model IDs, but Claude still uses hyphenated native names like
+   ``claude-sonnet-4-6``.
+ - **OpenCode Go** preserves dots in model names: ``minimax-m2.7``.
+-- **DeepSeek** accepts only the first-class V-series IDs
+-  (``deepseek-v4-pro``, ``deepseek-v4-flash``, and any future
+-  ``deepseek-v<N>-*``).  The legacy aliases ``deepseek-chat`` and
+-  ``deepseek-reasoner`` were retired on 2026-07-24 and are remapped to
+-  ``deepseek-v4-flash`` (official non-thinking / thinking shims).  Older
+-  Hermes revisions folded every non-reasoner input into
+-  ``deepseek-chat``, which on aggregators routes to V3 — so a user
+-  picking V4 Pro was silently downgraded.
++- **DeepSeek** preserves exact model IDs, including stored legacy names.
++  Catalog validation owns availability; normalization must not migrate a
++  saved selection or turn a newly released ID into an older model.
+ - **Custom** and remaining providers pass the name through as-is.
+ 
+ This module centralises that translation so callers can simply write::
+@@ -134,80 +129,14 @@ _LOWERCASE_MODEL_PROVIDERS: frozenset[str] = frozenset({
+ # ---------------------------------------------------------------------------
+ # DeepSeek special handling
+ # ---------------------------------------------------------------------------
+-# DeepSeek's direct API only accepts first-class V-series IDs after the
+-# 2026-07-24 cut-off.  Legacy aliases and fuzzy names are remapped here so
+-# saved configs / picker leftovers cannot keep sending retired IDs.
+-
+-_DEEPSEEK_REASONER_KEYWORDS: frozenset[str] = frozenset({
+-    "reasoner",
+-    "r1",
+-    "think",
+-    "reasoning",
+-    "cot",
+-})
+-
+-# Retired on 2026-07-24 15:59 UTC. Official docs: both aliases mapped to
+-# deepseek-v4-flash (chat = non-thinking, reasoner = thinking). Thinking
+-# mode itself is controlled by extra_body.thinking on the DeepSeek profile.
+-_DEEPSEEK_RETIRED_ALIASES: frozenset[str] = frozenset({
+-    "deepseek-chat",
+-    "deepseek-reasoner",
+-})
+-
+-_DEEPSEEK_CANONICAL_MODELS: frozenset[str] = frozenset({
+-    "deepseek-v4-pro",     # V4 Pro — first-class model ID
+-    "deepseek-v4-flash",   # V4 Flash — first-class model ID
+-})
+-
+-# First-class V-series IDs (``deepseek-v4-pro``, ``deepseek-v4-flash``,
+-# future ``deepseek-v5-*``, dated variants like ``deepseek-v4-flash-20260423``).
+-# Verified empirically 2026-04-24: DeepSeek's Chat Completions API returns
+-# ``provider: DeepSeek`` / ``model: deepseek-v4-flash-20260423`` when called
+-# with ``model=deepseek/deepseek-v4-flash``, so these names are not aliases
+-# of ``deepseek-chat`` and must not be folded into it.
+-_DEEPSEEK_V_SERIES_RE = re.compile(r"^deepseek-v\d+([-.].+)?$")
+-
+-
+ def _normalize_for_deepseek(model_name: str) -> str:
+-    """Map a model input to a DeepSeek-accepted identifier.
+-
+-    Rules:
+-    - Retired aliases ``deepseek-chat`` / ``deepseek-reasoner`` (cut off
+-      2026-07-24) -> ``deepseek-v4-flash``.
+-    - Already a known canonical (``deepseek-v4-pro``/``deepseek-v4-flash``)
+-      -> pass through.
+-    - Matches the V-series pattern ``deepseek-v<digit>...`` -> pass through
+-      (covers future ``deepseek-v5-*`` and dated variants without a release).
+-    - Contains a reasoner keyword (r1, think, reasoning, cot, reasoner)
+-      -> ``deepseek-v4-flash``.
+-    - Everything else -> ``deepseek-v4-flash``.
+-
+-    Args:
+-        model_name: The bare model name (vendor prefix already stripped).
++    """Preserve an exact direct-provider ID; never migrate saved names.
+ 
+-    Returns:
+-        A DeepSeek-accepted model identifier.
++    The matching provider prefix is handled by the caller. Availability and
++    retired-alias guidance belong to explicit selection validation, not this
++    helper, which is also used when loading existing configurations.
+     """
+-    bare = _strip_vendor_prefix(model_name).lower()
+-
+-    # Retired aliases must rewrite — DeepSeek returns HTTP 400 after the
+-    # 2026-07-24 cut-off if these IDs are sent on the wire.
+-    if bare in _DEEPSEEK_RETIRED_ALIASES:
+-        return "deepseek-v4-flash"
+-
+-    if bare in _DEEPSEEK_CANONICAL_MODELS:
+-        return bare
+-
+-    # V-series first-class IDs (v4-pro, v4-flash, future v5-*, dated variants)
+-    if _DEEPSEEK_V_SERIES_RE.match(bare):
+-        return bare
+-
+-    # Check for reasoner-like keywords anywhere in the name
+-    for keyword in _DEEPSEEK_REASONER_KEYWORDS:
+-        if keyword in bare:
+-            return "deepseek-v4-flash"
+-
+-    return "deepseek-v4-flash"
++    return model_name
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -546,7 +475,7 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
+             return name.split("/", 1)[1]
+         return stripped
+ 
+-    # --- DeepSeek: map to one of two canonical names ---
++    # --- DeepSeek: format the prefix without substituting the selected ID ---
+     if provider == "deepseek":
+         bare = _strip_matching_provider_prefix(name, provider)
+         if "/" in bare:
+@@ -579,4 +508,3 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
+ # ---------------------------------------------------------------------------
+ # Batch / convenience helpers
+ # ---------------------------------------------------------------------------
+-
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index 581c954..ec5e899 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -428,7 +428,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
+     ],
+     "deepseek": [
+         "deepseek-v4-pro",
+-        "deepseek-v4-flash",
++        "deepseek-flash",
+     ],
+     "xiaomi": [
+         "mimo-v2.5-pro",
+@@ -2562,7 +2562,7 @@ def _provider_keys(provider: str) -> set[str]:
+ # Retired model IDs kept for /model auto-detect only — not shown in pickers.
+ # DeepSeek cut these off on 2026-07-24; model_normalize remaps them on the wire.
+ _PROVIDER_RETIRED_ALIASES: dict[str, tuple[str, ...]] = {
+-    "deepseek": ("deepseek-chat", "deepseek-reasoner"),
++    "deepseek": ("deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"),
+ }
+ 
+ 
+@@ -3004,7 +3004,6 @@ def _resolve_copilot_catalog_api_key() -> str:
+ _MODELS_DEV_PREFERRED: frozenset[str] = frozenset({
+     "opencode-go",
+     "opencode-zen",
+-    "deepseek",
+     "kilocode",
+     "fireworks",
+     "mistral",
+@@ -3307,6 +3306,11 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False)
+             if api_key:
+                 live = _p.fetch_models(api_key=api_key, base_url=base_url or None)
+                 if live:
++                    if normalized == "deepseek":
++                        # Direct DeepSeek IDs are exact selections, not aliases.
++                        # Never merge retired curated IDs into a live listing.
++                        retired = _PROVIDER_RETIRED_ALIASES[normalized]
++                        return [m for m in live if m not in retired]
+                     # Merge static curated list with live API results so
+                     # models that the live endpoint omits (stale cache,
+                     # partial rollout) still appear in the picker.
+@@ -3346,6 +3350,10 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False)
+         pass
+ 
+     curated_static = list(_PROVIDER_MODELS.get(normalized, []))
++    if normalized == "deepseek":
++        # No live listing: use the current native fallback, not models.dev's
++        # independently versioned aliases or another provider's slug catalog.
++        return curated_static
+     if normalized in _MODELS_DEV_PREFERRED:
+         merged = _merge_with_models_dev(normalized, curated_static)
+         if normalized in {"xai", "xai-oauth"}:
+@@ -3376,6 +3384,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False)
+ #     to a live fetch — the picker keeps working.
+ 
+ _PROVIDER_MODELS_CACHE_TTL = 3600  # 1h
++# Invalidate only catalogs whose selection semantics changed. This does not
++# touch saved model settings, auth records, or other providers' cache entries.
++_PROVIDER_CATALOG_REVISIONS = {"deepseek": "exact-2026-09-10"}
+ # Stale-while-revalidate window: an expired-but-same-credentials entry is
+ # served IMMEDIATELY (picker opens stay instant) while a background daemon
+ # thread re-fetches the live catalog and rewrites the disk cache for the
+@@ -3463,6 +3474,9 @@ def _credential_fingerprint(provider: str) -> str:
+     import os as _os
+ 
+     parts: list[str] = []
++    revision = _PROVIDER_CATALOG_REVISIONS.get(provider)
++    if revision:
++        parts.append(f"catalog={revision}")
+ 
+     # Env vars from PROVIDER_REGISTRY for this slug
+     try:
+@@ -5272,6 +5286,39 @@ def validate_requested_model(
+             "message": "Model names cannot contain spaces.",
+         }
+ 
++    if normalized == "deepseek":
++        # Officially retained compatibility IDs must remain literal, including
++        # in saved defaults and historical sessions. A fuzzy match to the new
++        # name would violate the host's exact-pair contract. This acknowledges
++        # the provider's compatibility routing without migrating local config.
++        if requested in {"deepseek-v4-flash", "deepseek-v4-flash-vision-exp"}:
++            return {
++                "accepted": True, "persist": True, "recognized": True,
++                "message": (
++                    f"`{requested}` is a DeepSeek compatibility ID that the provider "
++                    "routes to its current Flash model. The selected ID was preserved. "
++                    "Select `deepseek-flash` explicitly to save the current name."
++                ),
++            }
++        live = fetch_api_models(api_key, base_url)
++        catalog = live if live is not None else _PROVIDER_MODELS[normalized]
++        if requested in catalog:
++            return {
++                "accepted": True, "persist": True, "recognized": True,
++                "message": None if live is not None else (
++                    "DeepSeek's live model listing was unavailable; the exact "
++                    "selection matches the current native fallback catalog."
++                ),
++            }
++        return {
++            "accepted": False, "persist": False, "recognized": False,
++            "message": (
++                f"Exact DeepSeek model `{requested}` was not found in this provider's "
++                "model listing. Refresh the list and select an exact model ID; "
++                "no model was substituted."
++            ),
++        }
++
+     if normalized == "lmstudio":
+         from hermes_cli.auth import AuthError
+         # Use probe_lmstudio_models so we can distinguish None (unreachable
+diff --git a/plugins/model-providers/deepseek/__init__.py b/plugins/model-providers/deepseek/__init__.py
+index cf8c20f..330952e 100644
+--- a/plugins/model-providers/deepseek/__init__.py
++++ b/plugins/model-providers/deepseek/__init__.py
+@@ -16,9 +16,9 @@ Moonshot wire shape that DeepSeek's OpenAI-compat endpoint expects:
+ Non-thinking models (``deepseek-v3-*`` variants) are left as no-ops so we
+ don't perturb the V3 wire format.
+ 
+-The legacy aliases ``deepseek-chat`` / ``deepseek-reasoner`` were retired on
+-2026-07-24.  Use ``deepseek-v4-flash`` or ``deepseek-v4-pro``; Hermes remaps
+-the retired IDs in ``hermes_cli.model_normalize``.
++The current Flash ID is ``deepseek-flash`` (2026-09-10); V4 Pro retains
++``deepseek-v4-pro``. Retired aliases are not automatically substituted:
++saved selections remain unchanged and new selections require exact IDs.
+ """
+ 
+ from __future__ import annotations
+@@ -32,13 +32,14 @@ from providers.base import ProviderProfile
+ def _model_supports_thinking(model: str | None) -> bool:
+     """DeepSeek thinking-capable model families.
+ 
+-    Currently covers the V4 family (``deepseek-v4-pro``, ``deepseek-v4-flash``,
+-    and any future ``deepseek-v4-*`` variants).  Retired aliases are remapped
+-    before requests leave Hermes, so they are not listed here.
++    Covers current Flash and the V4+ family, including saved compatibility
++    IDs. Recognition here does not rename a saved or selected model.
+     """
+     m = (model or "").strip().lower()
+     if not m:
+         return False
++    if m == "deepseek-flash":
++        return True
+     if m.startswith("deepseek-v") and not m.startswith("deepseek-v3"):
+         # deepseek-v4-*, deepseek-v5-*, etc. — every V4+ generation has
+         # thinking. v3 explicitly excluded.
+@@ -93,10 +94,10 @@ deepseek = DeepSeekProfile(
+     signup_url="https://platform.deepseek.com/",
+     fallback_models=(
+         "deepseek-v4-pro",
+-        "deepseek-v4-flash",
++        "deepseek-flash",
+     ),
+     base_url="https://api.deepseek.com/v1",
+-    default_aux_model="deepseek-v4-flash",
++    default_aux_model="deepseek-flash",
+ )
+ 
+ register_provider(deepseek)
+diff --git a/tests/hermes_cli/test_model_normalize.py b/tests/hermes_cli/test_model_normalize.py
+index 765525f..305c075 100644
+--- a/tests/hermes_cli/test_model_normalize.py
++++ b/tests/hermes_cli/test_model_normalize.py
+@@ -114,17 +114,13 @@ class TestDeepseekVSeriesPassThrough:
+ # ── DeepSeek post-2026-07-24 alias remapping ───────────────────────────
+ 
+ class TestDeepseekCanonicalAndReasonerMapping:
+-    """Retired aliases and fuzzy names rewrite to deepseek-v4-flash.
+-
+-    DeepSeek cut off ``deepseek-chat`` / ``deepseek-reasoner`` on
+-    2026-07-24; sending them on the wire returns HTTP 400.
+-    """
++    """Normalization preserves stored names; validation owns availability."""
+ 
+ 
+-    def test_provider_path_rewrites_reasoner(self):
++    def test_provider_path_preserves_stored_reasoner(self):
+         assert (
+             normalize_model_for_provider("deepseek-reasoner", "deepseek")
+-            == "deepseek-v4-flash"
++            == "deepseek-reasoner"
+         )
+ 
+     @pytest.mark.parametrize("model", [
+@@ -134,8 +130,8 @@ class TestDeepseekCanonicalAndReasonerMapping:
+         "deepseek-reasoning-preview",
+         "deepseek-cot-experimental",
+     ])
+-    def test_reasoner_keywords_map_to_v4_flash(self, model):
+-        assert _normalize_for_deepseek(model) == "deepseek-v4-flash"
++    def test_reasoner_keywords_do_not_silently_select_another_model(self, model):
++        assert _normalize_for_deepseek(model) == model
+ 
+ 
+ # ── Regression: issue #78796 ───────────────────────────────────────────
+@@ -186,4 +182,3 @@ class TestIssue78796NvidiaPrefixRepair:
+             normalize_model_for_provider("claude-sonnet-4.6", "openrouter")
+             == "anthropic/claude-sonnet-4.6"
+         )
+-
+diff --git a/tests/plugins/model_providers/test_deepseek_profile.py b/tests/plugins/model_providers/test_deepseek_profile.py
+index db974f6..7876f4d 100644
+--- a/tests/plugins/model_providers/test_deepseek_profile.py
++++ b/tests/plugins/model_providers/test_deepseek_profile.py
+@@ -105,6 +105,7 @@ class TestDeepSeekModelGating:
+         "model",
+         [
+             "deepseek-v4-pro",
++            "deepseek-flash",
+             "deepseek-v4-flash",
+             "deepseek-v4-future-variant",
+             "DEEPSEEK-V4-PRO",  # case-insensitive
+@@ -186,16 +187,15 @@ class TestDeepSeekAuxModel:
+     system.
+     """
+ 
+-    def test_profile_advertises_deepseek_v4_flash(self, deepseek_profile):
+-        assert deepseek_profile.default_aux_model == "deepseek-v4-flash"
++    def test_auxiliary_default_is_in_the_current_fallback_catalog(self, deepseek_profile):
++        assert deepseek_profile.default_aux_model in deepseek_profile.fallback_models
+ 
+-    def test_fallback_models_are_v4_only(self, deepseek_profile):
+-        assert deepseek_profile.fallback_models == (
+-            "deepseek-v4-pro",
+-            "deepseek-v4-flash",
+-        )
++    def test_fallback_models_support_existing_thinking_controls(self, deepseek_profile):
++        for model in deepseek_profile.fallback_models:
++            body, _ = deepseek_profile.build_api_kwargs_extras(
++                reasoning_config={"enabled": False}, model=model)
++            assert body == {"thinking": {"type": "disabled"}}
+ 
+-    def test_consumer_api_returns_deepseek_v4_flash(self):
++    def test_consumer_api_uses_the_profile_default(self, deepseek_profile):
+         from agent.auxiliary_client import _get_aux_model_for_provider
+-        assert _get_aux_model_for_provider("deepseek") == "deepseek-v4-flash"
+-
++        assert _get_aux_model_for_provider("deepseek") == deepseek_profile.default_aux_model
+diff --git a/tests/tui_gateway/test_deepseek_exact_model_catalog.py b/tests/tui_gateway/test_deepseek_exact_model_catalog.py
+new file mode 100644
+--- /dev/null
++++ b/tests/tui_gateway/test_deepseek_exact_model_catalog.py
+@@ -0,0 +1,203 @@
++"""Direct DeepSeek catalog/selection regression, with real native pipelines.
++
++Transport, credentials and external metadata are synthetic. Normalization,
++validation, switch_model, inventory and config.set run their actual code.
++"""
++from copy import deepcopy
++from pathlib import Path
++import socket
++import subprocess
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import model_tools  # noqa: F401 -- register actual provider profiles
++import providers
++import agent.identity_policy as identity
++import agent.models_dev as metadata
++import hermes_cli.auth as auth
++import hermes_cli.config as config
++import hermes_cli.inventory as inventory
++import hermes_cli.model_normalize as normalize
++import hermes_cli.model_switch as switching
++import hermes_cli.models as models
++import hermes_cli.providers as provider_defs
++import hermes_cli.runtime_provider as runtime
++import tui_gateway.server as server
++
++
++@pytest.fixture
++def fixture(monkeypatch, tmp_path):
++    def forbidden(*args, **kwargs):
++        raise AssertionError("Synthetic regression must not use network or subprocess")
++
++    monkeypatch.setattr(socket.socket, "connect", forbidden)
++    monkeypatch.setattr(socket.socket, "connect_ex", forbidden)
++    monkeypatch.setattr(subprocess, "run", forbidden)
++    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    state = SimpleNamespace(
++        live=["deepseek-flash", "deepseek-v4-pro"], cache={},
++        config={"model": {"provider": "deepseek", "default": "deepseek-v4-pro"}},
++        persist=Mock(), desire=Mock(return_value=(1, None)),
++    )
++    monkeypatch.setattr(config, "load_config", lambda: deepcopy(state.config))
++    monkeypatch.setattr(switching, "_load_direct_aliases", lambda: {})
++    monkeypatch.setattr(switching, "DIRECT_ALIASES", {})
++    monkeypatch.setattr(runtime, "resolve_runtime_provider", lambda **kwargs: {
++        "provider": kwargs.get("requested") or "deepseek", "api_key": "synthetic-not-a-credential",
++        "base_url": "https://api.deepseek.com/v1", "api_mode": "chat_completions"})
++    monkeypatch.setattr(auth, "resolve_api_key_provider_credentials", lambda *args, **kwargs: {
++        "api_key": "synthetic-not-a-credential", "base_url": "https://api.deepseek.com/v1"})
++    monkeypatch.setattr(auth, "get_provider_effective_credential_env", lambda provider, key:
++        "synthetic-not-a-credential" if provider == "deepseek" else "")
++    monkeypatch.setattr(auth, "_load_auth_store", lambda: {})
++    monkeypatch.setattr(models, "fetch_api_models", lambda *args, **kwargs: state.live)
++    profile = providers.get_provider_profile("deepseek")
++    assert profile is not None
++    state.profile = profile
++    monkeypatch.setattr(profile, "fetch_models", lambda **kwargs: state.live)
++    monkeypatch.setattr(models, "_load_provider_models_cache", lambda: deepcopy(state.cache))
++    monkeypatch.setattr(models, "_save_provider_models_cache", lambda value: state.cache.update(value))
++    monkeypatch.setattr(models, "get_curated_nous_model_ids", lambda: [])
++    monkeypatch.setattr(models, "fetch_ollama_cloud_models", lambda *args, **kwargs: [])
++    monkeypatch.setattr(switching, "get_model_capabilities", lambda *args, **kwargs: None)
++    monkeypatch.setattr(switching, "get_model_info", lambda *args, **kwargs: None)
++    monkeypatch.setattr(metadata, "PROVIDER_TO_MODELS_DEV", {"deepseek": "deepseek"})
++    monkeypatch.setattr(metadata, "fetch_models_dev", lambda: {"deepseek": {
++        "name": "DeepSeek", "env": ["DEEPSEEK_API_KEY"], "models": {}}})
++    monkeypatch.setattr(metadata, "get_provider_info", lambda name, **kwargs:
++        metadata.ProviderInfo("deepseek", "DeepSeek", ("DEEPSEEK_API_KEY",), "https://api.deepseek.com/v1")
++        if name == "deepseek" else None)
++    monkeypatch.setattr(provider_defs, "HERMES_OVERLAYS", {
++        key: value for key, value in provider_defs.HERMES_OVERLAYS.items() if key == "deepseek"})
++    monkeypatch.setattr(models, "CANONICAL_PROVIDERS", [p for p in models.CANONICAL_PROVIDERS if p.slug == "deepseek"])
++    monkeypatch.setattr(identity, "identity_lock_required_by_host", lambda: True)
++    monkeypatch.setattr(server, "_resolve_model", lambda: state.config["model"]["default"])
++    monkeypatch.setattr(server, "_persist_model_switch", state.persist)
++    monkeypatch.setattr(server, "_commit_runtime_desire", state.desire)
++    return state
++
++
++def select(model, provider="deepseek"):
++    return switching.switch_model(raw_input=model, current_provider=provider,
++        current_model="deepseek-v4-pro", explicit_provider=provider, is_global=True)
++
++
++@pytest.mark.parametrize("model", [
++    "deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash",
++    "deepseek-v4-flash-vision-exp", "deepseek-reasoner", "DeepSeek.Future.Exact",
++])
++def test_normalization_never_migrates_a_stored_literal(fixture, model):
++    assert normalize.normalize_model_for_provider(model, "deepseek") == model
++
++
++@pytest.mark.parametrize("live", [["deepseek-flash", "deepseek-v4-pro"], None])
++def test_new_exact_flash_survives_the_full_global_selection(fixture, live):
++    fixture.live = live
++    before = deepcopy(fixture.config)
++    result = server._apply_model_switch("", {"agent": None},
++        "deepseek-flash --provider deepseek --global", confirm_expensive_model=True)
++    assert result["value"] == "deepseek-flash"
++    fixture.persist.assert_called_once()
++    assert fixture.persist.call_args.args[0].new_model == "deepseek-flash"
++    assert fixture.config == before
++
++
++@pytest.mark.parametrize("model", ["deepseek-v4-flash", "deepseek-v4-flash-vision-exp"])
++@pytest.mark.parametrize("live", [["deepseek-flash", "deepseek-v4-pro"], None])
++def test_compatibility_literal_remains_exact_not_silently_upgraded(fixture, model, live):
++    fixture.live = live
++    result = select(model)
++    assert result.success and result.new_model == model
++    assert "compatibility" in result.warning_message
++    assert "corrected_model" not in models.validate_requested_model(model, "deepseek")
++
++
++def test_typo_is_not_fuzzily_saved_as_a_different_model(fixture):
++    result = select("deepseek-flahs")
++    assert not result.success
++    assert "Exact DeepSeek model" in result.error_message
++    fixture.persist.assert_not_called()
++
++
++@pytest.mark.parametrize("live", [["deepseek-flash", "deepseek-v4-pro"], None])
++def test_existing_compatibility_selection_can_still_pass_exact_global_guard(fixture, live):
++    fixture.live = live
++    result = server._apply_model_switch("", {"agent": None},
++        "deepseek-v4-flash --provider deepseek --global", confirm_expensive_model=True)
++    assert result["value"] == "deepseek-v4-flash"
++    fixture.persist.assert_called_once()
++    assert fixture.persist.call_args.args[0].new_model == "deepseek-v4-flash"
++
++
++def test_live_direct_catalog_is_exact_without_stale_curated_merge(fixture):
++    fixture.live = ["deepseek-flash", "DeepSeek.Future.Exact", "deepseek-v4-flash"]
++    assert models.provider_model_ids("deepseek") == ["deepseek-flash", "DeepSeek.Future.Exact"]
++    assert select("DeepSeek.Future.Exact").new_model == "DeepSeek.Future.Exact"
++
++
++def test_offline_catalog_and_profile_agree_on_selectable_exact_ids(fixture, monkeypatch):
++    fixture.live = None
++    monkeypatch.setattr(models, "_merge_with_models_dev", Mock(side_effect=AssertionError("No foreign alias merge")))
++    catalog = models.provider_model_ids("deepseek")
++    assert catalog == list(fixture.profile.fallback_models)
++    assert "deepseek-flash" in catalog  # incident regression: new ID must be selectable offline
++    assert "deepseek-v4-flash" not in catalog
++    for model in catalog:
++        selected = select(model)
++        assert selected.success and selected.new_model == model
++
++
++@pytest.mark.parametrize("current", ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"])
++def test_inventory_keeps_saved_default_and_historical_session_authority(fixture, current):
++    fixture.config["model"]["default"] = current
++    before = deepcopy(fixture.config)
++    ctx = inventory.ConfigContext("deepseek", current, "", {}, [])
++    payload = inventory.build_models_payload(ctx, picker_hints=True, runtime_availability=True)
++    assert (payload["provider"], payload["model"]) == ("deepseek", current)
++    row = next(row for row in payload["providers"] if row["slug"] == "deepseek")
++    assert "deepseek-flash" in row["models"] and current in row["models"]
++    assert inventory.select_authenticated_model_pair(payload["providers"], ctx,
++        requested_provider="deepseek", requested_model=current,
++        require_authoritative_availability=True) == ("deepseek", current)
++    assert fixture.config == before
++    fixture.persist.assert_not_called()
++    fixture.desire.assert_not_called()
++
++
++def test_old_cache_invalidates_only_direct_deepseek_catalog(fixture, monkeypatch):
++    revisions = models._PROVIDER_CATALOG_REVISIONS
++    with monkeypatch.context() as old:
++        old.setattr(models, "_PROVIDER_CATALOG_REVISIONS", {})
++        old_fp = models._credential_fingerprint("deepseek")
++        router_fp = models._credential_fingerprint("openrouter")
++    fixture.cache["deepseek"] = {"fp": old_fp, "at": models.time.time(), "models": ["deepseek-v4-flash"]}
++    assert models._credential_fingerprint("deepseek") != old_fp
++    assert models._credential_fingerprint("openrouter") == router_fp
++    assert models.cached_provider_model_ids("deepseek") == fixture.live
++    assert models._PROVIDER_CATALOG_REVISIONS is revisions
++
++
++@pytest.mark.parametrize("model", ["deepseek/deepseek-v4-flash", "deepseek/deepseek-flash"])
++def test_openrouter_namespace_does_not_adopt_direct_provider_policy(fixture, model):
++    fixture.live = [model]
++    assert normalize.normalize_model_for_provider(model, "openrouter") == model
++    verdict = models.validate_requested_model(model, "openrouter", base_url="https://openrouter.ai/api/v1")
++    assert verdict["accepted"] and "corrected_model" not in verdict
++    assert "deepseek/deepseek-v4-flash" in [model for model, _ in models.OPENROUTER_MODELS]
++
++
++def test_exact_global_guard_still_rejects_a_changed_pair(fixture, monkeypatch):
++    original = switching.switch_model
++    def changed_pair(**kwargs):
++        result = original(**kwargs)
++        result.new_model = "unexpected-substitution"
++        return result
++    monkeypatch.setattr(switching, "switch_model", changed_pair)
++    result = server.handle_request({"id": "exact-guard", "method": "config.set", "params": {
++        "key": "model", "value": "deepseek-flash --provider deepseek --global",
++        "confirm_expensive_model": True}})
++    assert result.get("error", {}).get("code") == 4094, result
++    fixture.persist.assert_not_called()
++    fixture.desire.assert_not_called()

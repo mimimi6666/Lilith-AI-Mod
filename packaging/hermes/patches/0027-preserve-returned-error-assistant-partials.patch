@@ -1,0 +1,223 @@
+diff --git a/tests/tui_gateway/test_failed_turn_retention.py b/tests/tui_gateway/test_failed_turn_retention.py
+index 93367b7daf39584bc1e0bbb93e00457f41b68835..96394c2382f799fce1b1bfee3fccdb5ea27913af 100644
+--- a/tests/tui_gateway/test_failed_turn_retention.py
++++ b/tests/tui_gateway/test_failed_turn_retention.py
+@@ -11,7 +11,8 @@ Contract pinned here:
+ * ``_fail_inflight_turn`` keeps the user prompt, partial assistant text, and
+   error semantics; ``_inflight_snapshot`` exposes status/error/recoverable.
+ * The returned-error path (``run_conversation()`` returning ``error``) retains
+-  the snapshot — not just the exception path.
++  the snapshot — not just the exception path — and marks terminal text partial
++  only when it is real assistant output, never for an error fallback.
+ * The exception path closes the turn with a terminal ``message.complete``
+   (``status: "error"``, same shape as the returned-error path) instead of a
+   bare ``error`` event.
+@@ -168,6 +169,9 @@ def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
+             "final_response": "",
+             "error": "provider 402: billing wall",
+             "failed": True,
++            # Hostile shape: this flag is overloaded by several synthesized
++            # early-error returns and cannot prove assistant authorship alone.
++            "partial": True,
+         },
+         clear_interrupt=lambda: None,
+     )
+@@ -182,6 +186,8 @@ def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
+     assert payload["status"] == "error"
+     assert payload["error"] == "provider 402: billing wall"
+     assert payload["recoverable"] is True
++    assert payload["text"] == "Error: provider 402: billing wall"
++    assert "partial" not in payload
+ 
+     # The retained snapshot survives the finally block for resume replay.
+     snapshot = server._inflight_snapshot(session)
+@@ -192,6 +198,88 @@ def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
+     assert session["running"] is False
+ 
+ 
++def test_returned_error_preserves_streamed_partial_over_error_echo(
++    emits, turn_env
++):
++    def _returned_error(_message, stream_callback=None, **_kwargs):
++        assert stream_callback is not None
++        stream_callback("half an ")
++        stream_callback("answer")
++        return {
++            "final_response": "provider failed safely",
++            "error": "provider failed safely",
++            "failed": True,
++            "partial": True,
++        }
++
++    agent = types.SimpleNamespace(
++        session_id="session-key",
++        run_conversation=_returned_error,
++        clear_interrupt=lambda: None,
++    )
++    session = _session(agent=agent, running=True)
++    server._start_inflight_turn(session, "do the thing")
++
++    server._run_prompt_submit("rid", "sid", session, "do the thing")
++
++    payload = _events(emits, "message.complete")[0]
++    assert payload["status"] == "error"
++    assert payload["text"] == "half an answer"
++    assert payload["partial"] is True
++    assert payload["error"] == "provider failed safely"
++    assert server._inflight_snapshot(session)["assistant"] == "half an answer"
++
++
++def test_returned_error_preserves_distinct_unstreamed_result_partial(
++    emits, turn_env
++):
++    agent = types.SimpleNamespace(
++        session_id="session-key",
++        run_conversation=lambda *a, **k: {
++            "final_response": "answer cut off here",
++            "error": "output remained truncated",
++            "failed": True,
++            "partial": True,
++        },
++        clear_interrupt=lambda: None,
++    )
++    session = _session(agent=agent, running=True)
++    server._start_inflight_turn(session, "do the thing")
++
++    server._run_prompt_submit("rid", "sid", session, "do the thing")
++
++    payload = _events(emits, "message.complete")[0]
++    assert payload["text"] == "answer cut off here"
++    assert payload["partial"] is True
++    assert payload["error"] == "output remained truncated"
++    assert server._inflight_snapshot(session)["assistant"] == "answer cut off here"
++
++
++def test_returned_error_does_not_mark_unstreamed_error_echo_as_partial(
++    emits, turn_env
++):
++    agent = types.SimpleNamespace(
++        session_id="session-key",
++        run_conversation=lambda *a, **k: {
++            "final_response": "provider failed safely",
++            "error": "provider failed safely",
++            "failed": True,
++            "partial": True,
++        },
++        clear_interrupt=lambda: None,
++    )
++    session = _session(agent=agent, running=True)
++    server._start_inflight_turn(session, "do the thing")
++
++    server._run_prompt_submit("rid", "sid", session, "do the thing")
++
++    payload = _events(emits, "message.complete")[0]
++    assert payload["status"] == "error"
++    assert payload["text"] == "provider failed safely"
++    assert payload["error"] == "provider failed safely"
++    assert "partial" not in payload
++
++
+ def test_canonically_closed_returned_error_dedupes_resume_but_keeps_snapshot(
+     emits, turn_env, monkeypatch
+ ):
+@@ -260,7 +348,11 @@ def test_completed_turn_still_clears_inflight(emits, turn_env):
+ # ── Exception path ─────────────────────────────────────────────────────
+ 
+ 
+-def test_exception_closes_turn_with_terminal_complete_and_partial(emits, turn_env):
++def test_exception_closes_turn_with_terminal_complete_and_partial(
++    emits, turn_env, monkeypatch
++):
++    monkeypatch.setattr(server, "render_message", lambda _text, _cols: "rendered")
++
+     def _boom(message, stream_callback=None, **kwargs):
+         if stream_callback is not None:
+             stream_callback("half an ans")
+@@ -286,6 +378,16 @@ def test_exception_closes_turn_with_terminal_complete_and_partial(emits, turn_en
+     assert payload["recoverable"] is True
+     assert payload["partial"] is True
+     assert payload["text"] == "half an ans"
++    assert payload["rendered"] == "rendered"
++    assert set(payload) == {
++        "error",
++        "partial",
++        "recoverable",
++        "rendered",
++        "status",
++        "text",
++        "usage",
++    }
+ 
+     snapshot = server._inflight_snapshot(session)
+     assert snapshot is not None
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index de4ae7c8398dd8b3526b6056a1a3fb0b8f30a51c..8b598f489f0d6cc48da18b7fbcfa2b1eddd25f3d 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -12273,6 +12273,33 @@ def _run_prompt_submit(
+                     if result.get("interrupted")
+                     else "error" if result.get("error") else "complete"
+                 )
++                assistant_partial = ""
++                if status == "error":
++                    with session["history_lock"]:
++                        turn = session.get("inflight_turn")
++                        streamed_partial = (
++                            str(turn.get("assistant") or "")
++                            if isinstance(turn, dict)
++                            else ""
++                        )
++                    # ``partial`` is overloaded by several early-return paths:
++                    # some carry real assistant prose while others carry only
++                    # a locally synthesized error explanation.  A streamed
++                    # delta is authoritative assistant output.  An unstreamed
++                    # result is authoritative only when the agent explicitly
++                    # marks it partial and it is not merely an echo of the
++                    # error field (with or without the gateway's ``Error:``
++                    # prefix).
++                    returned_partial = raw if isinstance(raw, str) else ""
++                    returned_error = str(result.get("error") or "").strip()
++                    if (
++                        not result.get("partial")
++                        or not returned_partial
++                        or returned_partial.strip()
++                        in {returned_error, f"Error: {returned_error}"}
++                    ):
++                        returned_partial = ""
++                    assistant_partial = returned_partial or streamed_partial
+                 # When the backend produced no visible response AND reported a
+                 # real error (e.g. invalid model slug → provider 4xx), surface
+                 # that error as the visible text instead of shipping an empty
+@@ -12308,7 +12335,11 @@ def _run_prompt_submit(
+                     (result.get("error") if isinstance(result, dict) else "")
+                     or raw,
+                 )
+-                raw = _safe_turn_error(agent, raw or gateway_error_text)
++                # Assistant prose is preserved as authored.  Only a fallback
++                # explanation crosses the error redaction/bounding funnel.
++                raw = assistant_partial or _safe_turn_error(
++                    agent, raw or gateway_error_text
++                )
+ 
+             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+             if last_reasoning:
+@@ -12333,6 +12364,10 @@ def _run_prompt_submit(
+                     # the failed turn for resume replay instead of clearing it.
+                     # If this terminal frame is lost to a disconnect, resume's
+                     # inflight payload is the only carrier of the failure.
++                    if assistant_partial:
++                        turn = session.get("inflight_turn")
++                        if isinstance(turn, dict):
++                            turn["assistant"] = assistant_partial
+                     _fail_inflight_turn(
+                         session,
+                         result.get("error") if isinstance(result, dict) else raw,
+@@ -12344,6 +12379,8 @@ def _run_prompt_submit(
+             if status == "error":
+                 payload["error"] = gateway_error_text
+                 payload["recoverable"] = True
++                if assistant_partial:
++                    payload["partial"] = True
+             _retire_turn_marker(session, marker_key)
+             if last_reasoning:
+                 reasoning_payload: dict[str, object] = {"text": last_reasoning}

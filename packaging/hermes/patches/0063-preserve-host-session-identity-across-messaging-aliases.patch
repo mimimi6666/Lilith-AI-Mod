@@ -1,0 +1,177 @@
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 36f6427..82929b8 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -1204,6 +1204,36 @@ def compression_skipped_due_to_lock(agent: Any) -> bool:
+     return _sig is True or isinstance(_sig, str)
+ 
+ 
++def _compression_child_source(agent: Any, parent_session_id: str) -> str:
++    """Inherit the durable parent's source across a compression rotation.
++
++    A gateway transport can be only an alias for a host-owned transcript.  In
++    that case ``agent.platform`` names the current delivery transport (for
++    example Telegram), while the state row remains the authoritative
++    ``lilith-game`` identity required by the game bridge.  Compression must
++    continue that durable identity instead of converting the child to the
++    transient transport.
++    """
++    fallback = (
++        getattr(agent, "platform", None)
++        or os.environ.get("HERMES_SESSION_SOURCE", "cli")
++    )
++    session_db = getattr(agent, "_session_db", None)
++    getter = getattr(session_db, "get_session", None)
++    if callable(getter) and parent_session_id:
++        try:
++            parent = getter(parent_session_id)
++            source = parent.get("source") if isinstance(parent, dict) else None
++            if isinstance(source, str) and source.strip():
++                return source.strip()
++        except Exception:
++            # Compression was already able to proceed without this advisory
++            # read. Preserve that historical fallback on a transient DB read
++            # failure rather than turning it into a new failure mode.
++            pass
++    return str(fallback)
++
++
+ def _adopt_live_compression_child(
+     agent: Any,
+     session_db: Any,
+@@ -3475,8 +3505,7 @@ def compress_context(
+                     agent._session_db.publish_compression_child(
+                         parent_session_id=old_session_id,
+                         child_session_id=new_session_id,
+-                        source=agent.platform
+-                        or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
++                        source=_compression_child_source(agent, old_session_id),
+                         model=agent.model,
+                         model_config=agent._session_init_model_config,
+                         system_prompt=new_system_prompt,
+diff --git a/hermes_state.py b/hermes_state.py
+index 9393b3c..39018d5 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -4410,6 +4410,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             lineage_cte = ""
+             target_clause = "WHERE id = ?"
+             query_params = []
++            # A Lilith game session is the canonical, host-attested identity
++            # for a transcript that may also be reached through a messaging
++            # alias.  Gateway peer refreshes are routing metadata, not an
++            # ownership transfer: rewriting one of these archived rows to the
++            # Telegram/Discord peer invalidates the game bridge's durable
++            # lineage attestation and strands F7/F10 on a fresh session.
++            #
++            # Keep the canonical row immutable while allowing the gateway's
++            # independent routing index to point at it.  The row-exists check
++            # below still distinguishes this protected update from a genuinely
++            # missing row, so the normal self-healing insert remains intact.
++            protected_identity_clause = (
++                " AND NOT (source = 'lilith-game' AND archived = 1)"
++            )
+             if include_compression_ancestors:
+                 lineage_cte = """
+                     WITH RECURSIVE compression_lineage(id) AS (
+@@ -4431,8 +4445,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+                           AND COALESCE(child.source, '') != 'tool'
+                     )
+                 """
+-                target_clause = "WHERE id IN (SELECT id FROM compression_lineage)"
++                target_clause = (
++                    "WHERE id IN (SELECT id FROM compression_lineage)"
++                    + protected_identity_clause
++                )
+                 query_params.append(session_id)
++            else:
++                target_clause += protected_identity_clause
+             query_params.extend(
+                 (
+                     session_key,
+diff --git a/tests/test_lilith_shared_session_identity.py b/tests/test_lilith_shared_session_identity.py
+new file mode 100644
+index 0000000..02f658c
+--- /dev/null
++++ b/tests/test_lilith_shared_session_identity.py
+@@ -0,0 +1,80 @@
++"""Regression proofs for one game transcript shared through messaging aliases."""
++
++from types import SimpleNamespace
++
++import pytest
++
++from agent.conversation_compression import _compression_child_source
++from hermes_state import SessionDB
++
++
++@pytest.fixture
++def db(tmp_path):
++    handle = SessionDB(tmp_path / "state.db")
++    try:
++        yield handle
++    finally:
++        handle.close()
++
++
++@pytest.mark.parametrize("include_compression_ancestors", [False, True])
++def test_gateway_peer_refresh_preserves_archived_game_identity(
++    db, include_compression_ancestors
++):
++    db.create_session("game", source="lilith-game", archived=True)
++
++    db.record_gateway_session_peer(
++        "game",
++        source="telegram",
++        user_id="owner",
++        session_key="agent:main:telegram:dm:owner",
++        chat_id="owner",
++        chat_type="dm",
++        display_name="Owner",
++        origin_json='{"platform":"telegram"}',
++        include_compression_ancestors=include_compression_ancestors,
++    )
++
++    row = db.get_session("game")
++    assert row["source"] == "lilith-game"
++    assert row["archived"] == 1
++    assert row["session_key"] is None
++    assert row["user_id"] is None
++    assert row["chat_id"] is None
++    assert row["origin_json"] is None
++
++
++def test_gateway_peer_refresh_still_updates_an_ordinary_gateway_session(db):
++    db.create_session("ordinary", source="telegram")
++
++    db.record_gateway_session_peer(
++        "ordinary",
++        source="telegram",
++        user_id="owner",
++        session_key="agent:main:telegram:dm:owner",
++        chat_id="owner",
++        chat_type="dm",
++    )
++
++    row = db.get_session("ordinary")
++    assert row["session_key"] == "agent:main:telegram:dm:owner"
++    assert row["user_id"] == "owner"
++    assert row["chat_id"] == "owner"
++
++
++def test_compression_child_inherits_canonical_parent_source():
++    session_db = SimpleNamespace(
++        get_session=lambda session_id: {
++            "id": session_id,
++            "source": "lilith-game",
++        }
++    )
++    agent = SimpleNamespace(platform="telegram", _session_db=session_db)
++
++    assert _compression_child_source(agent, "game") == "lilith-game"
++
++
++def test_compression_child_falls_back_to_transport_when_parent_is_unavailable():
++    agent = SimpleNamespace(platform="telegram", _session_db=None)
++
++    assert _compression_child_source(agent, "missing") == "telegram"

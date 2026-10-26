@@ -1,0 +1,16 @@
+uv 0.11.14 — Astral Software Inc.
+
+The included uv.exe matches the executable in the official Windows x64 release:
+https://github.com/astral-sh/uv/releases/tag/0.11.14
+
+uv-x86_64-pc-windows-msvc.zip SHA256:
+52ba5d19409aaa688a8a1a6ec8dfb6a4817230d20186e75f4006105c3e39a846
+uv.exe SHA256:
+442b73298cf8648217e5bc232588bb1067f98ea5b40beea18e43c9c7929c020c
+
+Unmodified license texts from that tag accompany the executable:
+https://github.com/astral-sh/uv/blob/0.11.14/LICENSE-MIT
+https://github.com/astral-sh/uv/blob/0.11.14/LICENSE-APACHE
+
+Byte identity verified on 2026-09-17. The source release and license notices
+describe uv; they do not grant redistribution rights for other bundle assets.

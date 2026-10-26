@@ -1,0 +1,295 @@
+diff --git a/agent/turn_identity.py b/agent/turn_identity.py
+index 7c2dc46..d802d4b 100644
+--- a/agent/turn_identity.py
++++ b/agent/turn_identity.py
+@@ -23,6 +23,14 @@ MESSAGE_KINDS = frozenset({"interim", "primary", "tool", "tool_call", "user"})
+ 
+ _CANONICAL_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+ 
++# Stable, domain-separated namespace for projecting rows written by the
++# pre-message-identity gateway.  This value is part of the compatibility
++# contract: changing it would make the same durable legacy row appear to be a
++# different message after an upgrade.
++_LEGACY_TURN_MESSAGE_NAMESPACE = uuid.UUID(
++    "3ad06d02-37d6-5f75-a849-e19f20e28b12"
++)
++
+ 
+ def canonical_id(value: Any) -> str:
+     """Return *value* only when it is an exact lowercase UUID hex id."""
+@@ -81,6 +89,54 @@ def durable_message_id(message: Any) -> str:
+     return canonical_id(metadata.get(MESSAGE_ID_METADATA_KEY))
+ 
+ 
++def legacy_turn_message_id(message: Any) -> str:
++    """Project one old turn-only DB row to a stable message identity.
++
++    Builds before durable message identities persisted a canonical turn id but
++    no per-message id.  A positive SQLite row id is the only stable row-local
++    discriminator available for those records.  UUIDv5 keeps the projection
++    reproducible without mutating history or guessing from text/adjacency.
++
++    Rows that declare any newer message identity or message-kind field are not
++    legacy turn-only rows.  Malformed new correlation therefore remains
++    visible to the strict Runtime boundary instead of being repaired here.
++    """
++
++    if not isinstance(message, dict):
++        return ""
++    metadata = message.get("display_metadata")
++    if not isinstance(metadata, dict):
++        return ""
++    turn_id = canonical_id(metadata.get(TURN_ID_METADATA_KEY))
++    if not turn_id or any(
++        key in metadata
++        for key in (
++            MESSAGE_ID_METADATA_KEY,
++            USER_MESSAGE_ID_METADATA_KEY,
++            MESSAGE_KIND_METADATA_KEY,
++        )
++    ):
++        return ""
++    row_id = message.get("_row_id")
++    if isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
++        return ""
++    role = message.get("role")
++    if role not in {"user", "assistant", "tool", "system"}:
++        return ""
++
++    material = f"{turn_id}:{row_id}:{role}"
++    candidate = uuid.uuid5(_LEGACY_TURN_MESSAGE_NAMESPACE, material).hex
++    # A UUIDv5 collision with the independently generated turn UUID is
++    # cryptographically negligible, but distinct identities are a protocol
++    # invariant rather than a probability claim.  Keep the fallback stable.
++    if candidate == turn_id:
++        candidate = uuid.uuid5(
++            _LEGACY_TURN_MESSAGE_NAMESPACE,
++            material + ":distinct",
++        ).hex
++    return candidate if candidate != turn_id else ""
++
++
+ def stamp_turn_messages(
+     messages: list[Any],
+     *,
+@@ -220,6 +276,7 @@ __all__ = [
+     "USER_MESSAGE_ID_METADATA_KEY",
+     "canonical_id",
+     "durable_message_id",
++    "legacy_turn_message_id",
+     "message_turn_id",
+     "new_message_id",
+     "new_turn_claim",
+diff --git a/tests/tui_gateway/test_turn_scope_protocol.py b/tests/tui_gateway/test_turn_scope_protocol.py
+index 240146b..65338a1 100644
+--- a/tests/tui_gateway/test_turn_scope_protocol.py
++++ b/tests/tui_gateway/test_turn_scope_protocol.py
+@@ -11,6 +11,7 @@ import pytest
+ 
+ from agent.turn_identity import (
+     canonical_id,
++    legacy_turn_message_id,
+     stamp_turn_messages,
+ )
+ from hermes_state import SessionDB
+@@ -470,6 +471,140 @@ def test_durable_history_reopens_user_tool_reasoning_and_assistant_in_one_turn(
+     assert "message_id" not in projected[4]
+ 
+ 
++def test_legacy_turn_only_row_gets_one_reproducible_message_identity():
++    row = {
++        "role": "user",
++        "content": "persisted before message ids",
++        "_row_id": 17,
++        "display_metadata": {"hermes_turn_id": TURN_1},
++    }
++
++    expected = "5db984635d9553e7a4efd417fa764e77"
++    assert legacy_turn_message_id(row) == expected
++    assert legacy_turn_message_id(dict(row)) == expected
++    assert canonical_id(expected) == expected
++    assert expected != TURN_1
++
++    first = server._history_to_messages([row])[0]
++    second = server._history_to_messages([dict(row)])[0]
++    assert first["turn_id"] == TURN_1
++    assert first["message_id"] == expected
++    assert first["row_id"] == 17
++    assert second["message_id"] == expected
++
++    different_row = dict(row, _row_id=18)
++    different_role = dict(row, role="assistant")
++    assert legacy_turn_message_id(different_row) != expected
++    assert legacy_turn_message_id(different_role) != expected
++
++
++def test_persisted_legacy_turn_only_row_keeps_identity_after_db_reopen(tmp_path):
++    db_path = tmp_path / "state.db"
++    db = SessionDB(db_path=db_path)
++    db.create_session("session", "tui")
++    try:
++        row_id = db.append_message(
++            "session",
++            "user",
++            "legacy turn",
++            display_metadata={"hermes_turn_id": TURN_1},
++        )
++        first_history = db.get_messages_as_conversation(
++            "session",
++            include_row_ids=True,
++        )
++    finally:
++        db.close()
++
++    reopened = SessionDB(db_path=db_path)
++    try:
++        second_history = reopened.get_messages_as_conversation(
++            "session",
++            include_row_ids=True,
++        )
++    finally:
++        reopened.close()
++
++    first = server._history_to_messages(first_history)[0]
++    second = server._history_to_messages(second_history)[0]
++    assert first["row_id"] == row_id
++    assert first["turn_id"] == TURN_1
++    assert canonical_id(first["message_id"]) == first["message_id"]
++    assert first["message_id"] != TURN_1
++    assert second["message_id"] == first["message_id"]
++
++
++@pytest.mark.parametrize(
++    "metadata",
++    [
++        {"hermes_turn_id": TURN_1},
++        {"hermes_message_id": USER_MESSAGE},
++        {"hermes_user_message_id": USER_MESSAGE},
++    ],
++)
++def test_legacy_partial_identity_without_a_stable_pair_is_atomically_unscoped(
++    metadata,
++):
++    row = {
++        "role": "user",
++        "content": "legacy",
++        "display_metadata": metadata,
++    }
++    if "hermes_turn_id" not in metadata:
++        row["_row_id"] = 17
++
++    projected = server._history_to_messages([row])[0]
++
++    assert "turn_id" not in projected
++    assert "message_id" not in projected
++
++
++@pytest.mark.parametrize(
++    "metadata,expected_key",
++    [
++        (
++            {
++                "hermes_turn_id": TURN_1,
++                "hermes_message_id": "not-a-canonical-id",
++            },
++            "turn_id",
++        ),
++        (
++            {
++                "hermes_turn_id": "A" * 32,
++                "hermes_message_id": USER_MESSAGE,
++            },
++            "message_id",
++        ),
++        (
++            {
++                "hermes_turn_id": TURN_1,
++                "hermes_message_kind": "user",
++            },
++            "turn_id",
++        ),
++    ],
++)
++def test_malformed_new_partial_correlation_is_not_legacy_normalized(
++    metadata,
++    expected_key,
++):
++    projected = server._history_to_messages(
++        [
++            {
++                "role": "user",
++                "content": "malformed new row",
++                "_row_id": 17,
++                "display_metadata": metadata,
++            }
++        ]
++    )[0]
++
++    other_key = "message_id" if expected_key == "turn_id" else "turn_id"
++    assert expected_key in projected
++    assert other_key not in projected
++
++
+ def test_reused_tool_call_id_is_paired_only_within_its_canonical_turn():
+     history = []
+     for turn_id, name, argument, result in (
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 9d3ef16..b543ec2 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -8307,17 +8307,54 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
+         from agent.turn_identity import (
+             MESSAGE_KIND_METADATA_KEY,
+             MESSAGE_KINDS,
++            MESSAGE_ID_METADATA_KEY,
++            TURN_ID_METADATA_KEY,
++            USER_MESSAGE_ID_METADATA_KEY,
+             durable_message_id,
++            legacy_turn_message_id,
+             message_turn_id,
+         )
+ 
+         turn_id = message_turn_id(source)
+         message_id = durable_message_id(source)
++        metadata = source.get("display_metadata")
++        metadata = metadata if isinstance(metadata, dict) else {}
++
++        # Patch-2-era rows persisted only a turn id.  A durable positive DB row
++        # id lets us project a stable, distinct message id without rewriting
++        # history or inferring identity from mutable text/adjacency.  When that
++        # row discriminator is unavailable, atomically fall back to the legacy
++        # unscoped shape instead of emitting a partial correlation pair.
++        legacy_turn_only = bool(turn_id) and not any(
++            key in metadata
++            for key in (
++                MESSAGE_ID_METADATA_KEY,
++                USER_MESSAGE_ID_METADATA_KEY,
++                MESSAGE_KIND_METADATA_KEY,
++            )
++        )
++        if legacy_turn_only and not message_id:
++            message_id = legacy_turn_message_id(source)
++            if not message_id:
++                turn_id = ""
++
++        # An older row may carry a message identity without a turn identity.
++        # There is no durable evidence from which to reconstruct grouping, so
++        # keep it legacy-unscoped.  A declared-but-invalid turn or a canonical
++        # message_kind is deliberately not normalized: strict downstream
++        # validation must still reject malformed new correlation.
++        legacy_message_only = (
++            bool(message_id)
++            and not turn_id
++            and TURN_ID_METADATA_KEY not in metadata
++            and MESSAGE_KIND_METADATA_KEY not in metadata
++        )
++        if legacy_message_only:
++            message_id = ""
+         if turn_id:
+             projected["turn_id"] = turn_id
+         if message_id:
+             projected["message_id"] = message_id
+-        metadata = source.get("display_metadata")
+         if turn_id and message_id and isinstance(metadata, dict):
+             message_kind = metadata.get(MESSAGE_KIND_METADATA_KEY)
+             if message_kind in MESSAGE_KINDS:

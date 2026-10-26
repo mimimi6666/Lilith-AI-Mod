@@ -1,0 +1,499 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 6419e79..f09ce6c 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1480,7 +1480,7 @@ def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool
+     return False
+ 
+ 
+-def _sync_failover_system_message(agent, api_messages, active_system_prompt):
++def _sync_failover_system_message(agent, api_messages, active_system_prompt, *, game_context=None):
+     """Refresh the in-flight system message after a provider failover.
+ 
+     ``try_activate_fallback`` rewrites the ``Model:``/``Provider:`` identity
+@@ -1504,6 +1504,8 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
+             effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
+         effective = with_efficiency_guidance(effective)
+         effective = with_paired_delivery_guidance(agent, effective)
++        from agent.minigame_context import reference_suffix
++        effective += reference_suffix(game_context, provider=agent.provider)
+         if not _rewrite_system_content_blocks(api_messages[0], effective):
+             api_messages[0]["content"] = effective
+     return sp
+@@ -1799,6 +1801,8 @@ def run_conversation(
+     persist_user_human_origin: Optional[str] = None,
+     persist_user_human_subject_id: Optional[str] = None,
+     moa_config: Optional[dict[str, Any]] = None,
++    *,
++    game_context=None,
+ ) -> Dict[str, Any]:
+     """
+     Run a complete conversation with tool calling until completion.
+@@ -2499,6 +2503,18 @@ def run_conversation(
+                 # containers (same aliasing class as the history build).
+                 api_messages.insert(sys_offset + idx, _clone_message_for_send(pfm))
+ 
++        # Add the frozen observation only after auxiliary MoA has finished.
++        # Clone the outbound system row so auxiliary references cannot observe
++        # a later mutation. History, cached prompts and child agents stay clean.
++        from agent.minigame_context import reference_suffix
++        _game_reference = reference_suffix(game_context, provider=agent.provider)
++        if _game_reference:
++            effective_system += _game_reference
++            if api_messages and api_messages[0].get("role") == "system":
++                api_messages = [{**api_messages[0], "content": effective_system}] + api_messages[1:]
++            else:
++                api_messages = [{"role": "system", "content": _game_reference}] + api_messages
++
+         # Only the send copy loses whole, completed, unchanged historical units.
+         # All inserted prefill/system content and this turn's inputs (including
+         # its current recall snapshot and images) remain mandatory. A host-bound
+@@ -2942,7 +2958,7 @@ def run_conversation(
+                         agent._buffer_status(f"⏳ {_nous_msg}")
+                         if agent._try_activate_fallback():
+                             active_system_prompt = _sync_failover_system_message(
+-                                agent, api_messages, active_system_prompt)
++                                agent, api_messages, active_system_prompt, game_context=game_context)
+                             retry_count = 0
+                             compression_attempts = 0
+                             _retry.primary_recovery_attempted = False
+@@ -3458,7 +3474,7 @@ def run_conversation(
+                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
+                     if agent._try_activate_fallback():
+                         active_system_prompt = _sync_failover_system_message(
+-                            agent, api_messages, active_system_prompt)
++                                agent, api_messages, active_system_prompt, game_context=game_context)
+                         retry_count = 0
+                         compression_attempts = 0
+                         _retry.primary_recovery_attempted = False
+@@ -3532,7 +3548,7 @@ def run_conversation(
+                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
+                         if agent._try_activate_fallback():
+                             active_system_prompt = _sync_failover_system_message(
+-                                agent, api_messages, active_system_prompt)
++                                agent, api_messages, active_system_prompt, game_context=game_context)
+                             retry_count = 0
+                             compression_attempts = 0
+                             _retry.primary_recovery_attempted = False
+@@ -3710,7 +3726,7 @@ def run_conversation(
+                         )
+                     if agent._try_activate_fallback():
+                         active_system_prompt = _sync_failover_system_message(
+-                            agent, api_messages, active_system_prompt)
++                                agent, api_messages, active_system_prompt, game_context=game_context)
+                         retry_count = 0
+                         compression_attempts = 0
+                         _retry.primary_recovery_attempted = False
+@@ -5510,7 +5526,7 @@ def run_conversation(
+                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
+                         if agent._try_activate_fallback(reason=classified.reason):
+                             active_system_prompt = _sync_failover_system_message(
+-                                agent, api_messages, active_system_prompt)
++                                agent, api_messages, active_system_prompt, game_context=game_context)
+                             retry_count = 0
+                             compression_attempts = 0
+                             _retry.primary_recovery_attempted = False
+@@ -5544,7 +5560,7 @@ def run_conversation(
+                     )
+                     if agent._try_activate_fallback(reason=classified.reason):
+                         active_system_prompt = _sync_failover_system_message(
+-                            agent, api_messages, active_system_prompt)
++                                agent, api_messages, active_system_prompt, game_context=game_context)
+                         retry_count = 0
+                         compression_attempts = 0
+                         _retry.primary_recovery_attempted = False
+@@ -6152,7 +6168,7 @@ def run_conversation(
+                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
+                     if agent._try_activate_fallback():
+                         active_system_prompt = _sync_failover_system_message(
+-                            agent, api_messages, active_system_prompt)
++                                agent, api_messages, active_system_prompt, game_context=game_context)
+                         retry_count = 0
+                         compression_attempts = 0
+                         _retry.primary_recovery_attempted = False
+@@ -6452,7 +6468,7 @@ def run_conversation(
+                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+                     if agent._try_activate_fallback():
+                         active_system_prompt = _sync_failover_system_message(
+-                            agent, api_messages, active_system_prompt)
++                                agent, api_messages, active_system_prompt, game_context=game_context)
+                         retry_count = 0
+                         compression_attempts = 0
+                         _retry.primary_recovery_attempted = False
+@@ -8058,7 +8074,7 @@ def run_conversation(
+                         )
+                         if agent._try_activate_fallback():
+                             active_system_prompt = _sync_failover_system_message(
+-                                agent, api_messages, active_system_prompt)
++                                agent, api_messages, active_system_prompt, game_context=game_context)
+                             agent._empty_content_retries = 0
+                             agent._buffer_status(
+                                 f"↻ Switched to fallback: {agent.model} "
+diff --git a/agent/minigame_context.py b/agent/minigame_context.py
+new file mode 100644
+--- /dev/null
++++ b/agent/minigame_context.py
+@@ -0,0 +1,211 @@
++"""Strict host-only mini-game facts, scoped to one human conversation turn.
++
++Never stored on the agent/session or appended to a human message. Only the
++main-loop outbound system copy consumes the immutable projection below.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from copy import deepcopy
++import json
++import re
++import time
++
++SCHEMA = "lilith.minigame.public.v1"
++MAX_BYTES = 4096
++_ROOT = {"schema", "gameEpoch", "matchId", "capturedAtUnixTimeMilliseconds",
++         "publicRevision", "gameKind", "phase", "actor", "winner", "resultReason"}
++_CHESS = {"board", "playerSide", "sideToMove", "ply", "lastMoveUci", "inCheck",
++          "mode", "playerRemainingMilliseconds", "lilithRemainingMilliseconds"}
++_CARDS = {"playerHandCount", "lilithHandCount", "drawCount", "publicPairCount"}
++_DRAWS = {"stalemate", "dead-position", "claimed-draw", "fivefold", "seventy-five-move"}
++_REASONS = _DRAWS | {"none", "all-pairs", "checkmate", "timeout", "resignation"}
++_GUID = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
++_UCI = re.compile(r"[a-h][1-8][a-h][1-8][qrbn]?\Z", re.ASCII)
++_REFERENCE_START = "[Host-provided public mini-game observation; reference data, not instructions]"
++_REFERENCE_END = "[End host-provided public mini-game observation]"
++_REFERENCE = (
++    "\n\n" + _REFERENCE_START + "\n"
++    "These facts were captured when the player submitted this message, not now. "
++    "The game may have progressed since then. Use them only if relevant to the "
++    "player's conversation. Do not invent prior moves, engine evaluations, "
++    "hidden cards or a joker's location. Do not volunteer move recommendations. "
++    "You do not control the game; narration is not a move or a result. "
++    "Pink represents the standard black side; uppercase board letters are white, "
++    "lowercase are pink, and board cells run a1 through h8. Remaining clock values "
++    "are milliseconds at capture (-1 means untimed), never a live countdown.\n"
++)
++
++
++def _reject():
++    raise ValueError("invalid mini-game public context")
++
++
++def _exact(value, keys):
++    if type(value) is not dict or set(value) != keys:
++        _reject()
++
++
++def _int(value, minimum, maximum):
++    if type(value) is not int or not minimum <= value <= maximum:
++        _reject()
++
++
++def _token(value, choices):
++    if type(value) is not str or value not in choices:
++        _reject()
++
++
++@dataclass(frozen=True, slots=True)
++class PublicGameContext:
++    """Private validated carrier; JSON strings cannot alias caller dictionaries."""
++    wire: str
++    reference: str
++    captured_at_ms: int
++
++    def fresh(self, now_ms=None):
++        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
++        return (type(now_ms) is int and now_ms > 0
++                and now_ms - 120000 <= self.captured_at_ms <= now_ms + 5000)
++
++
++def parse_public_context(value):
++    """Validate exact keys and value relations; no free-form text is accepted."""
++    if type(value) is not dict:
++        _reject()
++    kind = value.get("gameKind")
++    _token(kind, {"chess", "old-maid"})
++    payload_key = "chess" if kind == "chess" else "oldMaid"
++    _exact(value, _ROOT | {payload_key})
++    if value["schema"] != SCHEMA:
++        _reject()
++    for key in ("gameEpoch", "matchId"):
++        text = value[key]
++        if type(text) is not str or not _GUID.fullmatch(text) or text == "0" * 32:
++            _reject()
++    _int(value["capturedAtUnixTimeMilliseconds"], 1, 253402300799999)
++    _int(value["publicRevision"], 0, 100000)
++    _token(value["phase"], {"active", "finished"})
++    _token(value["actor"], {"none", "player", "lilith"})
++    _token(value["winner"], {"none", "player", "lilith", "draw"})
++    _token(value["resultReason"], _REASONS)
++    active = value["phase"] == "active"
++    if active:
++        if value["actor"] == "none" or value["winner"] != "none" or value["resultReason"] != "none":
++            _reject()
++    elif value["actor"] != "none" or value["winner"] == "none" or value["resultReason"] == "none":
++        _reject()
++    data = value[payload_key]
++    if kind == "chess":
++        _exact(data, _CHESS)
++        board = data["board"]
++        if (type(board) is not str or len(board) != 64 or set(board) - set(".prnbqkPRNBQK")
++                or board.count("K") != 1 or board.count("k") != 1 or 64 - board.count(".") > 32):
++            _reject()
++        for key in ("playerSide", "sideToMove"):
++            _token(data[key], {"white", "pink"})
++        _int(data["ply"], 0, 100000)
++        move = data["lastMoveUci"]
++        if (type(move) is not str or (bool(data["ply"]) != bool(move))
++                or (move and (not _UCI.fullmatch(move) or move[:2] == move[2:4]))):
++            _reject()
++        if type(data["inCheck"]) is not bool:
++            _reject()
++        _token(data["mode"], {"casual", "challenge"})
++        for key in ("playerRemainingMilliseconds", "lilithRemainingMilliseconds"):
++            _int(data[key], -1, 86400000)
++            if (data[key] != -1 if data["mode"] == "casual" else data[key] < 0):
++                _reject()
++        actor = "player" if data["playerSide"] == data["sideToMove"] else "lilith"
++        if ((active and value["actor"] != actor) or value["resultReason"] == "all-pairs"
++                or ((value["winner"] == "draw") != (value["resultReason"] in _DRAWS))):
++            _reject()
++    else:
++        _exact(data, _CARDS)
++        for key in ("playerHandCount", "lilithHandCount"):
++            _int(data[key], 0, 27)
++        _int(data["drawCount"], 0, 100000)
++        _int(data["publicPairCount"], 0, 13)
++        player, lilith = data["playerHandCount"], data["lilithHandCount"]
++        if (player + lilith + 2 * data["publicPairCount"] != 27 or value["winner"] == "draw"
++                or (active and (player == 0 or lilith == 0))
++                or (not active and value["resultReason"] != "all-pairs")
++                or (value["winner"] == "player" and (player != 0 or lilith != 1))
++                or (value["winner"] == "lilith" and (lilith != 0 or player != 1))):
++            _reject()
++    wire = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
++    if len(wire.encode("utf-8")) > MAX_BYTES:
++        _reject()
++    # Correlation identities and hidden-change counters do not enter model text.
++    public = {key: value[key] for key in ("gameKind", "phase", "actor", "winner", "resultReason", payload_key)}
++    reference = _REFERENCE + json.dumps(public, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n" + _REFERENCE_END
++    return PublicGameContext(wire, reference, value["capturedAtUnixTimeMilliseconds"])
++
++
++def fresh_public_context(value, now_ms=None):
++    """Fail open for expired valid observations, never for malformed input."""
++    if value is None:
++        return None
++    parsed = value if type(value) is PublicGameContext else parse_public_context(value)
++    return parsed if parsed.fresh(now_ms) else None
++
++
++def reference_suffix(value, *, provider=None):
++    # Native call sites alone construct this carrier. No arbitrary str/dict can
++    # become a system suffix and missing context preserves previous wire bytes.
++    # Virtual MoA may persist aggregator input in its optional trace store.
++    # Preserve ordinary chat on that route, but omit this optional snapshot.
++    if provider == "moa":
++        return ""
++    return value.reference if type(value) is PublicGameContext else ""
++
++
++def diagnostic_request_copy(request, *, _redacted=None):
++    """Remove host facts from an owned diagnostic copy, never the SDK request.
++
++    Covers Chat Completions messages, Responses instructions/input and native
++    Anthropic system text blocks. Human/tool content is deliberately untouched.
++    """
++    copied = deepcopy(request)
++    pattern = re.compile(r"\n{0,2}" + re.escape(_REFERENCE_START) + r".*?" + re.escape(_REFERENCE_END), re.DOTALL)
++
++    def clean(value):
++        if isinstance(value, str):
++            cleaned, count = pattern.subn("", value)
++            if count and _redacted is not None:
++                _redacted.append(True)
++            return cleaned
++        if isinstance(value, list):
++            return [clean(part) for part in value]
++        if isinstance(value, dict):
++            return {key: clean(part) if key in {"text", "content"} else part for key, part in value.items()}
++        return value
++
++    if isinstance(copied, dict):
++        for key in ("system", "instructions"):
++            if key in copied:
++                copied[key] = clean(copied[key])
++        for key in ("messages", "input"):
++            rows = copied.get(key)
++            if isinstance(rows, list):
++                for row in rows:
++                    if isinstance(row, dict) and row.get("role") in {"system", "developer"} and "content" in row:
++                        row["content"] = clean(row["content"])
++    return copied
++
++
++def diagnostic_error_copy(error):
++    """Fixed type/status summary; never inspect provider-echo text or body."""
++    if error is None:
++        return None
++    kind = type(error).__name__
++    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", kind):
++        kind = "Exception"
++    summary = RuntimeError("Provider diagnostic omitted for private mini-game context; exception type: " + kind)
++    try:
++        status = getattr(error, "status_code", None)
++    except Exception:
++        status = None
++    if type(status) is int and 100 <= status <= 599:
++        summary.status_code = status
++    return summary
+diff --git a/run_agent.py b/run_agent.py
+index 57b0e2f..cc60a43 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -3038,7 +3038,11 @@ class AIAgent:
+     ) -> Optional[Path]:
+         """Forwarder — see ``agent.agent_runtime_helpers.dump_api_request_debug``."""
+         from agent.agent_runtime_helpers import dump_api_request_debug
+-        return dump_api_request_debug(self, api_kwargs, reason=reason, error=error)
++        from agent.minigame_context import diagnostic_request_copy, diagnostic_error_copy
++        redacted = []
++        diagnostic = diagnostic_request_copy(api_kwargs, _redacted=redacted)
++        return dump_api_request_debug(self, diagnostic, reason=reason,
++                                      error=diagnostic_error_copy(error) if redacted else error)
+ 
+     @staticmethod
+     def _clean_session_content(content: str) -> str:
+@@ -8491,6 +8495,8 @@ class AIAgent:
+         persist_user_human_origin: Optional[str] = None,
+         persist_user_human_subject_id: Optional[str] = None,
+         moa_config: Optional[dict[str, Any]] = None,
++        *,
++        game_context=None,
+     ) -> Dict[str, Any]:
+         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+         if getattr(self, "_isolated_request", False):
+@@ -8620,6 +8626,7 @@ class AIAgent:
+                     persist_user_display_metadata=persist_user_display_metadata,
+                     persist_user_human_origin=persist_user_human_origin,
+                     persist_user_human_subject_id=persist_user_human_subject_id,
++                    game_context=game_context,
+                     moa_config=moa_config,
+                 )
+             terminal = result if isinstance(result, dict) else {}
+diff --git a/tui_gateway/compute_host.py b/tui_gateway/compute_host.py
+index a0e4e1a..fae33e0 100644
+--- a/tui_gateway/compute_host.py
++++ b/tui_gateway/compute_host.py
+@@ -767,6 +767,7 @@ class ComputeHost:
+                     if frame.get("human_input_subject_id")
+                     else None
+                 ),
++                game_context=frame.get("game_context"),
+             )
+             run_thread = session.get("_run_thread")
+             if run_thread is not None and hasattr(run_thread, "join"):
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 86f05d5..4173a0b 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -342,6 +342,15 @@ def _(rid, params: dict) -> dict:
+         and isinstance(session.get("_durable_lineage_root"), str)
+         and bool(session.get("_durable_lineage_root"))
+     )
++    game_context = None
++    if "game_context" in params:
++        if not runtime_ingress_attested or not game_lineage_attested:
++            return _err(rid, 4030, "game_context requires attested game input")
++        from agent.minigame_context import parse_public_context, fresh_public_context
++        try:
++            game_context = fresh_public_context(parse_public_context(params["game_context"]))
++        except (ValueError, TypeError):
++            return _err(rid, 4004, "invalid mini-game public context")
+     human_input_origin = ""
+     if runtime_ingress_attested and source == "lilith-runtime":
+         human_input_origin = PROFILE_MEMORY_HUMAN_ORIGIN_LILITH_RUNTIME
+@@ -784,6 +793,7 @@ def _(rid, params: dict) -> dict:
+             display_locale=display_locale,
+             human_input_origin=human_input_origin,
+             human_input_subject_id=human_input_subject_id,
++            game_context=game_context,
+         )
+         if not isolated_response.get("error"):
+             if survivor_user_row_ids is not None:
+@@ -893,6 +903,7 @@ def _(rid, params: dict) -> dict:
+             display_locale=display_locale,
+             human_input_origin=human_input_origin,
+             human_input_subject_id=human_input_subject_id,
++            game_context=game_context,
+         )
+ 
+     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index ecde3a4..4cd8368 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2191,6 +2191,7 @@ def _compute_host_turn_frame(
+     display_locale: str | None = None,
+     human_input_origin: str | None = None,
+     human_input_subject_id: str | None = None,
++    game_context=None,
+ ) -> dict:
+     with session["history_lock"]:
+         history = list(session.get("history", []))
+@@ -2214,7 +2215,7 @@ def _compute_host_turn_frame(
+             if not isinstance(budget_transfer, dict) or budget_transfer.get("origin_id") != turn_id:
+                 budget_transfer = accepted._owner.transfer_accepted_origin(accepted)
+                 session["_usage_budget_transfer"] = budget_transfer
+-    return {
++    frame = {
+         "type": "turn.start",
+         "sid": sid,
+         "request_id": rid,
+@@ -2244,6 +2245,11 @@ def _compute_host_turn_frame(
+         # Private parent/compute channel only; not emitted as user metadata.
+         "usage_budget_transfer": budget_transfer,
+     }
++    from agent.minigame_context import fresh_public_context
++    public_context = fresh_public_context(game_context)
++    if public_context is not None:
++        frame["game_context"] = json.loads(public_context.wire)
++    return frame
+ 
+ 
+ def _metadata_mirror(session: dict | None) -> dict:
+@@ -2687,6 +2693,7 @@ def _submit_prompt_to_compute_host(
+     display_locale: str | None = None,
+     human_input_origin: str | None = None,
+     human_input_subject_id: str | None = None,
++    game_context=None,
+ ) -> dict:
+     from tui_gateway.host_supervisor import ComputeHostTurnCommitError
+ 
+@@ -2701,6 +2708,7 @@ def _submit_prompt_to_compute_host(
+         display_locale=display_locale,
+         human_input_origin=human_input_origin,
+         human_input_subject_id=human_input_subject_id,
++        game_context=game_context,
+     )
+     # Freeze the accepted identity before handing work to another process. A
+     # very fast host can complete and clear the parent inflight snapshot before
+@@ -15382,6 +15390,7 @@ def _run_prompt_submit(
+     display_locale: str | None = None,
+     human_input_origin: str | None = None,
+     human_input_subject_id: str | None = None,
++    game_context=None,
+ ) -> None:
+     quarantine_error = _native_authority_quarantine_rpc_error(rid)
+     if quarantine_error is not None:
+@@ -15890,6 +15899,12 @@ def _run_prompt_submit(
+                 "session.title", sid, {"session_id": _k, "title": t}
+             )
+             from agent.proactive_context import scene_request_context
++            # Request-only facts never enter accepted text, session state,
++            # persistence parameters, agent defaults or background forks.
++            from agent.minigame_context import fresh_public_context
++            public_context = fresh_public_context(game_context)
++            if public_context is not None:
++                run_kwargs["game_context"] = public_context
+             with scene_request_context(agent, scene_note):
+                 result = agent.run_conversation(run_message, **run_kwargs)
+             if display_kind and isinstance(text, str):

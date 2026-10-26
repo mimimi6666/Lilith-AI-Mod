@@ -1,0 +1,6026 @@
+{
+  "schemaVersion": 1,
+  "reviewDocumentSha256": "531F392C87D6F7706C7D8BBCB1A5D8CC0BBBE1701F1B10AB4A30531E7A449101",
+  "sourceManifestSha256": "508A72B6F1AC7C0F8C3461C62DA282DF14F2B663F93C86221E41604C0F0B4EF1",
+  "sourceCatalogSha256": "A62E57E8C699B6F4F63FBA6F210DE80575982DD9CCABD6195FF4E3CEBBD629D8",
+  "numericEmotionIntensityApplied": false,
+  "lines": [
+    {
+      "id": "GD-S001",
+      "zh": "點心旁邊，還放得下一場小比賽。",
+      "ja": "おやつの隣に、小さな勝負をひとつ。",
+      "direction": "輕快邀請",
+      "proposedTrigger": "點心時間開啟遊戲選擇",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S001.wav",
+          "sha256": "B47DA955F3625DF9AA7A6579D74DB60354778CC6F223AA7B5A9F8EFA97DA6198",
+          "byteLength": 229164,
+          "durationSeconds": 3.58,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S001.wav",
+          "sha256": "63E7E19FF212427E963EB5EA4CB6C8E22FC8519A307E790D20524E4C4AAA81E8",
+          "byteLength": 234284,
+          "durationSeconds": 3.66,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S002",
+      "zh": "今天想碰運氣，還是動腦筋？",
+      "ja": "今日は運試し？ それとも頭を使う？",
+      "direction": "好奇；不催選",
+      "proposedTrigger": "點心時間開啟遊戲選擇",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S002.wav",
+          "sha256": "4FC8FF6E8F60F7D4130552E77F3DD7606E6B1BCD2B7D8160FAE2BA7EBF4ACAB1",
+          "byteLength": 211244,
+          "durationSeconds": 3.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S002.wav",
+          "sha256": "237DDF2F335F194A49E5F4F85A525DDCD0D8A10191C4D084C8EA057B559EB2C4",
+          "byteLength": 285484,
+          "durationSeconds": 4.46,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S003",
+      "zh": "好，這次我坐你對面。",
+      "ja": "いいよ。今度は向かいに座るね。",
+      "direction": "親近、平常",
+      "proposedTrigger": "玩家選定遊戲",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S003.wav",
+          "sha256": "EC8EA92663C9E664ABBBF43C2E08CA77662A478A7ED7B968C3AA249B33A1B31C",
+          "byteLength": 222764,
+          "durationSeconds": 3.48,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S003.wav",
+          "sha256": "34B0552567DC477DD3A8CC8F35FD4B30EE8EEDB22FC4C78DE8EBC5003505EFBF",
+          "byteLength": 203564,
+          "durationSeconds": 3.18,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S004",
+      "zh": "準備好了。這局請多指教。",
+      "ja": "準備できた。今回もよろしくね。",
+      "direction": "自然、帶一點笑意",
+      "proposedTrigger": "開局成功",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S004.wav",
+          "sha256": "96FFBEC387259EB1C824F4EE6CB8435EC51C83443761BCC2D3E3E3206FF7F9D6",
+          "byteLength": 189484,
+          "durationSeconds": 2.96,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": true,
+          "reusedAcceptedAudition": true
+        },
+        "ja": {
+          "relativePath": "ja/GD-S004.wav",
+          "sha256": "77C1538CEA5D0EF03647DF79232AC1A2BBD83333C27E6B41E210E0281F604085",
+          "byteLength": 198444,
+          "durationSeconds": 3.1,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": true,
+          "reusedAcceptedAudition": true
+        }
+      }
+    },
+    {
+      "id": "GD-S005",
+      "zh": "贏的人可以得意一下。一下就好。",
+      "ja": "勝ったほうは、ちょっと自慢していいことにしよう。",
+      "direction": "小玩心",
+      "proposedTrigger": "開局成功",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S005.wav",
+          "sha256": "0AB196EBC36271004E2893A73B2A67F85D37BC21842F029C391E032BADA95918",
+          "byteLength": 226604,
+          "durationSeconds": 3.54,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S005.wav",
+          "sha256": "BB7A99B4DC4D1EEDAD3204E04B08308DE1744AAD76BE62E23850CA7C35793442",
+          "byteLength": 336684,
+          "durationSeconds": 5.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S006",
+      "zh": "先把別的事放一邊，來玩。",
+      "ja": "ほかのことは少し置いといて、遊ぼう。",
+      "direction": "自然；不施壓",
+      "proposedTrigger": "開局成功",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S006.wav",
+          "sha256": "CE2B4989B6893486B9F343C1046FBD1722C236DA71F81D9D8C717444ACAED3DF",
+          "byteLength": 166444,
+          "durationSeconds": 2.6,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S006.wav",
+          "sha256": "EE921E9D5C6D57B0B839C2B0A8DA4C146AC5BA6BD759DA9326B4DCDA9BD589F7",
+          "byteLength": 208684,
+          "durationSeconds": 3.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S007",
+      "zh": "這局不趕時間，我也慢慢來。",
+      "ja": "この対局は時間制限なし。私ものんびりいこう。",
+      "direction": "放鬆",
+      "proposedTrigger": "選休閒且確認無時計",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S007.wav",
+          "sha256": "6C955A746DCC5FE33CA958B23E94BFD3FB5D1618CAE17CBA9629E183E3BE8761",
+          "byteLength": 189484,
+          "durationSeconds": 2.96,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S007.wav",
+          "sha256": "3C12FF8B2DF2796287EE7696362F3FE6C086FD3D455D99581F3D864729CE3A2B",
+          "byteLength": 346924,
+          "durationSeconds": 5.42,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S008",
+      "zh": "今天先跟時鐘休戰。",
+      "ja": "今日は時計とも休戦だね。",
+      "direction": "輕巧笑意",
+      "proposedTrigger": "選休閒且確認無時計",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S008.wav",
+          "sha256": "F550943002EB1F8D4E5962685647F94830B3F4B75DC8B767DD359C99322414BB",
+          "byteLength": 134444,
+          "durationSeconds": 2.1,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S008.wav",
+          "sha256": "BBACE59168244B91671BC65B6B692D719E8E03A653113BD254A4FEA31CDA60AB",
+          "byteLength": 144684,
+          "durationSeconds": 2.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S009",
+      "zh": "要認真比了？好，我接下。",
+      "ja": "本気で勝負する？ いいよ、受けて立つ。",
+      "direction": "精神稍提",
+      "proposedTrigger": "選挑戰；開始前",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S009.wav",
+          "sha256": "D4893F59E19245D2CBF755A394F9D053C10CBA1B9721A497BB151011F17CE3D9",
+          "byteLength": 243244,
+          "durationSeconds": 3.8,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S009.wav",
+          "sha256": "19CC5369D045EA0BD99BECEA040A54EBBE7E3C2848294D38DF07B28253ED4C28",
+          "byteLength": 282924,
+          "durationSeconds": 4.42,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S010",
+      "zh": "時間也算在勝負裡。準備好再開始。",
+      "ja": "時間も勝負のうち。準備ができたら始めよう。",
+      "direction": "清楚、不催",
+      "proposedTrigger": "挑戰設定確認",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S010.wav",
+          "sha256": "BB8B325F9C3450D87160A698CE550A1036A19D8CCFE97356D2682CC52BFFD4CF",
+          "byteLength": 234284,
+          "durationSeconds": 3.66,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S010.wav",
+          "sha256": "9975BE2199C0C514681728EB43EB157F9B720468DBB69C66C1BF846F6AAA727C",
+          "byteLength": 257324,
+          "durationSeconds": 4.02,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S011",
+      "zh": "可以呀，輪到我時也能聽你說。",
+      "ja": "もちろん。私の番でも話していいよ。",
+      "direction": "平常；不可宣稱麥克風常開",
+      "proposedTrigger": "玩家主動說想邊玩邊聊",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S011.wav",
+          "sha256": "8D7BCEC21C9DD8B0512C867EE504FB3288117D5F1B6664B3AA1F2B5C4DFB01AE",
+          "byteLength": 257324,
+          "durationSeconds": 4.02,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S011.wav",
+          "sha256": "708689BE97B5E3DB20BCB10906E2563DB0104871ABF94C2EC8BDC372C4A4804E",
+          "byteLength": 241964,
+          "durationSeconds": 3.78,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S012",
+      "zh": "嗯，這件事我想聽。棋局也先放在眼前。",
+      "ja": "うん、その話は気になる。盤面も見失わないようにしないと。",
+      "direction": "專注；西洋棋限定",
+      "proposedTrigger": "玩家聊天發言後；僅確認收到文字／轉錄",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S012.wav",
+          "sha256": "A69338E1FB470F62B043BE67131B77A605A9557667C8A70D93CA52631CB40ACD",
+          "byteLength": 353324,
+          "durationSeconds": 5.52,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S012.wav",
+          "sha256": "09EDC398089B8136C61DEFF30E8B42C44E0DEA4F26779997D1AE4F7091B40BBC",
+          "byteLength": 344364,
+          "durationSeconds": 5.38,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S013",
+      "zh": "我在想這一手，不是在故作神祕。",
+      "ja": "次の一手を考えてたの。意味ありげに黙ってたわけじゃないよ。",
+      "direction": "微微自嘲；西洋棋限定",
+      "proposedTrigger": "玩家問為何安靜；正值自己回合",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S013.wav",
+          "sha256": "065A73F82B7716BC7017DCB21555659478233562F5656E16B3127AF098AA3D18",
+          "byteLength": 220204,
+          "durationSeconds": 3.44,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S013.wav",
+          "sha256": "5B970AB06EF849786C2CF3912AFC6AA8EACF18B84EDA239DAE62953BCD0FEF58",
+          "byteLength": 367404,
+          "durationSeconds": 5.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S014",
+      "zh": "好，這段我安靜一點。",
+      "ja": "わかった。しばらく静かにしてる。",
+      "direction": "簡短；交給靜音政策",
+      "proposedTrigger": "玩家要求安靜",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S014.wav",
+          "sha256": "38B4D896DDC883AF99AB71662BBF2E3E520EEA46947BC1C4313A481513D2344B",
+          "byteLength": 180524,
+          "durationSeconds": 2.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S014.wav",
+          "sha256": "51B25831477FA252DB58561F68601B94BAC927E8FC86ED75A6376A53DFC9B254",
+          "byteLength": 231724,
+          "durationSeconds": 3.62,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S015",
+      "zh": "安靜地玩一會兒，也不錯。",
+      "ja": "静かに遊ぶ時間も、悪くないね。",
+      "direction": "輕聲但不耳語",
+      "proposedTrigger": "休閒久未操作；一局低頻",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S015.wav",
+          "sha256": "90A4B7DC24495834579E2DB0C84B6F479179F75BEC7161BC0B85437A0BB09879",
+          "byteLength": 152364,
+          "durationSeconds": 2.38,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S015.wav",
+          "sha256": "18C945A8CF1A1D4DF8F9C10721FE5D1FBC9C41B13379069F1855B09B44E48EC2",
+          "byteLength": 195884,
+          "durationSeconds": 3.06,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S016",
+      "zh": "我先不插話，輪到你了。",
+      "ja": "今は口を挟まないでおく。そっちの番だよ。",
+      "direction": "簡短；不緊接催促",
+      "proposedTrigger": "休閒閒置；不推斷玩家心情",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S016.wav",
+          "sha256": "1C8CD908D5FAE7A71C8CDAA0B2EC2DBEC44B37AC2D3039E58E41CCA569C25F71",
+          "byteLength": 161324,
+          "durationSeconds": 2.52,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S016.wav",
+          "sha256": "28B854FBB52B435BAB01980DA85AF4393C331BB5867D52271FC6AF2F9A551816",
+          "byteLength": 259884,
+          "durationSeconds": 4.06,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S017",
+      "zh": "好，接著剛才那局。",
+      "ja": "じゃあ、さっきの続きを。",
+      "direction": "平穩；沒有「恢復計時」",
+      "proposedTrigger": "玩家取消選單回到仍進行的對局",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S017.wav",
+          "sha256": "7F2E9B222B708A63E62B8F6300BF471D61E921DF920D365A729986FB6B61FECA",
+          "byteLength": 163884,
+          "durationSeconds": 2.56,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S017.wav",
+          "sha256": "B040C37735F48AD56198F72B88ADA3EB33C41D9242D66AA74F1801086B60CF19",
+          "byteLength": 175404,
+          "durationSeconds": 2.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S018",
+      "zh": "有些時候，結果反而是最短的那一段。",
+      "ja": "結果が出る瞬間って、いちばん短いんだね。",
+      "direction": "輕微餘韻；不展開哲學",
+      "proposedTrigger": "對局確實已結束；低頻感想",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S018.wav",
+          "sha256": "EC5D4F7AE91359DA129C2B4A2A34BEB3363D81935219361D2B440756393A934B",
+          "byteLength": 238124,
+          "durationSeconds": 3.72,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S018.wav",
+          "sha256": "BA5A546642B0C5EEF0F5F7B3A23E6DCF166361889B2149ED53BF0C531A0D2055",
+          "byteLength": 247084,
+          "durationSeconds": 3.86,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S019",
+      "zh": "再來一局，還是回去吃點心？",
+      "ja": "もう一勝負する？ それとも、おやつに戻る？",
+      "direction": "中性選擇",
+      "proposedTrigger": "終局後展示選項",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S019.wav",
+          "sha256": "AE463AC3A1551574ED34A41D88FB488999D721CAC9E10004906FC090D82F0AF9",
+          "byteLength": 189484,
+          "durationSeconds": 2.96,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S019.wav",
+          "sha256": "48AF928055E9EAB150A19E83AA2F86360C44DEB655722642AB92464FBDA8DE3E",
+          "byteLength": 318764,
+          "durationSeconds": 4.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S020",
+      "zh": "好，剛才那局到此為止。重新開始。",
+      "ja": "よし、さっきの勝負はここまで。新しい一局だ。",
+      "direction": "清爽、不計較",
+      "proposedTrigger": "玩家選再來；新局建立成功",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S020.wav",
+          "sha256": "8A0AB6A81B3E0D67CB2A5FACD821CAEE830ACAB8042D9669BA0527D2A617365C",
+          "byteLength": 320044,
+          "durationSeconds": 5,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S020.wav",
+          "sha256": "C8FD40EC0D25082548DB6D15857EC0CFD5B8068BB8D3E4217E62DEB822ABE7BF",
+          "byteLength": 316204,
+          "durationSeconds": 4.94,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S021",
+      "zh": "又坐回對面了。來吧。",
+      "ja": "また向かい同士だね。始めよう。",
+      "direction": "輕快",
+      "proposedTrigger": "玩家選再來；新局建立成功",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S021.wav",
+          "sha256": "2681E0805998EEA07FA0AC19E3D9E8E67642964A7CAC45D39F4E3319ECB69EFD",
+          "byteLength": 169004,
+          "durationSeconds": 2.64,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S021.wav",
+          "sha256": "A840F9C79A4201D4E9A59612763EAACFB429892DC1594979F1E5696B7CC53094",
+          "byteLength": 193324,
+          "durationSeconds": 3.02,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S022",
+      "zh": "好，收起來。回到點心時間。",
+      "ja": "うん、片づけよう。おやつの時間に戻ろうか。",
+      "direction": "柔和收尾",
+      "proposedTrigger": "玩家選不玩；退出成功",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S022.wav",
+          "sha256": "CF989DFBBC662DDF827FCD269EC7C7804B6B3D722A073C9F413698A6E3FF3BB6",
+          "byteLength": 249644,
+          "durationSeconds": 3.9,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S022.wav",
+          "sha256": "7150A4FEE594F000ADA8C58CF6B823EE06328941787E25100E193A85FCC4FD34",
+          "byteLength": 311084,
+          "durationSeconds": 4.86,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S023",
+      "zh": "今天就玩到這裡。",
+      "ja": "今日はここまでにしよう。",
+      "direction": "乾淨停句",
+      "proposedTrigger": "玩家選不玩；退出成功",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S023.wav",
+          "sha256": "8E84ADAB37B258A9D36DD099E686F5C20B1B9FAA6B5188E4241E4BE786A94B4E",
+          "byteLength": 106284,
+          "durationSeconds": 1.66,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S023.wav",
+          "sha256": "EAAB721F103D4C786A42E96FBC47C26A94C360899AD144FD9738A66AD422A61D",
+          "byteLength": 119084,
+          "durationSeconds": 1.86,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-S024",
+      "zh": "這局就先到這裡，不必硬分勝負。",
+      "ja": "この一局はここまで。無理に決着をつけなくてもいいよ。",
+      "direction": "自然接受；須符合終止政策",
+      "proposedTrigger": "玩家中途退出；不判輸贏",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-S024.wav",
+          "sha256": "A37EB4C12ECDB0B9200C60AC250D2BF0C1FCEF45984774DF90410E1381E99282",
+          "byteLength": 226604,
+          "durationSeconds": 3.54,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-S024.wav",
+          "sha256": "EB318206AADDFAB8583927B300646BE39151106CAEF7406F10E4B607600D3CC0",
+          "byteLength": 293164,
+          "durationSeconds": 4.58,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM001",
+      "zh": "好了，現在誰也別偷看對面的牌。",
+      "ja": "配り終わり。相手の手札は、のぞいちゃだめだよ。",
+      "direction": "對等玩笑",
+      "proposedTrigger": "發牌完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM001.wav",
+          "sha256": "12B9ACF9809597282C87D3CF22E4FCB63A5DCB69F53773418F30D1E81C52FCF5",
+          "byteLength": 225324,
+          "durationSeconds": 3.52,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM001.wav",
+          "sha256": "6EA6A9F90AF4C22D16AFFCB2319D1D381949400A5E558376E240057FC7F1B4C7",
+          "byteLength": 311084,
+          "durationSeconds": 4.86,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM002",
+      "zh": "小小一張牌，今天倒挺有存在感。",
+      "ja": "たった一枚なのに、今日はずいぶん存在感があるね。",
+      "direction": "泛指鬼牌規則；不指持有人",
+      "proposedTrigger": "發牌完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM002.wav",
+          "sha256": "4C57907696E3930FEA33865E13169CD8649259069CA55C3C326A5A0FED922B02",
+          "byteLength": 225324,
+          "durationSeconds": 3.52,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM002.wav",
+          "sha256": "42BB851FD514D49791E5DAC8C7CD08901848B07C29EC008BAF270B6AB025EA23",
+          "byteLength": 272684,
+          "durationSeconds": 4.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM003",
+      "zh": "我準備好了。運氣就讓它自己來。",
+      "ja": "準備できた。運のほうから来てもらおう。",
+      "direction": "輕巧",
+      "proposedTrigger": "發牌完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM003.wav",
+          "sha256": "A0E0AB356532F6C3CD5099B4B0237C596ED412FAD410B83707ED1DA92B1061C3",
+          "byteLength": 294444,
+          "durationSeconds": 4.6,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM003.wav",
+          "sha256": "7F3F614F28BAECE3A614150B2A625D4B5B7497B0F2A79BE6FB7C2F2952F43735",
+          "byteLength": 239404,
+          "durationSeconds": 3.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM004",
+      "zh": "這次不看誰的牌多，看誰先放得下。",
+      "ja": "今回は枚数の多さじゃなくて、先に手放せるかだね。",
+      "direction": "慢半拍",
+      "proposedTrigger": "發牌完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM004.wav",
+          "sha256": "4B1438964C0486FDCB989A3371B0ED8605850DA3C06BCDC90B183EA4BF129BD0",
+          "byteLength": 240684,
+          "durationSeconds": 3.76,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM004.wav",
+          "sha256": "9616E85DB64500486CEDC6F07AF5E5A07CD925F8A02D0E9E7DB1B6633CD68D70",
+          "byteLength": 298284,
+          "durationSeconds": 4.66,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM005",
+      "zh": "能成對的都先離席了，換我們。",
+      "ja": "ペアは先に退場したね。ここからは私たちの番。",
+      "direction": "擬人小玩笑",
+      "proposedTrigger": "開局初始公開配對已處理",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM005.wav",
+          "sha256": "A579CD474229FA9C7D567B1F0F423AC5B55CB559AF24FD0AEB0CB4F281B6ACC0",
+          "byteLength": 147244,
+          "durationSeconds": 2.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM005.wav",
+          "sha256": "185ADFF66C4C2F6705ABF3C7E8C8E9134D5DE643A57725A9C89ECFF99C67395D",
+          "byteLength": 334124,
+          "durationSeconds": 5.22,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM006",
+      "zh": "我會認真抽的，至少看起來很認真。",
+      "ja": "ちゃんと考えて引くよ。考えてるようには見えるはず。",
+      "direction": "輕輕改口",
+      "proposedTrigger": "開局完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM006.wav",
+          "sha256": "F520872DB1888F0AA955BCF87FF48563FB8B2D17A49E21C007D6377A8425C8AC",
+          "byteLength": 238124,
+          "durationSeconds": 3.72,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM006.wav",
+          "sha256": "408A3B698CF2E34E0CB8F092E41F31CA7936CE3F48427022136456CD54A2CB15",
+          "byteLength": 282924,
+          "durationSeconds": 4.42,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM007",
+      "zh": "規則很簡單，最後一張卻很會磨人。",
+      "ja": "ルールは簡単なのに、最後の一枚はなかなか手ごわいね。",
+      "direction": "無預知",
+      "proposedTrigger": "開局完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM007.wav",
+          "sha256": "6C06E82DF9EEE436907266B5B4B7B3EAC998161D8A0271F6AE8B492D002BF740",
+          "byteLength": 291884,
+          "durationSeconds": 4.56,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM007.wav",
+          "sha256": "F4EE657803B68A7086EFCD06C7A410EE3E41328420D2ED6A89DC19AB30E34529",
+          "byteLength": 321324,
+          "durationSeconds": 5.02,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM008",
+      "zh": "牌都到齊了。開始吧。",
+      "ja": "カードはそろった。始めよう。",
+      "direction": "俐落",
+      "proposedTrigger": "開局完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM008.wav",
+          "sha256": "929136B3B6E9E6DBB72A60757FB4B59BF5068FD7D9B34B4925B3D168AB838560",
+          "byteLength": 163884,
+          "durationSeconds": 2.56,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM008.wav",
+          "sha256": "4B4375EC4E98D02ADDB9AE406C7C4A2834112C7E5EF869EE2EB517D8E877D49A",
+          "byteLength": 170284,
+          "durationSeconds": 2.66,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM009",
+      "zh": "換你。這些牌的背面都很會裝乖。",
+      "ja": "そっちの番。裏から見ると、みんなおとなしい顔をしてるね。",
+      "direction": "只擬人牌；不看玩家臉",
+      "proposedTrigger": "玩家抽牌回合開始",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM009.wav",
+          "sha256": "40BCDF4B4CC3AEBF62ED205A781A483B5769C53D0E5FB45EA91E121F9DA6A1A2",
+          "byteLength": 245804,
+          "durationSeconds": 3.84,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM009.wav",
+          "sha256": "A2A63757D0E2C2F28563C0289C14A53E86D47F3C933954697E78594D143B117B",
+          "byteLength": 387884,
+          "durationSeconds": 6.06,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM010",
+      "zh": "請選。我不替任何一張拉票。",
+      "ja": "どうぞ。どのカードの応援もしないでおく。",
+      "direction": "輕得意",
+      "proposedTrigger": "玩家抽牌回合開始",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM010.wav",
+          "sha256": "7854270D944BC79F90EF04460E93AF8BB0E22E0B0131F88E7BDBFB18185EBCBD",
+          "byteLength": 217644,
+          "durationSeconds": 3.4,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM010.wav",
+          "sha256": "F07CC3A6759D28BEE98BB7EA4909F3C56696AD05C81CBA9E6964848E0522E668",
+          "byteLength": 311084,
+          "durationSeconds": 4.86,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM011",
+      "zh": "這回由你決定。",
+      "ja": "今度は、そっちが選ぶ番。",
+      "direction": "短、自然",
+      "proposedTrigger": "玩家抽牌回合開始",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM011.wav",
+          "sha256": "0BF8EB49E04E883E557FBBF3F000191C48D698E6D8B15E16272EF8A81C459684",
+          "byteLength": 154924,
+          "durationSeconds": 2.42,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM011.wav",
+          "sha256": "1187A6B50F8C5AEB93FB105ACA64C5BC7752FE41202B510695CC5DD941AC8E14",
+          "byteLength": 170284,
+          "durationSeconds": 2.66,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM012",
+      "zh": "我把牌拿穩，你慢慢選。",
+      "ja": "動かさずに持ってるから、ゆっくり選んで。",
+      "direction": "溫和；對應穩定手牌",
+      "proposedTrigger": "玩家抽牌回合開始",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM012.wav",
+          "sha256": "3F78BA2DD9A966658425D75AF84D7C2C0FD30859EBB09E85176F045767644DC5",
+          "byteLength": 180524,
+          "durationSeconds": 2.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM012.wav",
+          "sha256": "F116763CDA8C1973465AC676DF7C6C45F90761FE7892EE539AA3419A01142B90",
+          "byteLength": 229164,
+          "durationSeconds": 3.58,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM013",
+      "zh": "就這張？好，交給你。",
+      "ja": "これにする？ はい、どうぞ。",
+      "direction": "不能在取消時說",
+      "proposedTrigger": "玩家抽牌提交已接受",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM013.wav",
+          "sha256": "37CD769E70B7FC3F9BB203A488F55A2B1A114E0DFC45859C28F732B324B90797",
+          "byteLength": 201004,
+          "durationSeconds": 3.14,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM013.wav",
+          "sha256": "F295A70BAAD432E1C4498A16F027559EFED1E5BC19FA779C750462DFD865ACB0",
+          "byteLength": 226604,
+          "durationSeconds": 3.54,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM014",
+      "zh": "好，現在是你的牌了。",
+      "ja": "はい、そっちの手札に仲間入り。",
+      "direction": "不透露牌種",
+      "proposedTrigger": "玩家抽牌動畫抵達",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM014.wav",
+          "sha256": "609493DDDB0CC9CC00AF77FAFC51C10D1BE4241C6BAA3056F7ABECAE23B80EA3",
+          "byteLength": 171564,
+          "durationSeconds": 2.68,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM014.wav",
+          "sha256": "6C0FD104275C7A26F67DFA747B5818576802F1AC049406712384667AED721377",
+          "byteLength": 201004,
+          "durationSeconds": 3.14,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM015",
+      "zh": "選好了就不賣關子了。",
+      "ja": "決まったね。じゃあ、渡すよ。",
+      "direction": "輕快",
+      "proposedTrigger": "玩家抽牌提交已接受",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM015.wav",
+          "sha256": "3AB7E39B21F19085FDC712E246D3562AAEA8682108E75C7968E58D57BFD22A1E",
+          "byteLength": 147244,
+          "durationSeconds": 2.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM015.wav",
+          "sha256": "2AE84D16448898A333EAB20F3DDA966EAB5C2EDEC25CDC23AE44EA8515D56B10",
+          "byteLength": 221484,
+          "durationSeconds": 3.46,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM016",
+      "zh": "一張牌，換一個回合。",
+      "ja": "一枚渡して、次の番へ。",
+      "direction": "平穩",
+      "proposedTrigger": "玩家抽牌動畫完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM016.wav",
+          "sha256": "83C81AB273E7A61E23424244511BB83D77C07CB79E586F9E5E30BFA5E9021161",
+          "byteLength": 175404,
+          "durationSeconds": 2.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM016.wav",
+          "sha256": "52C89243A63D14528DABD260C09C4AB5EB26CD2C13B8C9512C1C3D299042B44E",
+          "byteLength": 203564,
+          "durationSeconds": 3.18,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM017",
+      "zh": "換我選了。讓我看看牌背的演技。",
+      "ja": "今度は私。裏向きの演技を見せてもらおうかな。",
+      "direction": "小玩心；不聲稱識破",
+      "proposedTrigger": "莉莉絲選牌開始",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM017.wav",
+          "sha256": "B7FBA50339229404F20005DAC87C185163C3D87DD149BAF8D6ED070D31FAE656",
+          "byteLength": 248364,
+          "durationSeconds": 3.88,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": true,
+          "reusedAcceptedAudition": true
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM017.wav",
+          "sha256": "5559CBC0C030C2B11C1C53B5D5BC90D447414BC9A6FFC81D2BB92DA511754EE2",
+          "byteLength": 259884,
+          "durationSeconds": 4.06,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": true,
+          "reusedAcceptedAudition": true
+        }
+      }
+    },
+    {
+      "id": "GD-OM018",
+      "zh": "這次就相信直覺。",
+      "ja": "今回は直感に任せよう。",
+      "direction": "平常",
+      "proposedTrigger": "莉莉絲選牌開始",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM018.wav",
+          "sha256": "942CB2DD4F1C73AEC59D05B6101333D9944933F6F63F95B4DE9793E1AD20B281",
+          "byteLength": 169004,
+          "durationSeconds": 2.64,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM018.wav",
+          "sha256": "12C3F2EA1317B981CDD22B5F7F259EF8D6C9BF2EFA628B345A971D72CC3BC7A0",
+          "byteLength": 157484,
+          "durationSeconds": 2.46,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM019",
+      "zh": "選哪張都得親手試一次。",
+      "ja": "どれも、引いてみないとわからないね。",
+      "direction": "誠實不讀牌",
+      "proposedTrigger": "莉莉絲選牌開始",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM019.wav",
+          "sha256": "352A853F494F1C9A3AD97AA766E2E0FEE5A9F8A5F76FE0B1F2E565888A2DAEB8",
+          "byteLength": 186924,
+          "durationSeconds": 2.92,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM019.wav",
+          "sha256": "B8271EFF7727E4257EA5246401BFDBE11AD0BFDA441FDB10878001A23AE7DE46",
+          "byteLength": 190764,
+          "durationSeconds": 2.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM020",
+      "zh": "好，輪到我的運氣上場。",
+      "ja": "よし、私の運の出番。",
+      "direction": "微微振奮",
+      "proposedTrigger": "莉莉絲選牌開始",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM020.wav",
+          "sha256": "892C8B703A5B4A5B04828849B5422EBFA3C3F099FD076C987309AD7FB99F5FDB",
+          "byteLength": 197164,
+          "durationSeconds": 3.08,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM020.wav",
+          "sha256": "B7D843C3D08C705CCE09B84F77C8F2F9B8FCEA4A3FAE9715A7E25B86BF625860",
+          "byteLength": 165164,
+          "durationSeconds": 2.58,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM021",
+      "zh": "我選這張。",
+      "ja": "これにする。",
+      "direction": "乾脆",
+      "proposedTrigger": "莉莉絲抽牌提交；未取得結果前",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM021.wav",
+          "sha256": "80052A9C1765A88EB1DE41E85F2457A62A0F0BDFEE243B16241765C91FA281AC",
+          "byteLength": 83244,
+          "durationSeconds": 1.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM021.wav",
+          "sha256": "71D62123DC0A4A69C1918C19E053DD8AE66D1C42F179E73B2C3E4E18D386A6BF",
+          "byteLength": 80684,
+          "durationSeconds": 1.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM022",
+      "zh": "決定了，不再猶豫。",
+      "ja": "決めた。もう迷わない。",
+      "direction": "短促、不戲劇化",
+      "proposedTrigger": "莉莉絲抽牌提交；未取得結果前",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM022.wav",
+          "sha256": "2FED9EB67F14D0441A147AAFB213244F204C59654310C513E796C6B436454311",
+          "byteLength": 157484,
+          "durationSeconds": 2.46,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM022.wav",
+          "sha256": "697F90E2DFCEAD9AD909B65F32CC68255F26BA66DE21C9EC5CB50C55A53AF4E5",
+          "byteLength": 231724,
+          "durationSeconds": 3.62,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM023",
+      "zh": "好，就你了。",
+      "ja": "よし、君に決めた。",
+      "direction": "對牌說；輕巧",
+      "proposedTrigger": "莉莉絲抽牌提交；未取得結果前",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM023.wav",
+          "sha256": "8452473E930D2A193A4FC814516D3A63A695D9C12040EE02A9DBB1D1BA5987D5",
+          "byteLength": 135724,
+          "durationSeconds": 2.12,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM023.wav",
+          "sha256": "C7A2E624B6B11034754D798E0787BB90035F81D3912A655C24885F1431E10C07",
+          "byteLength": 160044,
+          "durationSeconds": 2.5,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM024",
+      "zh": "讓這張離開隊伍吧。",
+      "ja": "この一枚に、列から出てもらおう。",
+      "direction": "平穩",
+      "proposedTrigger": "莉莉絲抽牌提交；未取得結果前",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM024.wav",
+          "sha256": "BA964596E80560C07F378B47D091CC6128C5723A60BBCD7B1C811BECDFBB3C47",
+          "byteLength": 180524,
+          "durationSeconds": 2.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM024.wav",
+          "sha256": "045093B309F9946FA1D43B17A3077D5CB7E34D5B5E5501005B89679CAEF0A52B",
+          "byteLength": 195884,
+          "durationSeconds": 3.06,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM025",
+      "zh": "找到同伴了。兩位一起走。",
+      "ja": "相方が見つかった。二枚そろって、どうぞ。",
+      "direction": "輕快",
+      "proposedTrigger": "莉莉絲配對公開後",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM025.wav",
+          "sha256": "F3ED07BB2208D8B5A1DE223D4B614C7CA991EB698DFB22310E437A30C11CDB13",
+          "byteLength": 206124,
+          "durationSeconds": 3.22,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM025.wav",
+          "sha256": "688712B86C4D616F065CDAC19F9AA4C30724EDFC45B2ADC1ACCDD873DE641CEA",
+          "byteLength": 270124,
+          "durationSeconds": 4.22,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM026",
+      "zh": "正好一對，這下輕鬆一點。",
+      "ja": "ぴったり一組。少し身軽になった。",
+      "direction": "小滿足",
+      "proposedTrigger": "莉莉絲配對公開後",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM026.wav",
+          "sha256": "C92267541736871800F0FBAF87EB15C4722078EE16B2750F68E87DC89CB27815",
+          "byteLength": 177964,
+          "durationSeconds": 2.78,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM026.wav",
+          "sha256": "07FC5CDA4521AF4757FC228FF11FFF539B2CB22BC0E79B8BD0013121BD051BCF",
+          "byteLength": 451884,
+          "durationSeconds": 7.06,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "relieved",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM027",
+      "zh": "這兩張先下班。",
+      "ja": "この二枚は、お先におしまい。",
+      "direction": "生活感玩笑",
+      "proposedTrigger": "莉莉絲配對拋出完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM027.wav",
+          "sha256": "42FE297F4DA661FC7F2B8DBF529C12558E43F3D93081487016A1A6BD46E9E65C",
+          "byteLength": 122924,
+          "durationSeconds": 1.92,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM027.wav",
+          "sha256": "B517AAD8046993CAD98DC285CD04856C4A537EB1559AFFA00FF5A46CE5DFBC83",
+          "byteLength": 180524,
+          "durationSeconds": 2.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM028",
+      "zh": "好，配得整整齊齊。",
+      "ja": "うん、きれいにそろった。",
+      "direction": "簡短",
+      "proposedTrigger": "莉莉絲配對公開後",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM028.wav",
+          "sha256": "EB63BDF0980E106C4CF8A63102E53BF7B75ADE87106817222FE6F063587579E1",
+          "byteLength": 147244,
+          "durationSeconds": 2.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM028.wav",
+          "sha256": "8BD80F7D72B11FE21453C68112A7519CD41AFDE7F6F9867CA160875BBFC1E7D1",
+          "byteLength": 167724,
+          "durationSeconds": 2.62,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM029",
+      "zh": "啊，被你湊成一對了。",
+      "ja": "あ、ペアにされた。",
+      "direction": "輕驚訝、無敵意",
+      "proposedTrigger": "玩家配對公開後",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM029.wav",
+          "sha256": "0F8C860C6AC268812CBC22A00572EFF17E512DA700E542168A8B7A33EA516B9B",
+          "byteLength": 175404,
+          "durationSeconds": 2.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM029.wav",
+          "sha256": "E72DF0D94C979E9ADAE1EC60374A617986CFF5F86F7D58B52B243220739A47FF",
+          "byteLength": 160044,
+          "durationSeconds": 2.5,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "surprised",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM030",
+      "zh": "又少兩張，你的手牌變輕了。",
+      "ja": "また二枚減ったね。手札が軽くなってきた。",
+      "direction": "根據公開張數",
+      "proposedTrigger": "玩家配對拋出完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM030.wav",
+          "sha256": "BAEB098E1A5C0E0646E7209E210C0E6B07E7F18269A4C38FC344EF2A3F516D26",
+          "byteLength": 212524,
+          "durationSeconds": 3.32,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM030.wav",
+          "sha256": "811EBACA794FB239125CC68D3E5E17525170B83FF5C6FE9AE2E4513803FE03E6",
+          "byteLength": 272684,
+          "durationSeconds": 4.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM031",
+      "zh": "這一抽很合拍嘛。",
+      "ja": "その一枚、うまく噛み合ったね。",
+      "direction": "小稱讚；不論牌技",
+      "proposedTrigger": "玩家配對公開後",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM031.wav",
+          "sha256": "A35BE67885239CDC1C4DA99CA8EEA3084C993E2D800E9666423338F1AD8D3438",
+          "byteLength": 131884,
+          "durationSeconds": 2.06,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM031.wav",
+          "sha256": "400A7E15B003E71E8FF9E6B0ECC94CA928CDB7545BE4646CF34D435EE472202E",
+          "byteLength": 183084,
+          "durationSeconds": 2.86,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM032",
+      "zh": "成對離開，倒也乾脆。",
+      "ja": "ペアで退場。潔いね。",
+      "direction": "短句",
+      "proposedTrigger": "任一方公開配對；動畫完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM032.wav",
+          "sha256": "31100F05DA8EBB19ED5712CEFE75E22789C07164428F675ADB8EADA00CBD3BE5",
+          "byteLength": 183084,
+          "durationSeconds": 2.86,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM032.wav",
+          "sha256": "AC81C41A9609231CD67CBCDF4FFE4319C45A2D545A8AB6A9EA2621FB4631D513",
+          "byteLength": 180524,
+          "durationSeconds": 2.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM033",
+      "zh": "這次先留著。",
+      "ja": "今回は、手元に置いておこう。",
+      "direction": "中性",
+      "proposedTrigger": "莉莉絲回合結束且沒有棄牌",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM033.wav",
+          "sha256": "DEC45CF419E81B91DADD872400C7597AF8841F0DD5D6D46CC1EE83014F2C5A4E",
+          "byteLength": 138284,
+          "durationSeconds": 2.16,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM033.wav",
+          "sha256": "5C3B1C038CC42DB0C3F406A584D5F244DE13B7C096B894B80BFD8304176124DF",
+          "byteLength": 172844,
+          "durationSeconds": 2.7,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM034",
+      "zh": "還不能一起送走呢。",
+      "ja": "まだ一緒には送り出せないか。",
+      "direction": "輕平；無特殊嘆氣",
+      "proposedTrigger": "莉莉絲回合結束且沒有棄牌",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM034.wav",
+          "sha256": "E5E24C8BF689A67A608A0989A71F2FA5D9E3D8905DC18653CCA209FAB1AC3EF2",
+          "byteLength": 126764,
+          "durationSeconds": 1.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM034.wav",
+          "sha256": "B2E98CBF48DAB372BD8ED177391C19D50B9F3647CB0C335489C60BADCE340442",
+          "byteLength": 185644,
+          "durationSeconds": 2.9,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM035",
+      "zh": "好，下一回合。",
+      "ja": "よし、次の番へ。",
+      "direction": "不分析",
+      "proposedTrigger": "莉莉絲回合結束且沒有棄牌",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM035.wav",
+          "sha256": "B7E7B1950DA6ADF84F53DD231983396B7134EF109A24333971AA5709836F4898",
+          "byteLength": 147244,
+          "durationSeconds": 2.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM035.wav",
+          "sha256": "2ADD9D54D18D62777F9386FAB54F7461E93103D9243DF5F2797CD42CF6CDED3C",
+          "byteLength": 149804,
+          "durationSeconds": 2.34,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM036",
+      "zh": "牌又多了一位客人。",
+      "ja": "手札に、お客さんが一枚増えた。",
+      "direction": "同等對待所有牌",
+      "proposedTrigger": "莉莉絲回合結束且沒有棄牌",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM036.wav",
+          "sha256": "93F4626FBA08B808E2F8DC1C67608490DD3347B1ECCD9A15B60F22D1D0B6C309",
+          "byteLength": 172844,
+          "durationSeconds": 2.7,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM036.wav",
+          "sha256": "5AE81BAD1634EFB0C604A66F9A777F6F68CAF5ED7A8355C42A4EEE8D762B3326",
+          "byteLength": 239404,
+          "durationSeconds": 3.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM037",
+      "zh": "這回沒配成，繼續。",
+      "ja": "今回はそろわなかったね。続けよう。",
+      "direction": "公開事實",
+      "proposedTrigger": "玩家回合結束且沒有棄牌",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM037.wav",
+          "sha256": "F19F256A4853A2A21F7C2B74B1038C905C3C681D69849E0A364486368F86110B",
+          "byteLength": 163884,
+          "durationSeconds": 2.56,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM037.wav",
+          "sha256": "57AF564C402DAC674D9C77416B84B488FF968393C6D59B0F24579EDA69C613A4",
+          "byteLength": 241964,
+          "durationSeconds": 3.78,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM038",
+      "zh": "那就讓它再待一會兒。",
+      "ja": "じゃあ、もう少しいてもらおう。",
+      "direction": "輕巧",
+      "proposedTrigger": "玩家回合結束且沒有棄牌",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM038.wav",
+          "sha256": "E5ED2F2F1BF5DEBFD87FF3A313FFC3BB12BF91A499128A4E1B248F210B1DD9C3",
+          "byteLength": 120364,
+          "durationSeconds": 1.88,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM038.wav",
+          "sha256": "13F49ECF6602CEA632273FFAA3CDA67A45F11C26D9A4A9F0E8CD75FEBDA7ACBA",
+          "byteLength": 172844,
+          "durationSeconds": 2.7,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM039",
+      "zh": "這一輪，牌還不想離場。",
+      "ja": "今回は、カードがまだ帰りたくないみたい。",
+      "direction": "對牌擬人",
+      "proposedTrigger": "任一方回合結束且沒有棄牌",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM039.wav",
+          "sha256": "8A58837A5D17D7CFD52A3108FDE8C7045B029E434DB0F0C1D1486A1F491D722E",
+          "byteLength": 194604,
+          "durationSeconds": 3.04,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM039.wav",
+          "sha256": "E0B15A3480A58DE82484EA1F3FC1C14371DEA59265FFEE5EF431DE7F34331133",
+          "byteLength": 254764,
+          "durationSeconds": 3.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM040",
+      "zh": "還有下一抽。",
+      "ja": "次の一枚があるからね。",
+      "direction": "不承諾好結果",
+      "proposedTrigger": "任一方回合結束且沒有棄牌",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM040.wav",
+          "sha256": "2B0D83722B0429D0EFD527129F123DB29DECB525CE47D7F58D8781F4FD151BB2",
+          "byteLength": 94764,
+          "durationSeconds": 1.48,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM040.wav",
+          "sha256": "72CD1C89ABFDAC5E5BD6C46798CCAF3DB87958595B31624DF2D7A11855582C74",
+          "byteLength": 144684,
+          "durationSeconds": 2.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM041",
+      "zh": "我把順序整理一下。",
+      "ja": "順番を少し並べ直すね。",
+      "direction": "中性",
+      "proposedTrigger": "莉莉絲整理開始；共用池",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM041.wav",
+          "sha256": "7FE66D5AD56EB1D539E8DEC3601FFD026D6080FFAF77D5368F467970EA245A0F",
+          "byteLength": 124204,
+          "durationSeconds": 1.94,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM041.wav",
+          "sha256": "1D59A658A30E6EA1B6A794BEB2D70218C07F46E9127840B015F0EB96A3D3CDB4",
+          "byteLength": 149804,
+          "durationSeconds": 2.34,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM042",
+      "zh": "好，這樣拿起來順手多了。",
+      "ja": "うん、こっちのほうが持ちやすい。",
+      "direction": "平常",
+      "proposedTrigger": "莉莉絲整理完成；共用池",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM042.wav",
+          "sha256": "FA5F34F2097BA0E69D54955FBE2FB256175787956EFB093903A08F75B794DA94",
+          "byteLength": 197164,
+          "durationSeconds": 3.08,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM042.wav",
+          "sha256": "455B62A761CB52659BB3D492999402EEBF52512B83F209AAB2177831ECFDAEF8",
+          "byteLength": 193324,
+          "durationSeconds": 3.02,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM043",
+      "zh": "讓它們換個鄰居。",
+      "ja": "お隣さんを入れ替えよう。",
+      "direction": "淡淡玩心",
+      "proposedTrigger": "莉莉絲整理開始；共用池",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM043.wav",
+          "sha256": "3CB7D46EB5ADF2C496B59F07CCBCEADCCD6CA53101648B3B418EF0C13A7C4134",
+          "byteLength": 112684,
+          "durationSeconds": 1.76,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM043.wav",
+          "sha256": "D8A9A3B0A7B6B1449991E6BD269DFE1B4E26DB4351F4D0E689BA973BE04EC242",
+          "byteLength": 131884,
+          "durationSeconds": 2.06,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM044",
+      "zh": "位置換過，還是一樣那些牌。",
+      "ja": "並びは変わっても、カードは同じ。",
+      "direction": "不透露具體身份",
+      "proposedTrigger": "莉莉絲整理完成；共用池",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM044.wav",
+          "sha256": "17F376B246D1F229AC39E6AEE3031C18C7A4C3B83AE9A687A8F58CDB67FD8B74",
+          "byteLength": 197164,
+          "durationSeconds": 3.08,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM044.wav",
+          "sha256": "AF822B5D15DF1687824BDC09696CD09421FDAEF3F61BB0BCAECC4F3B7BA0E57B",
+          "byteLength": 226604,
+          "durationSeconds": 3.54,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM045",
+      "zh": "你也換好順序了。",
+      "ja": "そっちも並べ替えたんだね。",
+      "direction": "只讀可見動作",
+      "proposedTrigger": "玩家完成自主拖動整理",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM045.wav",
+          "sha256": "D48B301EFAAF940F47ADA7F76EC821B8EFECA73EAA00CAA307E99C3281140E6B",
+          "byteLength": 106284,
+          "durationSeconds": 1.66,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM045.wav",
+          "sha256": "93EA45FC86B08FCA2A276BA1EA0F33F6AED0700162287AB3F193C0347ACC4776",
+          "byteLength": 129324,
+          "durationSeconds": 2.02,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM046",
+      "zh": "好，等你拿穩再抽。",
+      "ja": "うん、持ち直してから引くね。",
+      "direction": "體貼但不誇張",
+      "proposedTrigger": "玩家完成自主拖動整理",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM046.wav",
+          "sha256": "969AB1AA3DC5158E615092687C6BB38E4136A077ADCB7A2966DFF6BBF20BCFC2",
+          "byteLength": 180524,
+          "durationSeconds": 2.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM046.wav",
+          "sha256": "0F2AB3F1DBF9247730DF1E6D01BE6F89CC2F2C4C568D6A8810DBA87C25E5D7AA",
+          "byteLength": 183084,
+          "durationSeconds": 2.86,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM047",
+      "zh": "牌隊伍重新排好了。",
+      "ja": "カードの列が、並び直したね。",
+      "direction": "輕快",
+      "proposedTrigger": "玩家完成自主拖動整理",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM047.wav",
+          "sha256": "8C8E6C0A2764123B0362276C83610CF628539028E44AF283222B944F06168C9A",
+          "byteLength": 163884,
+          "durationSeconds": 2.56,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM047.wav",
+          "sha256": "02E0648B18A682745D3A3BD604182F583F9879DE323B4F8A624E65B20A98A45D",
+          "byteLength": 188204,
+          "durationSeconds": 2.94,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM048",
+      "zh": "整理好了，請。",
+      "ja": "並べ終わった。どうぞ。",
+      "direction": "短句",
+      "proposedTrigger": "莉莉絲整理完成；共用池",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM048.wav",
+          "sha256": "7E63416B5DA160870525C20462A266A1E18025D49DFD458350DDFEB8F9DDCFA1",
+          "byteLength": 89644,
+          "durationSeconds": 1.4,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM048.wav",
+          "sha256": "16D0589C6A075FB31959A1E59AE9302036AC62A776EEB2E61FCBAC5BB41AF785",
+          "byteLength": 167724,
+          "durationSeconds": 2.62,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM049",
+      "zh": "牌少了，每一抽倒更有分量。",
+      "ja": "枚数が減ると、一枚が重くなるね。",
+      "direction": "稍收斂",
+      "proposedTrigger": "依公開張數確認進入尾盤",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM049.wav",
+          "sha256": "8AE8E970235D20B90F31102A601F45B547E9E31C1D403BB568DF6E4EF8B08F10",
+          "byteLength": 262444,
+          "durationSeconds": 4.1,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM049.wav",
+          "sha256": "F9315A50B1967EA4AD6F17DC8C0652BD4ABAF1B7206698CF4A25F4287CB27B9F",
+          "byteLength": 239404,
+          "durationSeconds": 3.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM050",
+      "zh": "都沒幾張了。接著看誰先清空。",
+      "ja": "もう残りわずか。先に手放すのはどっちかな。",
+      "direction": "輕期待",
+      "proposedTrigger": "雙方公開張數都少；一局一次",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM050.wav",
+          "sha256": "312334E79D5E1D8B97FADAF7E797741E842A43FAC8CAE8D980E55431A521D397",
+          "byteLength": 225324,
+          "durationSeconds": 3.52,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM050.wav",
+          "sha256": "BD37D53A86E939F2B7B2E20BEB391E94D5253DBA4F890889A390DEA208370F3B",
+          "byteLength": 293164,
+          "durationSeconds": 4.58,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM051",
+      "zh": "選項變少，決心可不能跟著變少。",
+      "ja": "選択肢は減ったけど、思い切りは減らさない。",
+      "direction": "小認真",
+      "proposedTrigger": "尾盤莉莉絲選牌前；不依牌身份",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM051.wav",
+          "sha256": "6FC483A9C9BA5AF6F144B086654DEAF99F25B3F6B4CA5AD7B0CE49F2DDA83FDE",
+          "byteLength": 308524,
+          "durationSeconds": 4.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM051.wav",
+          "sha256": "3EF3493B5BE262013B57D0C129E61F824D37FD91296D215DB38951A5159A2B5D",
+          "byteLength": 239404,
+          "durationSeconds": 3.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM052",
+      "zh": "這次我就不加旁白了。",
+      "ja": "今度は、余計なことは言わないでおこう。",
+      "direction": "說完真的安靜",
+      "proposedTrigger": "尾盤玩家回合；不依牌身份",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM052.wav",
+          "sha256": "2807FB168DA65D744F33295E0DBF3C0C2AB73A6A2C51532B24216BD201CC1D06",
+          "byteLength": 177964,
+          "durationSeconds": 2.78,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM052.wav",
+          "sha256": "A26F7F083F6E138442BBB39A692C8BA4163FAA4E9151980DB090AE1737610BB2",
+          "byteLength": 198444,
+          "durationSeconds": 3.1,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM053",
+      "zh": "牌走了一圈，還挺忙的。",
+      "ja": "カードだけが、ずいぶん忙しく行ったり来たりしてるね。",
+      "direction": "淡笑",
+      "proposedTrigger": "連續數回合無棄牌；依公開事件",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM053.wav",
+          "sha256": "D031F3D6B60C1275F456BDA65EC99A13000FA8E528D5730D0CBD3F25C75D7F6E",
+          "byteLength": 249644,
+          "durationSeconds": 3.9,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM053.wav",
+          "sha256": "C7032FE15420564D981B64B2F40195C42D7A0BB585DEC3F16EFBB95D178AC082",
+          "byteLength": 288044,
+          "durationSeconds": 4.5,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM054",
+      "zh": "明明牌少了，場面卻沒安靜多少。",
+      "ja": "カードは減ったのに、勝負は落ち着かないね。",
+      "direction": "不推斷玩家緊張",
+      "proposedTrigger": "尾盤；公平公共條件",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM054.wav",
+          "sha256": "44E7FFBBFF0ED6A08069B1737B151FD561BCC3B3ABC86F0542C6E5EEA9E51D38",
+          "byteLength": 238124,
+          "durationSeconds": 3.72,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM054.wav",
+          "sha256": "7DAF69E59D81B0C2788D68DD020AFC447CCA7C72977C0AF48410789D15088A4E",
+          "byteLength": 218924,
+          "durationSeconds": 3.42,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM055",
+      "zh": "地上比手上熱鬧了。",
+      "ja": "手元より、下のほうがにぎやかになったね。",
+      "direction": "需確有棄牌可見",
+      "proposedTrigger": "公開棄牌累積；一局低頻",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM055.wav",
+          "sha256": "25DD1A0E90332D75719D7F1737F31A029D490F0E4AB471DEC97E543B4D07182A",
+          "byteLength": 154924,
+          "durationSeconds": 2.42,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM055.wav",
+          "sha256": "7DDAD01A8E78C047CB63F1D764CA67053174D9DA93DACD616D0B80B5F2E53174",
+          "byteLength": 211244,
+          "durationSeconds": 3.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM056",
+      "zh": "結果還沒翻過來，就都算數。",
+      "ja": "決着がつくまでは、まだ勝負の途中。",
+      "direction": "平穩",
+      "proposedTrigger": "尾盤；公平公共條件",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM056.wav",
+          "sha256": "F1DF1B46C06C48C3F918182934C12FFB8331906751FD4AF6082591C7E379583F",
+          "byteLength": 206124,
+          "durationSeconds": 3.22,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM056.wav",
+          "sha256": "F8DB0EDA3B149E2C25DF53B23020A6A7032207765469B85E465964D66A0709F7",
+          "byteLength": 213804,
+          "durationSeconds": 3.34,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM057",
+      "zh": "我先清空了。這局是我贏。",
+      "ja": "先に手札がなくなった。今回は私の勝ち。",
+      "direction": "輕得意",
+      "proposedTrigger": "正式結果：莉莉絲勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM057.wav",
+          "sha256": "C22C1989058E20DB2572812BCE93218841BBBC09EC1A5D8D244FB24E17603C38",
+          "byteLength": 203564,
+          "durationSeconds": 3.18,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM057.wav",
+          "sha256": "62169A431EF8601619FF62BC53C6BC745E602B5563111AB6DD6F96D35261E17D",
+          "byteLength": 288044,
+          "durationSeconds": 4.5,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM058",
+      "zh": "空手反而是好事，這遊戲真有趣。",
+      "ja": "手ぶらになって喜ぶなんて、面白い遊びだね。",
+      "direction": "看手牌的玩笑",
+      "proposedTrigger": "正式結果：莉莉絲勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM058.wav",
+          "sha256": "88C3B7673553814459913439B1E68B76D64321ACB1700552402ED9C50693660C",
+          "byteLength": 240684,
+          "durationSeconds": 3.76,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM058.wav",
+          "sha256": "1304035DCB4298D9FAC9C30171A4B7746D5E36334BF9E3BD75627C04D85BCB37",
+          "byteLength": 249644,
+          "durationSeconds": 3.9,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM059",
+      "zh": "好，這次讓我高興一下。",
+      "ja": "よし。今回は、ちょっと喜ばせて。",
+      "direction": "開心、不炫耀過頭",
+      "proposedTrigger": "正式結果：莉莉絲勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM059.wav",
+          "sha256": "8B115C2A09674DAC9981B8DA8677D30C982A1C5FFDCDAB893B521B051451B9BF",
+          "byteLength": 185644,
+          "durationSeconds": 2.9,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM059.wav",
+          "sha256": "D9DFE7F568B13188C8BD2259D0E30AE9B37EC9A76592B75B5A29D91DA8C27363",
+          "byteLength": 218924,
+          "durationSeconds": 3.42,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM060",
+      "zh": "鬼牌最後沒留下我。",
+      "ja": "最後まで残ったジョーカーは、私のところじゃなかったね。",
+      "direction": "只在結果公開後",
+      "proposedTrigger": "正式結果：莉莉絲勝；鬼牌已揭示",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM060.wav",
+          "sha256": "1F5FE289415F5656F8EC8B179140F33A3003B18D822D67608A23611C8EBF9FB9",
+          "byteLength": 134444,
+          "durationSeconds": 2.1,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM060.wav",
+          "sha256": "F7ECA76778D4A7AA5F204A612DE7262254B142CCB1F1A5E332FD81EAB3FC3E53",
+          "byteLength": 395564,
+          "durationSeconds": 6.18,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "relieved",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM061",
+      "zh": "剛才那一抽，替我收了尾。",
+      "ja": "さっきの一枚が、締めくくってくれた。",
+      "direction": "需最後抽牌確為決定回合",
+      "proposedTrigger": "正式結果：莉莉絲勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM061.wav",
+          "sha256": "6B8C065E8C22370E4586E2FDBC34471803952F6327E2B243A3A99355D1B33391",
+          "byteLength": 194604,
+          "durationSeconds": 3.04,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM061.wav",
+          "sha256": "80B1B315C6B121673FAEC096E08D80CFC423DAB21A682F20AA61A51C79DA0B8F",
+          "byteLength": 206124,
+          "durationSeconds": 3.22,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM062",
+      "zh": "贏了。嗯，這聲音我喜歡。",
+      "ja": "勝った。うん、いい響き。",
+      "direction": "小得意短停頓",
+      "proposedTrigger": "正式結果：莉莉絲勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM062.wav",
+          "sha256": "BE08EB4D89CCF6A3E54327F9137F27F541DBF0A5037DF0DFCD07C6D5A7B08F96",
+          "byteLength": 262444,
+          "durationSeconds": 4.1,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": true,
+          "reusedAcceptedAudition": true
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM062.wav",
+          "sha256": "235ACFA8497E86E971CBBDC69E485AFD831046B85A2F1684502C7270BC8B16B9",
+          "byteLength": 382764,
+          "durationSeconds": 5.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": true,
+          "reusedAcceptedAudition": true
+        }
+      }
+    },
+    {
+      "id": "GD-OM063",
+      "zh": "這局的運氣，暫時站我這邊。",
+      "ja": "この一局の運は、私の味方だったみたい。",
+      "direction": "不宣稱超能力",
+      "proposedTrigger": "正式結果：莉莉絲勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM063.wav",
+          "sha256": "A1BE8639397FE0A67A92E8CB2BB5A538472BF15126C8DC54FF113D0FD34FBD61",
+          "byteLength": 215084,
+          "durationSeconds": 3.36,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM063.wav",
+          "sha256": "C19EB5C547030EFBF24623A2268EFB46C16BA14C5DF9773EAF3BF5C329039807",
+          "byteLength": 234284,
+          "durationSeconds": 3.66,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM064",
+      "zh": "收牌了。最後一張終於有了答案。",
+      "ja": "勝負はおしまい。最後の一枚で、決まったね。",
+      "direction": "清楚收尾",
+      "proposedTrigger": "正式結果：莉莉絲勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM064.wav",
+          "sha256": "2F9D0DCAEA5C635D3DBF511232614D2044D58B90D9134736F46D76E8A218CCBB",
+          "byteLength": 285484,
+          "durationSeconds": 4.46,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM064.wav",
+          "sha256": "7E8AC82847230E6CDB8191C084EA056B891E548E369EDEBAB5E29E4C15520BF1",
+          "byteLength": 298284,
+          "durationSeconds": 4.66,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM065",
+      "zh": "啊，我輸了。你先清空了。",
+      "ja": "あ、私の負け。先に手札をなくされたね。",
+      "direction": "接受、短失落",
+      "proposedTrigger": "正式結果：玩家勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM065.wav",
+          "sha256": "958C68923CD005F8F3F1C49196D7CF9A8B0220A956E75876FFC442C3DF6067BE",
+          "byteLength": 206124,
+          "durationSeconds": 3.22,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": true,
+          "reusedAcceptedAudition": true
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM065.wav",
+          "sha256": "6564B0DBE2B6D1065F0FDB0D0D47E22936525E33BED6FA4A273E228DDF50D125",
+          "byteLength": 293164,
+          "durationSeconds": 4.58,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": true,
+          "reusedAcceptedAudition": true
+        }
+      }
+    },
+    {
+      "id": "GD-OM066",
+      "zh": "最後還是我陪著這張鬼牌。",
+      "ja": "最後は、私がジョーカーのお相手か。",
+      "direction": "自嘲不怪玩家",
+      "proposedTrigger": "正式結果：玩家勝；鬼牌已揭示",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM066.wav",
+          "sha256": "77D5E6DDB397C3EBCD8484C375C7D34BBA95A34557F76C7190F2BD07DBC610AE",
+          "byteLength": 175404,
+          "durationSeconds": 2.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM066.wav",
+          "sha256": "B8E7FB5562840E85C95958083A25D8B53353452BB1499517D43227F460E50C8F",
+          "byteLength": 262444,
+          "durationSeconds": 4.1,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM067",
+      "zh": "這次換你得意了。",
+      "ja": "今度は、そっちが自慢する番だね。",
+      "direction": "自然承認",
+      "proposedTrigger": "正式結果：玩家勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM067.wav",
+          "sha256": "D8B17EEEB7F753C5DE66A507793623F09BB3CE5259790246A64D4B52A6E9E311",
+          "byteLength": 135724,
+          "durationSeconds": 2.12,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM067.wav",
+          "sha256": "B39BC1B0524ACB3A4EEF424AA67EF97E80065744391378968D76C0A617F56312",
+          "byteLength": 198444,
+          "durationSeconds": 3.1,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM068",
+      "zh": "剛才還想著能贏呢。好吧，你贏了。",
+      "ja": "まだ勝てると思ってたんだけどな。うん、そっちの勝ち。",
+      "direction": "一拍不甘、收住",
+      "proposedTrigger": "正式結果：玩家勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM068.wav",
+          "sha256": "E4350B2EE1BC62EABDA5EC15C2FF068569AC84DC598969BD919C3B437413EF3F",
+          "byteLength": 262444,
+          "durationSeconds": 4.1,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM068.wav",
+          "sha256": "BBEE0FDE2403701EFC8C611789F88FE5FA4FBE3544608420975BCE9F44BD13C6",
+          "byteLength": 377644,
+          "durationSeconds": 5.9,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM069",
+      "zh": "這局的好運，被你帶走了。",
+      "ja": "この一局の幸運は、そっちに行ったね。",
+      "direction": "輕巧",
+      "proposedTrigger": "正式結果：玩家勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM069.wav",
+          "sha256": "DF03C130F62DA3A8DAF50430B81A40F617584126F4D88C7EDE1608EEDB8076EA",
+          "byteLength": 169004,
+          "durationSeconds": 2.64,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM069.wav",
+          "sha256": "43EFE91485EFB889E2DDBA5F5B2B9E526A83582440CF35C80D53CB1225DC9F89",
+          "byteLength": 213804,
+          "durationSeconds": 3.34,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM070",
+      "zh": "原來今天留下來的是我們兩個。",
+      "ja": "今日は私とジョーカーが、最後のお客さんなんだね。",
+      "direction": "對鬼牌說；溫和玩笑",
+      "proposedTrigger": "正式結果：玩家勝；鬼牌已揭示",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM070.wav",
+          "sha256": "248C851B2D495EB9620E6234B8697BA10BA65B45C70127A37A4EC7BB4991E356",
+          "byteLength": 194604,
+          "durationSeconds": 3.04,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM070.wav",
+          "sha256": "5514184ECE254797E4BAE37D7B851A8C68AAE82B41D5CF68A13B0B5A6814CB4D",
+          "byteLength": 298284,
+          "durationSeconds": 4.66,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM071",
+      "zh": "輸得很明白，連藉口都省了。",
+      "ja": "はっきり負けちゃった。言い訳を考える手間もないね。",
+      "direction": "自嘲、無苦澀",
+      "proposedTrigger": "正式結果：玩家勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM071.wav",
+          "sha256": "7E8D1058BB63E432FDBDD821EA90E018E7BA20E97D4B45CBD6DA649E1BA5F686",
+          "byteLength": 220204,
+          "durationSeconds": 3.44,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM071.wav",
+          "sha256": "7D9BC9FC67DC9B12E50DE70831465AF1C8BFAA02324674755DA9ED780910F7DB",
+          "byteLength": 282924,
+          "durationSeconds": 4.42,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM072",
+      "zh": "好，這一勝是你的。",
+      "ja": "うん、この一勝はそっちのもの。",
+      "direction": "簡短真誠",
+      "proposedTrigger": "正式結果：玩家勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM072.wav",
+          "sha256": "75E51B60ABE98BF42178760002E6314F283B7F10EDC2569A4736A81716ECDBD9",
+          "byteLength": 211244,
+          "durationSeconds": 3.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM072.wav",
+          "sha256": "BCCFFDBD27903225FD6F1966BB9C5FB80096F806D6FCEFA6556D05E00EC05BD0",
+          "byteLength": 188204,
+          "durationSeconds": 2.94,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH001",
+      "zh": "這局你先走，我等你的第一步。",
+      "ja": "この対局はそっちが先手。最初の一手を待ってる。",
+      "direction": "平穩邀請",
+      "proposedTrigger": "新局建立；玩家執白",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH001.wav",
+          "sha256": "950E738D218FCDDBD6A28A6260F04964EDEDFD7F247AEA704F30A37305555860",
+          "byteLength": 199724,
+          "durationSeconds": 3.12,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH001.wav",
+          "sha256": "57F37CABF847FA97E24F10D0CB2D634582081999A3BC1EF223EAC2C72C73C0A2",
+          "byteLength": 293164,
+          "durationSeconds": 4.58,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH002",
+      "zh": "這次由我先走。",
+      "ja": "今回は私が先手だね。",
+      "direction": "俐落",
+      "proposedTrigger": "新局建立；莉莉絲執白",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH002.wav",
+          "sha256": "4EE9245B6AA77F8D1BBB89C3870E6E8F317B0007A2FAEB1CC3BDEE50B824709E",
+          "byteLength": 147244,
+          "durationSeconds": 2.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH002.wav",
+          "sha256": "0EBBE055B7ABD6A7671EDD27697640E14528521842383E6A25FDB62D339150D1",
+          "byteLength": 165164,
+          "durationSeconds": 2.58,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH003",
+      "zh": "位置換過了，這次換個角度較量。",
+      "ja": "陣営が変わったね。今度は反対側から勝負しよう。",
+      "direction": "只指陣營；不承諾旋轉棋盤",
+      "proposedTrigger": "新局建立；確認與上局換邊",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH003.wav",
+          "sha256": "068E744B6048752C0FB9393C742A127CF3CF7DDB0FEB9F18070F725E65B10359",
+          "byteLength": 238124,
+          "durationSeconds": 3.72,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH003.wav",
+          "sha256": "E17D4396E20256F94D624F2F7CC9F9CFC6378D6FEC6B7688EBA620FDAD2D5DE4",
+          "byteLength": 300844,
+          "durationSeconds": 4.7,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH004",
+      "zh": "三十二枚棋子，先安靜排好隊。",
+      "ja": "三十二の駒が、まずは静かに整列。",
+      "direction": "僅標準初始局面",
+      "proposedTrigger": "新局建立",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH004.wav",
+          "sha256": "54EDCA4C51012412D21F1D32249070F25ADE61F261DF15AFD7202B288265284C",
+          "byteLength": 238124,
+          "durationSeconds": 3.72,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH004.wav",
+          "sha256": "494F20FCD376939D4A52DFE14C60D40202E805680BFE275F3706987EE9F89CC5",
+          "byteLength": 239404,
+          "durationSeconds": 3.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH005",
+      "zh": "不用追著秒針走，想好了再落子。",
+      "ja": "秒針に追われなくていい。決まったら指して。",
+      "direction": "放鬆",
+      "proposedTrigger": "休閒新局建立",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH005.wav",
+          "sha256": "0B30618D32546DD7D36AFBD811FF051A72D24178E7367005030945669F1C3DDC",
+          "byteLength": 234284,
+          "durationSeconds": 3.66,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH005.wav",
+          "sha256": "BE2AB70A7AE1698075143B67AFFFDBED72A56999CA31EC5A662EA0A83602F917",
+          "byteLength": 254764,
+          "durationSeconds": 3.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH006",
+      "zh": "時鐘動了。這次連猶豫也算時間。",
+      "ja": "時計が動き出した。迷っている時間も、勝負のうちだね。",
+      "direction": "清楚、非催促",
+      "proposedTrigger": "挑戰新局開始",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH006.wav",
+          "sha256": "AD7C819B7FDBFCFAECEFF1298957421120109D70E88B0730C981DDDCF6C0D3DD",
+          "byteLength": 257324,
+          "durationSeconds": 4.02,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH006.wav",
+          "sha256": "D20698F60156FF47CC5FB2C271A16A6F01D58E6DA5799FFCAF2BF25A9633292A",
+          "byteLength": 380204,
+          "durationSeconds": 5.94,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH007",
+      "zh": "先把勝負留到最後，眼前只走一步。",
+      "ja": "勝ち負けは最後まで取っておこう。まずは一手。",
+      "direction": "平常、非教學",
+      "proposedTrigger": "新局建立",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH007.wav",
+          "sha256": "9AA009723E7E64E360352E07581A59B4F7FEF2D2EA79936775732744F103B6B9",
+          "byteLength": 303404,
+          "durationSeconds": 4.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH007.wav",
+          "sha256": "340EB1FB89068C4C52051C51327590D3B046BCE790B925215389619160E37165",
+          "byteLength": 252204,
+          "durationSeconds": 3.94,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH008",
+      "zh": "棋盤準備好了。來吧，對手。",
+      "ja": "盤の準備はできた。さあ、対戦相手さん。",
+      "direction": "半開玩笑",
+      "proposedTrigger": "新局建立",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH008.wav",
+          "sha256": "DA0C3DD1990F5A50855ECBCB0F4D4DB38A1E5AB06D6F297CC0D3B8E2348667E4",
+          "byteLength": 208684,
+          "durationSeconds": 3.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH008.wav",
+          "sha256": "AD3D08CDFA28FD83D3A4E844E6365FAD077AF6024C28EB71439CCD393FE431B6",
+          "byteLength": 303404,
+          "durationSeconds": 4.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH009",
+      "zh": "我走好了，換你。",
+      "ja": "指したよ。そっちの番。",
+      "direction": "乾淨短句",
+      "proposedTrigger": "莉莉絲合法普通走法完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH009.wav",
+          "sha256": "C5C22609E22FC1034F0F6659C1A1EACEC73FC151BEFBDF0D8A32A605A5375EC3",
+          "byteLength": 140844,
+          "durationSeconds": 2.2,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH009.wav",
+          "sha256": "357A2CA58DB2984FF7E9096EB06D97EFD8930AE3E88CE8267F2F9865A10CC221",
+          "byteLength": 160044,
+          "durationSeconds": 2.5,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH010",
+      "zh": "這一步就放在這裡。",
+      "ja": "この一手は、ここに。",
+      "direction": "不描述不存在意圖",
+      "proposedTrigger": "莉莉絲合法普通走法完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH010.wav",
+          "sha256": "B3BA9E1082A1277A146A60FF15574DF85DEABF2E51DF76508FA308BAC712C569",
+          "byteLength": 169004,
+          "durationSeconds": 2.64,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH010.wav",
+          "sha256": "A4B9E9B61E7186BE2D0147739AC64F094C157CCDCB3FEFB3D6811AACAE3D62CF",
+          "byteLength": 172844,
+          "durationSeconds": 2.7,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH011",
+      "zh": "好，交給你回應。",
+      "ja": "よし。次は、そっちの答えを。",
+      "direction": "輕期待",
+      "proposedTrigger": "莉莉絲合法普通走法完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH011.wav",
+          "sha256": "E2D6A75ADE23040C8C6E84CCD0F12F10B189BA7069E5DC4C1A113CD51AAE8573",
+          "byteLength": 161324,
+          "durationSeconds": 2.52,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH011.wav",
+          "sha256": "79DDCE12A23E13849EF7DC5D6B3846EA5349026DED6102D88156B4B46483E989",
+          "byteLength": 239404,
+          "durationSeconds": 3.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH012",
+      "zh": "落子了，不再改口。",
+      "ja": "指した。もう言い直さない。",
+      "direction": "一點果斷",
+      "proposedTrigger": "莉莉絲合法普通走法完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH012.wav",
+          "sha256": "E11CA0376DC7F4D6EDF242498DF4D2B35FC7AD969EDE3C244B66285C8A9D8B60",
+          "byteLength": 157484,
+          "durationSeconds": 2.46,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH012.wav",
+          "sha256": "A83D6FDA56A6619A0242BF2F2572267327C019F62A7D95DB1D17016CEB712790",
+          "byteLength": 175404,
+          "durationSeconds": 2.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH013",
+      "zh": "嗯，走到那裡了。",
+      "ja": "うん、そこに来たんだね。",
+      "direction": "中性；不暗示最佳著",
+      "proposedTrigger": "玩家合法普通走法完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH013.wav",
+          "sha256": "6926A381DDF985A74036ABFD89CAACD00FA7A97EBA186C0B1B3EF4A38621DC17",
+          "byteLength": 160044,
+          "durationSeconds": 2.5,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH013.wav",
+          "sha256": "09A90FD26D7BF4CA4F72664E20A214C445EFB66BB381AF148CF58C0FF0D5166E",
+          "byteLength": 157484,
+          "durationSeconds": 2.46,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH014",
+      "zh": "這一步收到了，換我想想。",
+      "ja": "その一手、受け取った。次は私が考える番。",
+      "direction": "自然、不客服",
+      "proposedTrigger": "玩家合法普通走法完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH014.wav",
+          "sha256": "BF20C92E25824FFDA4C2D6A29B34F1EAC06B91F576990E83207E6CC4FF561274",
+          "byteLength": 189484,
+          "durationSeconds": 2.96,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH014.wav",
+          "sha256": "510C835BAEA8EBC71C4C9B48800FE8091E7341FCEFD5C1CEAB97C4A2C39E28FE",
+          "byteLength": 300844,
+          "durationSeconds": 4.7,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH015",
+      "zh": "好，棋盤又變了。",
+      "ja": "よし、盤面がまた変わった。",
+      "direction": "淡淡興趣",
+      "proposedTrigger": "玩家合法普通走法完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH015.wav",
+          "sha256": "E2418C00093300774C41BFA2B53C9E8C97343D4CDC7367056C05599B9746C1EE",
+          "byteLength": 157484,
+          "durationSeconds": 2.46,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH015.wav",
+          "sha256": "673E8703942B64801DF8B7A003DB4D6FB8CC382C380D6E14D39AD20B6596B668",
+          "byteLength": 180524,
+          "durationSeconds": 2.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH016",
+      "zh": "接下來該我出聲了。用棋子。",
+      "ja": "次は私が話す番だね。駒で。",
+      "direction": "小停頓、淡笑",
+      "proposedTrigger": "玩家合法普通走法完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH016.wav",
+          "sha256": "E3045B257E576733CCD94F7658578AC0DD5CC526466E58A083AFAD04A5F09DE4",
+          "byteLength": 248364,
+          "durationSeconds": 3.88,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH016.wav",
+          "sha256": "8C778399E47E72C1F4F55B89BC715A2D9B61BA5E6D22A8C2A2148825DCA22728",
+          "byteLength": 254764,
+          "durationSeconds": 3.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH017",
+      "zh": "等我一下，這裡我想仔細看看。",
+      "ja": "少し待って。ここは、よく見ておきたい。",
+      "direction": "專注、短句",
+      "proposedTrigger": "莉莉絲確在計算；高冷卻",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH017.wav",
+          "sha256": "EF317C3A7037478579144A7E53E38D13F1A7C8BDAF9BADBA75CA525F99E76D64",
+          "byteLength": 226604,
+          "durationSeconds": 3.54,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH017.wav",
+          "sha256": "2B48665C9B1DB47F8ADB7140C9B8E2871D4510B5B1B95F0FDC27322D10244C76",
+          "byteLength": 218924,
+          "durationSeconds": 3.42,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH018",
+      "zh": "看著簡單，決定起來沒那麼快。",
+      "ja": "見た目は簡単でも、すぐには決められないね。",
+      "direction": "不宣稱有特定戰術",
+      "proposedTrigger": "莉莉絲確在計算；高冷卻",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH018.wav",
+          "sha256": "396455324BBA200498419EF74BB6BD19A0BD856CDA69F02509C519109AFBBC7F",
+          "byteLength": 211244,
+          "durationSeconds": 3.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH018.wav",
+          "sha256": "AD939DC69F672824C59E479BD6F19E346BAD652C0EBB77ED6E14273EDBF2F112",
+          "byteLength": 259884,
+          "durationSeconds": 4.06,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH019",
+      "zh": "我先把話留著，想完這一步。",
+      "ja": "おしゃべりは少し後。この一手を考えよう。",
+      "direction": "說完安靜",
+      "proposedTrigger": "莉莉絲確在計算；高冷卻",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH019.wav",
+          "sha256": "3B74811E0F8AB0AE2BE2D50DB97C51137CB63DDA2BE4EF65286BFF127C569CE5",
+          "byteLength": 206124,
+          "durationSeconds": 3.22,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH019.wav",
+          "sha256": "2558BE794685726810DB5D292B38E4806D2E465C48CB14E71E85AFC9ADDB8467",
+          "byteLength": 367404,
+          "durationSeconds": 5.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH020",
+      "zh": "嗯……先不急著替自己鼓掌。",
+      "ja": "うーん。自分に拍手するのは、まだ早いか。",
+      "direction": "克制的小自嘲",
+      "proposedTrigger": "莉莉絲確在計算；高冷卻",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH020.wav",
+          "sha256": "6BE62B5DD6E8797173D09085009CF2A531EA531036A6916A4C611F3349108478",
+          "byteLength": 238124,
+          "durationSeconds": 3.72,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH020.wav",
+          "sha256": "4738C71BEA53B06C93544289169FC2AB8970A0720F2A8B51A8E620EB9189CBB7",
+          "byteLength": 65324,
+          "durationSeconds": 1.02,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH021",
+      "zh": "我先安靜等這一步。",
+      "ja": "この一手は、静かに待ってる。",
+      "direction": "無催促",
+      "proposedTrigger": "休閒玩家回合久未操作",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH021.wav",
+          "sha256": "ED05AF78EA6C268CA40D3DE1121568580B6422AC81B5157F24C559350B4E205B",
+          "byteLength": 120364,
+          "durationSeconds": 1.88,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH021.wav",
+          "sha256": "0FFBB8470CBFE2DE9C83B92EF203480EB5978881089CE6BBB86480A9EF08C508",
+          "byteLength": 198444,
+          "durationSeconds": 3.1,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH022",
+      "zh": "小小的棋盤，倒能裝下不少念頭。",
+      "ja": "小さな盤なのに、考えることはたくさんあるね。",
+      "direction": "輕、非長篇哲學",
+      "proposedTrigger": "休閒長局；低頻氣氛",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH022.wav",
+          "sha256": "643286284DD059A48F76A3C226134F281911A015CBCB98EF5372751EEA122F45",
+          "byteLength": 249644,
+          "durationSeconds": 3.9,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH022.wav",
+          "sha256": "048E5EE027852EADFD08C223EC44A586CA08B1646D87A9A4F655FB0CF71D49CC",
+          "byteLength": 257324,
+          "durationSeconds": 4.02,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH023",
+      "zh": "棋子一停，連聲音都變得清楚了。",
+      "ja": "駒が止まると、ひとつの音がよく聞こえるね。",
+      "direction": "只指遊戲音；不可描述外部聲音",
+      "proposedTrigger": "休閒長局；玩家未在聊天",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH023.wav",
+          "sha256": "D499E3E84A4DEA7FF61F74E29757E48E16212347D0999560015BAF59964F7A50",
+          "byteLength": 229164,
+          "durationSeconds": 3.58,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH023.wav",
+          "sha256": "BD9F31259664754750F2471C1711BB3C67A84F2C9029901F6713B9245A7D3547",
+          "byteLength": 254764,
+          "durationSeconds": 3.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH024",
+      "zh": "還在想。不是忘記輪到我了。",
+      "ja": "まだ考えてる。自分の番を忘れたわけじゃないよ。",
+      "direction": "輕玩笑；不是故障遮掩",
+      "proposedTrigger": "玩家主動問是否還在思考；狀態確認",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH024.wav",
+          "sha256": "AEACB614CA9AC2BB462AEB5ACEA3679348259A6309A8008E4ABE8F4B32C776F6",
+          "byteLength": 226604,
+          "durationSeconds": 3.54,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH024.wav",
+          "sha256": "BDEF17B250895CDD2C43ED6EC7923F94CC378FD8BEAAE9805F46C76C2FA6E586",
+          "byteLength": 282924,
+          "durationSeconds": 4.42,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH025",
+      "zh": "這枚棋子，我收下了。",
+      "ja": "この駒は、もらっておくね。",
+      "direction": "小得意",
+      "proposedTrigger": "莉莉絲合法吃子已完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH025.wav",
+          "sha256": "F4B7F83ACC1D936234378E6942A5988D2F1147620C6BA1FE783A81ACA64834C0",
+          "byteLength": 180524,
+          "durationSeconds": 2.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH025.wav",
+          "sha256": "9215245774FE802884FD5E7079302B9FF635C8967E1843C8E7AA356329852B7C",
+          "byteLength": 224044,
+          "durationSeconds": 3.5,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH026",
+      "zh": "這個位置，現在換我的棋子。",
+      "ja": "このマスは、今度は私の駒の場所。",
+      "direction": "中性；不稱必勝",
+      "proposedTrigger": "莉莉絲合法吃子已完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH026.wav",
+          "sha256": "A4A9685794B0DDF5927A107871DB21EF50E94BFBFF009EF320A1C724F7FEE050",
+          "byteLength": 208684,
+          "durationSeconds": 3.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH026.wav",
+          "sha256": "456655B00888C07022154BA92E69BE7A4D5E63C165C13D40DF839F517AC7994F",
+          "byteLength": 249644,
+          "durationSeconds": 3.9,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH027",
+      "zh": "好，少了一位對手。",
+      "ja": "よし、相手の駒がひとつ減った。",
+      "direction": "簡短",
+      "proposedTrigger": "莉莉絲合法吃子已完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH027.wav",
+          "sha256": "41FD3FF16DAC8EE22DF61E727772C80B33147FC235EF871ED5DC59EE1D5E2FDD",
+          "byteLength": 169004,
+          "durationSeconds": 2.64,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH027.wav",
+          "sha256": "6DF21DB29365D8EE1D1B417DB21F3B7F4A58B05FFBAAE08E558B7689404F30E7",
+          "byteLength": 193324,
+          "durationSeconds": 3.02,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH028",
+      "zh": "這一步有收穫。",
+      "ja": "この一手は、収穫あり。",
+      "direction": "輕快；不聲稱評分上升",
+      "proposedTrigger": "莉莉絲合法吃子已完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH028.wav",
+          "sha256": "77788D53D70BF8AD10BFCFE7F83AC50D79AD747CCE6F4CE31D4FBAA6D2B7C676",
+          "byteLength": 161324,
+          "durationSeconds": 2.52,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH028.wav",
+          "sha256": "2FBA81EEEDE90C11F8A98F87F78D3E4544831E9E4BD31B44933DEE69C7403EBD",
+          "byteLength": 175404,
+          "durationSeconds": 2.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH029",
+      "zh": "啊，這枚被你帶走了。",
+      "ja": "あ、その駒を取られた。",
+      "direction": "一拍驚訝",
+      "proposedTrigger": "玩家合法吃子已完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH029.wav",
+          "sha256": "A4C1D89EC0F9FE529E8586BFF57F84C4201A0E4DACBE8D6E27B39709A4E0E7A8",
+          "byteLength": 126764,
+          "durationSeconds": 1.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH029.wav",
+          "sha256": "E32A95BDB9B0AFA318BC1110BEBD4986CBCC518597B3CF9F017802DF71413B80",
+          "byteLength": 188204,
+          "durationSeconds": 2.94,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "surprised",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH030",
+      "zh": "好，這枚歸你了。",
+      "ja": "うん、その駒はそっちへ。",
+      "direction": "只承認已發生的吃子",
+      "proposedTrigger": "玩家合法吃子已完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH030.wav",
+          "sha256": "6A5116FCBDC1D4EB4C2A1D69747DF5158C3D77220580E02F158401D96957FE49",
+          "byteLength": 154924,
+          "durationSeconds": 2.42,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH030.wav",
+          "sha256": "A3285645F0B0B778966A9BDB4653ACE0E6BEED0782E683FC74B4EFD178E66E47",
+          "byteLength": 172844,
+          "durationSeconds": 2.7,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH031",
+      "zh": "棋盤少了一枚，局還沒結束。",
+      "ja": "一枚減ったけど、対局はまだ続く。",
+      "direction": "沉穩",
+      "proposedTrigger": "玩家合法吃子已完成且尚未終局",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH031.wav",
+          "sha256": "20D8EB664B72F14335F5A62774164F53D087174BE9BEA5AB6BE55D96E69490FA",
+          "byteLength": 222764,
+          "durationSeconds": 3.48,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH031.wav",
+          "sha256": "224102C23B57582862CBF356A4E67E5F0EDE6E3239CC96E5FABCB35C4239F935",
+          "byteLength": 272684,
+          "durationSeconds": 4.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH032",
+      "zh": "嗯，輪到我重新想了。",
+      "ja": "うん、ここから考え直そう。",
+      "direction": "不責怪玩家",
+      "proposedTrigger": "玩家合法吃子已完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH032.wav",
+          "sha256": "F71AD1CE7089ED84776C11B69C28773A2F139C4F9C5A00E5C508E5341C04B155",
+          "byteLength": 180524,
+          "durationSeconds": 2.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH032.wav",
+          "sha256": "C40562AB1C31CBECC4B71DC6D828741D91F6600670CD412110FBE9ECD5426751",
+          "byteLength": 188204,
+          "durationSeconds": 2.94,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH033",
+      "zh": "你拿一枚，我也拿一枚。",
+      "ja": "一枚取って、一枚取られて。",
+      "direction": "不評價交換划算",
+      "proposedTrigger": "雙方連續互吃；已確認兩步公開記錄",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH033.wav",
+          "sha256": "7F38A415978D44D5832F917A08129331520F23E9A676EECE6D97E7C07E91CF0B",
+          "byteLength": 175404,
+          "durationSeconds": 2.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH033.wav",
+          "sha256": "0DBCD34379D110B6600834A37928448716D71A7347552CCF26B35D9C7C6E4BAA",
+          "byteLength": 249644,
+          "durationSeconds": 3.9,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH034",
+      "zh": "兩邊都少了棋子，倒都還不肯退。",
+      "ja": "お互い駒は減ったけど、勝負は譲らないね。",
+      "direction": "輕認真",
+      "proposedTrigger": "雙方連續互吃；已確認兩步公開記錄",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH034.wav",
+          "sha256": "22915D5C37EECB3963870878BA5A1C838ADF0C40D0CFF466FDAB8C297F6A533D",
+          "byteLength": 231724,
+          "durationSeconds": 3.62,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH034.wav",
+          "sha256": "93A3AB38ACDFB3F126076B5B365D15A87C40224513F82475E7134AC8D6A777B0",
+          "byteLength": 295724,
+          "durationSeconds": 4.62,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH035",
+      "zh": "過路兵也沒能走過去呢。",
+      "ja": "アンパッサン。通り過ぎる前に、つかまったね。",
+      "direction": "規則成立後才說",
+      "proposedTrigger": "玩家合法吃過路兵完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH035.wav",
+          "sha256": "A6019397FA646FE7AB4CDD078519AD07FAFC9E59D429C7CFEE9A5161703E8CCA",
+          "byteLength": 169004,
+          "durationSeconds": 2.64,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH035.wav",
+          "sha256": "64D9FFEB402262A6D43B30C737FF27F350D29BBDCF187481450BE1F2AAD69E69",
+          "byteLength": 341804,
+          "durationSeconds": 5.34,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH036",
+      "zh": "這一步，我接住了過路的那枚兵。",
+      "ja": "アンパッサンで、そのポーンを取ったよ。",
+      "direction": "清楚不講攻略",
+      "proposedTrigger": "莉莉絲合法吃過路兵完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH036.wav",
+          "sha256": "0021AEF5676CACCD192428DB91C863075D054FD9411B45A7865B511A423C3980",
+          "byteLength": 222764,
+          "durationSeconds": 3.48,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH036.wav",
+          "sha256": "E8D9226260271676E564EC41BA420B98DF7CB781CA7E4DADCF6EB69EC60DDDD0",
+          "byteLength": 193324,
+          "durationSeconds": 3.02,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH037",
+      "zh": "將軍。",
+      "ja": "チェック。",
+      "direction": "清楚、平聲",
+      "proposedTrigger": "規則確認：玩家王被將軍；非將死",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH037.wav",
+          "sha256": "06D9ABE494BD4F84DC74B80B3C1322F54E11A2C30CE1DAA9487955A02D890BA9",
+          "byteLength": 57644,
+          "durationSeconds": 0.9,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH037.wav",
+          "sha256": "8149D3733555A2715BCFB5D0BE1A6C4A8058DB416FB0D6734AB787444F143B4D",
+          "byteLength": 62764,
+          "durationSeconds": 0.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH038",
+      "zh": "這一步，是將軍。",
+      "ja": "この一手で、チェックだよ。",
+      "direction": "短、略認真",
+      "proposedTrigger": "規則確認：玩家王被將軍；非將死",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH038.wav",
+          "sha256": "F576A5A5A3432A0B306EE12C42B4BC53AF037527C3F8769357B6A24D58B854F1",
+          "byteLength": 171564,
+          "durationSeconds": 2.68,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": true,
+          "reusedAcceptedAudition": true
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH038.wav",
+          "sha256": "3603542857152BADF963213CA3F5A81DA9788B73DC9AC083A08C18C235C73FA2",
+          "byteLength": 147244,
+          "durationSeconds": 2.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": true,
+          "reusedAcceptedAudition": true
+        }
+      }
+    },
+    {
+      "id": "GD-CH039",
+      "zh": "嗯，被將軍了。",
+      "ja": "うん、チェックされたね。",
+      "direction": "收起玩笑",
+      "proposedTrigger": "規則確認：莉莉絲王被將軍；非將死",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH039.wav",
+          "sha256": "77701A2FC45D0060BF6C3C6FCE33707779DE921E27433B723E34DE50E933DA12",
+          "byteLength": 169004,
+          "durationSeconds": 2.64,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH039.wav",
+          "sha256": "8685B69BECE193B486EDF6079EBB15E147C5E918ED2049F6E768FE1084E4B672",
+          "byteLength": 149804,
+          "durationSeconds": 2.34,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH040",
+      "zh": "好，這下得先應付你。",
+      "ja": "さて、まずはこのチェックに答えないと。",
+      "direction": "不說解法",
+      "proposedTrigger": "規則確認：莉莉絲王被將軍；非將死",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH040.wav",
+          "sha256": "E0CBF5F3FE9CD94C23F469BA5A1531C88469A66799B2E11DC3B649BC015D316E",
+          "byteLength": 175404,
+          "durationSeconds": 2.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH040.wav",
+          "sha256": "2617162E1A60A467AABAEE8D4175CB3837E79848E5E672FFA822B82588E95A84",
+          "byteLength": 226604,
+          "durationSeconds": 3.54,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH041",
+      "zh": "好，將軍解除了。",
+      "ja": "うん、チェックは外れた。",
+      "direction": "公開事實",
+      "proposedTrigger": "玩家合法解將完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH041.wav",
+          "sha256": "87F42127BBD00D2CC2D3DDC6D6FF54028D4B813C2EA6DD0E9DE88F862D0D1833",
+          "byteLength": 157484,
+          "durationSeconds": 2.46,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH041.wav",
+          "sha256": "20BC26B03DB8B02839AF3E3176ACA0831EDDB9B5CAE526B893E7A3C8E5A7A526",
+          "byteLength": 167724,
+          "durationSeconds": 2.62,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH042",
+      "zh": "這一回沒能結束。繼續吧。",
+      "ja": "この一手では終わらなかったね。続けよう。",
+      "direction": "無威脅、無提示",
+      "proposedTrigger": "玩家合法解將完成且尚未終局",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH042.wav",
+          "sha256": "9B3FEB7287872C6B8FDE1C03544C8AED16F92A13A4F2B5CDA276ABC2A6DCE62F",
+          "byteLength": 199724,
+          "durationSeconds": 3.12,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH042.wav",
+          "sha256": "7F80D60ABE8CA36D1B7135CAE1DFABA4E6B547E0B2BC20833EB1B6D2F3A83644",
+          "byteLength": 241964,
+          "durationSeconds": 3.78,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH043",
+      "zh": "暫時脫身了。",
+      "ja": "ひとまず、チェックはしのいだ。",
+      "direction": "小鬆一口氣",
+      "proposedTrigger": "莉莉絲合法解將完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH043.wav",
+          "sha256": "AAACB22B71D1DF42196B6C399DC888866B2B01875D7DE2BF507B09131B9FE433",
+          "byteLength": 92204,
+          "durationSeconds": 1.44,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH043.wav",
+          "sha256": "918CD312128EA920925A45D5108D86E1981FC914D5B8B131FCCC5DB3C2B23532",
+          "byteLength": 295724,
+          "durationSeconds": 4.62,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "relieved",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH044",
+      "zh": "好，還能接著下。",
+      "ja": "よし、まだ続けられる。",
+      "direction": "俐落",
+      "proposedTrigger": "莉莉絲合法解將完成且尚未終局",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH044.wav",
+          "sha256": "CEA968D94E9B5ADD400650DF31486C13860AAF9DA9623CDF2AEAE59499DE1483",
+          "byteLength": 157484,
+          "durationSeconds": 2.46,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH044.wav",
+          "sha256": "ABF427ACFAB04949A8904E53A4C70C50C6B0B60444F938C68A2EE6F2FA656F71",
+          "byteLength": 167724,
+          "durationSeconds": 2.62,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH045",
+      "zh": "王和車，一起換個位置。",
+      "ja": "キングとルーク、一緒にお引っ越し。",
+      "direction": "小玩笑；非絕對安全宣告",
+      "proposedTrigger": "莉莉絲合法王車易位完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH045.wav",
+          "sha256": "28B765A47A459869F7B59D3C43AC5913E0F2CC27A1099059B0D3E57EE6484BE8",
+          "byteLength": 180524,
+          "durationSeconds": 2.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH045.wav",
+          "sha256": "8EDF63DFE8CEBCD11C0CD6A83D0235828D2AF0266C96EE2A774E98E5F338441D",
+          "byteLength": 211244,
+          "durationSeconds": 3.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH046",
+      "zh": "王車易位。兩枚一起出動了。",
+      "ja": "キャスリング。二つが一度に動いたね。",
+      "direction": "好奇、不評價好壞",
+      "proposedTrigger": "玩家合法王車易位完成",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH046.wav",
+          "sha256": "CF660A0993F5E4CB570E11A31B349AA154E0B9B0EAE92930EF54683D11885276",
+          "byteLength": 254764,
+          "durationSeconds": 3.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH046.wav",
+          "sha256": "B3B716BD003838BB57004C1AE658DD5E9A66825714FDF4E3F7C7C5CDE35232D3",
+          "byteLength": 270124,
+          "durationSeconds": 4.22,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "surprised",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH047",
+      "zh": "這枚兵要升變了，選個新的角色吧。",
+      "ja": "このポーンを昇格させよう。どの駒にする？",
+      "direction": "不提示選皇后；不預報尚未提交的抵達",
+      "proposedTrigger": "玩家合法升變候選已確認且選擇待處理",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH047.wav",
+          "sha256": "6E1F82D16D00B508D0F858B0A8E31A0F3285BF1CB1BCA5FDE5054F5A2C5A0BFF",
+          "byteLength": 245804,
+          "durationSeconds": 3.84,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH047.wav",
+          "sha256": "97B572358074B2D270626A909F66882B4D1100355196B3A4B1416F1F5A4A7168",
+          "byteLength": 265004,
+          "durationSeconds": 4.14,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH048",
+      "zh": "小兵換了身分，這局還在繼續。",
+      "ja": "ポーンが姿を変えたね。対局はまだ続く。",
+      "direction": "輕讚嘆",
+      "proposedTrigger": "玩家升變選擇確認且完成；尚未終局",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH048.wav",
+          "sha256": "81E4B6D0DB1278E7098ACE0D7A69CA587C132BA1C54F81E728E14CFCD0F636E0",
+          "byteLength": 231724,
+          "durationSeconds": 3.62,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH048.wav",
+          "sha256": "F576ED18A9D70150A112992952493E762D497C51501E5E2BC6735871A11DEAD9",
+          "byteLength": 262444,
+          "durationSeconds": 4.1,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "surprised",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH049",
+      "zh": "走了這麼遠，該換個身分了。",
+      "ja": "ここまで来たんだもの。新しい役を。",
+      "direction": "小滿足",
+      "proposedTrigger": "莉莉絲升變完成；任一合法種類",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH049.wav",
+          "sha256": "7C55C2BD3A4EF8F486A47ED1D7101E33D71D1443C665E8F138F65E4491B1ECE2",
+          "byteLength": 194604,
+          "durationSeconds": 3.04,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH049.wav",
+          "sha256": "644559CE26B2766632F85997929F87451FAD6DF1EBE041D42733F550807F4C41",
+          "byteLength": 398124,
+          "durationSeconds": 6.22,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "relieved",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH050",
+      "zh": "新的皇后，登場。",
+      "ja": "新しいクイーンの登場。",
+      "direction": "微得意，不戲劇化大喊",
+      "proposedTrigger": "莉莉絲升變完成；確為皇后",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH050.wav",
+          "sha256": "E7E5A640C4FB83593944BCB444F5F529BCDBCB786FB9D9F9008F0EDB74993CDE",
+          "byteLength": 154924,
+          "durationSeconds": 2.42,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH050.wav",
+          "sha256": "BD7C5DDAF60EF8388245DD6717584A71B0981C4C8938EA7433B6D1F53A45047C",
+          "byteLength": 152364,
+          "durationSeconds": 2.38,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH051",
+      "zh": "你選了騎士。走法也跟著變了。",
+      "ja": "ナイトにしたんだね。動き方も変わった。",
+      "direction": "不暗示這是妙手",
+      "proposedTrigger": "玩家升變完成；確為騎士",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH051.wav",
+          "sha256": "077DF382DBFAEEEA27A535A166D9FE9A02307E97F794444A2CAFF667C9080495",
+          "byteLength": 226604,
+          "durationSeconds": 3.54,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH051.wav",
+          "sha256": "006CF52CEA6C98DFA0C37A2F3D48FB31990A3296FD46AA0EFC53543571595754",
+          "byteLength": 295724,
+          "durationSeconds": 4.62,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH052",
+      "zh": "同一枚棋子，接下來能走的路不同了。",
+      "ja": "同じ駒でも、ここから進める道が変わるんだね。",
+      "direction": "短餘韻；低頻",
+      "proposedTrigger": "任一方升變完成；沒有同時將死",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH052.wav",
+          "sha256": "5554C56E27F0B0B90DA774486EC9F98F2F88C2DD0BCCC74B93D2E0F0654AEFCF",
+          "byteLength": 243244,
+          "durationSeconds": 3.8,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH052.wav",
+          "sha256": "D003A8B4BA63FD96535C9581763FB61CE66D90EB681878554428DA5F73C18577",
+          "byteLength": 272684,
+          "durationSeconds": 4.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH053",
+      "zh": "你的時間不多了，我先不說別的。",
+      "ja": "残り時間が少なくなってる。余計な話はやめておくね。",
+      "direction": "平穩提醒；隨後靜默",
+      "proposedTrigger": "玩家時間首次進入低時間門檻",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH053.wav",
+          "sha256": "A921CF72543331D180B3BD9731BABC180C9EE1B5A2F89FB4320E43A8585FF787",
+          "byteLength": 208684,
+          "durationSeconds": 3.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH053.wav",
+          "sha256": "50A00A9F164F6119E45D076FB571CCB39F8EBFE6F49F2C0F2B338C8723AD4E82",
+          "byteLength": 311084,
+          "durationSeconds": 4.86,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH054",
+      "zh": "我的時間也得省著用了。",
+      "ja": "私も、残り時間を大事にしないと。",
+      "direction": "簡短，不裝慌",
+      "proposedTrigger": "莉莉絲時間首次進入低時間門檻",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH054.wav",
+          "sha256": "0FD524BDFD3C6669152965BCBCD2788B08BA6EF96740BB65F5F38EA0106E14AB",
+          "byteLength": 147244,
+          "durationSeconds": 2.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH054.wav",
+          "sha256": "7F143F6B9A907B4F4380D161C237880806BE59B8EAA24DB11502C70155052987",
+          "byteLength": 224044,
+          "durationSeconds": 3.5,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH055",
+      "zh": "剩十秒。",
+      "ja": "残り十秒。",
+      "direction": "清楚；若排隊已過時就丟棄",
+      "proposedTrigger": "玩家時間首次降至十秒門檻",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH055.wav",
+          "sha256": "04389EC55C6FEBC50B5D3B1B92CC3AAA6507F5FC80BBAC7D22113BD09DAFBB54",
+          "byteLength": 84524,
+          "durationSeconds": 1.32,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH055.wav",
+          "sha256": "3913660DEFE571EFBB818643E6F8AD4F07A6D263CEE687062D574A2F793026AC",
+          "byteLength": 116524,
+          "durationSeconds": 1.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH056",
+      "zh": "我剩十秒了。",
+      "ja": "私の残りは十秒。",
+      "direction": "簡短；不拖延走棋",
+      "proposedTrigger": "莉莉絲時間首次降至十秒門檻",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH056.wav",
+          "sha256": "5305AE71C51ABB816FA3B3B8808A0400E3D2BF712B1A005ED5CD60238D53EBA4",
+          "byteLength": 94764,
+          "durationSeconds": 1.48,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH056.wav",
+          "sha256": "5D9CD839C1FF7787504A0C7D35E8639222CC2A242DAB22E28F126DD2E3EFA607",
+          "byteLength": 142124,
+          "durationSeconds": 2.22,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH057",
+      "zh": "時間到了，這局由我獲勝。",
+      "ja": "時間切れ。この対局は私の勝ちだね。",
+      "direction": "中性、不嘲諷",
+      "proposedTrigger": "正式結果：玩家逾時且判莉莉絲勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH057.wav",
+          "sha256": "1983961C99E7D9AF8F3DA6F844D4D3FD504048C804449FF925BB1E60A37026FC",
+          "byteLength": 263724,
+          "durationSeconds": 4.12,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH057.wav",
+          "sha256": "A55BFA5C5AF9FCE40221CC476D4C66BFB4642CA92F62666411D8CF8E638651AE",
+          "byteLength": 229164,
+          "durationSeconds": 3.58,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH058",
+      "zh": "我想得太久了。這局你贏。",
+      "ja": "考えすぎたね。この対局はそっちの勝ち。",
+      "direction": "自嘲、接受",
+      "proposedTrigger": "正式結果：莉莉絲逾時且判玩家勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH058.wav",
+          "sha256": "CA1E03E519E006E9EC0D62E8DD62B623061D4824B3B4C81B95F17453DBA5CE70",
+          "byteLength": 254764,
+          "durationSeconds": 3.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH058.wav",
+          "sha256": "20B21DE2203AB56DFED7B1420FEDF79A414C06325648F91C61641CB239DC2B2B",
+          "byteLength": 316204,
+          "durationSeconds": 4.94,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH059",
+      "zh": "時間到了，不過這局判和棋。",
+      "ja": "時間切れだけど、判定は引き分けだね。",
+      "direction": "不套一般逾時輸句",
+      "proposedTrigger": "正式結果：逾時但規則判和棋",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH059.wav",
+          "sha256": "1EFAE05A24A098C16233CD06273438DF7DFF7247BA84569915F177E4041E3733",
+          "byteLength": 222764,
+          "durationSeconds": 3.48,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH059.wav",
+          "sha256": "73D49F78F32E9ACD9768CA6D75934B0C5496451C274B20001C20CC7503CBF829",
+          "byteLength": 216364,
+          "durationSeconds": 3.38,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH060",
+      "zh": "這次連時鐘都參了一腳。",
+      "ja": "今回は、時計まで勝負に加わってたね。",
+      "direction": "僅次要結果感想；不連播",
+      "proposedTrigger": "終局後；確認剛才是計時挑戰",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH060.wav",
+          "sha256": "5F9D35D4B95439B2B6AB15A4ECE7DE58908370EFF5CF67AB7AC209E950A9AD93",
+          "byteLength": 145964,
+          "durationSeconds": 2.28,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH060.wav",
+          "sha256": "1A1813EC5A5979C5669BBE8932E231EC25267D4B48FC34D9110DB26011F9BE70",
+          "byteLength": 259884,
+          "durationSeconds": 4.06,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH061",
+      "zh": "將死。這局是我的。",
+      "ja": "チェックメイト。この一局は私の勝ち。",
+      "direction": "清楚、輕得意",
+      "proposedTrigger": "正式結果：莉莉絲將死玩家",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH061.wav",
+          "sha256": "AE8AFB20C3D321CD78A12548AEFC539D285FE967513E4A0C7EFF88CEB151FFDF",
+          "byteLength": 185644,
+          "durationSeconds": 2.9,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH061.wav",
+          "sha256": "2267658E9137E91C2ADAAB9FB70C2E0968E6D799530CA1413DE6FFF4F484BF96",
+          "byteLength": 244524,
+          "durationSeconds": 3.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH062",
+      "zh": "最後一步，走到了。",
+      "ja": "最後の一手に、たどり着いたね。",
+      "direction": "先結果字幕再感想",
+      "proposedTrigger": "正式結果：莉莉絲將死玩家",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH062.wav",
+          "sha256": "321CACF6FE2202D13CF982DF5733733BD9E95F4AC61B35200FBFAFDACD082F71",
+          "byteLength": 157484,
+          "durationSeconds": 2.46,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH062.wav",
+          "sha256": "8E3B5F5B69CF4635096198772DD90F617677AA331D56596B0F513858D9DC62D4",
+          "byteLength": 188204,
+          "durationSeconds": 2.94,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH063",
+      "zh": "贏了。現在可以放鬆一點了。",
+      "ja": "勝った。これで少し、肩の力を抜けるね。",
+      "direction": "自己的角色感受",
+      "proposedTrigger": "正式結果：莉莉絲將死玩家",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH063.wav",
+          "sha256": "3757C0D65CF1260F4D8285DF3683451268935FF58D3CDBB3257053A6205F2C61",
+          "byteLength": 206124,
+          "durationSeconds": 3.22,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH063.wav",
+          "sha256": "54EFFD6FA6E9644362414165751DDF4613FED2408D2361627B2B9DC8FB256D83",
+          "byteLength": 467244,
+          "durationSeconds": 7.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "relieved",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH064",
+      "zh": "這次的句點，由我來放。",
+      "ja": "今回の終止符は、私が打たせてもらった。",
+      "direction": "偶爾文氣；低權重",
+      "proposedTrigger": "正式結果：莉莉絲將死玩家",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH064.wav",
+          "sha256": "4A13659FBF7C3083928A57955926D7FA9D41CEE1999E3758E6BCD3AE889C840F",
+          "byteLength": 208684,
+          "durationSeconds": 3.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH064.wav",
+          "sha256": "10683CB6F7BFC560E1FA44A4C4FBD17BE408B5D56B301B9BC1591DEF704F88E6",
+          "byteLength": 249644,
+          "durationSeconds": 3.9,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH065",
+      "zh": "將死了。這局你贏得很確實。",
+      "ja": "チェックメイトだね。今回は、文句なしでそっちの勝ち。",
+      "direction": "坦然、真誠",
+      "proposedTrigger": "正式結果：玩家將死莉莉絲",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH065.wav",
+          "sha256": "CC98B952D4D068F2BCA02D1D1A1488359A0E68BCD306298258FB6C807627296F",
+          "byteLength": 226604,
+          "durationSeconds": 3.54,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH065.wav",
+          "sha256": "5BFF4C278EE0AD0B76FF04BADE5C75ABCBC528E3A9FF3F645234064F117227B0",
+          "byteLength": 352044,
+          "durationSeconds": 5.5,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH066",
+      "zh": "我的王無路可走了。你贏了。",
+      "ja": "私のキングはもう逃げられない。そっちの勝ち。",
+      "direction": "不暗示可悔棋",
+      "proposedTrigger": "正式結果：玩家將死莉莉絲",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH066.wav",
+          "sha256": "1AA6F550DA3A88578F896DD15E61908DDC383FBF5E547C40594ED0E6EADE0CA0",
+          "byteLength": 222764,
+          "durationSeconds": 3.48,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH066.wav",
+          "sha256": "DFB411E3A189D24A58DC62920A73647D14F17D25B3B43B39C93FB795D14E6318",
+          "byteLength": 280364,
+          "durationSeconds": 4.38,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH067",
+      "zh": "最後還是被你走到了。",
+      "ja": "最後の一手まで、指し切られちゃったね。",
+      "direction": "微不甘、仍尊重",
+      "proposedTrigger": "正式結果：玩家將死莉莉絲",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH067.wav",
+          "sha256": "189172E8305FF7663A1D893E9D3DA968EA3CCA17E1DAB0CA8FA068170A27F1E9",
+          "byteLength": 131884,
+          "durationSeconds": 2.06,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH067.wav",
+          "sha256": "C027A483BCE68F975C25AAE283D68C1AF8BF603FDFB0A7709917EA5030C1FE80",
+          "byteLength": 252204,
+          "durationSeconds": 3.94,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH068",
+      "zh": "好，認輸的話這次由我來說。你贏了。",
+      "ja": "うん、今回は私が言う番だね。負けました。",
+      "direction": "終局演出；不是新增投降功能",
+      "proposedTrigger": "正式結果：玩家將死莉莉絲",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH068.wav",
+          "sha256": "C0E28FD6A6C6ED65A50BFC6E0ECF83B7B92E05E458F5ECC5C082CB82CE61D3EF",
+          "byteLength": 329004,
+          "durationSeconds": 5.14,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH068.wav",
+          "sha256": "1AF49B58B964D06E4A41EEABF86FC1064F7FF962E978BFBE09862E211C5B3044",
+          "byteLength": 300844,
+          "durationSeconds": 4.7,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH069",
+      "zh": "和棋。這次誰也沒帶走勝利。",
+      "ja": "引き分け。今回は、どちらも勝ちを持ち帰れなかったね。",
+      "direction": "平和",
+      "proposedTrigger": "正式結果：和棋；任一原因",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH069.wav",
+          "sha256": "EF9C69BECEBC56A9730A4904BE5659522DE6AE9C833A17193011E881CFCCAB0D",
+          "byteLength": 231724,
+          "durationSeconds": 3.62,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH069.wav",
+          "sha256": "CE21E015721576256024EE1D3B80C99CFF1668CB3A936690B0BFE335926CD869",
+          "byteLength": 318764,
+          "durationSeconds": 4.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH070",
+      "zh": "這局，就在這裡握手吧。",
+      "ja": "この一局は、ここで握手だね。",
+      "direction": "比喻收尾、不執行玩家動作",
+      "proposedTrigger": "正式結果：和棋；任一原因",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH070.wav",
+          "sha256": "306FAE7F46C60BA34881E6F8FB31EF39BF52061DE79BC7906534384180876068",
+          "byteLength": 201004,
+          "durationSeconds": 3.14,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH070.wav",
+          "sha256": "9D86EF1EE84CF2F42E7C9E8A334A5995DE064E7ADF693D1660B1CFC757C693C8",
+          "byteLength": 180524,
+          "durationSeconds": 2.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH071",
+      "zh": "沒被將軍，卻也無棋可走。這局逼和。",
+      "ja": "チェックではないのに、指せる手がない。ステイルメイトだね。",
+      "direction": "清楚區分將死",
+      "proposedTrigger": "正式結果：逼和",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH071.wav",
+          "sha256": "B8F1C6B3E3787AF65DFD69EE1ACB5174D82747F32BD06AEF7B8F1055D39904DB",
+          "byteLength": 329004,
+          "durationSeconds": 5.14,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH071.wav",
+          "sha256": "4886BC5C69B2446BE140FDE3A26B82E283F87777AC8106A7E921715E88A6E8F4",
+          "byteLength": 277804,
+          "durationSeconds": 4.34,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH072",
+      "zh": "剩下的棋子無法分出勝負，和棋了。",
+      "ja": "残った駒ではメイトできないから、引き分けだね。",
+      "direction": "只在規則明確判定後",
+      "proposedTrigger": "正式結果：確認規則因子力不足判和棋",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH072.wav",
+          "sha256": "84E7F70EF6142C544C21C0438A91EF8B73DBC615EE60086CC0272C4CFDED927A",
+          "byteLength": 271404,
+          "durationSeconds": 4.24,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH072.wav",
+          "sha256": "C52936F6FF57571B47C4D90B442D214351652087B529960A6D1E30DF8B8927AD",
+          "byteLength": 254764,
+          "durationSeconds": 3.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH073",
+      "zh": "又回到同樣的局面了。這次以和棋結束。",
+      "ja": "同じ局面に戻ったね。今回は引き分けでおしまい。",
+      "direction": "不把可申請說成自動結束",
+      "proposedTrigger": "正式結果：合法重複局面和棋已生效",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH073.wav",
+          "sha256": "8AC78CD08C0EA12FE80CFBFAE20025C06C528DB046798312259AF78427C20BBA",
+          "byteLength": 282924,
+          "durationSeconds": 4.42,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH073.wav",
+          "sha256": "75B39CEDD156498C9B344C538A06E700FB73B4FEA00E03FDE01653AF304CC60B",
+          "byteLength": 341804,
+          "durationSeconds": 5.34,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH074",
+      "zh": "依規則，這局到此和棋。",
+      "ja": "ルールによって、この対局は引き分けだね。",
+      "direction": "不混淆五十／七十五步",
+      "proposedTrigger": "正式結果：合法步數規則和棋已生效",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH074.wav",
+          "sha256": "547145A3AEAD7F99EF12CC3A3AAD5E4796192501C1B4D930513EDD226A90E76F",
+          "byteLength": 203564,
+          "durationSeconds": 3.18,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH074.wav",
+          "sha256": "64AB815C67696A8BDE1461F353DF62A625BE933830B4F8CC2673CDF627AA9F25",
+          "byteLength": 254764,
+          "durationSeconds": 3.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH075",
+      "zh": "現在可以申請和棋，要這樣結束嗎？",
+      "ja": "今なら引き分けを申請できる。このまま終える？",
+      "direction": "中性；不替玩家提交",
+      "proposedTrigger": "玩家打開選單且確認可合法申請和棋",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH075.wav",
+          "sha256": "CD268D597DC9C9F784077D69D7F7908E2F05C16D7513FD45600A1C8C1280CD3B",
+          "byteLength": 243244,
+          "durationSeconds": 3.8,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH075.wav",
+          "sha256": "3D4BA323EE013E3C191E68637D69E8493B67F809C54633E7D0880A96A5A7DDC9",
+          "byteLength": 288044,
+          "durationSeconds": 4.5,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH076",
+      "zh": "走了這麼久，最後誰也沒讓誰。",
+      "ja": "ここまで指して、最後までお互い譲らなかったね。",
+      "direction": "溫和感想",
+      "proposedTrigger": "正式和棋後；較長局且記錄成立",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH076.wav",
+          "sha256": "E049D81B180B8A3794E306EEF4A9B1D8B72320C18DAAC7CAC68BBC4A9CF2FEB2",
+          "byteLength": 234284,
+          "durationSeconds": 3.66,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH076.wav",
+          "sha256": "2B0B6A996F75FF72AD00477860A4BDB4B6982DA318AC3DF5957F459FF9EFAD1D",
+          "byteLength": 270124,
+          "durationSeconds": 4.22,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH077",
+      "zh": "剛才那枚小兵，都走成別的樣子了。",
+      "ja": "さっきのポーン、最後には別の姿になってたね。",
+      "direction": "依本局事件，不杜撰往事",
+      "proposedTrigger": "正式結果後；這局確有升變",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH077.wav",
+          "sha256": "61D7021DA4FEFE487F1D920E2368FB16C9158F789B99B374987CE808E8BAAA02",
+          "byteLength": 234284,
+          "durationSeconds": 3.66,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH077.wav",
+          "sha256": "55F085441765FD4C2F082D831F574866D37CEADB04BF8BC35567BD9BA77B2EB0",
+          "byteLength": 257324,
+          "durationSeconds": 4.02,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH078",
+      "zh": "剛開始滿滿一盤，現在倒空出不少地方。",
+      "ja": "最初はいっぱいだった盤も、ずいぶん広くなったね。",
+      "direction": "選用需確認實際子數減少",
+      "proposedTrigger": "正式結果後；本局雙方都有公開吃子",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH078.wav",
+          "sha256": "779A29086BF12DD992AF3DC16CF60F9BECEC15A817D4CDFEDB06DADC815A5CB3",
+          "byteLength": 289324,
+          "durationSeconds": 4.52,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH078.wav",
+          "sha256": "CE0AFDB41E77C488EACB72285DACAE7FE4C58CB206FE6CBDA7AA9512B3A340FB",
+          "byteLength": 254764,
+          "durationSeconds": 3.98,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH079",
+      "zh": "又被你贏了一局。下次我得更認真。",
+      "ja": "また一本取られたね。次は、もう少し気を引き締めよう。",
+      "direction": "不承諾必勝，不催再玩",
+      "proposedTrigger": "正式結果：玩家連勝；只用本次可驗證場次",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH079.wav",
+          "sha256": "579AE1A18E8ADCD73C446759DD17B8010B700A19D1939F4BA739E765E7D86033",
+          "byteLength": 289324,
+          "durationSeconds": 4.52,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH079.wav",
+          "sha256": "E545542EBE86F79E02CCBC397691C467380C5E7932E9898FA4501B551083A739",
+          "byteLength": 403244,
+          "durationSeconds": 6.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH080",
+      "zh": "這次也讓我拿下了。先得意一下就好。",
+      "ja": "今回も勝てた。自慢は、ちょっとだけにしておくね。",
+      "direction": "克制得意",
+      "proposedTrigger": "正式結果：莉莉絲連勝；只用本次可驗證場次",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH080.wav",
+          "sha256": "CF39C479637BFC2B4096DB765E3B639DEE255C7E35B285B67849FFAAF3E47099",
+          "byteLength": 262444,
+          "durationSeconds": 4.1,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH080.wav",
+          "sha256": "45B3C33411E2207E871867499DE1CB730881C77C4C49EE93342D583F9DBF7139",
+          "byteLength": 280364,
+          "durationSeconds": 4.38,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH081",
+      "zh": "我的連勝，就到你這一步為止了。",
+      "ja": "私の連勝は、その一手でおしまいだね。",
+      "direction": "承認、無責怪",
+      "proposedTrigger": "正式結果：玩家終結莉莉絲本段連勝",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH081.wav",
+          "sha256": "C2068A67AB867D9590C0E2A86DC66873CDFE62DF3E6679539E91D7FBC6F80374",
+          "byteLength": 208684,
+          "durationSeconds": 3.26,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH081.wav",
+          "sha256": "D44BCDD859F6B96619FD09661FFDB542A56B9E7644F80FF17B219E39651EC933",
+          "byteLength": 270124,
+          "durationSeconds": 4.22,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "wronged",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH082",
+      "zh": "棋子回到起點，我們重新來。",
+      "ja": "駒は出発点へ。最初から始めよう。",
+      "direction": "不把未完成局記為勝負",
+      "proposedTrigger": "玩家選重新開始；新局已成功建立",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH082.wav",
+          "sha256": "B48C35F9AF67BF1DC19499307FF9E66E115EA0ECB8C885692FEEC58DDAC4BC6B",
+          "byteLength": 211244,
+          "durationSeconds": 3.3,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH082.wav",
+          "sha256": "2CCEDA2583B130E220C85DC2D0A277B96E9D292ED3711F52ABA02B92123CCC74",
+          "byteLength": 249644,
+          "durationSeconds": 3.9,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH083",
+      "zh": "要重開，還是不玩了？時鐘還在走喔。",
+      "ja": "最初からやり直す？ それとも、やめる？ 時計は動いたままだよ。",
+      "direction": "說明一次；不暫停",
+      "proposedTrigger": "雙擊莉莉絲；開啟局中選項；挑戰且時計確仍走",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH083.wav",
+          "sha256": "B58ABAE665979995F01D77E562E6940B7E86CE3EF292D6EC61C9E2E345CDDC3A",
+          "byteLength": 271404,
+          "durationSeconds": 4.24,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH083.wav",
+          "sha256": "B15FDDF370D8B32220DB97833D513099E6CEA066D1846F1D604851159D84D84F",
+          "byteLength": 436524,
+          "durationSeconds": 6.82,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-CH084",
+      "zh": "要重新開始，還是先收起棋盤？",
+      "ja": "最初からやり直す？ それとも、盤を片づける？",
+      "direction": "中性、無挽留",
+      "proposedTrigger": "雙擊莉莉絲；開啟局中選項；休閒",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-CH084.wav",
+          "sha256": "CD5E5DDFA0169443CED6EBB3757EE5D076E95C11E4E086B4AEA1364232C9889A",
+          "byteLength": 236844,
+          "durationSeconds": 3.7,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "calm",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-CH084.wav",
+          "sha256": "8199751AF47BBED5F49EA963D5078684339F8D66324D280E363D8CC488391245",
+          "byteLength": 303404,
+          "durationSeconds": 4.74,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "gentle",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM073",
+      "zh": "我這裡才沒有鬼牌呢。",
+      "ja": "私の手札にジョーカーなんて、ないよ。",
+      "direction": "帶笑意的遊戲內唬人；輕巧否認，不是真實牌況報告",
+      "proposedTrigger": "莉莉絲抽牌與整理完成後的普通反應共用池；不依鬼牌持有人分流",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM073.wav",
+          "sha256": "E293F001C83D3612B9BC44A74846C760656FE143BB05E0DCDA26251B945E758A",
+          "byteLength": 122924,
+          "durationSeconds": 1.92,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM073.wav",
+          "sha256": "D16EA80D0B0F027F2DEB67533ADB69D8672BDAB71828E9ECCC769622B547A800",
+          "byteLength": 257324,
+          "durationSeconds": 4.02,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    },
+    {
+      "id": "GD-OM074",
+      "zh": "放心抽吧，我的牌都很安全喔。",
+      "ja": "安心して引いて。私のカードは、どれも安全だよ。",
+      "direction": "親近而故作無辜的遊戲內誘導；不指定卡位，不保證真實牌況",
+      "proposedTrigger": "莉莉絲抽牌與整理完成後的普通反應共用池；不依鬼牌持有人分流",
+      "audio": {
+        "zh": {
+          "relativePath": "zh/GD-OM074.wav",
+          "sha256": "51059E862B6E34063F5624320F96558B839D514BA88F013C2ADA84A552F2D0F1",
+          "byteLength": 248364,
+          "durationSeconds": 3.88,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "excited",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        },
+        "ja": {
+          "relativePath": "ja/GD-OM074.wav",
+          "sha256": "724AF57AC10D7312B14AFDB5179C4D3F077005060FD584F023790B93A513CD50",
+          "byteLength": 364844,
+          "durationSeconds": 5.7,
+          "sampleRate": 32000,
+          "channels": 1,
+          "bitsPerSample": 16,
+          "emotion": "playful",
+          "humanListeningAccepted": false,
+          "reusedAcceptedAudition": false
+        }
+      }
+    }
+  ],
+  "extensions": [
+    {
+      "reviewDocumentSha256": "6C83996131331304561688ED85CE8BDB9B100620BF245B8976FBF1C01E64A3F7",
+      "sourceManifestSha256": "24F356533725628DED076AB0C1B96B90AFCDB6515025EFB3B996068B517F2DB5",
+      "sourceCatalogSha256": "D62813E5D9E4A5CCE1D632C216ABC65CAA03EBF8796DD0319339C0C1829A1D2E",
+      "ids": [
+        "GD-OM073",
+        "GD-OM074"
+      ]
+    }
+  ]
+}

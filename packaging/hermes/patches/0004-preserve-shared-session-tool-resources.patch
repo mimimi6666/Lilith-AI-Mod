@@ -1,0 +1,363 @@
+From: Lilith Runtime Integration
+Subject: [PATCH] Preserve shared session tool resources across auxiliary close
+
+Background review, manual compression, and session-hygiene agents intentionally
+alias a live session_id. Their close() must not tear down processes, terminal or
+browser sessions, or computer-use target state owned by the primary agent.
+
+Add explicit session tool-resource ownership, opt all three auxiliary paths out,
+and cover lifecycle assignment, local cleanup, and captured-target preservation.
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1663,6 +1663,13 @@ def init_agent(
+     # background skill/memory review fork so its harness turn can't leak into
+     # the user's real session and hijack the next live turn. Default False.
+     agent._persist_disabled = False
++    # Whether this agent owns session-scoped execution resources keyed by
++    # session_id (processes, terminal/browser sessions, and computer-use
++    # target/ref state). The primary agent owns them by default. Auxiliary
++    # agents that deliberately alias an existing live session_id must opt out
++    # before they run, otherwise their close() would tear down the primary
++    # agent's still-live execution state.
++    agent._owns_session_tool_resources = True
+     agent._session_init_model_config = {
+         "max_iterations": agent.max_iterations,
+         "reasoning_config": reasoning_config,
+diff --git a/agent/background_review.py b/agent/background_review.py
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -854,6 +854,11 @@ def _run_review_in_thread(
+             review_agent._persist_disabled = True
+             review_agent._session_db = None
+             review_agent._session_json_enabled = False
++            # This fork aliases the live parent's session_id for prompt-cache
++            # parity. It does not own resources keyed by that identity: closing
++            # the review must not kill the parent's processes or discard its
++            # browser/computer-use target state between foreground turns.
++            review_agent._owns_session_tool_resources = False
+             # Suppress all status/warning emits from the fork so the
+             # user only sees the final successful-action summary.
+             # Without this, mid-review "Iteration budget exhausted",
+diff --git a/run_agent.py b/run_agent.py
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -4314,36 +4314,41 @@ class AIAgent:
+         """
+         task_id = getattr(self, "session_id", None) or ""
+ 
+-        # 1. Kill background processes for this task
+-        try:
+-            from tools.process_registry import process_registry
+-            process_registry.kill_all(task_id=task_id)
+-        except Exception:
+-            pass
++        # Auxiliary agents may deliberately alias a live parent's session_id
++        # (background review does this for prompt-cache parity). Only the
++        # explicit owner may tear down resources keyed by that shared identity;
++        # the auxiliary instance still closes its own clients/children below.
++        if getattr(self, "_owns_session_tool_resources", True):
++            # 1. Kill background processes for this task
++            try:
++                from tools.process_registry import process_registry
++                process_registry.kill_all(task_id=task_id)
++            except Exception:
++                pass
+ 
+-        # 2. Clean terminal sandbox environments
+-        try:
+-            cleanup_vm(task_id)
+-        except Exception:
+-            pass
++            # 2. Clean terminal sandbox environments
++            try:
++                cleanup_vm(task_id)
++            except Exception:
++                pass
+ 
+-        # 3. Clean browser daemon sessions
+-        try:
+-            cleanup_browser(task_id)
+-        except Exception:
+-            pass
++            # 3. Clean browser daemon sessions
++            try:
++                cleanup_browser(task_id)
++            except Exception:
++                pass
+ 
+-        # 4. Release the session-owned computer-use backend.  This ends the
+-        # exact cua-driver session, drops typed-browser refs/grants, and stops
+-        # a private embedded daemon when Hermes YOLO selected unrestricted
+-        # mode.  The import is lazy so sessions without computer_use retain
+-        # the narrow core footprint.
+-        try:
+-            from tools.computer_use import release_computer_use_session
++            # 4. Release the session-owned computer-use backend.  This ends the
++            # exact cua-driver session, drops typed-browser refs/grants, and stops
++            # a private embedded daemon when Hermes YOLO selected unrestricted
++            # mode.  The import is lazy so sessions without computer_use retain
++            # the narrow core footprint.
++            try:
++                from tools.computer_use import release_computer_use_session
+ 
+-            release_computer_use_session(task_id)
+-        except Exception:
+-            pass
++                release_computer_use_session(task_id)
++            except Exception:
++                pass
+ 
+         # 5. Close active child agents
+         try:
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -4167,6 +4167,11 @@ class GatewaySlashCommandsMixin:
+                 session_id=session_entry.session_id,
+                 session_db=getattr(self._session_db, "_db", self._session_db),
+             )
++            # This temporary compressor deliberately aliases the live gateway
++            # session. It may use that session's context, but it must not own
++            # or tear down processes, browser state, or computer-use targets
++            # when the helper closes.
++            tmp_agent._owns_session_tool_resources = False
+             _seed_hygiene_system_prompt(tmp_agent, session_row)
+             # Keep the real source platform during construction so external
+             # context engines bind correctly. If compression has to rebuild the
+diff --git a/gateway/run.py b/gateway/run.py
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -18431,6 +18431,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                                     session_id=session_entry.session_id,
+                                     session_db=_hyg_session_db,
+                                 )
++                                # The hygiene helper aliases the live gateway
++                                # session only to compact its context. Closing
++                                # it must not evict the primary agent's shared
++                                # process/browser/computer-use resources.
++                                _hyg_agent._owns_session_tool_resources = False
+                                 _seed_hygiene_system_prompt(
+                                     _hyg_agent,
+                                     _hyg_session_row,
+diff --git a/tests/run_agent/test_background_review.py b/tests/run_agent/test_background_review.py
+--- a/tests/run_agent/test_background_review.py
++++ b/tests/run_agent/test_background_review.py
+@@ -81,11 +81,11 @@ def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
+     ]
+ 
+ 
+-def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
++def test_background_review_fork_opts_out_of_shared_session_ownership(monkeypatch):
+     """The review fork shares the parent's live session_id, so it must set
+-    ``_end_session_on_close = False``. Otherwise close() (now finalizing owned
+-    session rows) would end the still-active parent session mid-conversation
+-    every time the review fires (~every 10 turns). Regression for #12029.
++    both lifecycle ownership flags to False. Otherwise close() would end the
++    still-active parent session row or tear down its session-scoped execution
++    resources every time the review fires (~every 10 turns).
+     """
+     seen = {}
+ 
+@@ -94,15 +94,21 @@ def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
+             self._session_messages = []
+             # Default matches AIAgent.__init__ (agent_init.py): owns its row.
+             self._end_session_on_close = True
++            self._owns_session_tool_resources = True
+ 
+         def __setattr__(self, name, value):
+             object.__setattr__(self, name, value)
+             if name == "_end_session_on_close":
+                 seen["end_session_on_close"] = value
++            if name == "_owns_session_tool_resources":
++                seen["owns_session_tool_resources"] = value
+ 
+         def run_conversation(self, **kwargs):
+             # By the time the fork runs, the opt-out must already be applied.
+             seen["at_run_time"] = self._end_session_on_close
++            seen["owns_resources_at_run_time"] = (
++                self._owns_session_tool_resources
++            )
+ 
+         def shutdown_memory_provider(self):
+             pass
+@@ -123,6 +129,8 @@ def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
+ 
+     assert seen.get("end_session_on_close") is False
+     assert seen.get("at_run_time") is False
++    assert seen.get("owns_session_tool_resources") is False
++    assert seen.get("owns_resources_at_run_time") is False
+ 
+ 
+ def test_background_review_registers_on_active_children_for_interrupt(monkeypatch):
+diff --git a/tests/tools/test_zombie_process_cleanup.py b/tests/tools/test_zombie_process_cleanup.py
+--- a/tests/tools/test_zombie_process_cleanup.py
++++ b/tests/tools/test_zombie_process_cleanup.py
+@@ -120,6 +120,32 @@ class TestAgentCloseMethod:
+                 mock_cleanup_browser.assert_called_once_with("test-close-cleanup")
+                 mock_cleanup_cua.assert_called_once_with("test-close-cleanup")
+ 
++    def test_close_non_owner_preserves_shared_session_resources(self):
++        """An auxiliary agent sharing a live session must not tear it down."""
++        from unittest.mock import MagicMock, patch
++
++        with patch("run_agent.AIAgent.__init__", return_value=None):
++            from run_agent import AIAgent
++            agent = AIAgent.__new__(AIAgent)
++            agent.session_id = "shared-live-session"
++            agent._owns_session_tool_resources = False
++            child = MagicMock()
++            agent._active_children = [child]
++            agent._active_children_lock = threading.Lock()
++            agent.client = None
++
++            with patch("tools.process_registry.process_registry") as mock_registry, \
++                 patch("run_agent.cleanup_vm") as mock_cleanup_vm, \
++                 patch("run_agent.cleanup_browser") as mock_cleanup_browser, \
++                 patch("tools.computer_use.release_computer_use_session") as mock_cleanup_cua:
++                agent.close()
++
++            mock_registry.kill_all.assert_not_called()
++            mock_cleanup_vm.assert_not_called()
++            mock_cleanup_browser.assert_not_called()
++            mock_cleanup_cua.assert_not_called()
++            child.close.assert_called_once()
++
+     def test_close_is_idempotent(self):
+         """close() can be called multiple times without error."""
+         from unittest.mock import patch
+diff --git a/tests/tools/test_computer_use_approval_isolation.py b/tests/tools/test_computer_use_approval_isolation.py
+--- a/tests/tools/test_computer_use_approval_isolation.py
++++ b/tests/tools/test_computer_use_approval_isolation.py
+@@ -11,6 +11,7 @@ below simulates the forgetful test and asserts the next test reaches the
+ """
+ 
+ import json
++import threading
+ 
+ 
+ def _install_backend(cu_tool):
+@@ -150,3 +151,99 @@ def test_safe_action_never_requests_generic_approval(monkeypatch):
+ 
+     assert result["mode"] == "som"
+     assert backend.calls == []
++
++
++def test_non_owner_review_close_preserves_captured_target_until_owner_close(
++    monkeypatch,
++):
++    """A review fork sharing session_id must not evict the live CUA backend."""
++    from run_agent import AIAgent
++    from tools.computer_use import tool as cu_tool
++    from tools.computer_use.backend import ActionResult, CaptureResult
++
++    class TargetBackend:
++        def __init__(self):
++            self.active = False
++            self.stop_count = 0
++
++        def start(self):
++            pass
++
++        def stop(self):
++            self.stop_count += 1
++
++        def capture(self, **_kwargs):
++            self.active = True
++            return CaptureResult(
++                mode="ax",
++                width=1,
++                height=1,
++                png_b64=None,
++                elements=[],
++                app="Hermes Workbench",
++                window_title="Hermes Workbench",
++            )
++
++        def set_value(self, value, element=None):
++            if not self.active:
++                return ActionResult(
++                    ok=False,
++                    action="set_value",
++                    message="No active window",
++                )
++            return ActionResult(ok=True, action="set_value")
++
++    def bare_agent(*, owns_resources):
++        agent = object.__new__(AIAgent)
++        agent.session_id = "shared-live-session"
++        agent._owns_session_tool_resources = owns_resources
++        agent._active_children = []
++        agent._active_children_lock = threading.Lock()
++        agent.client = None
++        agent._session_db = None
++        agent._end_session_on_close = False
++        return agent
++
++    monkeypatch.setattr(
++        "tools.approval.request_tool_approval",
++        lambda *_args, **_kwargs: {"approved": True, "message": None},
++    )
++    monkeypatch.setattr(
++        "tools.process_registry.process_registry.kill_all",
++        lambda **_kwargs: None,
++    )
++    monkeypatch.setattr("run_agent.cleanup_vm", lambda _task_id: None)
++    monkeypatch.setattr("run_agent.cleanup_browser", lambda _task_id: None)
++
++    cu_tool.reset_backend_for_tests()
++    backend = TargetBackend()
++    session_id = "shared-live-session"
++    with cu_tool._backend_lock:
++        cu_tool._backends[session_id] = backend
++        cu_tool._backend_call_locks[session_id] = threading.RLock()
++        cu_tool._backend_permission_modes[session_id] = "standard"
++
++    capture = cu_tool.handle_computer_use(
++        {"action": "capture", "mode": "ax", "pid": 1, "window_id": 2},
++        session_id=session_id,
++    )
++    assert backend.active is True
++    assert json.loads(capture)["mode"] == "ax"
++
++    bare_agent(owns_resources=False).close()
++    with cu_tool._backend_lock:
++        assert cu_tool._backends[session_id] is backend
++    assert backend.stop_count == 0
++
++    result = json.loads(
++        cu_tool.handle_computer_use(
++            {"action": "set_value", "element": 20, "value": "ok"},
++            session_id=session_id,
++        )
++    )
++    assert result["ok"] is True
++
++    bare_agent(owns_resources=True).close()
++    with cu_tool._backend_lock:
++        assert session_id not in cu_tool._backends
++    assert backend.stop_count == 1
+
+diff --git a/tests/gateway/test_compress_command.py b/tests/gateway/test_compress_command.py
+--- a/tests/gateway/test_compress_command.py
++++ b/tests/gateway/test_compress_command.py
+@@ -261,6 +261,7 @@ async def test_compress_command_preserves_platform_and_gateway_session_key():
+     # Stable gateway session key preserved, identical to a normal gateway turn.
+     assert kwargs.get("gateway_session_key") == runner._session_key_for_source(_make_source())
+     assert kwargs["gateway_session_key"]
++    assert agent_instance._owns_session_tool_resources is False
+
+
+ @pytest.mark.asyncio
+diff --git a/tests/gateway/test_session_hygiene.py b/tests/gateway/test_session_hygiene.py
+--- a/tests/gateway/test_session_hygiene.py
++++ b/tests/gateway/test_session_hygiene.py
+@@ -689,6 +689,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
+             type(self).last_instance = self
+
+         def _compress_context(self, messages, *_args, **_kwargs):
++            assert self._owns_session_tool_resources is False
+             assert self.compression_in_place is True
+             assert self._session_db is fake_db
+             assert self.platform == "gateway_hygiene"

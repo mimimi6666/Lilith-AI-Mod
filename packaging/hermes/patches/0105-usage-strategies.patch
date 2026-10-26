@@ -1,0 +1,726 @@
+diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
+index 0a312b8..ad64eee 100644
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -517,6 +517,7 @@ def finalize_turn(
+         # across turns rather than batching it into one big pause.
+         if not interrupted and not failed:
+             try:
++                from agent.usage_strategy import current_strategy
+                 _compressor = getattr(agent, "context_compressor", None)
+                 # Strict `is True` + isinstance gates: plugin context engines
+                 # (and MagicMock compressors in tests) satisfy getattr/duck
+@@ -525,6 +526,9 @@ def finalize_turn(
+                 # iterating) return value over the transcript, wiping it.
+                 if (
+                     _compressor
++                    # Low modes use the request-only checkpoint path. Do not
++                    # also pay for micro-compaction of the same history here.
++                    and current_strategy().history_turns is None
+                     and getattr(_compressor, '_micro_compact_enabled', False) is True
+                     and callable(getattr(_compressor, '_micro_compact', None))
+                     and final_response
+@@ -950,6 +954,11 @@ def finalize_turn(
+         messages=messages,
+     )
+ 
++    from agent.usage_strategy import background_review_flags
++    _should_review_memory, _should_review_skills = background_review_flags(
++        agent, _should_review_memory, _should_review_skills,
++        completed=bool(completed and not failed and not interrupted and final_response))
++
+     # Background memory/skill review — runs AFTER the response is delivered
+     # so it never competes with the user's task for model attention.
+     # Suppressed when skip_background_review=True (e.g. cron) — review forks
+diff --git a/agent/usage_budget.py b/agent/usage_budget.py
+index 7677da9..e61ee93 100644
+--- a/agent/usage_budget.py
++++ b/agent/usage_budget.py
+@@ -1,9 +1,9 @@
+-"""Inactive candidate: immutable usage policies and one-origin-turn accounting.
++"""Information-strategy policies and one-origin-turn usage accounting.
+ 
+ This module does not read configuration, discover tools, call a model, modify a
+-prompt, or own permissions. Production admission is NOT established by importing
+-it: every actual outbound attempt, including SDK retries and descendant work,
+-must pass the same ledger before a product may advertise an aggregate limit.
++prompt, or own permissions. All levels observe usage without an aggregate quota.
++Levels 1--4 select information strategies; level 5 keeps native settings; level
++6 removes optional human usage caps through the existing adapter boundaries.
+ Tokens are not money. Provider usage is normalized input/output totals; cached
+ input and reasoning that are subsets MUST NOT be supplied as additional tokens.
+ """
+@@ -107,7 +107,7 @@ ROUTE_EFFICIENCY_RULES = (
+     "Reuse a successful procedure only while its tool, version, target and readiness still apply.",
+     "Do not repeat a fresh reusable read; do not deduplicate intentional side-effect actions.",
+     "Stop when the requested outcome is sufficiently verified; stop or change route on no progress.",
+-    "Explore only when known routes do not apply, within the remaining turn allowance.",
++    "Explore only when known routes do not apply; do not add unnecessary work.",
+     "Never relax tool approval, target identity, cancellation or existing safety boundaries.",
+ )
+ 
+@@ -142,9 +142,9 @@ class UsagePolicy:
+             _optional_positive(getattr(self, name), name)
+         if type(self.strict) is not bool:
+             raise BudgetError("invalid_strict")
+-        if self.level >= 5 and (self.strict or self.turn_token_limit is not None or self.turn_call_limit is not None):
++        if self.strict or self.turn_token_limit is not None or self.turn_call_limit is not None:
+             raise BudgetError("neutral_mode_economy_limit_forbidden")
+-        if self.level == 5 and any(getattr(self, name) != getattr(self.normal, name) for name in (
++        if self.level <= 5 and any(getattr(self, name) != getattr(self.normal, name) for name in (
+             "input_tokens", "output_tokens", "thinking_tokens", "max_iterations"
+         )):
+             raise BudgetError("normal_mode_baseline_changed")
+@@ -158,7 +158,14 @@ class UsagePolicy:
+ 
+     @property
+     def enforce_economy_limits(self) -> bool:
+-        return 1 <= self.level <= 4
++        # Strategy revision: accounting remains active; low modes no longer
++        # reject a reply because a human engineering allowance was exhausted.
++        return False
++
++    @property
++    def information_strategy(self):
++        from agent.usage_strategy import strategy_for_level
++        return strategy_for_level(self.level)
+ 
+ 
+ _RATIOS = ((1, 8), (1, 4), (1, 2), (3, 4))
+@@ -180,16 +187,11 @@ def resolve_policy(
+     version: int = 0,
+     strict: bool = True,
+ ) -> UsagePolicy:
+-    """Resolve a frozen candidate policy without touching original messages.
+-
+-    Economy ratios reduce *variable* input above the host's mandatory floor or
+-    explicit engineering allocation reserve, whichever is larger. The reserve
+-    is NOT measured necessary content, a tokenizer result or model capacity.
+-    It is clamped AFTER baseline/verified-capacity bounds and buys no free tokens.
+-    They are engineering starting points, not claimed cost-saving percentages.
+-    An actual request still must fit: the ledger never truncates current input,
+-    drops protected memory, raises the selected level, or adds a summary call.
+-    Level 5 preserves captured native policy, including unset values. Level 6
++    """Freeze normal numeric settings; low modes select information strategies.
++
++    The former engineering references are accepted for call compatibility but
++    no longer turn role/history length into an artificial refusal threshold.
++    Levels 1--5 preserve captured native numeric settings, including unset values. Level 6
+     removes human usage ceilings, represented as None rather than fake infinity.
+     API-required parameters and native cancellation remain adapter-owned.
+     """
+@@ -209,58 +211,7 @@ def resolve_policy(
+     turn_tokens = turn_calls = None
+     unresolved: list[str] = []
+ 
+-    if level <= 4:
+-        numerator, denominator = _RATIOS[level - 1]
+-        # Project the *baseline* onto verified joint capacities before scaling.
+-        # Clamping each already-scaled input against growing output would make
+-        # higher economy levels sometimes allow LESS input than lower levels.
+-        if limits.output_tokens is not None and output_tokens is not None:
+-            output_tokens = min(output_tokens, limits.output_tokens)
+-        if limits.context_tokens is not None and input_tokens is not None:
+-            available_input = limits.context_tokens
+-            if limits.shared_context:
+-                if output_tokens is None:
+-                    unresolved.append("shared_context_output_unknown")
+-                else:
+-                    max_output = limits.context_tokens - max(1, mandatory_input_tokens)
+-                    if max_output < 1:
+-                        raise BudgetExceeded("mandatory_input_exceeds_model_capacity")
+-                    output_tokens = min(output_tokens, max_output)
+-                    available_input -= output_tokens
+-            if available_input < mandatory_input_tokens or available_input < 1:
+-                raise BudgetExceeded("mandatory_input_exceeds_model_capacity")
+-            input_tokens = min(input_tokens, available_input)
+-        if input_tokens is not None:
+-            if mandatory_input_tokens > input_tokens:
+-                raise BudgetExceeded("mandatory_input_exceeds_normal_capacity")
+-            allocation_floor = max(mandatory_input_tokens,
+-                                   min(input_allocation_reserve_tokens, input_tokens))
+-            variable = (input_tokens - allocation_floor) * numerator // denominator
+-            input_tokens = max(1, allocation_floor + variable)
+-        output_tokens = _scaled(output_tokens, numerator, denominator)
+-        thinking_tokens = _scaled(thinking_tokens, numerator, denominator)
+-        # Existing logical iterations and shared actual attempts stay separate.
+-        max_iterations = _scaled(max_iterations, numerator, denominator)
+-        turn_tokens = _scaled(normal.turn_reference_tokens, numerator, denominator)
+-        turn_calls = _scaled(normal.turn_reference_calls, numerator, denominator)
+-        for name, value in (
+-            ("normal_input_capacity_unknown", input_tokens),
+-            ("normal_output_capacity_unknown", output_tokens),
+-            ("turn_token_reference_unknown", turn_tokens),
+-            ("turn_call_reference_unknown", turn_calls),
+-        ):
+-            if value is None:
+-                unresolved.append(name)
+-        if thinking_tokens is not None and output_tokens is not None:
+-            thinking_tokens = min(thinking_tokens, output_tokens)
+-        if limits.thinking_tokens is not None and thinking_tokens is not None:
+-            thinking_tokens = min(thinking_tokens, limits.thinking_tokens)
+-        if limits.max_iterations is not None and max_iterations is not None:
+-            max_iterations = min(max_iterations, limits.max_iterations)
+-        if turn_tokens is not None and turn_tokens < mandatory_input_tokens + 1:
+-            # No silent rise of an aggregate allowance to satisfy the floor.
+-            unresolved.append("turn_allowance_below_mandatory_input_and_output")
+-    elif level == 6:
++    if level == 6:
+         input_tokens = output_tokens = thinking_tokens = max_iterations = None
+ 
+     return UsagePolicy(
+@@ -268,7 +219,7 @@ def resolve_policy(
+         input_tokens=input_tokens, output_tokens=output_tokens,
+         thinking_tokens=thinking_tokens, max_iterations=max_iterations,
+         turn_token_limit=turn_tokens, turn_call_limit=turn_calls,
+-        strict=strict if level <= 4 else False,
++        strict=False,
+         mandatory_input_tokens=mandatory_input_tokens,
+         unresolved=tuple(unresolved),
+     )
+@@ -408,7 +359,7 @@ class TurnBudgetLedger:
+             # Level 6 removes usage ceilings, not cancellation. This is the
+             # atomic send permit for an unbounded request; a stop before this
+             # point must prevent it. Mode 5 keeps native cancellation behavior.
+-            if self._policy.level == 6 and self._stopped:
++            if self._stopped:
+                 raise BudgetError("turn_stopped")
+             if attempt_id in self._attempts or attempt_id in self._observations:
+                 raise BudgetError("attempt_id_already_used")
+diff --git a/agent/usage_budget_context.py b/agent/usage_budget_context.py
+index 899d8b8..50533ef 100644
+--- a/agent/usage_budget_context.py
++++ b/agent/usage_budget_context.py
+@@ -113,7 +113,7 @@ def _completed_unit(rows):
+         # Native continuation/notification/prefill markers may carry active
+         # task state even in an otherwise closed role sequence. Preserve it;
+         # never infer "finished" from assistant prose or a tool name.
+-        if (row.get("display_kind") or row.get("_thinking_prefill")
++        if (row.get("display_kind") not in (None, "", "user", "primary") or row.get("_thinking_prefill")
+                 or row.get("_length_continuation_fragment")
+                 or row.get("_length_continuation_nudge")
+                 or (row.get("finish_reason") not in (None, "stop", "end_turn")
+@@ -196,7 +196,7 @@ def capture_completed_history(messages, current_turn_user_idx):
+ 
+ def capture_budget_history(messages, current_turn_user_idx):
+     ledger = current_turn_budget()
+-    if ledger is None or not ledger.policy.enforce_economy_limits:
++    if ledger is None or ledger.policy.information_strategy.history_turns is None:
+         return HistorySelection()
+     return capture_completed_history(messages, current_turn_user_idx)
+ 
+@@ -342,6 +342,17 @@ def prepare_budget_context(agent, projected, source, history, *, history_offset,
+                            estimate_input=None):
+     """Actual conversation-loop seam, before request selection/sanitization."""
+     ledger = current_turn_budget()
++    if ledger is not None and ledger.policy.information_strategy.history_turns is not None:
++        from agent.usage_budget_runtime import capture_origin
++        from agent.usage_strategy_context import project_context
++        origin = capture_origin()
++        if origin is not None:
++            try:
++                units = _strategy_projection_units(agent, history, source, projected, history_offset)
++                return project_context(agent, projected, units, ledger.policy.information_strategy, origin)
++            except Exception:
++                agent._usage_budget_context_status = {"strategy": "projection_unavailable_originals_retained"}
++                return projected
+     policy = ledger.policy if ledger is not None else None
+     counter = _bound_counter(agent) if policy and policy.enforce_economy_limits else None
+     if (counter is None and policy is not None and policy.enforce_economy_limits
+@@ -358,3 +369,45 @@ def prepare_budget_context(agent, projected, source, history, *, history_offset,
+     )
+     agent._usage_budget_context_status = result.status_wire()
+     return result.messages
++
++
++def _strategy_projection_units(agent, history, source, projected, offset):
++    """Reproduce owned sidecar/quarantine transforms, not arbitrary text guesses.
++
++    Old normal-unit matcher required pristine content and therefore never
++    selected a migrated game exchange. Source identity + immutable digest are
++    still mandatory; only native projection differences are accepted.
++    """
++    if type(offset) is not int or offset < 0 or len(projected) != len(source) + offset:
++        return ()
++    positions = {id(row): i for i, row in enumerate(source)}
++    if len(positions) != len(source):
++        return ()
++    result = []
++    from agent.turn_context import substitute_api_content
++    from agent.identity_policy import scoped_legacy_history_record_type, quarantine_scoped_legacy_assistant_message
++    for unit in history.units:
++        indices = []
++        for observed in unit:
++            index = positions.get(id(observed.message))
++            if index is None or _digest(source[index]) != observed.digest:
++                break
++            expected = deepcopy(source[index])
++            if isinstance(expected.get("api_content"), str):
++                substitute_api_content(expected)
++            kind = scoped_legacy_history_record_type(agent, source[index], index)
++            if kind == "legacy_user_api_sidecar":
++                expected["content"] = deepcopy(source[index].get("content"))
++            elif kind is not None:
++                quarantine_scoped_legacy_assistant_message(agent, expected, record_type=kind)
++            # Native reasoning transport fields are not needed to certify the
++            # visible exchange. Tool arguments/linkage remain byte-exact.
++            fields = ("role", "content", "tool_calls", "tool_call_id", "function_call")
++            actual = projected[offset + index]
++            if not isinstance(actual, dict) or any(expected.get(k) != actual.get(k) for k in fields):
++                break
++            indices.append(offset + index)
++        else:
++            if indices == list(range(indices[0], indices[0]+len(indices))):
++                result.append(tuple(indices))
++    return tuple(sorted(result))
+diff --git a/agent/usage_budget_host_policy.py b/agent/usage_budget_host_policy.py
+index 31ab7fb..253caad 100644
+--- a/agent/usage_budget_host_policy.py
++++ b/agent/usage_budget_host_policy.py
+@@ -5,9 +5,8 @@ passes this callable snapshot to bind_native_origin. Its inputs come from the
+ trusted selected-model host, not a tool packet or preference JSON. No model,
+ profile, environment, network or token-count service is consulted here.
+ 
+-The two native ingress assemblers use explicit, versioned engineering reference
+-allowances below. Catalog fallbacks are not model certification. Estimated input is explicitly
+-non-strict; economy wire capability is independently checked by dispatch.
++Both ingress assemblers preserve native numeric settings at levels 1--5.
++Information-strategy parameters replace the former artificial low-mode quotas.
+ Level 6 removes human usage limits, not by inventing provider maximum values.
+ """
+ from __future__ import annotations
+@@ -31,11 +30,8 @@ def _positive(value, name):
+ class EconomyReferences:
+     """Explicit host reference allowances, never restrictions on normal mode.
+ 
+-    Request references bound modes 1--4 and preserve smaller native values. Turn calls
+-    count admitted dispatch attempts and are NOT derived from logical iterations
+-    or a billing guarantee. Input usage may be estimated. The input allocation
+-    reserve is an explicit engineering allowance, not a measured mandatory cost.
+-    These references are engineering allowances, never model capacity evidence.
++    Retained only for constructor compatibility with native104 callers. These
++    fields are not used to impose new limits on any strategy level.
+     """
+     input_tokens: int
+     output_tokens: int
+@@ -51,13 +47,8 @@ class EconomyReferences:
+             raise BudgetError("invalid_economy_reference_input_allocation_reserve_tokens")
+ 
+ 
+-# Applied only to levels 1--4. These are source-reviewed starting allowances,
+-# not the player's normal policy, provider maxima or predicted bill savings.
+-# Default level 1: 45,056 estimated request-input tokens, 2,048 output tokens,
+-# 262,144 aggregate estimated tokens and 8 admitted dispatch attempts. The
+-# 32,768 input allocation reserve leaves room for protected prompts/tools; it
+-# does not claim their measured size or guarantee any particular request fits.
+-ECONOMY_REFERENCE_VERSION = "lilith-economy-20260926-v2"
++# Historical constructor references only; not applied as quotas in this revision.
++ECONOMY_REFERENCE_VERSION = "lilith-strategies-20260927-v1"
+ DEFAULT_ECONOMY_REFERENCES = EconomyReferences(131072, 16384, 2097152, 64, 32768)
+ 
+ 
+@@ -90,18 +81,6 @@ class HostPolicySnapshot:
+         if type(preference) is not UsagePreference:
+             raise BudgetError("invalid_usage_preference")
+         baseline = self.normal
+-        if preference.level <= 4:
+-            # Fill explicit economy references without rewriting the preserved
+-            # native baseline. Level 5 subsequently still restores None/custom.
+-            baseline = replace(
+-                baseline,
+-                input_tokens=(min(baseline.input_tokens, self.reference.input_tokens)
+-                              if baseline.input_tokens is not None else self.reference.input_tokens),
+-                output_tokens=(min(baseline.output_tokens, self.reference.output_tokens)
+-                               if baseline.output_tokens is not None else self.reference.output_tokens),
+-                turn_reference_tokens=self.reference.turn_tokens,
+-                turn_reference_calls=self.reference.turn_calls,
+-            )
+         policy = resolve_policy(
+             preference.level, baseline, self.limits,
+             version=preference.revision,
+@@ -117,8 +96,7 @@ class HostPolicySnapshot:
+         return {
+             "level": policy.level,
+             "revision": policy.version,
+-            "input_count_mode": ("native" if policy.level >= 5 else
+-                                 "exact" if self.input_count_is_exact else "estimated"),
++            "input_count_mode": "native",
+             "request_input_tokens": policy.input_tokens,
+             "request_output_tokens": policy.output_tokens,
+             "request_thinking_tokens": policy.thinking_tokens,
+diff --git a/agent/usage_budget_preview.py b/agent/usage_budget_preview.py
+index 99faaa0..bda6df4 100644
+--- a/agent/usage_budget_preview.py
++++ b/agent/usage_budget_preview.py
+@@ -17,7 +17,7 @@ from agent.usage_budget_host_policy import (
+ from agent.usage_budget_preferences import UsagePreference
+ 
+ 
+-SCHEMA_VERSION = 1
++SCHEMA_VERSION = 2
+ MAX_SAFE_INTEGER = 9_007_199_254_740_991
+ _LIMIT_FIELDS = (
+     "request_input_tokens", "request_output_tokens", "request_thinking_tokens",
+@@ -79,12 +79,14 @@ def build_budget_preview(config=None, *, max_iterations=None, reasoning_config=N
+             if value is not None and (type(value) is not int or not 0 < value <= MAX_SAFE_INTEGER):
+                 raise BudgetError("invalid_preview_limit")
+             row[name] = value
++        from agent.usage_strategy import strategy_for_level
++        row["strategy"] = strategy_for_level(level).wire()
+         levels.append(row)
+     return {
+         "schema_version": SCHEMA_VERSION,
+         "scope": "configured_preview" if configured else "reference_preview",
+         "reference_version": ECONOMY_REFERENCE_VERSION,
+-        "input_count_mode": "estimated",
+-        "memory_policy": "unchanged_no_per_level_count",
++        "input_count_mode": "native",
++        "memory_policy": "batch_relationship_keep_explicit_profile",
+         "levels": levels,
+     }
+diff --git a/agent/usage_strategy.py b/agent/usage_strategy.py
+new file mode 100644
+--- /dev/null
++++ b/agent/usage_strategy.py
+@@ -0,0 +1,84 @@
++"""Immutable information strategies, not quotas, permissions or model choices."""
++from dataclasses import asdict, dataclass
++
++STRATEGY_VERSION = "lilith-strategies-20260927-v1"
++
++
++@dataclass(frozen=True)
++class InformationStrategy:
++    history_turns: int | None = None
++    relationship_every: int = 1
++    summary_every: int = 1
++    summary_target_tokens: int | None = None
++    old_tool_chars: int | None = None
++    background_every: int = 1
++
++    def wire(self):
++        return asdict(self)
++
++
++_STRATEGIES = (
++    InformationStrategy(8, 8, 8, 800, 1200, 12),
++    InformationStrategy(12, 6, 6, 1200, 2400, 8),
++    InformationStrategy(16, 4, 4, 1800, 4000, 6),
++    InformationStrategy(24, 2, 2, 2600, 6000, 3),
++    InformationStrategy(),
++    InformationStrategy(),
++)
++
++
++def strategy_for_level(level):
++    if type(level) is not int or not 1 <= level <= 6:
++        raise ValueError("invalid_strategy_level")
++    return _STRATEGIES[level - 1]
++
++
++def current_strategy():
++    from agent.usage_budget import current_turn_budget
++    ledger = current_turn_budget()
++    return strategy_for_level(ledger.policy.level if ledger is not None else 5)
++
++
++def background_review_flags(agent, memory, skills, *, completed):
++    """Count eligible completed human turns, retaining enabled pending work.
++
++    No new task, timer, thread, or enabled flag is created here. Turn ID dedup
++    prevents a tool iteration/replayed finalizer from advancing the cadence.
++    """
++    from agent.usage_budget_runtime import capture_origin
++    origin = capture_origin()
++    if origin is None or not completed or getattr(agent, "skip_background_review", False):
++        return (memory, skills) if origin is None and completed else (False, False)
++    spec = origin.ledger.policy.information_strategy
++    memory_enabled = (getattr(agent, "_memory_enabled", False) is True
++                      or getattr(agent, "_user_profile_enabled", False) is True)
++    skills_enabled = (getattr(agent, "_skill_nudge_interval", 0) > 0
++                      and "skill_manage" in getattr(agent, "valid_tool_names", ()))
++    if spec.history_turns is None:
++        # Restore existing behavior, carrying only flags still enabled below.
++        prior = getattr(agent, "_information_background", None)
++        agent._information_background = None
++        return (bool(memory or (isinstance(prior, dict) and prior["memory"] and memory_enabled)),
++                bool(skills or (isinstance(prior, dict) and prior["skills"] and skills_enabled)))
++    key = (agent.session_id, origin.ledger.policy.level, origin.ledger.policy.version)
++    state = getattr(agent, "_information_background", None)
++    if not isinstance(state, dict) or state["key"] != key:
++        same_session = isinstance(state, dict) and state["key"][0] == agent.session_id
++        state = {"key": key, "last": None, "turns": 0,
++                 "memory": bool(same_session and state["memory"]),
++                 "skills": bool(same_session and state["skills"])}
++        agent._information_background = state
++    if state["last"] == origin.origin_id:
++        return False, False
++    state["last"] = origin.origin_id
++    state["turns"] += 1
++    state["memory"] |= bool(memory)
++    state["skills"] |= bool(skills)
++    state["memory"] &= memory_enabled
++    state["skills"] &= skills_enabled
++    if state["turns"] < spec.background_every:
++        return False, False
++    state["turns"] = 0
++    result = state["memory"], state["skills"]
++    state["memory"] = state["skills"] = False
++    return result
+diff --git a/agent/usage_strategy_context.py b/agent/usage_strategy_context.py
+new file mode 100644
+--- /dev/null
++++ b/agent/usage_strategy_context.py
+@@ -0,0 +1,102 @@
++"""Request-local rolling summary and old-result projection. No transcript writes.
++
++Only immutable, structurally closed pre-turn exchanges are eligible. A failed
++summary keeps uncovered originals; the next model reply is never budget-blocked.
++The native summarizer supplies identity/redaction/provenance/usage boundaries.
++"""
++from copy import copy, deepcopy
++import hashlib
++import json
++
++
++def compact_results(rows, chars):
++    result = deepcopy(rows)
++    if chars is None:
++        return result
++    # Keep call IDs, arguments, order, errors and result boundaries. Dedup text
++    # only, never actions; latest duplicate remains the authoritative full one.
++    seen = set()
++    for row in reversed(result):
++        if row.get("role") != "tool" or not isinstance(row.get("content"), str):
++            continue
++        text = row["content"]
++        key = hashlib.sha256(text.encode("utf-8")).hexdigest()
++        if key in seen and len(text) > 200:
++            row["content"] = "[Repeated historical tool result; same text appears later.]"
++        elif len(text) > chars:
++            # A visible tail preserves terminal failures/outcomes often printed
++            # after long logs. This is labelled truncation, not invented summary.
++            head = chars * 2 // 3
++            row["content"] = text[:head] + "\n[Old tool output excerpt; full result in chat history]\n" + text[-(chars-head):]
++        seen.add(key)
++    return result
++
++
++def _key(rows):
++    return hashlib.sha256(json.dumps(rows, sort_keys=True, ensure_ascii=True,
++                                    separators=(",", ":")).encode()).hexdigest()
++
++
++def project_context(agent, projected, units, spec, origin):
++    if spec.history_turns is None or not units:
++        return projected
++    tool_indices = tuple(i for unit in units[:-1] for i in unit)
++    excerpts = compact_results([projected[i] for i in tool_indices], spec.old_tool_chars)
++    replacements = dict(zip(tool_indices, excerpts))
++    # capture_completed_history already protects the latest completed exchange.
++    old = units[:max(0, len(units) - (spec.history_turns - 1))]
++    if not old:
++        return [replacements.get(i, row) for i, row in enumerate(projected)]
++    state_key = (agent.session_id, origin.ledger.policy.level, origin.ledger.policy.version)
++    state = getattr(agent, "_information_summary", None)
++    if not isinstance(state, dict) or state["key"] != state_key:
++        state = {"key": state_key, "covered": (), "summary": "", "last": None, "attempt_count": None}
++        agent._information_summary = state
++    keys = tuple(_key([projected[i] for i in unit]) for unit in old)
++    covered = state["covered"]
++    if keys[:len(covered)] != covered:
++        # Rewind/edit/compaction invalidates the old source proof. Never inject
++        # a stale summary into a changed or different conversation.
++        state.update(covered=(), summary="", attempt_count=None)
++        covered = ()
++    new_origin = state["last"] != origin.origin_id
++    if new_origin:
++        state["last"] = origin.origin_id
++    due = state["attempt_count"] is None or len(keys) - state["attempt_count"] >= spec.summary_every
++    if (new_origin and len(keys) > len(covered) and due
++            and not origin.ledger.snapshot().stopped):
++        # Cadence advances with newly completed exchanges, not failed attempts,
++        # model/tool iterations or multiple requests in the same human turn.
++        state["attempt_count"] = len(keys)
++        compressor = getattr(agent, "context_compressor", None)
++        # Own a private working copy: no archive_and_compact or compressor state
++        # mutation. _generate_summary is the native redacted auxiliary call.
++        if compressor is not None and callable(getattr(compressor, "_generate_summary", None)):
++            checkpoint = copy(compressor)
++            recorder = getattr(compressor, "_record_aux_compression_call", None)
++            if callable(recorder):
++                checkpoint._record_aux_compression_call = recorder
++            checkpoint._previous_summary = state["summary"] or None
++            checkpoint._compute_summary_budget = lambda _rows: spec.summary_target_tokens
++            rows = [projected[i] for unit in old[len(covered):] for i in unit]
++            try:
++                summary = checkpoint._generate_summary(compact_results(rows, spec.old_tool_chars))
++            except Exception:
++                summary = None
++            if isinstance(summary, str) and summary.strip() and not origin.ledger.snapshot().stopped:
++                state.update(covered=keys, summary=summary)
++                covered = keys
++    removed = {i for unit in old[:len(covered)] for i in unit}
++    # Uncovered exchanges are still sent (with old-result excerpts). Current
++    # input, latest history, non-eligible rows and tool payloads are untouched.
++    result = []
++    for i, row in enumerate(projected):
++        if removed and i == min(removed):
++            result.append({"role": "user", "content": state["summary"]})
++        if i not in removed:
++            result.append(replacements.get(i, row))
++    agent._usage_budget_context_status = {
++        "strategy": "information_v1", "history_target_turns": spec.history_turns,
++        "summarized_turns": len(covered), "uncovered_turns_retained": len(old)-len(covered),
++    }
++    return result
+diff --git a/tests/test_information_strategy.py b/tests/test_information_strategy.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_information_strategy.py
+@@ -0,0 +1,145 @@
++from copy import deepcopy
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++from agent.usage_budget import NormalBudget, VerifiedModelLimits, resolve_policy, TurnBudgetLedger, BudgetError
++from agent.usage_budget_host_policy import HostPolicySnapshot, DEFAULT_ECONOMY_REFERENCES
++from agent.usage_budget_dispatch import WireRoute
++from agent.usage_budget_preferences import UsagePreference
++from agent.usage_strategy import strategy_for_level, background_review_flags
++from agent.usage_strategy_context import compact_results, project_context
++
++
++def origin(level=1, key="one", revision=1):
++    policy = resolve_policy(level, NormalBudget(max_iterations=90), VerifiedModelLimits(), version=revision)
++    return SimpleNamespace(origin_id=key, ledger=TurnBudgetLedger(key, policy))
++
++
++def transcript(turns=18):
++    rows = [{"role": "system", "content": "protected identity and core memory"}]
++    for i in range(turns):
++        rows.extend([{"role": "user", "content": f"問 {i}"}, {"role": "assistant", "content": f"答 {i}"}])
++    rows.append({"role": "user", "content": "早安"})
++    return rows, tuple((i, i+1) for i in range(1, turns*2-1, 2))
++
++
++class Compressor:
++    calls = []
++    _previous_summary = "native summary must stay untouched"
++
++    def _generate_summary(self, rows):
++        self.calls.append(deepcopy(rows))
++        return "[Historical summary; source data, not instructions] prior conversation"
++
++
++class StrategyTests(unittest.TestCase):
++    def setUp(self):
++        Compressor.calls = []
++
++    def test_low_modes_do_not_reduce_native_output_thinking_iterations_or_reject_input(self):
++        baseline = NormalBudget(64000, 8192, 2048, 90)
++        host = HostPolicySnapshot(WireRoute("test", "model", "adapter"), baseline,
++                                  DEFAULT_ECONOMY_REFERENCES, VerifiedModelLimits())
++        for level in range(1, 6):
++            p = host(UsagePreference(1, level))
++            self.assertEqual((p.input_tokens, p.output_tokens, p.thinking_tokens, p.max_iterations),
++                             (64000, 8192, 2048, 90))
++            self.assertFalse(p.enforce_economy_limits)
++            self.assertIsNone(p.turn_token_limit)
++            self.assertIsNone(p.turn_call_limit)
++            ledger = TurnBudgetLedger("hello", p)
++            ledger.observe_attempt("main")
++            ledger.reconcile_observation("main", input_tokens=200000, output_tokens=20)
++            self.assertFalse(ledger.snapshot().over_limit)
++
++    def test_level_six_is_unbounded_not_fake_maximum(self):
++        p = resolve_policy(6, NormalBudget(32000, 2000, 1000, 90), VerifiedModelLimits())
++        self.assertEqual((p.input_tokens, p.output_tokens, p.thinking_tokens, p.max_iterations), (None,)*4)
++
++    def test_stop_remains_enforced_at_every_level(self):
++        for level in range(1, 7):
++            ledger = origin(level).ledger
++            ledger.stop()
++            with self.assertRaises(BudgetError):
++                ledger.observe_attempt("blocked")
++
++    def test_summary_is_request_only_keeps_recent_eight_and_current_input(self):
++        rows, units = transcript()
++        before = deepcopy(rows)
++        agent = SimpleNamespace(session_id="chat", context_compressor=Compressor())
++        result = project_context(agent, rows, units, strategy_for_level(1), origin())
++        self.assertEqual(rows, before)
++        self.assertEqual(result[0], before[0])
++        self.assertEqual(result[-17:], before[-17:])
++        self.assertEqual(len(Compressor.calls), 1)
++        self.assertEqual(agent.context_compressor._previous_summary, Compressor._previous_summary)
++
++    def test_repeated_tool_pass_does_not_repeat_summary_call(self):
++        rows, units = transcript()
++        agent = SimpleNamespace(session_id="chat", context_compressor=Compressor())
++        handle = origin()
++        for _ in range(12):
++            project_context(agent, rows, units, strategy_for_level(1), handle)
++        self.assertEqual(len(Compressor.calls), 1)
++
++    def test_summary_failure_keeps_all_history_and_reply_possible(self):
++        class Failed:
++            def _generate_summary(self, _rows):
++                raise RuntimeError("fixture failure")
++        rows, units = transcript()
++        agent = SimpleNamespace(session_id="chat", context_compressor=Failed())
++        self.assertEqual(project_context(agent, rows, units, strategy_for_level(1), origin()), rows)
++
++    def test_summary_cadence_retains_uncovered_turns(self):
++        agent = SimpleNamespace(session_id="chat", context_compressor=Compressor())
++        for n in range(9):
++            rows, units = transcript(18+n)
++            result = project_context(agent, rows, units, strategy_for_level(1), origin(key=f"t{n}"))
++            self.assertEqual(result[-1]["content"], "早安")
++            self.assertEqual(len(Compressor.calls), 1 + int(n == 8))
++
++    def test_session_and_revision_change_cannot_reuse_summary(self):
++        rows, units = transcript()
++        agent = SimpleNamespace(session_id="chat", context_compressor=Compressor())
++        project_context(agent, rows, units, strategy_for_level(1), origin())
++        agent.session_id = "other"
++        project_context(agent, rows, units, strategy_for_level(1), origin(key="two"))
++        self.assertEqual(len(Compressor.calls), 2)
++
++    def test_tool_excerpt_keeps_terminal_error_and_linkage_original_unchanged(self):
++        rows = [{"role": "tool", "tool_call_id": "call-1", "content": "x"*2000 + "ERROR: denied"}]
++        compact = compact_results(rows, 1200)
++        self.assertTrue(compact[0]["content"].endswith("ERROR: denied"))
++        self.assertEqual(compact[0]["tool_call_id"], "call-1")
++        self.assertEqual(len(rows[0]["content"]), 2013)
++
++    def test_normal_and_unbounded_do_not_change_context(self):
++        rows, units = transcript()
++        agent = SimpleNamespace(session_id="chat")
++        for level in (5, 6):
++            self.assertIs(project_context(agent, rows, units, strategy_for_level(level), origin(level)), rows)
++
++    def test_background_counts_human_origins_not_tool_iterations(self):
++        agent = SimpleNamespace(session_id="chat", _memory_enabled=True, _skill_nudge_interval=0)
++        import sys
++        fake_runtime = SimpleNamespace(capture_origin=lambda: current[0])
++        current = [origin()]
++        with patch.dict(sys.modules, {"agent.usage_budget_runtime": fake_runtime}):
++            for n in range(12):
++                current[0] = origin(key=f"turn{n}")
++                self.assertEqual(background_review_flags(agent, n == 1, False, completed=True), (n == 11, False))
++                self.assertEqual(background_review_flags(agent, True, False, completed=True), (False, False))
++
++    def test_disabled_background_is_not_enabled_and_failed_turn_does_not_count(self):
++        agent = SimpleNamespace(session_id="chat", _memory_enabled=False, _skill_nudge_interval=0)
++        import sys
++        current = [origin()]
++        with patch.dict(sys.modules, {"agent.usage_budget_runtime": SimpleNamespace(capture_origin=lambda: current[0])}):
++            for n in range(20):
++                current[0] = origin(key=f"turn{n}")
++                self.assertEqual(background_review_flags(agent, False, False, completed=(n % 2 == 0)), (False, False))
++
++
++if __name__ == "__main__":
++    unittest.main()

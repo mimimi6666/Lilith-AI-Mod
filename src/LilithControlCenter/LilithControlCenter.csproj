@@ -1,0 +1,67 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>LilithControlCenter</AssemblyName>
+    <RootNamespace>LilithControlCenter</RootNamespace>
+    <ApplicationIcon>Assets\lilith-control-center-icon.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\LilithRuntimeContracts\LilithRuntimeContracts.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Retired product surface. Files remain available to explicit historical
+         presentation fixtures, but no toggle or lifecycle handler ships. -->
+    <Page Remove="LocalCompatibilityPanel.xaml" />
+    <Compile Remove="LocalCompatibilityPanel.xaml.cs" />
+    <Compile Remove="LocalCompatibilityViewModel.cs" />
+    <Compile Remove="MainWindow.LocalCompatibility.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Using Remove="System.Windows.Forms" />
+    <Using Remove="System.Drawing" />
+    <EmbeddedResource Include="Localization\strings.json" />
+    <Resource Include="Assets\lilith-control-center-icon.png" />
+    <Resource Include="Assets\lilith-control-center-icon.ico" />
+    <Compile Include="..\LilithRuntimeConfiguration\D046GameControlPreferences.cs"
+             Link="RuntimeConfiguration\D046GameControlPreferences.cs" />
+    <Compile Include="..\LilithRuntimeConfiguration\D059ManualNotePreferences.cs"
+             Link="RuntimeConfiguration\D059ManualNotePreferences.cs" />
+    <Compile Include="..\LilithProviderControlPlane\DeepSeekControlPlane.cs"
+             Link="ProviderControl\DeepSeekControlPlane.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderProfiles.cs"
+             Link="ProviderControl\UnifiedProviderProfiles.cs" />
+    <Compile Include="..\LilithProviderControlPlane\D045WorkbenchModelCatalogRules.cs"
+             Link="ProviderControl\D045WorkbenchModelCatalogRules.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderEndpointAdmission.cs"
+             Link="ProviderControl\UnifiedProviderEndpointAdmission.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderConnectedAddressTransport.cs"
+             Link="ProviderControl\UnifiedProviderConnectedAddressTransport.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderControlPlaneCanonicalSnapshotCodec.cs"
+             Link="ProviderControl\UnifiedProviderControlPlaneCanonicalSnapshotCodec.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderControlPlaneStore.cs"
+             Link="ProviderControl\UnifiedProviderControlPlaneStore.cs" />
+    <Compile Include="..\LilithProviderControlPlane\D045AiFunctionRoutingStore.cs"
+             Link="ProviderControl\D045AiFunctionRoutingStore.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderCatalogAdapters.cs"
+             Link="ProviderControl\UnifiedProviderCatalogAdapters.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderCatalogNetworkClient.cs"
+             Link="ProviderControl\UnifiedProviderCatalogNetworkClient.cs" />
+    <Compile Include="..\LilithProviderControlPlane\ProviderControlPlaneCoreContracts.cs"
+             Link="ProviderControl\ProviderControlPlaneCoreContracts.cs" />
+    <Compile Include="..\LilithProviderControlPlane\ProviderControlPlaneCoreStore.cs"
+             Link="ProviderControl\ProviderControlPlaneCoreStore.cs" />
+    <Compile Include="..\LilithProviderControlPlane\ProviderStartupHealthScheduler.cs"
+             Link="ProviderControl\ProviderStartupHealthScheduler.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderStartupHealthRuntimeHost.cs"
+             Link="ProviderControl\UnifiedProviderStartupHealthRuntimeHost.cs" />
+    <Compile Include="..\LilithProviderControlPlane\UnifiedProviderSetupTransactionHost.cs"
+             Link="ProviderControl\UnifiedProviderSetupTransactionHost.cs" />
+    <Compile Include="..\LilithProviderControlPlane\ProviderControlCenterPreferences.cs"
+             Link="ProviderControl\ProviderControlCenterPreferences.cs" />
+  </ItemGroup>
+</Project>

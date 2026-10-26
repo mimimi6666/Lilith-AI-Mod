@@ -1,0 +1,88 @@
+--- a/tools/voice_mode.py
++++ b/tools/voice_mode.py
+@@ -611,6 +611,76 @@
+     return (tone * env * volume * 32767).astype(np.int16)
+ 
+ 
++def _play_personal_thinking_cue(stop: threading.Event, should_play) -> bool:
++    """Play one bounded profile-relative WAV using an independently owned stream.
++
++    False means no personal asset is configured, preserving the upstream path.
++    Once an asset exists, failure/cancellation is silent; never resume bubbles.
++    The original file is read-only and never mixed down, normalized or rewritten.
++    """
++    stream = None
++    try:
++        import stat
++        from hermes_constants import get_hermes_home
++
++        folder = get_hermes_home() / "audio"
++        path = folder / "thinking-cue.wav"
++        try:
++            metadata = path.lstat()
++        except FileNotFoundError:
++            return False
++        for item in (folder, path):
++            info = item.lstat()
++            if (stat.S_ISLNK(info.st_mode)
++                    or getattr(info, "st_file_attributes", 0) & 0x400):
++                return True
++        if not stat.S_ISREG(metadata.st_mode) or not 44 <= metadata.st_size <= 4 * 1024 * 1024:
++            return True
++        if (not _sounddevice_output_allowed() or stop.is_set()
++                or (should_play is not None and not should_play())):
++            return True
++        with wave.open(str(path), "rb") as source:
++            channels, width = source.getnchannels(), source.getsampwidth()
++            rate, frames = source.getframerate(), source.getnframes()
++            if (source.getcomptype() != "NONE" or channels not in (1, 2)
++                    or width != 2 or not 8000 <= rate <= 96000
++                    or not 0 < frames <= rate * 8):
++                return True
++            data = source.readframes(frames)
++            if len(data) != frames * channels * width:
++                return True
++        sd, np = _import_audio()
++        gain = max(0., min(.25, float(_get_beep_volume())))
++        if not math.isfinite(gain) or gain <= 0:
++            return True
++        pcm = (np.frombuffer(data, dtype="<i2").astype(np.float32) * gain).astype("<i2").tobytes()
++        if stop.is_set() or (should_play is not None and not should_play()):
++            return True
++        stream = sd.RawOutputStream(samplerate=rate, channels=channels, dtype="int16", blocksize=0)
++        stream.start()
++        block_bytes = max(1, rate // 100) * channels * width
++        for offset in range(0, len(pcm), block_bytes):
++            if stop.is_set() or (should_play is not None and not should_play()):
++                return True
++            stream.write(pcm[offset:offset + block_bytes])
++        # Drain only this owned stream; never sd.stop(), which can cut off TTS.
++        stream.stop()
++        return True
++    except Exception:
++        logger.debug("Personal thinking cue unavailable; remaining silent")
++        return True
++    finally:
++        if stream is not None:
++            try:
++                stream.abort()
++            except Exception:
++                pass
++            try:
++                stream.close()
++            except Exception:
++                pass
++
++
+ def _thinking_sound_loop(stop: threading.Event, should_play) -> None:
+     """Daemon loop: play alternating-pitch blips every ~0.8-1.2s until *stop*.
+ 
+@@ -619,6 +689,8 @@
+     output is TCC-gated, and per-second afplay subprocess churn is worse
+     than silence, so the loop exits immediately there.
+     """
++    if _play_personal_thinking_cue(stop, should_play):
++        return
+     if not _sounddevice_output_allowed():
+         return
+     try:

@@ -1,0 +1,713 @@
+diff --git a/tests/tools/test_computer_use.py b/tests/tools/test_computer_use.py
+index acefa74..7e21515 100644
+--- a/tests/tools/test_computer_use.py
++++ b/tests/tools/test_computer_use.py
+@@ -2576,15 +2576,15 @@ class TestBoundsSpaceNote:
+                            bounds=(3771, 0, 69, 60), app="")]
+         note = _bounds_space_note(elems, 1455, 791)
+         assert note is not None
+-        assert "native desktop coordinates" in note
++        assert "screen-absolute" in note and "NOT coordinate= input" in note
+ 
+-    def test_no_note_when_spaces_match(self):
++    def test_note_even_when_bounds_happen_to_fit_the_image(self):
+         from tools.computer_use.backend import UIElement
+         from tools.computer_use.tool import _bounds_space_note
+ 
+         elems = [UIElement(index=0, role="Button", label="OK",
+                            bounds=(10, 10, 50, 20), app="")]
+-        assert _bounds_space_note(elems, 1455, 791) is None
++        assert "screen-absolute" in _bounds_space_note(elems, 1455, 791)
+ 
+     def test_no_note_for_empty_or_degenerate(self):
+         from tools.computer_use.backend import UIElement
+@@ -2593,8 +2593,8 @@ class TestBoundsSpaceNote:
+         assert _bounds_space_note([], 1455, 791) is None
+         zero = [UIElement(index=0, role="B", label="x",
+                           bounds=(0, 0, 0, 0), app="")]
+-        assert _bounds_space_note(zero, 1455, 791) is None
+-        assert _bounds_space_note(zero, 0, 0) is None
++        assert "missing geometry" in _bounds_space_note(zero, 1455, 791)
++        assert "missing geometry" in _bounds_space_note(zero, 0, 0)
+ 
+ 
+ class TestEscalationEnrichment:
+@@ -2716,7 +2716,7 @@ class TestElementSpillFile:
+ 
+ 
+ class TestBoundsScaleField:
+-    def test_scale_reported_when_spaces_diverge(self, tmp_path, monkeypatch):
++    def test_desktop_extents_never_become_a_scale_factor(self, tmp_path, monkeypatch):
+         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+         from tools.computer_use.backend import CaptureResult, UIElement
+         from tools.computer_use.tool import _capture_response
+@@ -2728,8 +2728,10 @@ class TestBoundsScaleField:
+                             elements=elems, app="chrome.exe",
+                             window_title="", png_bytes_len=0)
+         out = json.loads(_capture_response(cap))
+-        assert out["bounds_scale"] == pytest.approx(3799 / 1455, abs=0.01)
+-        assert f"~{out['bounds_scale']}x" in out["summary"]
++        assert "bounds_scale" not in out
++        assert out["coordinate_space"] == "window_screenshot"
++        assert out["element_bounds_space"] == "screen_absolute"
++        assert "estimated scale" not in out["summary"]
+ 
+     def test_no_scale_when_spaces_match(self):
+         from tools.computer_use.backend import UIElement
+diff --git a/tests/tools/test_coordinate_contract.py b/tests/tools/test_coordinate_contract.py
+new file mode 100644
+--- /dev/null
++++ b/tests/tools/test_coordinate_contract.py
+@@ -0,0 +1,215 @@
++"""Synthetic geometry only: no installed apps, real capture or OS input."""
++import base64
++import io
++import json
++from unittest.mock import patch
++
++import pytest
++from tools.computer_use.backend import CaptureResult, UIElement
++from tools.computer_use.cua_backend import CuaDriverBackend, _CuaDriverSession
++from tools.computer_use import tool as cu
++from tools.computer_use.schema import COMPUTER_USE_SCHEMA
++
++
++def pixel(width=800, height=600):
++    return base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\0" * 8
++                           + width.to_bytes(4, "big") + height.to_bytes(4, "big")).decode()
++
++
++def backend(width=800, height=600, scroll=True, origin=(-1920, 400), dpi=1.0):
++    session = _CuaDriverSession.__new__(_CuaDriverSession)
++    names = ("get_window_state", "click", "double_click", "drag", "scroll", "hotkey")
++    session._capabilities = {name: set() for name in names}
++    session._tool_schemas = {name: {"properties": {"delivery_mode": {}}} for name in names}
++    if scroll:
++        session._tool_schemas["scroll"]["properties"].update(x={}, y={})
++    calls = []
++    def driver(name, args):
++        calls.append((name, dict(args)))
++        sc = ({"snapshot_id": "fresh", "screenshot_png_b64": pixel(width, height),
++               "elements": [{"element_index": 7, "element_token": "fresh:7", "role": "button",
++                             "frame": {"x": origin[0] + int(80 * dpi),
++                                       "y": origin[1] + int(180 * dpi),
++                                       "w": int(30 * dpi), "h": int(20 * dpi)}}]}
++              if name == "get_window_state" else {"status": "accepted"})
++        return {"isError": False, "data": "ok", "images": [], "structuredContent": sc}
++    session.call_tool = driver
++    instance = CuaDriverBackend.__new__(CuaDriverBackend)
++    instance._session, instance._session_id = session, "synthetic"
++    instance._last_app = None
++    instance.capture(mode="som", app="Fixture", pid=12, window_id=34)
++    calls.clear()
++    return instance, calls
++
++
++@pytest.mark.parametrize("size", [(800, 600), (1366, 768), (1920, 1080), (1455, 791),
++                                 (2560, 1440), (3440, 1440), (3840, 2160),
++                                 (5120, 1440), (1080, 1920)])
++@pytest.mark.parametrize("dpi", [1.0, 1.25, 1.5, 2.0])
++@pytest.mark.parametrize("origin", [(0, 0), (346, 80), (-3840, 0), (6000, -2160)])
++def test_click_passes_screenshot_pixels_once_without_offset_or_dpi(size, dpi, origin):
++    # Model the contract boundary, not a real display driver. DPI and desktop
++    # origin alter AX geometry; neither may alter the supplied PNG-local point.
++    instance, calls = backend(*size, dpi=dpi, origin=origin)
++    for point in ((0, 0), (215, 132), (size[0] - 1, size[1] - 1)):
++        calls.clear()
++        assert instance.click(x=point[0], y=point[1]).ok
++        assert len(calls) == 1
++        assert (calls[0][1]["x"], calls[0][1]["y"]) == point
++        assert (calls[0][1]["pid"], calls[0][1]["window_id"]) == (12, 34)
++
++
++@pytest.mark.parametrize("kind", ["click", "double_click", "right_click", "drag", "scroll"])
++@pytest.mark.parametrize("point", [(-1, 20), (800, 20), (20, 600), (20, -1),
++                                    (True, 20), (20.5, 20), ("20", 20), (None, 20)])
++def test_invalid_points_never_dispatch_or_retry(kind, point):
++    instance, calls = backend()
++    if kind == "drag":
++        result = instance.drag(from_xy=(1, 1), to_xy=point)
++    elif kind == "scroll":
++        result = instance.scroll(direction="down", x=point[0], y=point[1])
++    else:
++        result = instance.click(x=point[0], y=point[1],
++                                button="right" if kind == "right_click" else "left",
++                                click_count=2 if kind == "double_click" else 1)
++    assert not result.ok and not calls
++
++
++@pytest.mark.parametrize("kind", ["click", "drag", "scroll"])
++def test_missing_or_other_target_capture_cannot_authorize_pixel_actions(kind):
++    instance, calls = backend()
++    for frame in (None, (99, 34, 800, 600), (12, 99, 800, 600)):
++        instance._coordinate_capture = frame
++        if kind == "click": result = instance.click(x=20, y=30)
++        elif kind == "drag": result = instance.drag(from_xy=(1, 2), to_xy=(3, 4))
++        else: result = instance.scroll(direction="down", x=20, y=30)
++        assert result.code == "fresh_coordinate_capture_required" and not calls
++
++
++def test_drag_and_scroll_keep_axis_values_without_silent_whole_window_fallback():
++    instance, calls = backend()
++    assert instance.drag(from_xy=(12, 23), to_xy=(799, 599)).ok
++    assert {k: calls[-1][1][k] for k in ("from_x", "from_y", "to_x", "to_y")} == {
++        "from_x": 12, "from_y": 23, "to_x": 799, "to_y": 599}
++    assert instance.scroll(direction="down", x=77, y=88).ok
++    assert (calls[-1][1]["x"], calls[-1][1]["y"]) == (77, 88)
++    instance, calls = backend(scroll=False)
++    assert instance.scroll(direction="down", x=77, y=88).code == "coordinate_scroll_unsupported"
++    assert not calls
++    assert instance.scroll(direction="down").ok  # explicit window-wide intent remains available
++
++
++def test_focus_failure_recapture_and_resize_disarm_old_pixel_geometry():
++    instance, calls = backend()
++    instance._load_windows = lambda: [{"pid": 56, "window_id": 78, "app_name": "Other"}]
++    instance._match_windows_for_app = lambda windows, app: windows
++    instance.focus_app("Other")
++    assert instance.click(x=20, y=20).code == "fresh_coordinate_capture_required"
++    assert not calls
++    instance._failed_capture("som")
++    assert instance._coordinate_capture is None
++    instance.capture(mode="vision", app="Fixture", pid=12, window_id=34)
++    assert instance._coordinate_capture == (12, 34, 800, 600)
++    calls.clear()
++    instance._session.call_tool = lambda *args: (_ for _ in ()).throw(RuntimeError("synthetic failure"))
++    with pytest.raises(RuntimeError): instance.capture(mode="som", pid=12, window_id=34)
++    assert instance._coordinate_capture is None
++
++
++def test_element_tokens_do_not_need_pixel_conversion():
++    instance, calls = backend()
++    instance._coordinate_capture = None
++    instance._session._tool_schemas["click"]["properties"]["element_token"] = {}
++    assert instance.click(element=7).ok
++    assert calls[0][1]["element_token"] == "fresh:7"
++    assert "x" not in calls[0][1] and "y" not in calls[0][1]
++
++
++def test_new_capture_replaces_dimensions_instead_of_reusing_previous_monitor():
++    instance, calls = backend(3840, 2160)
++    previous = instance._session.call_tool
++    def smaller(name, args):
++        result = previous(name, args)
++        if name == "get_window_state":
++            result["structuredContent"]["screenshot_png_b64"] = pixel(800, 600)
++        return result
++    instance._session.call_tool = smaller
++    instance.capture(mode="som", pid=12, window_id=34)
++    calls.clear()
++    assert instance.click(x=3000, y=1800).code == "invalid_screenshot_coordinate"
++    assert not calls
++    assert instance.click(x=799, y=599).ok
++    assert (calls[-1][1]["x"], calls[-1][1]["y"]) == (799, 599)
++
++
++@pytest.mark.parametrize("size", [(1920, 1080), (3440, 1440), (3840, 2160), (1080, 1920)])
++def test_aux_success_and_spill_keep_original_png_dimensions(size, tmp_path):
++    from PIL import Image
++    raw = io.BytesIO()
++    Image.new("RGB", size).save(raw, format="PNG")
++    cap = CaptureResult("som", 99, 99, png_b64=base64.b64encode(raw.getvalue()).decode(),
++                        elements=[UIElement(7, "button", "x" * 800,
++                                            bounds=(-2600, 1800, 80, 40))])
++    seen = {}
++    def fake_vision(path, prompt):
++        with Image.open(path) as image:
++            seen["size"] = image.size
++        seen["prompt"] = prompt
++        return json.dumps({"success": True, "analysis": "Synthetic description"})
++    with patch.object(cu, "_should_route_through_aux_vision", return_value=True), \
++         patch("hermes_constants.get_hermes_dir", return_value=tmp_path), \
++         patch("model_tools._run_async", side_effect=lambda value: value), \
++         patch("tools.vision_tools.vision_analyze_tool", new=fake_vision):
++        payload = json.loads(cu._capture_response(cap))
++    assert payload["vision_analysis"] == "Synthetic description"
++    assert (payload["coordinate_width"], payload["coordinate_height"]) == size
++    assert (payload["width"], payload["height"]) == size
++    assert max(seen["size"]) <= 1456
++    assert f"x_seen * {size[0]}/{seen['size'][0]}" in seen["prompt"]
++    assert f"y_seen * {size[1]}/{seen['size'][1]}" in seen["prompt"]
++    assert "exactly once" in seen["prompt"]
++    from pathlib import Path
++    spilled = json.loads(Path(payload["elements_file"]).read_text())
++    assert (spilled["coordinate_width"], spilled["coordinate_height"]) == size
++    assert not list(tmp_path.glob("computer_use_*.png"))
++
++
++@pytest.mark.parametrize("origin", [(0, 0), (346, 80), (-1920, 400), (6000, -1400)])
++def test_translation_is_not_scale_and_all_text_outputs_label_spaces(origin, tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    elements = [UIElement(index=7, role="button", label="x" * 800,
++                         bounds=(*origin, 45, 25))]
++    cap = CaptureResult("som", 800, 600, elements=elements)
++    payload = json.loads(cu._capture_response(cap))
++    assert payload["coordinate_space"] == "window_screenshot"
++    assert payload["element_bounds_space"] == "screen_absolute"
++    assert payload["elements"][0]["bounds_space"] == "screen_absolute"
++    assert "bounds_scale" not in payload and cu._bounds_scale(elements, 800, 600) is None
++    assert "Pass screenshot pixels unchanged" in payload["summary"]
++    from pathlib import Path
++    spilled = json.loads(Path(payload["elements_file"]).read_text())
++    assert spilled["coordinate_space"] == "window_screenshot"
++    assert spilled["elements"][0]["bounds_space"] == "screen_absolute"
++
++
++def test_multimodal_and_aux_failure_disclose_identical_coordinate_contract():
++    cap = CaptureResult("som", 800, 600, png_b64=pixel(),
++                        elements=[UIElement(7, "button", bounds=(3000, -400, 50, 30))])
++    with patch.object(cu, "_should_route_through_aux_vision", return_value=False):
++        payload = cu._capture_response(cap)
++    assert payload["meta"]["coordinate_space"] == "window_screenshot"
++    assert "Do not copy a bounds center" in payload["text_summary"]
++    with patch.object(cu, "_should_route_through_aux_vision", return_value=True), \
++         patch.object(cu, "_route_capture_through_aux_vision", return_value=None):
++        failed = json.loads(cu._capture_response(cap))
++    assert failed["vision_unavailable"] and failed["coordinate_space"] == "window_screenshot"
++    assert "bounds_scale" not in failed
++
++
++def test_schema_requires_window_png_not_accessibility_bounds():
++    properties = COMPUTER_USE_SCHEMA["parameters"]["properties"]
++    assert "screenshot" in properties["coordinate"]["description"]
++    assert "screen-absolute" in properties["coordinate"]["description"]
++    for key in ("from_coordinate", "to_coordinate"):
++        assert "screenshot" in properties[key]["description"]
++    assert "separate viewport" in properties["coordinate"]["description"]
+diff --git a/tests/tools/test_vision_scale_disclosure.py b/tests/tools/test_vision_scale_disclosure.py
+index f3678ae..06002a4 100644
+--- a/tests/tools/test_vision_scale_disclosure.py
++++ b/tests/tools/test_vision_scale_disclosure.py
+@@ -72,8 +72,11 @@ class TestShrinkCaptureForVision:
+         assert note is not None
+         assert "downscaled" in note
+         assert f"{ORIG_W}x{ORIG_H}" in note
+-        # Stated rounded factor: 3024/1456 = 2.0769... -> 2.08
+-        assert "2.08" in note
++        # Exact per-axis ratios; never a guessed desktop/DPI conversion.
++        assert "3024/1456" in note
++        assert "ORIGINAL window screenshot" in note
++        assert "exactly once" in note
++        assert "Do not add" in note
+ 
+         m = re.search(r"downscaled from (\d+)x(\d+) to (\d+)x(\d+)", note)
+         assert m, f"note missing dimensions: {note}"
+diff --git a/tools/computer_use/cua_backend.py b/tools/computer_use/cua_backend.py
+index 05de6af..394cca9 100644
+--- a/tools/computer_use/cua_backend.py
++++ b/tools/computer_use/cua_backend.py
+@@ -1966,6 +1966,9 @@ class CuaDriverBackend(ComputerUseBackend):
+         self._snapshot_tokens: Dict[int, str] = {}
+         self._snapshot_id = None
+         self._snapshot_indices = set()
++        # Driver input uses the original window PNG, not desktop AX bounds.
++        # Bind pixel validation to the exact target that produced that PNG.
++        self._coordinate_capture = None
+         # Per-instance cua-driver session id. cua-driver's MCP server
+         # instructions ask every consumer to declare a stable session
+         # at the start of a run (start_session) and tear it down at
+@@ -2101,6 +2104,7 @@ class CuaDriverBackend(ComputerUseBackend):
+         self._snapshot_tokens = {}
+         self._snapshot_id = None
+         self._snapshot_indices = set()
++        self._coordinate_capture = None
+ 
+     def _failed_capture(self, mode: str, message: str = "") -> CaptureResult:
+         """Return an empty capture after disarming any prior target context."""
+@@ -2264,6 +2268,7 @@ class CuaDriverBackend(ComputerUseBackend):
+         Maps hermes `capture(mode, app)` → cua-driver `list_windows` +
+         `get_window_state` (ax/som) or `screenshot` (vision).
+         """
++        self._coordinate_capture = None
+         # Step 1: enumerate on-screen windows to find target pid/window_id.
+         # Surface 3 of NousResearch/hermes-agent#47072: read the canonical
+         # `structuredContent.windows` array directly. Pre-fix the wrapper
+@@ -2588,6 +2593,9 @@ class CuaDriverBackend(ComputerUseBackend):
+             except Exception:
+                 png_bytes_len = len(png_b64) * 3 // 4
+ 
++        if width > 0 and height > 0 and self._active_pid and self._active_window_id:
++            self._coordinate_capture = (self._active_pid, self._active_window_id, width, height)
++
+         return CaptureResult(
+             mode=mode,
+             width=width,
+@@ -2601,6 +2609,27 @@ class CuaDriverBackend(ComputerUseBackend):
+         )
+ 
+     # ── Pointer ────────────────────────────────────────────────────
++    def _check_coordinate_points(self, action: str, *points) -> Optional[ActionResult]:
++        """Validate PNG-local points; leave all OS transforms to the driver.
++
++        No screen-origin/DPI inference, clamping, second capture, or action
++        retry. Focus/capture failure disarms the old geometry before this seam.
++        """
++        frame = getattr(self, "_coordinate_capture", None)
++        if not frame or frame[:2] != (self._active_pid, self._active_window_id):
++            return ActionResult(ok=False, action=action, code="fresh_coordinate_capture_required",
++                message="Capture the exact target window before choosing screenshot pixel coordinates.")
++        width, height = frame[2:]
++        if any(not isinstance(point, (list, tuple)) or len(point) != 2
++               or any(type(value) is not int for value in point)
++               or not (0 <= point[0] < width and 0 <= point[1] < height)
++               for point in points):
++            return ActionResult(ok=False, action=action, code="invalid_screenshot_coordinate",
++                message=f"Use integer pixels inside the latest {width}x{height} window screenshot. "
++                        "Do not pass screen-absolute element bounds or apply a remembered offset. "
++                        "Capture again if the target or window geometry changed; no input was sent.")
++        return None
++
+     def _apply_delivery(
+         self,
+         action: str,
+@@ -2735,6 +2764,9 @@ class CuaDriverBackend(ComputerUseBackend):
+             if self._active_window_id is None:
+                 return ActionResult(ok=False, action=tool,
+                                     message="No active window_id for coordinate click.")
++            refusal = self._check_coordinate_points(tool, (x, y))
++            if refusal is not None:
++                return refusal
+             args["x"] = x
+             args["y"] = y
+             args["window_id"] = self._active_window_id
+@@ -2774,8 +2806,11 @@ class CuaDriverBackend(ComputerUseBackend):
+             if self._active_window_id is None:
+                 return ActionResult(ok=False, action="drag",
+                                     message="No active window_id for coordinate drag.")
+-            args["from_x"], args["from_y"] = int(from_xy[0]), int(from_xy[1])
+-            args["to_x"], args["to_y"] = int(to_xy[0]), int(to_xy[1])
++            refusal = self._check_coordinate_points("drag", from_xy, to_xy)
++            if refusal is not None:
++                return refusal
++            args["from_x"], args["from_y"] = from_xy
++            args["to_x"], args["to_y"] = to_xy
+             args["window_id"] = self._active_window_id
+         else:
+             return ActionResult(ok=False, action="drag",
+@@ -2806,21 +2841,21 @@ class CuaDriverBackend(ComputerUseBackend):
+         if element is not None and self._active_window_id is not None:
+             args["element_index"] = element
+             args["window_id"] = self._active_window_id
+-        elif x is not None and y is not None:
++        elif x is not None or y is not None:
+             if self._active_window_id is None:
+                 return ActionResult(ok=False, action="scroll",
+                                     message="No active window_id for coordinate scroll.")
+-            # CUA Driver 0.7.1 Linux schema rejects x/y on scroll. Only
+-            # include them when the driver explicitly advertises support
+-            # for coordinate scrolling; otherwise omit and let the driver
+-            # scroll the targeted window (window_id is still sent for
+-            # routing).  This is the safe default when capabilities
+-            # haven't been discovered yet (older drivers).
+-            if self._session.supports_capability(
+-                "input.scroll.coordinates", tool="scroll"
+-            ):
+-                args["x"] = x
+-                args["y"] = y
++            refusal = self._check_coordinate_points("scroll", (x, y))
++            if refusal is not None:
++                return refusal
++            supports = getattr(self._session, "supports_input_property", lambda *args: False)
++            if not (self._session.supports_capability("input.scroll.coordinates", tool="scroll") is True
++                    or (supports("scroll", "x") is True and supports("scroll", "y") is True)):
++                return ActionResult(ok=False, action="scroll", code="coordinate_scroll_unsupported",
++                    message="This driver cannot target a scroll point. Use a current element index "
++                            "or explicitly request window scrolling without a coordinate.")
++            args["x"] = x
++            args["y"] = y
+             args["window_id"] = self._active_window_id
+         return self._run_input_action("scroll", args, delivery_mode, bring_to_front)
+ 
+@@ -2958,6 +2993,7 @@ class CuaDriverBackend(ComputerUseBackend):
+         separately approved by the Hermes adapter, and uses cua-driver's
+         standalone ``bring_to_front`` tool rather than an action property.
+         """
++        self._coordinate_capture = None
+         try:
+             windows = self._load_windows()
+         except Exception:
+diff --git a/tools/computer_use/schema.py b/tools/computer_use/schema.py
+index 7f1251b..1c82cce 100644
+--- a/tools/computer_use/schema.py
++++ b/tools/computer_use/schema.py
+@@ -169,9 +169,14 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
+                 "minItems": 2,
+                 "maxItems": 2,
+                 "description": (
+-                    "Pixel coordinates [x, y] relative to the captured window "
+-                    "screenshot (top-left origin). Only use this if no element "
+-                    "index is available."
++                    "For desktop mouse actions: integer pixels [x, y] in the latest captured window PNG "
++                    "(top-left origin), inside its width/height. Pass screenshot "
++                    "pixels unchanged: do not add screen offsets or DPI scaling. "
++                    "Element bounds are screen-absolute, NOT this input space. "
++                    "Prefer element= when available; otherwise use a visible "
++                    "point from a fresh screenshot of the intended window. "
++                    "For cua_browser_click/pointer, use their separate viewport "
++                    "x/y fields instead (this legacy alias uses viewport pixels there)."
+                 ),
+             },
+             "button": {
+@@ -199,13 +204,13 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
+                 "type": "array",
+                 "items": {"type": "integer"},
+                 "minItems": 2, "maxItems": 2,
+-                "description": "Source [x,y] (drag; use when no element available).",
++                "description": "Drag source integer [x,y] inside the latest window screenshot; same space as coordinate, not element bounds.",
+             },
+             "to_coordinate": {
+                 "type": "array",
+                 "items": {"type": "integer"},
+                 "minItems": 2, "maxItems": 2,
+-                "description": "Target [x,y] (drag; use when no element available).",
++                "description": "Drag destination integer [x,y] inside the same window screenshot; do not add screen offsets or DPI scaling.",
+             },
+             # ── scroll ─────────────────────────────────────────────
+             "direction": {
+diff --git a/tools/computer_use/tool.py b/tools/computer_use/tool.py
+index 0a421c2..9b09d11 100644
+--- a/tools/computer_use/tool.py
++++ b/tools/computer_use/tool.py
+@@ -1472,12 +1472,6 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
+     response_width = image_dimensions[0] if image_dimensions else cap.width
+     response_height = image_dimensions[1] if image_dimensions else cap.height
+     bounds_note = _bounds_space_note(visible_elements, response_width, response_height)
+-    bounds_scale = _bounds_scale(visible_elements, response_width, response_height)
+-    if bounds_note and bounds_scale:
+-        bounds_note += (
+-            f"; estimated scale ~{bounds_scale}x (screenshot position x "
+-            f"{bounds_scale} ≈ native coordinate)"
+-        )
+     # When the in-context response drops detail (capped labels / capped element
+     # array), spill the complete tree to a cache file so the model can read or
+     # grep the full text on demand instead of losing it entirely.
+@@ -1503,6 +1497,7 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
+         f"capture mode={cap.mode} {response_width}x{response_height}"
+         + (f" app={cap.app}" if cap.app else "")
+         + (f" window={cap.window_title!r}" if cap.window_title else ""),
++        _WINDOW_COORDINATE_NOTE,
+         f"{total_elements} interactable element(s):",
+     ]
+     if bounds_note:
+@@ -1562,6 +1557,7 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
+                     "app= to narrow)"
+                 )
+             payload = {
++                **_coordinate_metadata(response_width, response_height),
+                 "mode": cap.mode,
+                 "width": response_width,
+                 "height": response_height,
+@@ -1576,8 +1572,6 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
+                 payload["truncated_elements"] = truncated_elements
+             if elements_file:
+                 payload["elements_file"] = elements_file
+-            if bounds_scale:
+-                payload["bounds_scale"] = bounds_scale
+             return json.dumps(payload)
+ 
+         # Prefer the explicit MIME type cua-driver attaches to its image
+@@ -1602,8 +1596,8 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
+             "text_summary": summary,
+             "meta": {"mode": cap.mode, "width": response_width, "height": response_height,
+                      "elements": total_elements, "png_bytes": cap.png_bytes_len,
+-                     **({"elements_file": elements_file} if elements_file else {}),
+-                     **({"bounds_scale": bounds_scale} if bounds_scale else {})},
++                     **_coordinate_metadata(response_width, response_height),
++                     **({"elements_file": elements_file} if elements_file else {})},
+         }
+     # AX-only (or image-missing fallback): text path actually carries the
+     # `elements` array, so the truncation note applies here.
+@@ -1614,6 +1608,7 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
+         )
+     summary = "\n".join(summary_lines)
+     payload: Dict[str, Any] = {
++        **_coordinate_metadata(response_width, response_height),
+         "mode": cap.mode,
+         "width": response_width,
+         "height": response_height,
+@@ -1627,8 +1622,6 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
+         payload["truncated_elements"] = truncated_elements
+     if elements_file:
+         payload["elements_file"] = elements_file
+-    if bounds_scale:
+-        payload["bounds_scale"] = bounds_scale
+     return json.dumps(payload)
+ 
+ 
+@@ -1650,8 +1643,8 @@ def _shrink_capture_for_vision(raw: bytes, ext: str,
+     Returns ``(bytes, scale_note)``. ``scale_note`` is ``None`` when the image
+     was returned unchanged (already fits, or Pillow unavailable/failed — no
+     worse than the pre-shrink behavior). When a downscale happened, the note
+-    tells the vision model the scale factor so any coordinates it reports can
+-    be mapped back to the real screen instead of being silently wrong.
++    tells the vision model the exact axis ratios back to the ORIGINAL window
++    screenshot. This is only our additional resize, not DPI or screen origin.
+     """
+     try:
+         from io import BytesIO
+@@ -1664,21 +1657,12 @@ def _shrink_capture_for_vision(raw: bytes, ext: str,
+         new_w, new_h = img.size
+         out = BytesIO()
+         img.save(out, format="JPEG" if ext == ".jpg" else "PNG")
+-        fx = orig_w / new_w if new_w else 1.0
+-        fy = orig_h / new_h if new_h else 1.0
+-        if f"{fx:.2f}" == f"{fy:.2f}":
+-            factor_clause = (
+-                f"multiply any coordinates you report by {fx:.2f} "
+-                f"to map back to the real screen."
+-            )
+-        else:
+-            factor_clause = (
+-                f"multiply any x coordinates you report by {fx:.2f} and "
+-                f"any y coordinates by {fy:.2f} to map back to the real screen."
+-            )
+         scale_note = (
+             f"Screenshot downscaled from {orig_w}x{orig_h} to "
+-            f"{new_w}x{new_h} for vision; {factor_clause}"
++            f"{new_w}x{new_h} for vision only. Report coordinates in the ORIGINAL "
++            f"window screenshot: x_original = x_seen * {orig_w}/{new_w}; "
++            f"y_original = y_seen * {orig_h}/{new_h}. Apply this resize exactly "
++            "once. Do not add the window's screen origin or apply a DPI factor."
+         )
+         return out.getvalue(), scale_note
+     except Exception as exc:
+@@ -1841,10 +1825,12 @@ def _route_capture_through_aux_vision(
+     # dense Electron UI (Discord, Slack, IDEs) could blow the response budget
+     # on this branch alone.
+     elements_out = cap.elements if visible_elements is None else visible_elements
++    dimensions = _image_dimensions_from_b64(cap.png_b64 or "") or (cap.width, cap.height)
+     payload: Dict[str, Any] = {
++        **_coordinate_metadata(*dimensions),
+         "mode": cap.mode,
+-        "width": cap.width,
+-        "height": cap.height,
++        "width": dimensions[0],
++        "height": dimensions[1],
+         "app": cap.app,
+         "window_title": cap.window_title,
+         "elements": [_element_to_dict(e) for e in elements_out],
+@@ -1965,7 +1951,10 @@ def _spill_elements_to_file(cap: CaptureResult) -> Optional[str]:
+         except Exception:
+             pass
+         path = cache_dir / f"elements_{_uuid.uuid4().hex}.json"
++        dimensions = _image_dimensions_from_b64(cap.png_b64 or "") or (cap.width, cap.height)
+         payload = {
++            **_coordinate_metadata(*dimensions),
++            "coordinate_note": _WINDOW_COORDINATE_NOTE,
+             "app": cap.app,
+             "window_title": cap.window_title,
+             "total_elements": len(cap.elements),
+@@ -1975,6 +1964,7 @@ def _spill_elements_to_file(cap: CaptureResult) -> Optional[str]:
+                     "role": e.role,
+                     "label": e.label,  # full, untruncated
+                     "bounds": list(e.bounds),
++                    "bounds_space": "screen_absolute",
+                     "app": e.app,
+                 }
+                 for e in cap.elements
+@@ -2001,70 +1991,45 @@ def _capture_lost_detail(
+     )
+ 
+ 
++_WINDOW_COORDINATE_NOTE = (
++    "Pixel actions use coordinate=[x,y] in this window screenshot, with (0,0) "
++    "at its top-left. Pass screenshot pixels unchanged; the driver handles "
++    "window origin and capture scaling. Do not add/subtract a remembered "
++    "screen offset, multiply by DPI, or derive a scale from element bounds. "
++    "Prefer an element index from this capture. After moving/resizing the "
++    "window or changing targets, capture again before choosing a pixel point."
++)
++
++
++def _coordinate_metadata(width: int, height: int) -> Dict[str, Any]:
++    return {"coordinate_space": "window_screenshot",
++            "coordinate_width": width, "coordinate_height": height,
++            "element_bounds_space": "screen_absolute"}
++
++
+ def _bounds_scale(
+     elements: List[UIElement], image_width: int, image_height: int,
+ ) -> Optional[float]:
+-    """Estimated native-bounds → screenshot-pixel scale factor, or None.
++    """Compatibility helper: element extents cannot establish capture scale.
+ 
+-    Only meaningful when the two spaces diverge (same condition as
+-    ``_bounds_space_note``). Uses the larger of the two axis ratios so the
+-    estimate is driven by the axis with real extent data. Rounded to 2
+-    decimals — this is a heuristic for mapping screenshot positions to
+-    native coordinates, not display-metrics ground truth.
++    Desktop translation, negative monitor origins and off-window elements all
++    change extents independently of DPI. Never turn that heuristic into input.
+     """
+-    if not elements or image_width <= 0 or image_height <= 0:
+-        return None
+-    max_x = 0
+-    max_y = 0
+-    for e in elements:
+-        try:
+-            x, y, w, h = e.bounds
+-        except (TypeError, ValueError):
+-            continue
+-        max_x = max(max_x, int(x) + int(w))
+-        max_y = max(max_y, int(y) + int(h))
+-    if max_x <= image_width * 1.05 and max_y <= image_height * 1.05:
+-        return None
+-    return round(max(max_x / image_width, max_y / image_height), 2)
++    return None
+ 
+ 
+ def _bounds_space_note(
+     elements: List[UIElement], image_width: int, image_height: int,
+ ) -> Optional[str]:
+-    """Warn when element bounds live in a different coordinate space.
+-
+-    On HiDPI/scaled displays (common on Windows + macOS retina), cua-driver
+-    reports AX element bounds in native desktop coordinates while the
+-    screenshot is captured/downscaled to a smaller pixel grid. Nothing in the
+-    response related the two, so models reading a position off the screenshot
+-    and clicking by coordinate= missed by the scale factor (e.g. 2.6x on a
+-    4K display with a 1455px-wide screenshot). Element bounds are what
+-    click(coordinate=...) expects; the note makes that explicit whenever the
+-    two spaces visibly diverge.
+-    """
+-    if not elements or image_width <= 0 or image_height <= 0:
+-        return None
+-    max_x = 0
+-    max_y = 0
+-    for e in elements:
+-        try:
+-            x, y, w, h = e.bounds
+-        except (TypeError, ValueError):
+-            continue
+-        max_x = max(max_x, int(x) + int(w))
+-        max_y = max(max_y, int(y) + int(h))
+-    if max_x <= 0 and max_y <= 0:
+-        return None
+-    # 5% slack: window chrome can hang a few px past the captured frame
+-    # without implying a different coordinate space.
+-    if max_x <= image_width * 1.05 and max_y <= image_height * 1.05:
++    """State the contract, even when the numbers happen to fit the image."""
++    if not elements:
+         return None
+     return (
+-        f"element bounds are in native desktop coordinates (extend to "
+-        f"~{max_x}x{max_y}), NOT screenshot pixels ({image_width}x"
+-        f"{image_height}). coordinate= clicks expect the native space — "
+-        "derive click points from element bounds, or scale screenshot "
+-        "positions up accordingly"
++        "Element bounds are screen-absolute accessibility geometry, NOT "
++        "coordinate= input. Units are OS-native (Windows/Linux physical pixels; "
++        "macOS logical points); missing geometry may be all zeros. Use element= "
++        "for these controls, or choose a point from the window screenshot. "
++        "Do not copy a bounds center into coordinate=."
+     )
+ 
+ 
+@@ -2078,6 +2043,7 @@ def _element_to_dict(e: UIElement) -> Dict[str, Any]:
+         "role": e.role,
+         "label": label,
+         "bounds": list(e.bounds),
++        "bounds_space": "screen_absolute",
+         "app": e.app,
+     }
+     if truncated:

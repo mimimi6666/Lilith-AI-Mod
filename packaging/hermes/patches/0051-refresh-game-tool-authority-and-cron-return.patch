@@ -1,0 +1,344 @@
+diff --git a/tests/cron/test_local_workbench_completion.py b/tests/cron/test_local_workbench_completion.py
+index 008953d324bdb27b3608d0286c30bde52fc1deed..4d537ef55b222d491ffea5e203a9f25bab6156b0 100644
+--- a/tests/cron/test_local_workbench_completion.py
++++ b/tests/cron/test_local_workbench_completion.py
+@@ -96,6 +96,31 @@ def test_capture_accepts_lilith_runtime_formal_session(monkeypatch):
+     }
+ 
+ 
++def test_capture_accepts_exact_lilith_game_session(monkeypatch):
++    from tools.cronjob_tools import _local_workbench_origin_from_env
++
++    monkeypatch.setenv("HERMES_CRON_TICKER", "1")
++    env = {
++        "HERMES_SESSION_SOURCE": "lilith-game",
++        "HERMES_SESSION_KEY": "game-continuation-tip",
++        "HERMES_SESSION_ID": "game-continuation-tip",
++        "HERMES_UI_SESSION_ID": "game-live-owner",
++    }
++
++    with _session_env(env):
++        captured = _local_workbench_origin_from_env(None)
++        explicit_local = _local_workbench_origin_from_env("local")
++
++    assert captured == {
++        "kind": "local_workbench",
++        "source": "lilith-game",
++        "session_key": "game-continuation-tip",
++        "session_id": "game-continuation-tip",
++        "ui_session_id": "game-live-owner",
++    }
++    assert explicit_local is None
++
++
+ @pytest.mark.parametrize("updated_deliver", ["local", "all"])
+ def test_delivery_update_preserves_lilith_runtime_return_address(
+     isolated_cron_home,
+diff --git a/tests/tui_gateway/test_game_current_capabilities.py b/tests/tui_gateway/test_game_current_capabilities.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae81921a0af16e069cc8035278662a7bf8a471d2
+--- /dev/null
++++ b/tests/tui_gateway/test_game_current_capabilities.py
+@@ -0,0 +1,142 @@
++"""Current tool authority for the durable hidden game conversation."""
++
++from __future__ import annotations
++
++import threading
++
++import pytest
++
++from tui_gateway import server
++
++
++def _session(agent, **extra):
++    return {
++        "agent": agent,
++        "archived": True,
++        "attached_images": [],
++        "cols": 80,
++        "history": [],
++        "history_lock": threading.Lock(),
++        "history_version": 0,
++        "inflight_turn": None,
++        "running": True,
++        "session_key": "game-tip",
++        "source": "lilith-game",
++        "transport": None,
++        "_durable_lineage_root": "game-root",
++        **extra,
++    }
++
++
++class _Tools:
++    def __init__(self, names):
++        self.valid_tool_names = set(names)
++
++
++def test_note_uses_only_the_current_agents_exposed_tool_names():
++    note = server._game_current_capability_note(
++        _session(_Tools({"web_search", "cronjob"}))
++    )
++
++    assert "authoritative over stale tool-availability claims" in note
++    assert "Current callable tool identifiers: cronjob, web_search." in note
++    assert "one minute or longer" in note
++    assert "omit the `deliver` argument" in note
++    assert "computer_use" not in note
++
++
++def test_tool_specific_guidance_is_absent_when_the_tool_is_not_exposed():
++    note = server._game_current_capability_note(_session(_Tools({"web_search"})))
++
++    assert "Current callable tool identifiers: web_search." in note
++    assert "cronjob" not in note
++    assert "computer_use" not in note
++
++
++@pytest.mark.parametrize(
++    "session_change",
++    [
++        {"source": "desktop"},
++        {"archived": False},
++        {"_durable_lineage_root": None},
++    ],
++)
++def test_note_is_limited_to_attested_hidden_game_sessions(session_change):
++    session = _session(_Tools({"cronjob", "computer_use"}))
++    session.update(session_change)
++
++    assert server._game_current_capability_note(session) == ""
++
++
++def test_current_note_reaches_only_model_input_and_keeps_history_clean(monkeypatch):
++    captured = {}
++    original_text = "  一分鐘後提醒我  "
++    stale_history = [
++        {"role": "user", "content": "以前能計時嗎？"},
++        {
++            "role": "assistant",
++            "content": "Tool 'cronjob' does not exist. Available tools: web_search",
++        },
++    ]
++
++    class Agent:
++        model = "test-model"
++        valid_tool_names = {"computer_use", "cronjob", "terminal"}
++
++        def run_conversation(
++            self,
++            prompt,
++            *,
++            conversation_history=None,
++            stream_callback=None,
++            **kwargs,
++        ):
++            captured["prompt"] = prompt
++            captured["persist_user_message"] = kwargs["persist_user_message"]
++            return {
++                "final_response": "已設定。",
++                "messages": [
++                    *conversation_history,
++                    {"role": "user", "content": kwargs["persist_user_message"]},
++                    {"role": "assistant", "content": "已設定。"},
++                ],
++            }
++
++    class ImmediateThread:
++        def __init__(self, target=None, daemon=None, **_kwargs):
++            self._target = target
++
++        def start(self):
++            self._target()
++
++    session = _session(Agent(), history=list(stale_history))
++    server._start_inflight_turn(session, original_text)
++    server._sessions["game-sid"] = session
++    monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
++    monkeypatch.setattr(server, "record_turn_start", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
++    monkeypatch.setattr(server, "render_message", lambda _text, _cols: "")
++    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(
++        server,
++        "_attest_durable_lineage_postcondition",
++        lambda _session: {"stored_session_id": "game-tip"},
++    )
++    try:
++        server._run_prompt_submit("run", "game-sid", session, original_text)
++    finally:
++        server._sessions.pop("game-sid", None)
++
++    assert captured["prompt"].startswith("[Host current-capability metadata")
++    assert "Current callable tool identifiers: computer_use, cronjob, terminal." in captured[
++        "prompt"
++    ]
++    assert "older transcript claim" in captured["prompt"]
++    assert captured["prompt"].endswith(original_text)
++    assert captured["persist_user_message"] == original_text
++    assert session["history"][-2] == {"role": "user", "content": original_text}
++    assert all(
++        "Host current-capability metadata" not in str(message.get("content") or "")
++        for message in session["history"]
++    )
+diff --git a/tools/cronjob_tools.py b/tools/cronjob_tools.py
+index 6f1c6cfc12ca3fe9175995091ab4481f7adc9c69..8646889ef0072c02d4b18a20cc962b92a7235dc8 100644
+--- a/tools/cronjob_tools.py
++++ b/tools/cronjob_tools.py
+@@ -359,13 +359,15 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
+ def _local_workbench_origin_from_env(
+     deliver: Optional[str],
+ ) -> Optional[Dict[str, str]]:
+-    """Capture an exact, live-only return address for embedded Workbench cron.
++    """Capture an exact, live-only return address for embedded local cron.
+ 
+     This is deliberately separate from platform ``origin``: it is not a
+     messaging destination and must never fall back to a home channel or a
+-    resumed sibling session.  The host-only ticker flag distinguishes the
+-    embedded Runtime from a standalone TUI.  Explicit ``deliver='local'`` (or
+-    any target without an ``origin`` token) remains save-only.
++    resumed sibling session.  It covers both the visible Workbench and the
++    Runtime-attested hidden game conversation.  The host-only ticker flag
++    distinguishes the embedded Runtime from a standalone TUI.  Explicit
++    ``deliver='local'`` (or any target without an ``origin`` token) remains
++    save-only.
+     """
+     from gateway.session_context import get_session_env
+     from utils import env_var_enabled, is_truthy_value
+@@ -380,7 +382,13 @@ def _local_workbench_origin_from_env(
+         return None
+ 
+     source = str(get_session_env("HERMES_SESSION_SOURCE", "") or "").strip().lower()
+-    if source not in {"desktop", "lilith-runtime", "local", "tui"}:
++    if source not in {
++        "desktop",
++        "lilith-game",
++        "lilith-runtime",
++        "local",
++        "tui",
++    }:
+         return None
+     session_key = str(get_session_env("HERMES_SESSION_KEY", "") or "").strip()
+     session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
+@@ -403,19 +411,20 @@ def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) ->
+     ``HERMES_SESSION_PLATFORM``/``CHAT_ID`` is set for them), so a
+     ``deliver="origin"`` request — or an omitted ``deliver`` that defaults to
+     origin-or-local — produces a job that runs and saves output to
+-    ``last_output`` but is never delivered back into the session. The embedded
+-    Runtime Workbench is the narrow exception: one-shot jobs can carry an exact
+-    live-only local return address. Otherwise, silently
+-    dropping the user's "tell me when it runs" intent is the trap reported in
+-    #51568. Surface it at create time so the agent can relay it instead of
+-    promising a delivery that never happens.
++    ``last_output`` but is never delivered back into the session. Embedded
++    Runtime Workbench and hidden-game sessions are the narrow exceptions:
++    one-shot jobs can carry an exact live-only local return address. Otherwise,
++    silently dropping the user's "tell me when it runs" intent is the trap
++    reported in #51568. Surface it at create time so the agent can relay it
++    instead of promising a delivery that never happens.
+ 
+     Returns ``None`` when the user explicitly asked for ``local`` (no surprise),
+-    when an exact Workbench one-shot return address exists, or when the job
++    when an exact embedded one-shot return address exists, or when the job
+     resolves to a real delivery target.
+     """
+-    # A one-shot created from the embedded Workbench has an exact live-only
+-    # completion rail even though its normal delivery value remains ``local``.
++    # A one-shot created from the embedded Workbench or hidden game has an
++    # exact live-only completion rail even though its normal delivery value
++    # remains ``local``.
+     if (
+         (job.get("schedule") or {}).get("kind") == "once"
+         and job.get("local_workbench_origin")
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index f5bc859241bcba8e337e1c40346cefe1b229e6ca..fb8443897a97ccbdca428a841d8ab643ee1848a2 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -13819,6 +13819,70 @@ def _game_display_locale_note(display_locale: str | None) -> str:
+     )
+ 
+ 
++def _game_current_capability_note(session: dict) -> str:
++    """Return current tool truth for one attested hidden-game turn.
++
++    A durable game conversation can contain old tool-not-found results from a
++    previous Runtime generation.  Those rows are legitimate history, but they
++    are not authority for the schemas attached to the current request.  Keep
++    that distinction on the new model-bound message so the persisted user text,
++    memory input, and cache prefix remain untouched.
++
++    ``valid_tool_names`` is the agent's post-resolution schema set.  Do not
++    infer capabilities from config, the registry, or a process-global snapshot:
++    only name a tool, and only add tool-specific guidance, when that exact
++    identifier is present on this agent.
++    """
++    if (
++        session.get("source") != "lilith-game"
++        or session.get("archived") is not True
++        or not isinstance(session.get("_durable_lineage_root"), str)
++        or not session.get("_durable_lineage_root")
++    ):
++        return ""
++
++    agent = session.get("agent")
++    raw_names = getattr(agent, "valid_tool_names", None)
++    if raw_names is None:
++        return ""
++    names = sorted(
++        {
++            name.strip()
++            for name in raw_names
++            if isinstance(name, str) and name.strip()
++        }
++    )
++    exposed = ", ".join(names) if names else "(none)"
++    sentences = [
++        "[Host current-capability metadata for this durable hidden game turn. "
++        "The callable tool schemas attached to this request are authoritative "
++        "over stale tool-availability claims or tool-not-found errors in the "
++        "conversation history.",
++        f"Current callable tool identifiers: {exposed}.",
++        "Before claiming that a capability is unavailable, inspect this current "
++        "exposure and use a matching tool when one is present and the normal "
++        "authorization policy permits it. Exposure permits an attempted call; "
++        "the tool result remains authoritative about whether an external "
++        "operation actually succeeded.",
++    ]
++    if "cronjob" in names:
++        sentences.append(
++            "For reminders of one minute or longer, use cronjob to create a "
++            "one-shot schedule such as `1m`; make its prompt self-contained and "
++            "omit the `deliver` argument so completion returns to this exact "
++            "current session."
++        )
++    if "computer_use" in names:
++        sentences.append(
++            "For user-requested interaction with an installed desktop "
++            "application, use computer_use under the normal authorization "
++            "policy instead of relying on an older transcript claim that "
++            "desktop control was absent."
++        )
++    sentences.append("This metadata is not part of the user's message.]")
++    return " ".join(sentences)
++
++
+ def _prepend_note(run_message: Any, note: str) -> Any:
+     """Prefix a per-turn note onto the MODEL INPUT, leaving the prompt alone.
+ 
+@@ -14276,6 +14340,15 @@ def _run_prompt_submit(
+                 _game_display_locale_note(display_locale),
+             )
+ 
++            # A long-lived hidden game transcript can retain a truthful OLD
++            # tool-not-found result after Runtime exposes a richer current
++            # schema.  Give the model current per-agent authority on the NEW
++            # request only; persistence continues to use accepted_user_text.
++            run_message = _prepend_note(
++                run_message,
++                _game_current_capability_note(session),
++            )
++
+             def _stream(delta):
+                 with session["history_lock"]:
+                     _append_inflight_delta(session, delta)

@@ -1,0 +1,199 @@
+diff --git a/agent/identity_policy.py b/agent/identity_policy.py
+index 2c2003c..ef14114 100644
+--- a/agent/identity_policy.py
++++ b/agent/identity_policy.py
+@@ -89,12 +89,16 @@ _NATIVE_RECEIPT_SOURCE_PROVIDER_SETUP = "hermes.provider.setup"
+ _NATIVE_RECEIPT_SOURCE_CANONICAL_PROFILE_MIGRATION = (
+     "canonical.profile_migration"
+ )
++_NATIVE_RECEIPT_SOURCE_PREVIOUS_STATE_RECOVERY = (
++    "runtime.profile.previous_state_recovery"
++)
+ _NATIVE_RECEIPT_SOURCES_WITHOUT_OPERATION_NONCE = frozenset(
+     {
+         _NATIVE_RECEIPT_SOURCE_TOOLS_SET,
+         _NATIVE_RECEIPT_SOURCE_MODEL_DEFAULT_SET,
+         _NATIVE_RECEIPT_SOURCE_PROVIDER_SETUP,
+         _NATIVE_RECEIPT_SOURCE_CANONICAL_PROFILE_MIGRATION,
++        _NATIVE_RECEIPT_SOURCE_PREVIOUS_STATE_RECOVERY,
+     }
+ )
+ _NATIVE_RECEIPT_KEYS = (
+diff --git a/tests/agent/test_previous_state_recovery_receipt.py b/tests/agent/test_previous_state_recovery_receipt.py
+new file mode 100644
+--- /dev/null
++++ b/tests/agent/test_previous_state_recovery_receipt.py
+@@ -0,0 +1,173 @@
++"""Strict native receipt admission after separately authorized offline recovery."""
++import copy
++import hashlib
++import json
++import os
++from pathlib import Path
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++from agent import identity_policy as identity
++
++SOURCE = "runtime.profile.previous_state_recovery"
++FIXTURE = None
++
++
++def receipt():
++    return {"schema_version": 1, "source": SOURCE, "sequence": 9,
++        "canonical_base_sha256": "a" * 64, "previous_config_sha256": "b" * 64,
++        "config_sha256": "c" * 64, "identity_fingerprint_sha256": "d" * 64,
++        "soul_sha256": "e" * 64, "personality_sha256": "f" * 64,
++        "approval_mode": "manual", "enabled_toolsets": ["hermes-cli"]}
++
++
++def raw(value):
++    return json.dumps(value, separators=(",", ":")).encode("utf-8")
++
++
++class PreviousStateRecoveryReceiptTests(unittest.TestCase):
++    def decode(self, value):
++        return identity._decode_native_config_receipt(raw(value))
++
++    def test_exact_source_is_normal_receipt_without_operation_nonce(self):
++        for mode in ("manual", "smart", "off"):
++            value = receipt()
++            value["approval_mode"] = mode
++            with self.subTest(mode=mode):
++                self.assertEqual(value, self.decode(value))
++        self.assertIn(SOURCE, identity._NATIVE_RECEIPT_SOURCES_WITHOUT_OPERATION_NONCE)
++        self.assertNotEqual(SOURCE, identity._NATIVE_RECEIPT_SOURCE_APPROVAL_ALWAYS)
++
++    def test_unknown_sources_and_spelling_variations_remain_rejected(self):
++        for source in (SOURCE + ".v1", SOURCE.upper(), " " + SOURCE,
++                       "runtime.profile.recovery", "canonical.previous_state_recovery", "", None):
++            with self.subTest(source=source), self.assertRaises(identity.IdentityPolicyError):
++                self.decode({**receipt(), "source": source})
++
++    def test_missing_unknown_reordered_duplicate_and_nonce_fields_rejected(self):
++        value = receipt()
++        for key in value:
++            changed = value.copy()
++            del changed[key]
++            with self.subTest(missing=key), self.assertRaises(identity.IdentityPolicyError):
++                self.decode(changed)
++        for key, added in (("operation_nonce", "0" * 64), ("authorized", True)):
++            with self.subTest(extra=key), self.assertRaises(identity.IdentityPolicyError):
++                self.decode({**value, key: added})
++        with self.assertRaises(identity.IdentityPolicyError):
++            self.decode(dict(reversed(tuple(value.items()))))
++        duplicate = raw(value)[:-1] + b',"source":"' + SOURCE.encode() + b'"}'
++        with self.assertRaises(identity.IdentityPolicyError):
++            identity._decode_native_config_receipt(duplicate)
++
++    def test_metadata_types_bounds_and_approval_mode_remain_strict(self):
++        for key, values in (("schema_version", (True, "1", 0, 2, 1.0)),
++                            ("sequence", (True, "9", 0, -1, 1 << 63, 9.0)),
++                            ("approval_mode", ("auto", "always", "Manual", "", None))):
++            for changed in values:
++                with self.subTest(key=key, value=changed), self.assertRaises(identity.IdentityPolicyError):
++                    self.decode({**receipt(), key: changed})
++
++    def test_all_digest_fields_remain_lowercase_exact_sha256(self):
++        for key in (key for key in receipt() if key.endswith("sha256")):
++            for value in ("A" * 64, "g" * 64, "a" * 63, "a" * 65, None, 1):
++                with self.subTest(key=key, value=value), self.assertRaises(identity.IdentityPolicyError):
++                    self.decode({**receipt(), key: value})
++
++    def test_toolsets_remain_sorted_unique_bounded_exact_tokens(self):
++        for toolsets in (("hermes-cli",), ["z", "a"], ["a", "a"], [""], ["space token"],
++                         [1], None, ["a" * 257], [f"t{i:03}" for i in range(129)]):
++            # JSON arrays intentionally erase tuples; test the decoder's list
++            # constraint separately with an object value.
++            if isinstance(toolsets, tuple):
++                toolsets = {"hermes-cli": True}
++            with self.subTest(toolsets=toolsets), self.assertRaises(identity.IdentityPolicyError):
++                self.decode({**receipt(), "enabled_toolsets": toolsets})
++
++    def test_malformed_json_and_size_are_rejected(self):
++        for value in (b"", b"{}", b"[]", b"null", b"\xff", b" " * (64 * 1024 + 1),
++                      raw(receipt()).replace(b'"sequence":9', b'"sequence":NaN')):
++            with self.subTest(value=value[:30]), self.assertRaises(identity.IdentityPolicyError):
++                identity._decode_native_config_receipt(value)
++
++    def capture(self, value, *, expected="c" * 64, mode="manual", toolsets=("hermes-cli",)):
++        snapshot = SimpleNamespace(config_sha256="c" * 64, soul_sha256="e" * 64,
++            personality_sha256="f" * 64, files=[SimpleNamespace(
++                label="runtime/native-config-receipt.v1.json", existed=True, raw=raw(value))])
++        preflight = SimpleNamespace(policy=SimpleNamespace(fingerprint="d" * 64))
++        with patch.object(identity, "require_native_runtime_parent_authority", return_value=123), \
++             patch.object(identity, "capture_strict_authority_snapshot", return_value=snapshot), \
++             patch.object(identity, "preflight_aia_agent_identity", return_value=preflight):
++            return identity.capture_native_config_receipt_base(expected,
++                approval_mode=mode, enabled_toolsets=toolsets)
++
++    def test_recovered_receipt_can_be_captured_as_next_transition_base(self):
++        base = self.capture(receipt())
++        self.assertEqual((9, "a" * 64, "c" * 64),
++            (base.sequence, base.canonical_base_sha256, base.config_sha256))
++        self.assertEqual(("manual", ("hermes-cli",)), (base.approval_mode, base.enabled_toolsets))
++
++    def test_capture_preserves_config_identity_soul_personality_and_policy_checks(self):
++        for key in ("config_sha256", "identity_fingerprint_sha256", "soul_sha256", "personality_sha256"):
++            with self.subTest(key=key), self.assertRaises(identity.IdentityPolicyError):
++                self.capture({**receipt(), key: "0" * 64})
++        for value in ({"expected": "0" * 64}, {"mode": "off"}, {"toolsets": ()}):
++            with self.subTest(value=value), self.assertRaises(identity.IdentityPolicyError):
++                self.capture(receipt(), **value)
++
++    def test_recovery_source_cannot_impersonate_a_provider_commit(self):
++        value = receipt()
++        value["sequence"] = 10
++        value["previous_config_sha256"] = "c" * 64
++        base = self.capture(receipt())
++        snapshot = SimpleNamespace(config_sha256="c" * 64, files=[SimpleNamespace(
++            label="runtime/native-config-receipt.v1.json", existed=True, raw=raw(value))])
++        preflight = SimpleNamespace(policy=SimpleNamespace(fingerprint="d" * 64),
++            soul_sha256="e" * 64, personality_sha256="f" * 64)
++        with patch.object(identity, "require_native_runtime_parent_authority", return_value=123), \
++             patch.object(identity, "capture_strict_authority_snapshot", return_value=snapshot), \
++             patch.object(identity, "preflight_aia_agent_identity", return_value=preflight), \
++             self.assertRaises(identity.IdentityPolicyError):
++            identity.verify_native_provider_setup_commit_receipt(base,
++                previous_config_sha256="c" * 64, config_sha256="c" * 64,
++                receipt_sha256=hashlib.sha256(raw(value)).hexdigest())
++
++    def test_real_synthetic_profile_preflight_and_receipt_capture(self):
++        import yaml
++        profile = Path(FIXTURE) / "strict-recovered-profile"
++        profile.mkdir()
++        (profile / "runtime").mkdir()
++        soul, personality, fingerprint = "SYNTHETIC SOUL\n", "SYNTHETIC VOICE\n", "d" * 64
++        config = {"model": {"default": "fixture", "provider": "fixture"},
++            "identity": {"require_soul": True, "suppress_kernel_help": True,
++                "personality_allowlist": ["lilith"], "locked_personality": "lilith",
++                "force_soul_for_children": True, "fingerprint": fingerprint.upper()},
++            "display": {"personality": "lilith"},
++            "agent": {"system_prompt": "", "personalities": {"lilith": {"system_prompt": personality}}}}
++        config_raw = yaml.safe_dump(config).encode()
++        (profile / "config.yaml").write_bytes(config_raw)
++        (profile / "SOUL.md").write_bytes(soul.encode())
++        pins = {"HERMES_HOME": str(profile), "HERMES_PARENT_PID": "123", "HERMES_IDENTITY_REQUIRED": "1",
++            "HERMES_IDENTITY_EXPECTED_FINGERPRINT": fingerprint,
++            "HERMES_IDENTITY_EXPECTED_CONFIG_SHA256": hashlib.sha256(config_raw).hexdigest(),
++            "HERMES_IDENTITY_EXPECTED_SOUL_SHA256": hashlib.sha256(soul.encode()).hexdigest(),
++            "HERMES_IDENTITY_EXPECTED_PERSONALITY_SHA256": hashlib.sha256(personality.encode()).hexdigest()}
++        value = receipt()
++        for field, env in (("config_sha256", "CONFIG"), ("soul_sha256", "SOUL"), ("personality_sha256", "PERSONALITY")):
++            value[field] = pins[f"HERMES_IDENTITY_EXPECTED_{env}_SHA256"]
++        receipt_path = profile / "runtime/native-config-receipt.v1.json"
++        receipt_path.write_bytes(raw(value))
++        with patch.dict(os.environ, pins):
++            captured = identity.capture_native_config_receipt_base(value["config_sha256"],
++                approval_mode="manual", enabled_toolsets=("hermes-cli",))
++            self.assertEqual(9, captured.sequence)
++            for key in ("config_sha256", "soul_sha256", "personality_sha256", "identity_fingerprint_sha256"):
++                bad = copy.deepcopy(value)
++                bad[key] = "0" * 64
++                receipt_path.write_bytes(raw(bad))
++                with self.subTest(key=key), self.assertRaises(identity.IdentityPolicyError):
++                    identity.capture_native_config_receipt_base(value["config_sha256"],
++                        approval_mode="manual", enabled_toolsets=("hermes-cli",))
++            receipt_path.write_bytes(raw(value))
++            self.assertEqual(config_raw, (profile / "config.yaml").read_bytes())

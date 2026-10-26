@@ -1,0 +1,663 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index d79de59..633bb16 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -10674,6 +10674,10 @@ def _call_llm_impl(
+         except Exception as transient_err:
+             if not _is_transient_transport_error(transient_err):
+                 raise
++            if task == "lilith_relationship_review":
++                # Durable review owns cooldown/recovery on the next eligible
++                # human turn. Do not spend three full timeouts in one worker.
++                raise
+             # Compression is on the critical preflight path: a user cannot
+             # continue or resume an oversized session until it compacts. A
+             # same-provider retry on a timeout means another full ``timeout``-
+@@ -10729,7 +10733,7 @@ def _call_llm_impl(
+     except BudgetError:
+         raise
+     except Exception as first_err:
+-        if _strict_auxiliary_request:
++        if _strict_auxiliary_request or task == "lilith_relationship_review":
+             if _is_connection_error(first_err):
+                 try:
+                     _evict_cached_client_instance(client)
+@@ -10739,6 +10743,13 @@ def _call_llm_impl(
+                         "error failed",
+                         exc_info=True,
+                     )
++            if task == "lilith_relationship_review":
++                # Plugins depend on host semantics, never vendor exception
++                # classes or a second SDK. Keep provider diagnostics in cause.
++                if _is_timeout_error(first_err):
++                    raise TimeoutError("relationship review transport timeout") from first_err
++                if _is_transient_transport_error(first_err):
++                    raise ConnectionError("relationship review transport unavailable") from first_err
+             raise
+         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
+             retry_kwargs = dict(kwargs)
+@@ -11493,6 +11504,8 @@ async def _async_call_llm_impl(
+         except Exception as transient_err:
+             if not _is_transient_transport_error(transient_err):
+                 raise
++            if task == "lilith_relationship_review":
++                raise
+             # See call_llm(): compression is on the critical preflight path,
+             # so skip the same-provider retry on a full-budget timeout and
+             # fall straight through to fallback (issue #54465).
+@@ -11520,7 +11533,7 @@ async def _async_call_llm_impl(
+     except BudgetError:
+         raise
+     except Exception as first_err:
+-        if _strict_auxiliary_request:
++        if _strict_auxiliary_request or task == "lilith_relationship_review":
+             if _is_connection_error(first_err):
+                 try:
+                     _evict_cached_client_instance(client)
+@@ -11530,6 +11543,11 @@ async def _async_call_llm_impl(
+                         "connection error failed",
+                         exc_info=True,
+                     )
++            if task == "lilith_relationship_review":
++                if _is_timeout_error(first_err):
++                    raise TimeoutError("relationship review transport timeout") from first_err
++                if _is_transient_transport_error(first_err):
++                    raise ConnectionError("relationship review transport unavailable") from first_err
+             raise
+         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
+             retry_kwargs = dict(kwargs)
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 1089eba..04af879 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -1711,6 +1711,10 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
+     # can return invalid surrogate code points that crash json.dumps() on persist.
+     _raw_content = flatten_message_text(getattr(assistant_message, "content", None))
+     _san_content = _sanitize_surrogates(_raw_content)
++    # Truncation and interim exits may reach this builder before the normal
++    # response handler; they must not put a partial speech suffix in history.
++    from agent.paired_speech import display_only
++    _san_content = display_only(agent, _san_content)
+     if reasoning_text:
+         reasoning_text = _sanitize_surrogates(reasoning_text)
+ 
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 878d16b..cd8f162 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -2959,6 +2959,8 @@ def run_conversation(
+ 
+             try:
+                 agent._reset_stream_delivery_tracking()
++                from agent.paired_speech import begin_response
++                begin_response(agent)
+                 # api_messages is built once, before this retry loop, while the
+                 # primary provider is active.  A mid-conversation fallback can
+                 # switch to a require-side provider (DeepSeek / Kimi / MiMo) that
+@@ -6833,6 +6835,11 @@ def run_conversation(
+                 else:
+                     assistant_message.content = str(raw)
+ 
++            # Strip the host-requested speech suffix BEFORE tool/interim hooks,
++            # persistence and memory. Only a complete no-tool response can pair.
++            from agent.paired_speech import accept_response
++            accept_response(agent, assistant_message, finish_reason)
++
+             try:
+                 from hermes_cli.lifecycle import (
+                     has_hook,
+diff --git a/agent/paired_speech.py b/agent/paired_speech.py
+new file mode 100644
+--- /dev/null
++++ b/agent/paired_speech.py
+@@ -0,0 +1,134 @@
++"""Ephemeral, host-requested display/speech pairing from ONE main completion.
++
++This is output formatting, not a tool or permission. No provider calls, database
++writes, preference reads or extra origins. Legacy/notification turns opt out.
++"""
++from dataclasses import dataclass
++import uuid
++
++_PREFIX = "<lilith_speech"
++_KEY = "_lilith_paired_speech"
++
++
++@dataclass(frozen=True)
++class PairedSpeechResult:
++    turn_id: str
++    display_locale: str
++    speech_locale: str
++    display_text: str
++    speech_text: str
++
++
++class PairedSpeech:
++    def __init__(self, turn_id, display_locale):
++        from agent.turn_identity import require_canonical_id
++        require_canonical_id(turn_id, "turn_id")
++        if display_locale not in {"zh-Hant", "zh-Hans", "en"}:
++            raise ValueError("unsupported paired display locale")
++        self.turn_id = turn_id
++        self.display_locale = display_locale
++        self.nonce = uuid.uuid4().hex
++        self.open_tag = f'<lilith_speech id="{self.nonce}" locale="ja">'
++        self.close_tag = '</lilith_speech>'
++        self.result = None
++        self.begin_response()
++
++    def instruction(self):
++        return (
++            "Host presentation contract for THIS turn only: write your answer in the "
++            "requested display language exactly as usual. In the SAME final text response, "
++            "after that complete answer append a faithful Japanese TTS rendition, enclosed "
++            f"exactly as: \n{self.open_tag}\nJapanese speech text\n{self.close_tag}\n"
++            "Do not explain or label this formatting. Do not wrap it in a code fence. "
++            "The display answer comes first; nothing follows the closing tag. The enclosed "
++            "script is not a second answer: preserve meaning, persona, names, tone and facts; "
++            "add no advice, claims or actions. Use natural Japanese sentences and kana readings "
++            "for Han-only names/headings; never leave Chinese clauses for a Japanese voice. "
++            "Omit unreadable markup, URLs and local file paths from speech. "
++            "Do not attach a speech script to tool calls or interim commentary. Continue using "
++            "real tools normally when needed, then attach the script only to the final answer. "
++            "This contract neither authorizes any action nor changes conversation language."
++        )
++
++    def begin_response(self):
++        self.pending = ""
++        self.hidden = False
++        self.result = None
++
++    def feed(self, delta):
++        """Hide the suffix even when the marker arrives one character at a time."""
++        if self.hidden or not isinstance(delta, str):
++            return ""
++        text = self.pending + delta
++        self.pending = ""
++        at = text.lower().find(_PREFIX)
++        if at >= 0:
++            self.hidden = True
++            return text[:at]
++        for length in range(min(len(_PREFIX) - 1, len(text)), 0, -1):
++            if text[-length:].lower() == _PREFIX[:length]:
++                self.pending = text[-length:]
++                return text[:-length]
++        return text
++
++    def display(self, text):
++        if not isinstance(text, str):
++            return text
++        at = text.lower().find(_PREFIX)
++        return text[:at].rstrip() if at >= 0 else text
++
++    def accept(self, text, *, has_tools=False, finish_reason="stop"):
++        from agent.speech_projection import _speech_language_issue
++        from agent.redact import redact_sensitive_text
++        self.result = None
++        display = self.display(text)
++        if (not isinstance(text, str) or not display or has_tools or finish_reason != "stop"
++                or len(display) > 32768 or text.count(self.open_tag) != 1
++                or text.count(self.close_tag) != 1):
++            return display
++        prefix, suffix = text.split(self.open_tag, 1)
++        speech, closing, tail = suffix.partition(self.close_tag)
++        speech = speech.strip()
++        # A malformed/foreign marker cannot bless a later legitimate-looking
++        # suffix. Speech text is never reparsed as a tool, JSON or permission.
++        if (not closing or prefix.rstrip() != display.rstrip() or tail.strip() or not speech or len(speech) > 32768
++                or _PREFIX in speech.lower() or '<' in speech or '>' in speech
++                or redact_sensitive_text(speech) != speech
++                or _speech_language_issue(display, speech, "ja") is not None):
++            return display
++        self.result = PairedSpeechResult(self.turn_id, self.display_locale, "ja", display.strip(), speech)
++        return display
++
++    def for_reply(self, text):
++        if self.result is not None and self.result.display_text == text.strip():
++            return self.result
++        return None
++
++
++def state_for(agent):
++    state = getattr(agent, _KEY, None)
++    if type(state) is PairedSpeech and getattr(agent, "_current_turn_id", None) == state.turn_id:
++        return state
++    return None
++
++
++def display_only(agent, text):
++    state = state_for(agent)
++    return state.display(text) if state is not None else text
++
++
++def begin_response(agent):
++    state = state_for(agent)
++    if state is not None:
++        state.begin_response()
++
++
++def accept_response(agent, message, finish_reason):
++    state = state_for(agent)
++    if state is not None:
++        # Match the existing display normalizer before pairing; inline thinking
++        # is neither the visible answer nor material to speak aloud.
++        strip_thinking = getattr(agent, "_strip_think_blocks", None)
++        if isinstance(message.content, str) and callable(strip_thinking):
++            message.content = strip_thinking(message.content).strip()
++        message.content = state.accept(message.content, has_tools=bool(message.tool_calls), finish_reason=finish_reason)
+diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
+index ad64eee..2cf718c 100644
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -244,6 +244,10 @@ def finalize_turn(
+     """
+     from agent.conversation_loop import logger
+ 
++    from agent.paired_speech import display_only
++    final_response = display_only(agent, final_response)
++    _pending_verification_response = display_only(agent, _pending_verification_response)
++
+     _unlimited_iterations = unlimited_iterations()
+     budget_exhausted = not _unlimited_iterations and (
+         api_call_count >= agent.max_iterations
+diff --git a/tests/test_completed_speech_origin.py b/tests/test_completed_speech_origin.py
+index 9d50ed6..4dc2040 100644
+--- a/tests/test_completed_speech_origin.py
++++ b/tests/test_completed_speech_origin.py
+@@ -47,6 +47,31 @@ class CompletedOriginTests(unittest.TestCase):
+         self.assertFalse(subject.is_current(self.session, grant))
+         with self.assertRaises(ValueError): self.claim()
+ 
++    def test_pair_is_ephemeral_and_bound_to_exact_completed_display(self):
++        from agent.paired_speech import PairedSpeech, PairedSpeechResult
++        pair = PairedSpeech("a" * 32, "zh-Hant")
++        pair.result = PairedSpeechResult("a" * 32, "zh-Hant", "ja", "早安。", "おはようございます。")
++        self.session['agent'] = types.SimpleNamespace(_current_turn_id="a"*32, _lilith_paired_speech=pair)
++        self.retain()
++        grant = self.claim()
++        self.assertTrue(grant.paired_requested)
++        self.assertEqual(grant.paired.speech_text, "おはようございます。")
++        self.assertNotIn("おはよう", repr(grant))
++        subject.finish(self.session, grant)
++        self.assertFalse(subject.is_current(self.session, grant))
++
++    def test_requested_but_missing_script_cannot_become_legacy_projection(self):
++        from agent.paired_speech import PairedSpeech
++        pair = PairedSpeech("a" * 32, "zh-Hant")
++        self.session['agent'] = types.SimpleNamespace(_current_turn_id="a"*32, _lilith_paired_speech=pair)
++        self.retain()
++        grant = self.claim()
++        self.assertTrue(grant.paired_requested)
++        self.assertIsNone(grant.paired)
++        subject.finish(self.session, grant)
++        self.assertFalse(subject.is_current(self.session, grant))
++        with self.assertRaises(ValueError): self.claim()
++
+     def test_missing_or_restarted_session(self):
+         with self.assertRaises(ValueError): self.claim()
+ 
+diff --git a/tests/test_paired_speech.py b/tests/test_paired_speech.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_paired_speech.py
+@@ -0,0 +1,72 @@
++"""Pure hostile formatting cases, using actual language/identity validators."""
++import types
++import unittest
++from agent.paired_speech import PairedSpeech, accept_response, state_for
++
++
++class PairTests(unittest.TestCase):
++    def setUp(self):
++        self.pair = PairedSpeech("a" * 32, "zh-Hant")
++        self.answer = "早安，今天一起散步吧。"
++        self.speech = "おはよう。今日は一緒に散歩しましょう。"
++
++    def wire(self, speech=None):
++        return self.answer + "\n" + self.pair.open_tag + "\n" + (speech or self.speech) + "\n" + self.pair.close_tag
++
++    def test_one_pair_and_all_stream_splits(self):
++        wire = self.wire()
++        for cut in range(len(wire) + 1):
++            self.pair.begin_response()
++            visible = self.pair.feed(wire[:cut]) + self.pair.feed(wire[cut:])
++            self.assertEqual(visible.strip(), self.answer)
++        self.pair.begin_response()
++        self.assertEqual(''.join(self.pair.feed(c) for c in wire).strip(), self.answer)
++        self.assertEqual(self.pair.accept(wire), self.answer)
++        self.assertEqual(self.pair.for_reply(self.answer).speech_text, self.speech)
++        self.assertIsNone(self.pair.for_reply("別的回覆"))
++
++    def test_plain_text_survives_without_pair(self):
++        self.assertEqual(self.pair.accept(self.answer), self.answer)
++        self.assertIsNone(self.pair.result)
++        self.assertEqual(self.pair.feed(self.answer), self.answer)
++
++    def test_bad_suffix_never_turns_chat_into_failure(self):
++        for raw in (self.wire()[:-5], self.wire() + "extra", self.wire().replace(self.pair.nonce, "b"*32),
++                    self.wire("我還是中文。"), self.wire() + self.wire(),
++                    self.answer + self.pair.open_tag, self.answer + "<LILITH_SPEECH bad>日本語です。",
++                    self.pair.close_tag + self.answer + self.pair.open_tag + "日本語です。"):
++            self.pair.accept(raw)
++            self.assertIsNone(self.pair.result)
++            self.assertNotIn("日本語", self.pair.display(raw))
++
++    def test_interim_truncated_and_tool_results_never_pair(self):
++        for kwargs in ({"has_tools": True}, {"finish_reason": "length"}, {"finish_reason": "incomplete"}):
++            self.assertEqual(self.pair.accept(self.wire(), **kwargs), self.answer)
++            self.assertIsNone(self.pair.result)
++
++    def test_new_response_invalidates_old_candidate(self):
++        self.pair.accept(self.wire())
++        self.pair.begin_response()
++        self.assertIsNone(self.pair.result)
++        self.assertEqual(self.pair.feed("下一次的回答"), "下一次的回答")
++
++    def test_only_exact_agent_turn_is_parsed(self):
++        agent = types.SimpleNamespace(_lilith_paired_speech=self.pair, _current_turn_id="b"*32)
++        self.assertIsNone(state_for(agent))
++        msg = types.SimpleNamespace(content=self.answer, tool_calls=[])
++        accept_response(agent, msg, "stop")
++        self.assertEqual(msg.content, self.answer)
++        agent._current_turn_id = "a"*32
++        msg.content = self.wire()
++        accept_response(agent, msg, "stop")
++        self.assertEqual(msg.content, self.answer)
++        self.assertIsNotNone(self.pair.result)
++
++    def test_invalid_settings_rejected(self):
++        for turn, locale in (("bad", "zh-Hant"), ("a"*32, "ja"), ("a"*32, "untrusted")):
++            with self.assertRaises(ValueError):
++                PairedSpeech(turn, locale)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_paired_speech_integration.py b/tests/test_paired_speech_integration.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_paired_speech_integration.py
+@@ -0,0 +1,156 @@
++"""Actual main AIAgent + SDK mock + speech RPC: one call, clean persistence.
++
++Run only by the denied-effects harness in a disposable fixture profile.
++"""
++import copy
++import json
++import re
++import threading
++import uuid
++from unittest.mock import patch
++
++
++def exercise(profile):
++    import httpx
++    import openai
++    import requests
++    import run_agent
++    import tools.env_probe
++    import hermes_constants
++    import agent.prompt_builder as prompt_builder
++    from run_agent import AIAgent
++    from agent import identity_policy, speech_projection, auxiliary_client
++    from agent.paired_speech import PairedSpeech
++    from agent.usage_budget_runtime import get_runtime
++    from agent.usage_budget_preferences import PreferenceUpdate
++    from agent.usage_budget_entrypoints import accept_native_origin, bind_native_agent_origin, native_origin_scope, complete_primary
++    from tui_gateway import server, speech_origin
++
++    wire_calls = []
++    answer = "早安，今天一起散步吧。"
++    speech = "おはよう。今日は一緒に散歩しましょう。"
++    mode = ["valid"]
++
++    def fake_http(request):
++        payload = json.loads(request.content)
++        wire_calls.append(payload)
++        # The request carries the exact host nonce, not a fixture-side shortcut
++        # to pair acceptance. Observe actual prompt/persistence separation.
++        joined = '\n'.join(str(m.get('content', '')) for m in payload['messages'])
++        tag = re.search(r'<lilith_speech id="[a-f0-9]{32}" locale="ja">', joined)
++        assert tag, 'main completion omitted the pairing contract'
++        script = speech if mode[0] != "wrong_language" else "這還是中文。"
++        content = answer if mode[0] == "missing" else answer + '\n' + tag[0] + '\n' + script + '\n</lilith_speech>'
++        usage = dict(prompt_tokens=1234, completion_tokens=50, total_tokens=1284)
++        if payload.get('stream'):
++            # Worst-case one-character chunking of the private suffix marker.
++            rows = [dict(id="fixture", object="chat.completion.chunk", created=0, model="gpt-4o",
++                choices=[dict(index=0, delta=dict(content=c), finish_reason=None)]) for c in content]
++            rows.append(dict(id="fixture", object="chat.completion.chunk", created=0, model="gpt-4o",
++                choices=[dict(index=0, delta={}, finish_reason="stop")], usage=usage))
++            body = ''.join('data: ' + json.dumps(row) + '\n\n' for row in rows) + 'data: [DONE]\n\n'
++            return httpx.Response(200, headers={'content-type': 'text/event-stream'}, content=body.encode())
++        return httpx.Response(200, json=dict(id="fixture", object="chat.completion", created=0, model="gpt-4o",
++            choices=[dict(index=0, message=dict(role="assistant", content=content), finish_reason="stop")], usage=usage))
++
++    client = openai.OpenAI(api_key='synthetic-not-a-secret', base_url='https://api.openai.com/v1', max_retries=0,
++        http_client=httpx.Client(transport=httpx.MockTransport(fake_http), trust_env=False))
++    run_agent.OpenAI = lambda *a, **kw: client
++    AIAgent._build_keepalive_http_client = staticmethod(lambda *a, **kw: client._client)
++    tools.env_probe.warm_environment_probe_async = lambda *a, **kw: None
++    tools.env_probe.get_environment_probe_line = lambda *a, **kw: "synthetic environment"
++    tools.env_probe._build_probe_line = lambda *a, **kw: "synthetic environment"
++    hermes_constants.is_wsl = lambda: False
++    prompt_builder.is_wsl = lambda: False
++    def catalog(*a, **kw):
++        response = requests.Response()
++        response.status_code = 200
++        response._content = b'{"data":[]}'
++        return response
++    requests.Session.request = catalog
++    runtime = get_runtime(profile)
++    projection = server._methods['prompt.project_speech']
++
++    for level in range(1, 7):
++        for case in ('valid', 'missing', 'wrong_language'):
++            mode[0] = case
++            current = runtime.store.get()
++            runtime.store.set(PreferenceUpdate(f'paired-{level}-{case}', current.revision, level))
++            agent = AIAgent(model='gpt-4o', provider='openai', api_mode='chat_completions', api_key='synthetic-not-a-secret',
++                base_url='https://api.openai.com/v1', session_id=f'paired-{level}-{case}', max_tokens=2048, max_iterations=32,
++                enabled_toolsets=[], skip_context_files=True, skip_memory=True, skip_background_review=True, quiet_mode=True)
++            agent.client = client
++            turn_id = uuid.uuid4().hex
++            agent._relay_pending_turn_id = turn_id
++            agent._relay_pending_user_message_id = uuid.uuid4().hex
++            agent._relay_pending_assistant_message_id = uuid.uuid4().hex
++            pair = PairedSpeech(turn_id, 'zh-Hant')
++            agent._lilith_paired_speech = pair
++            handle = bind_native_agent_origin(accept_native_origin(profile, turn_id), agent)
++            session = dict(agent=agent, archived=True, source='lilith-game', session_key=agent.session_id,
++                _durable_lineage_root=agent.session_id, history_lock=threading.Lock(), running=False,
++                inflight_turn=None, history=[], profile_home=profile)
++            visible = []
++            before = len(wire_calls)
++            with native_origin_scope(handle):
++                result = agent.run_conversation(pair.instruction() + '\n早安', persist_user_message='早安',
++                    conversation_history=[], stream_callback=lambda delta: visible.append(pair.feed(delta)))
++                assert result.get('final_response') == answer and not result.get('failed'), result
++                assert len(wire_calls) == before + 1, 'paired speech must not add another model call'
++                transcript = json.dumps(result['messages'], ensure_ascii=False)
++                assert '<lilith_speech' not in transcript and speech not in transcript, transcript
++                assert speech not in ''.join(visible) and '<lilith_speech' not in ''.join(visible)
++                assert ''.join(visible).strip() == answer, visible
++                speech_origin.retain_completed(session, 'live', turn_id, answer, handle)
++            complete_primary(handle)
++            params = dict(session_id='live', turn_id=turn_id, text=answer, display_locale='zh-Hant', speech_locale='ja')
++            with patch.object(server, '_sess', return_value=(session, None)), \
++                    patch.object(server, '_attest_durable_lineage_postcondition', return_value={'stored_session_id': session['session_key']}), \
++                    patch.object(identity_policy, 'bind_host_required_auxiliary_messages', side_effect=lambda value: value), \
++                    patch.object(speech_projection, 'project_speech', side_effect=AssertionError('second translation is forbidden')):
++                frozen_history = copy.deepcopy(result['messages'])
++                response = projection('paired', params)
++                if case == 'valid':
++                    assert response.get('result', {}).get('speech_text') == speech, response
++                else:
++                    assert 'error' in response, response
++                assert 'error' in projection('replay', params)
++                assert len(wire_calls) == before + 1
++                assert result['messages'] == frozen_history
++                if case == 'valid':
++                    for mismatch in ({'speech_locale': 'zh'}, {'display_locale': 'en'}, {'turn_id': 'b'*32}, {'text': '另一輪的話'}):
++                        with native_origin_scope(handle):
++                            speech_origin.retain_completed(session, 'live', turn_id, answer, handle)
++                        assert 'error' in projection('mismatch', {**params, **mismatch})
++                        assert len(wire_calls) == before + 1
++                    for field in ('_turn_cancel_requested', '_finalized', 'running'):
++                        with native_origin_scope(handle):
++                            speech_origin.retain_completed(session, 'live', turn_id, answer, handle)
++                        session[field] = True
++                        assert 'error' in projection('stale', params)
++                        session[field] = False
++                        assert len(wire_calls) == before + 1
++            print(f'PASS: paired main call level {level} / {case}, original retained, zero auxiliary translation')
++
++    # Recovery policy belongs to the durable reviewer, not the SDK's internal
++    # retry loop. The provider's sync entry point must attempt once on timeout.
++    timeout_calls = []
++    def time_out(request):
++        timeout_calls.append(1)
++        raise httpx.ReadTimeout('fixture timeout', request=request)
++    timeout_client = openai.OpenAI(api_key='synthetic-not-a-secret', max_retries=0,
++        http_client=httpx.Client(transport=httpx.MockTransport(time_out), trust_env=False))
++    current = runtime.store.get()
++    runtime.store.set(PreferenceUpdate('timeout-normal', current.revision, 5))
++    with patch.object(auxiliary_client, '_get_cached_client', return_value=(timeout_client, 'gpt-4o')), \
++            patch.object(identity_policy, 'preflight_host_required_auxiliary_request', return_value=False):
++        before = len(timeout_calls)
++        try:
++            auxiliary_client.call_llm(task='lilith_relationship_review', messages=[{'role':'user','content':'synthetic review'}],
++                provider='openai', model='gpt-4o', timeout=90)
++        except TimeoutError:
++            pass
++        else:
++            raise AssertionError('timeout expected')
++        assert len(timeout_calls) == before + 1
++    print('PASS: relationship transport timeout has one attempt, no immediate retry/fallback')
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 0605c98..6923807 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -399,6 +399,14 @@ def _(rid, params: dict) -> dict:
+         )
+     isolation_cfg = _load_dashboard_process_isolation_config()
+     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
++    speech_locale = params.get("speech_locale")
++    if "speech_locale" in params:
++        if type(speech_locale) is not str or speech_locale not in {"zh", "ja"}:
++            return _err(rid, 4004, "unsupported speech_locale")
++        if display_locale is None or not runtime_ingress_attested or not game_lineage_attested:
++            return _err(rid, 4030, "speech_locale requires attested game input")
++        if turn_isolation:
++            return _err(rid, 4091, "paired game speech is unavailable in isolated compute mode")
+     # Re-bind to the current client transport for this request. This keeps
+     # streaming events on the active websocket even if an earlier disconnect
+     # or fallback moved the session transport to stdio.
+@@ -742,6 +750,8 @@ def _(rid, params: dict) -> dict:
+         session["_turn_cancel_requested"] = False
+         session["last_active"] = time.time()
+         _start_inflight_turn(session, accepted_text)
++        # Host-only per-turn preference, never a session default or chat row.
++        session["inflight_turn"]["speech_locale"] = speech_locale
+         accepted_turn_id, accepted_user_message_id = _inflight_turn_identity(
+             session
+         )
+@@ -1468,6 +1478,15 @@ def _(rid, params: dict) -> dict:
+         if turn_id is not None:
+             grant = claim(session, session_id, turn_id, text)
+             snapshot = grant.snapshot
++            if grant.paired_requested:
++                from agent.speech_projection import speech_authority_is_current
++                pair = grant.paired
++                if (not is_current(session, grant) or not speech_authority_is_current(snapshot)
++                        or pair is None or pair.turn_id != turn_id or pair.display_text != text.strip()
++                        or pair.speech_locale != speech_locale or pair.display_locale != display_locale):
++                    raise ValueError("paired speech unavailable")
++                # No auxiliary call, no language repair, no new economic origin.
++                return _ok(rid, {"speech_text": pair.speech_text})
+         else:
+             # Preserve the separate legacy notification path. In particular,
+             # missing foreground provenance never falls back here, even at 5.
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index dc22826..81ed156 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -15358,6 +15358,8 @@ def _run_prompt_submit(
+         secret_token = None
+         goal_followup = None  # set by the post-turn goal hook below
+         result = None  # turn outcome; read after the finally for leftover /steer
++        paired_speech = None
++        agent._lilith_paired_speech = None
+         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
+         thinking_started = False  # ambient thinking sound armed for this turn
+         one_turn_restore = session.pop("one_turn_model_restore", None)
+@@ -15578,6 +15580,13 @@ def _run_prompt_submit(
+                 run_message,
+                 _game_display_locale_note(display_locale),
+             )
++            if (_budget_is_human and session.get("source") == "lilith-game"
++                    and (session.get("inflight_turn") or {}).get("speech_locale") == "ja"
++                    and display_locale in {"zh-Hant", "zh-Hans", "en"}):
++                from agent.paired_speech import PairedSpeech
++                paired_speech = PairedSpeech(turn_id, display_locale)
++                agent._lilith_paired_speech = paired_speech
++                run_message = _prepend_note(run_message, paired_speech.instruction())
+ 
+             # A long-lived hidden game transcript can retain a truthful OLD
+             # tool-not-found result after Runtime exposes a richer current
+@@ -15598,6 +15607,10 @@ def _run_prompt_submit(
+             )
+ 
+             def _stream(delta):
++                if paired_speech is not None:
++                    delta = paired_speech.feed(delta)
++                    if not delta:
++                        return
+                 with session["history_lock"]:
+                     _append_inflight_delta(session, delta)
+                 payload = {"text": delta}
+@@ -15836,6 +15849,8 @@ def _run_prompt_submit(
+                 )
+ 
+                 raw = result.get("final_response", "")
++                if paired_speech is not None:
++                    raw = paired_speech.display(raw)
+                 status = (
+                     "interrupted"
+                     if result.get("interrupted")
+@@ -16212,6 +16227,7 @@ def _run_prompt_submit(
+                 reset_secret_scope(secret_token)
+             _clear_session_context(session_tokens)
+             _current_runtime_session_record.reset(runtime_session_token)
++            agent._lilith_paired_speech = None
+             _current_assistant_event_message_id.reset(assistant_event_token)
+             _current_turn_event_id.reset(turn_event_token)
+             reset_transport(transport_token)
+diff --git a/tui_gateway/speech_origin.py b/tui_gateway/speech_origin.py
+index 59f6b87..85466be 100644
+--- a/tui_gateway/speech_origin.py
++++ b/tui_gateway/speech_origin.py
+@@ -18,6 +18,8 @@ class CompletedSpeechOrigin:
+     origin: object = field(repr=False)
+     snapshot: object = field(repr=False)
+     claimed: bool = False
++    paired_requested: bool = False
++    paired: object = field(default=None, repr=False)
+ 
+ 
+ def _digest(text):
+@@ -53,9 +55,13 @@ def retain_completed(session, session_id, turn_id, text, origin):
+             raise ValueError("speech session is unavailable")
+         agent = session.get("agent")
+         snapshot = capture_speech_projection(agent, session_id=session_id)
++        from agent.paired_speech import state_for
++        pair_state = state_for(agent)
+         session[_KEY] = CompletedSpeechOrigin(
+             session, agent, session_id, session["session_key"], session["_durable_lineage_root"],
+-            turn_id, _digest(text), origin, snapshot)
++            turn_id, _digest(text), origin, snapshot,
++            paired_requested=pair_state is not None,
++            paired=pair_state.for_reply(text) if pair_state is not None else None)
+ 
+ 
+ def _current_locked(session, grant):

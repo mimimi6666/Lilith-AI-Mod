@@ -1,0 +1,1393 @@
+diff --git a/tests/tools/test_computer_use.py b/tests/tools/test_computer_use.py
+index 7dc07239f95c59a69015486339fc12c5360566c4..acefa74aa846d7b480789e1aa06519c4839d95ec 100644
+--- a/tests/tools/test_computer_use.py
++++ b/tests/tools/test_computer_use.py
+@@ -19,11 +19,16 @@ import pytest
+ @pytest.fixture(autouse=True)
+ def _reset_backend():
+     """Tear down the cached backend between tests."""
+-    from tools.computer_use.tool import reset_backend_for_tests
++    from tools.computer_use.tool import reset_backend_for_tests, set_approval_callback
+     reset_backend_for_tests()
++    # Unit dispatch tests exercise the backend after an explicit positive
++    # decision.  Production gateway/API paths deliberately fail closed when no
++    # approval surface exists; tests for deny/timeout override this callback.
++    set_approval_callback(lambda action, args, summary: "approve_once")
+     # Force the noop backend.
+     with patch.dict(os.environ, {"HERMES_COMPUTER_USE_BACKEND": "noop"}, clear=False):
+         yield
++    set_approval_callback(None)
+     reset_backend_for_tests()
+ 
+ 
+@@ -46,9 +51,17 @@ class TestSchema:
+         assert actions >= {
+             "capture", "click", "double_click", "right_click", "middle_click",
+             "drag", "scroll", "type", "key", "wait", "list_apps", "list_windows",
+-            "focus_app",
++            "launch_app", "focus_app",
+         }
+ 
++    def test_launch_schema_exposes_registry_id_without_path_input(self):
++        from tools.computer_use.schema import COMPUTER_USE_SCHEMA
++
++        properties = COMPUTER_USE_SCHEMA["parameters"]["properties"]
++        assert properties["app_id"]["maxLength"] == 512
++        assert "launch_path" not in properties
++        assert "aumid" not in properties
++
+     def test_schema_max_elements_documents_default_and_upper_bound(self):
+         """Schema description must agree with the runtime. The original PR
+         text said "Default 100" without a corresponding `default` field, and
+@@ -167,6 +180,291 @@ class TestDispatch:
+         capture_calls = [c for c in noop_backend.calls if c[0] == "capture"]
+         assert len(capture_calls) == 0, "capture must not be called after a failed action"
+ 
++
++class TestGenericLaunchAction:
++    class Backend:
++        def __init__(self, catalog, receipt=None, post_apps=None, post_windows=None):
++            self.catalog = catalog
++            self.receipt = receipt or {
++                "ok": True, "status": "accepted", "pid": 7101, "windows": [],
++            }
++            self.post_apps = list(post_apps or [])
++            self.post_windows = list(post_windows or [])
++            self.list_apps_calls = 0
++            self.list_windows_calls = 0
++            self.launch_calls = []
++
++        def list_apps(self):
++            self.list_apps_calls += 1
++            if self.list_apps_calls == 1:
++                return self.catalog
++            index = min(self.list_apps_calls - 2, max(0, len(self.post_apps) - 1))
++            return self.post_apps[index] if self.post_apps else []
++
++        def list_windows(self):
++            self.list_windows_calls += 1
++            index = min(self.list_windows_calls - 1, max(0, len(self.post_windows) - 1))
++            return self.post_windows[index] if self.post_windows else []
++
++        def launch_app(self, **kwargs):
++            self.launch_calls.append(kwargs)
++            return dict(self.receipt)
++
++    @staticmethod
++    def _call(backend, args, approval="approve_once"):
++        from tools.computer_use import tool as cu_tool
++
++        with patch.object(cu_tool, "_get_backend", return_value=backend), \
++             patch.object(cu_tool, "_approval_callback",
++                          lambda action, call_args, summary: approval), \
++             patch.object(cu_tool, "_LAUNCH_VERIFY_DELAY_SECONDS", 0):
++            return json.loads(cu_tool.handle_computer_use(args))
++
++    @pytest.mark.parametrize("args", [
++        {"action": "launch_app"},
++        {"action": "launch_app", "app": "Generic App", "app_id": "vendor.app!main"},
++        {"action": "launch_app", "app": "  "},
++    ])
++    def test_selector_requires_exactly_one_name_or_registry_id(self, args):
++        backend = self.Backend([])
++
++        out = self._call(backend, args)
++
++        assert out["code"] == "invalid_launch_selector"
++        assert out["activation_count"] == 0
++        assert backend.launch_calls == []
++        assert backend.list_apps_calls == 0
++
++    def test_native_approval_denial_prevents_catalog_and_activation(self):
++        backend = self.Backend([])
++
++        out = self._call(
++            backend, {"action": "launch_app", "app": "Generic App"}, approval="deny",
++        )
++
++        assert out["error"] == "denied by user"
++        assert backend.list_apps_calls == 0
++        assert backend.launch_calls == []
++
++    def test_native_approval_timeout_prevents_catalog_and_activation(self):
++        backend = self.Backend([])
++
++        out = self._call(
++            backend,
++            {"action": "launch_app", "app": "Generic App"},
++            approval="timeout",
++        )
++
++        assert "timed out" in out["error"]
++        assert backend.list_apps_calls == 0
++        assert backend.launch_calls == []
++
++    def test_name_resolution_is_exact_and_not_found_does_not_activate(self):
++        backend = self.Backend([{
++            "name": "Generic App Extended",
++            "kind": "desktop",
++            "launch_path": "C:\\Registered\\generic.exe",
++            "running": False,
++            "pid": 0,
++        }])
++
++        out = self._call(backend, {"action": "launch_app", "app": "Generic App"})
++
++        assert out["status"] == "not_found"
++        assert out["activation_count"] == 0
++        assert backend.launch_calls == []
++
++    def test_ambiguous_exact_name_does_not_activate(self):
++        backend = self.Backend([
++            {"name": "Generic App", "kind": "desktop",
++             "launch_path": "C:\\Registered\\one.exe", "running": False, "pid": 0},
++            {"name": "Generic App", "kind": "desktop",
++             "launch_path": "C:\\Registered\\two.exe", "running": False, "pid": 0},
++        ])
++
++        out = self._call(backend, {"action": "launch_app", "app": "Generic App"})
++
++        assert out["status"] == "ambiguous"
++        assert out["candidate_count"] == 2
++        assert out["activation_count"] == 0
++        assert backend.launch_calls == []
++
++    def test_desktop_launch_round_trips_only_frozen_catalog_path_and_confirms_window(self):
++        frozen_path = '"C:\\Registered Apps\\generic.exe" --registered-argument'
++        catalog = [{
++            "name": "Generic App", "kind": "desktop", "launch_path": frozen_path,
++            "running": False, "pid": 0,
++        }]
++        backend = self.Backend(
++            catalog,
++            receipt={"ok": True, "status": "accepted", "pid": 7101, "windows": []},
++            post_apps=[[{**catalog[0], "running": True, "pid": 7101}]],
++            post_windows=[[{
++                "app_name": "Generic App", "pid": 7101,
++                "window_id": 71, "title": "Generic Window",
++            }]],
++        )
++
++        out = self._call(backend, {"action": "launch_app", "app": "Generic App"})
++
++        assert backend.launch_calls == [{"launch_path": frozen_path}]
++        assert out["status"] == "confirmed"
++        assert out["confirmed"] is True
++        assert out["activation_count"] == 1
++        assert out["verified_by"] == ["catalog_pid", "window"]
++        assert out["effect"] == "confirmed"
++
++    def test_registry_id_routes_packaged_catalog_aumid_and_confirms_window(self):
++        app_id = "vendor.family!main"
++        catalog = [{
++            "name": "Generic App", "kind": "uwp", "bundle_id": app_id,
++            "launch_path": f"shell:appsFolder\\{app_id}", "running": False, "pid": 0,
++        }]
++        backend = self.Backend(
++            catalog,
++            receipt={"ok": True, "status": "accepted", "pid": 7202, "windows": []},
++            post_apps=[[{**catalog[0], "running": True, "pid": 7202}]],
++            post_windows=[[{
++                "app_name": "Generic App", "pid": 7202, "window_id": 81,
++                "title": "Generic Window",
++            }]],
++        )
++
++        out = self._call(backend, {"action": "launch_app", "app_id": app_id})
++
++        assert backend.launch_calls == [{"aumid": app_id}]
++        assert out["status"] == "confirmed"
++        assert out["verified_by"] == ["catalog_pid", "window"]
++        assert out["windows"][0]["pid"] == 7202
++
++    def test_already_running_is_confirmed_without_duplicate_activation(self):
++        backend = self.Backend(
++            [{
++                "name": "Generic App", "kind": "desktop",
++                "launch_path": "C:\\Registered\\generic.exe",
++                "running": True, "pid": 7303,
++            }],
++            post_windows=[[{
++                "app_name": "Generic App", "pid": 7303,
++                "window_id": 91, "title": "Generic Window",
++            }]],
++        )
++
++        out = self._call(backend, {"action": "launch_app", "app": "Generic App"})
++
++        assert backend.launch_calls == []
++        assert out["status"] == "confirmed"
++        assert out["already_running"] is True
++        assert out["activation_count"] == 0
++        assert out["verified_by"] == ["catalog_pid", "window"]
++
++    def test_running_process_without_window_relaunches_but_remains_unverified(self):
++        catalog = [{
++            "name": "Generic App", "kind": "desktop",
++            "launch_path": "C:\\Registered\\generic.exe",
++            "running": True, "pid": 7353,
++        }]
++        backend = self.Backend(
++            catalog,
++            receipt={"ok": True, "status": "accepted", "pid": 7353, "windows": []},
++            post_apps=[[catalog[0]] for _ in range(5)],
++            # One pre-launch observation plus five post-launch observations.
++            post_windows=[[] for _ in range(6)],
++        )
++
++        out = self._call(backend, {"action": "launch_app", "app": "Generic App"})
++
++        assert backend.launch_calls == [{"launch_path": "C:\\Registered\\generic.exe"}]
++        assert out["status"] == "accepted_unverified"
++        assert out["ok"] is False
++        assert out["effect"] == "unverifiable"
++        assert out["already_running"] is True
++        assert out["activation_count"] == 0
++        assert out["activation_request_count"] == 1
++
++    def test_driver_acceptance_without_observation_is_not_reported_confirmed(self):
++        backend = self.Backend(
++            [{
++                "name": "Generic App", "kind": "desktop",
++                "launch_path": "C:\\Registered\\generic.exe",
++                "running": False, "pid": 0,
++            }],
++            receipt={
++                "ok": True, "status": "accepted", "pid": 7404,
++                "windows": [{"pid": 7404, "window_id": 101}],
++            },
++            post_apps=[[] for _ in range(5)],
++            post_windows=[[] for _ in range(5)],
++        )
++
++        out = self._call(backend, {"action": "launch_app", "app": "Generic App"})
++
++        assert out["status"] == "accepted_unverified"
++        assert out["ok"] is False
++        assert out["confirmed"] is False
++        assert out["effect"] == "unverifiable"
++        assert out["activation_count"] == 0
++        assert out["activation_request_count"] == 1
++        assert out["verdict"]["decision"] == "verify_fresh_state"
++        assert backend.list_apps_calls == 1 + 5
++        assert backend.list_windows_calls == 5
++
++    def test_foreign_receipt_pid_and_window_cannot_confirm_selected_app(self):
++        catalog = [{
++            "name": "Generic App", "kind": "desktop",
++            "launch_path": "C:\\Registered\\generic.exe",
++            "running": False, "pid": 0,
++        }]
++        backend = self.Backend(
++            catalog,
++            receipt={"ok": True, "status": "accepted", "pid": 7505, "windows": []},
++            post_apps=[[
++                catalog[0],
++                {
++                    "name": "Different App", "kind": "desktop",
++                    "launch_path": "C:\\Registered\\different.exe",
++                    "running": True, "pid": 7505,
++                },
++            ] for _ in range(5)],
++            post_windows=[[{
++                "app_name": "Different App", "pid": 7505,
++                "window_id": 111, "title": "Different Window",
++            }] for _ in range(5)],
++        )
++
++        out = self._call(backend, {"action": "launch_app", "app": "Generic App"})
++
++        assert out["ok"] is False
++        assert out["status"] == "accepted_unverified"
++        assert out["confirmed"] is False
++        assert out["activation_count"] == 0
++        assert out["verified_by"] == ["window"]
++
++    def test_mismatched_packaged_identity_in_receipt_is_rejected(self):
++        app_id = "vendor.family!main"
++        backend = self.Backend(
++            [{
++                "name": "Generic App", "kind": "uwp", "bundle_id": app_id,
++                "launch_path": f"shell:appsFolder\\{app_id}",
++                "running": False, "pid": 0,
++            }],
++            receipt={
++                "ok": True,
++                "status": "accepted",
++                "pid": 7606,
++                "app_id": "different.family!main",
++                "windows": [],
++            },
++        )
++
++        out = self._call(backend, {"action": "launch_app", "app_id": app_id})
++
++        assert out["ok"] is False
++        assert out["code"] == "invalid_launch_receipt"
++        assert out["activation_request_count"] == 1
++        assert backend.list_apps_calls == 1
++        assert backend.list_windows_calls == 0
++
+ # ---------------------------------------------------------------------------
+ # Safety guards (type / key block lists)
+ # ---------------------------------------------------------------------------
+@@ -1114,8 +1412,11 @@ class TestCuaDriverSessionReconnect:
+             returncode = 0
+             stderr = ""
+             # Daemon returns a path, not inline base64.
+-            stdout = ('{"element_count": 7, "tree_markdown": "- [0] AXButton",'
+-                      ' "screenshot_file_path": "%s"}' % str(shot))
++            stdout = json.dumps({
++                "element_count": 7,
++                "tree_markdown": "- [0] AXButton",
++                "screenshot_file_path": str(shot),
++            })
+ 
+         import subprocess as _sp
+         orig_run = _sp.run
+@@ -1221,6 +1522,7 @@ class TestCaptureAppFilterNoMatch:
+         assert backend._active_pid is None
+         assert backend._active_window_id is None
+ 
++    @pytest.mark.linux_only
+     def test_linux_default_capture_skips_gnome_shell_helper(self):
+         windows = [
+             {"app_name": "", "pid": 100, "window_id": 1,
+@@ -2056,9 +2358,87 @@ class TestCuaToolCoverageExpansion:
+     def test_launch_app_requires_bundle_id_or_name(self):
+         backend = self._backend()
+         import pytest
+-        with pytest.raises(ValueError, match="bundle_id or name"):
++        with pytest.raises(ValueError, match="exactly one"):
+             backend.launch_app()
+ 
++    def test_launch_app_fails_closed_when_driver_does_not_advertise_capability(self):
++        backend = self._backend()
++        backend._session._has_tool.return_value = False
++
++        receipt = backend.launch_app(launch_path="C:\\Registered\\generic.exe")
++
++        assert receipt["ok"] is False
++        assert receipt["code"] == "launch_app_unavailable"
++        backend._session.call_tool.assert_not_called()
++
++    def test_launch_app_rejects_unstructured_or_pidless_driver_receipts(self):
++        backend = self._backend()
++        backend._session._has_tool.return_value = True
++        backend._session.call_tool.return_value = {
++            "data": "accepted", "images": [], "image_mime_types": [],
++            "structuredContent": None, "isError": False,
++        }
++
++        missing_structured = backend.launch_app(launch_path="C:\\Registered\\generic.exe")
++
++        assert missing_structured["ok"] is False
++        assert missing_structured["code"] == "invalid_launch_receipt"
++
++        backend._session.call_tool.return_value["structuredContent"] = {"windows": []}
++        missing_pid = backend.launch_app(launch_path="C:\\Registered\\generic.exe")
++        assert missing_pid["ok"] is False
++        assert missing_pid["code"] == "invalid_launch_receipt"
++
++    def test_launch_app_bounds_and_filters_driver_receipt_windows(self):
++        backend = self._backend()
++        backend._session._has_tool.return_value = True
++        backend._session.call_tool.return_value = {
++            "data": "accepted", "images": [], "image_mime_types": [],
++            "structuredContent": {
++                "pid": 7505,
++                "name": "Generic App" * 100,
++                "bundle_id": "vendor.family!main",
++                "windows": [
++                    {
++                        "app_name": "Generic App" * 100,
++                        "pid": 7505 if index % 2 == 0 else 9999,
++                        "window_id": index + 1,
++                        "title": "Generic Window" * 100,
++                        "is_on_screen": True,
++                    }
++                    for index in range(50)
++                ],
++            },
++            "isError": False,
++        }
++
++        receipt = backend.launch_app(aumid="vendor.family!main")
++
++        assert receipt["ok"] is True
++        assert receipt["pid"] == 7505
++        tool_name, tool_args = backend._session.call_tool.call_args.args
++        assert tool_name == "launch_app"
++        assert tool_args == {
++            "session": backend._session_id,
++            "aumid": "vendor.family!main",
++        }
++        assert len(receipt["windows"]) == 16
++        assert all(window["pid"] == 7505 for window in receipt["windows"])
++        assert all(len(window["app_name"]) <= 512 for window in receipt["windows"])
++        assert all(len(window["title"]) <= 512 for window in receipt["windows"])
++        assert receipt["receipt_windows_truncated"] == 18
++
++    def test_launch_app_round_trips_frozen_catalog_path_unchanged(self):
++        backend = self._backend(structured={"pid": 7606, "windows": []})
++        backend._session._has_tool.return_value = True
++        frozen_path = ' "C:\\Registered Apps\\generic.exe" --registered-argument '
++
++        receipt = backend.launch_app(launch_path=frozen_path)
++
++        assert receipt["ok"] is True
++        _, tool_args = backend._session.call_tool.call_args.args
++        assert tool_args["launch_path"] == frozen_path
++
+     # ── Pointer + display introspection ─────────────────────────
+ 
+ 
+diff --git a/tests/tools/test_local_env_windows_msys.py b/tests/tools/test_local_env_windows_msys.py
+index 79a3edff0e7a9eaec93e607c60f48a1a4ec94179..cf3c2e09fb20f3032a5d62f789eaea808693d3e8 100644
+--- a/tests/tools/test_local_env_windows_msys.py
++++ b/tests/tools/test_local_env_windows_msys.py
+@@ -30,6 +30,8 @@ host ``_IS_WINDOWS`` is already False, so no patching is needed at all.
+ """
+ 
+ import os
++import shlex
++import sys
+ from unittest.mock import patch
+ 
+ import pytest
+@@ -43,6 +45,7 @@ from tools.environments.local import (
+     _make_run_env,
+     _msys_to_windows_path,
+     _prepend_git_bash_dirs,
++    _prepend_windows_git_bash_start_shim,
+     _quote_bash_path,
+     _resolve_safe_cwd,
+     _sanitize_subprocess_env,
+@@ -237,6 +240,143 @@ class TestWindowsMsysPathconvDefaults:
+         assert run_env.get("MSYS2_ARG_CONV_EXCL") == "/custom"
+ 
+ 
++# ---------------------------------------------------------------------------
++# Git Bash ``start`` compatibility with path conversion disabled
++# ---------------------------------------------------------------------------
++
++class TestWindowsGitBashStartShim:
++    @pytest.mark.linux_only
++    def test_noop_off_windows(self):
++        command = 'printf "unchanged\\n"'
++        assert _prepend_windows_git_bash_start_shim(command) == command
++
++    @pytest.mark.windows_only
++    def test_wrap_command_installs_native_cmd_bridge_after_snapshot_source(self, tmp_path):
++        with patch.object(
++            LocalEnvironment, "init_session", autospec=True, return_value=None
++        ):
++            env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
++
++        env._snapshot_ready = True
++        wrapped = env._wrap_command("start example.invalid", str(tmp_path))
++
++        assert wrapped.index("source ") < wrapped.index("function start")
++        assert 'type -t start' in wrapped
++        assert '"$COMSPEC" /d /s /c start' in wrapped
++        assert '"$COMSPEC" //c start' not in wrapped
++        assert "MSYS_NO_PATHCONV" not in wrapped
++        assert "MSYS2_ARG_CONV_EXCL" not in wrapped
++
++    @pytest.mark.windows_only
++    def test_start_executes_target_and_preserves_ampersand_argument(self, tmp_path):
++        """Regression: banner-only EOF/exit-zero must not count as launch."""
++        with patch.object(
++            LocalEnvironment, "init_session", autospec=True, return_value=None
++        ):
++            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
++
++        # Avoid user login profiles in this focused integration check.  The
++        # command wrapper still exercises the exact non-login Git Bash path
++        # used when the session snapshot is unavailable.
++        env._snapshot_ready = False
++        env._prefer_nonlogin = True
++        target = shlex.quote(sys.executable.replace("\\", "/"))
++        program = shlex.quote(
++            'import sys; print("HERMES_START_ARG=" + sys.argv[1])'
++        )
++        argument = shlex.quote("alpha&beta")
++
++        try:
++            result = env.execute(
++                f"start /b /wait {target} -c {program} {argument}",
++                timeout=15,
++                rewrite_compound_background=False,
++            )
++        finally:
++            env.cleanup()
++
++        assert result["returncode"] == 0
++        assert "HERMES_START_ARG=alpha&beta" in result["output"]
++        assert "Microsoft Windows" not in result["output"]
++
++    @pytest.mark.windows_only
++    def test_start_treats_quoted_spaced_name_as_target_not_window_title(self, tmp_path):
++        helper = tmp_path / "generic helper with spaces.cmd"
++        helper.write_text("@echo HERMES_SPACED_TARGET_OK\r\n", encoding="ascii")
++
++        with patch.object(
++            LocalEnvironment, "init_session", autospec=True, return_value=None
++        ):
++            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
++
++        env._snapshot_ready = False
++        env._prefer_nonlogin = True
++        target = shlex.quote(str(helper).replace("\\", "/"))
++
++        try:
++            result = env.execute(
++                f"start /b /wait \"\" {target}",
++                timeout=15,
++                rewrite_compound_background=False,
++            )
++        finally:
++            env.cleanup()
++
++        assert result["returncode"] == 0
++        assert "HERMES_SPACED_TARGET_OK" in result["output"]
++        assert "Microsoft Windows" not in result["output"]
++
++    @pytest.mark.windows_only
++    def test_start_preserves_named_title_semantics(self, tmp_path):
++        with patch.object(
++            LocalEnvironment, "init_session", autospec=True, return_value=None
++        ):
++            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
++
++        env._snapshot_ready = False
++        env._prefer_nonlogin = True
++        target = shlex.quote(sys.executable.replace("\\", "/"))
++        program = shlex.quote('print("HERMES_NAMED_TITLE_OK")')
++
++        try:
++            result = env.execute(
++                f'start /b /wait "Hermes Named Title" {target} -c {program}',
++                timeout=15,
++                rewrite_compound_background=False,
++            )
++        finally:
++            env.cleanup()
++
++        assert result["returncode"] == 0
++        assert "HERMES_NAMED_TITLE_OK" in result["output"]
++
++    @pytest.mark.windows_only
++    def test_snapshot_user_start_function_is_not_overwritten(self, tmp_path):
++        with patch.object(
++            LocalEnvironment, "init_session", autospec=True, return_value=None
++        ):
++            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
++
++        snapshot_path = local_mod._msys_to_windows_path(env._snapshot_path)
++        with open(snapshot_path, "w", encoding="utf-8", newline="\n") as snapshot:
++            snapshot.write(
++                "start () { printf 'HERMES_USER_START=%s\\n' \"$1\"; }\n"
++            )
++        env._snapshot_ready = True
++
++        try:
++            result = env.execute(
++                "start preserved",
++                timeout=15,
++                rewrite_compound_background=False,
++            )
++        finally:
++            env.cleanup()
++
++        assert result["returncode"] == 0
++        assert "HERMES_USER_START=preserved" in result["output"]
++
++
+ # ---------------------------------------------------------------------------
+ # Git Bash coreutils on PATH — non-login ``bash -c`` fallback (empty
+ # write_file error / terminal exit 127 when login bash is broken)
+diff --git a/tools/computer_use/backend.py b/tools/computer_use/backend.py
+index 9e233459f75e010ec2cb2fd1609f228ec026da25..1dd85cb316f5dc4acf824519f9d9abff5ad41003 100644
+--- a/tools/computer_use/backend.py
++++ b/tools/computer_use/backend.py
+@@ -190,7 +190,29 @@ class ComputerUseBackend(ABC):
+     # ── Introspection ───────────────────────────────────────────────
+     @abstractmethod
+     def list_apps(self) -> List[Dict[str, Any]]:
+-        """Return running apps with bundle IDs, PIDs, window counts."""
++        """Return the current user's registered apps and their running state."""
++
++    def launch_app(
++        self,
++        *,
++        bundle_id: Optional[str] = None,
++        aumid: Optional[str] = None,
++        launch_path: Optional[str] = None,
++        name: Optional[str] = None,
++    ) -> Dict[str, Any]:
++        """Launch one application selected from the OS-owned app catalog.
++
++        This optional hook fails closed so an older or alternate backend can
++        never turn model text into an implicit shell launch.  The public tool
++        resolves an exact catalog row first and passes only identifiers or a
++        frozen launch path obtained from that row.
++        """
++        return {
++            "ok": False,
++            "status": "refused",
++            "code": "launch_app_unavailable",
++            "message": "This computer-use backend does not advertise native application launch.",
++        }
+ 
+     def list_windows(self) -> List[Dict[str, Any]]:
+         """Return visible native windows with PID and window identifiers.
+diff --git a/tools/computer_use/cua_backend.py b/tools/computer_use/cua_backend.py
+index 213c5e3e74c1e04f50d94edea82d3320c1f25dd4..3e7543a2f43f9d9d4247105efaebfd8aa238e32d 100644
+--- a/tools/computer_use/cua_backend.py
++++ b/tools/computer_use/cua_backend.py
+@@ -2948,34 +2948,128 @@ class CuaDriverBackend(ComputerUseBackend):
+         self,
+         *,
+         bundle_id: Optional[str] = None,
++        aumid: Optional[str] = None,
++        launch_path: Optional[str] = None,
+         name: Optional[str] = None,
+-        urls: Optional[List[str]] = None,
+-        additional_arguments: Optional[List[str]] = None,
+-        creates_new_application_instance: bool = False,
+     ) -> Dict[str, Any]:
+-        """Idempotent launch. Returns ``{pid, bundle_id, name, windows[]}``
+-        so callers can skip an extra ``list_windows`` round-trip before
+-        ``get_window_state``.
++        """Launch one catalog-resolved app and return a bounded receipt.
++
++        The model-facing adapter never passes a free-form path or name here:
++        it exact-matches the current user's OS app catalog and round-trips the
++        selected row's frozen launch locator.  This backend independently
++        fails closed when the connected driver did not advertise launch_app,
++        and treats structuredContent as the only authoritative receipt.
++        """
++        locators = {
++            "bundle_id": bundle_id,
++            "aumid": aumid,
++            "launch_path": launch_path,
++            "name": name,
++        }
++        supplied = [key for key, value in locators.items()
++                    if isinstance(value, str) and value.strip()]
++        if len(supplied) != 1:
++            raise ValueError(
++                "launch_app requires exactly one of bundle_id, aumid, "
++                "launch_path, or name"
++            )
++        if not self._session._has_tool("launch_app"):
++            return {
++                "ok": False,
++                "status": "refused",
++                "code": "launch_app_unavailable",
++                "message": (
++                    "The connected cua-driver does not advertise the native "
++                    "launch_app capability."
++                ),
++            }
+ 
+-        ``creates_new_application_instance=True`` forces a new instance
+-        even if the app is already running — use it when concurrent
+-        runs may touch the same app so each session gets its own
+-        isolated window."""
+-        if not bundle_id and not name:
+-            raise ValueError("launch_app requires either bundle_id or name")
+         args: Dict[str, Any] = {"session": self._session_id}
+-        if bundle_id:
+-            args["bundle_id"] = bundle_id
+-        if name:
+-            args["name"] = name
+-        if urls:
+-            args["urls"] = list(urls)
+-        if additional_arguments:
+-            args["additional_arguments"] = list(additional_arguments)
+-        if creates_new_application_instance:
+-            args["creates_new_application_instance"] = True
++        locator = supplied[0]
++        locator_value = str(locators[locator])
++        # launch_path is an opaque command line frozen by the OS catalog;
++        # round-trip it byte-for-byte instead of reformatting model input.
++        args[locator] = (
++            locator_value if locator == "launch_path" else locator_value.strip()
++        )
+         out = self._session.call_tool("launch_app", args)
+-        return out["structuredContent"] or {"data": out["data"]}
++        if not isinstance(out, dict):
++            return {
++                "ok": False,
++                "status": "failed",
++                "code": "invalid_launch_receipt",
++                "message": "cua-driver returned an invalid application-launch result.",
++            }
++        if out.get("isError") is True:
++            raw_message = out.get("data")
++            if not isinstance(raw_message, str):
++                raw_message = "cua-driver rejected the application launch"
++            return {
++                "ok": False,
++                "status": "failed",
++                "code": "launch_app_driver_error",
++                "message": raw_message[:1000],
++            }
++
++        structured = out.get("structuredContent")
++        if not isinstance(structured, dict):
++            return {
++                "ok": False,
++                "status": "failed",
++                "code": "invalid_launch_receipt",
++                "message": "cua-driver returned no structured application-launch receipt.",
++            }
++        pid = _positive_int(structured.get("pid"))
++        if pid is None:
++            return {
++                "ok": False,
++                "status": "failed",
++                "code": "invalid_launch_receipt",
++                "message": "cua-driver launch receipt did not contain a positive process id.",
++            }
++
++        raw_windows = structured.get("windows")
++        if raw_windows is None:
++            raw_windows = []
++        if not isinstance(raw_windows, list):
++            return {
++                "ok": False,
++                "status": "failed",
++                "code": "invalid_launch_receipt",
++                "message": "cua-driver launch receipt contained an invalid windows field.",
++            }
++        max_windows = 32
++        normalized_windows = _ingest_windows(raw_windows[:max_windows])
++        bounded_windows = [
++            {
++                "app_name": str(window.get("app_name") or "")[:512],
++                "pid": window["pid"],
++                "window_id": window["window_id"],
++                "title": str(window.get("title") or "")[:512],
++                "off_screen": bool(window.get("off_screen")),
++            }
++            for window in normalized_windows
++            if window.get("pid") == pid
++        ]
++        receipt: Dict[str, Any] = {
++            "ok": True,
++            "status": "accepted",
++            "pid": pid,
++            "windows": bounded_windows,
++        }
++        for source, public in (
++            ("name", "name"),
++            ("bundle_id", "app_id"),
++            ("aumid", "app_id"),
++        ):
++            value = structured.get(source)
++            if isinstance(value, str) and value.strip():
++                receipt[public] = value.strip()[:512]
++        if isinstance(structured.get("active"), bool):
++            receipt["active"] = structured["active"]
++        if len(raw_windows) > max_windows:
++            receipt["receipt_windows_truncated"] = len(raw_windows) - max_windows
++        return receipt
+ 
+     def kill_app(self, *, pid: int) -> ActionResult:
+         """Terminate by pid. Equivalent to ``kill -9`` on POSIX,
+diff --git a/tools/computer_use/schema.py b/tools/computer_use/schema.py
+index 2ef4ba9dfb2325333497ef5a1aefefc548f280a4..72bca2720ff681df25610bdf3e592ceedcbbcfd4 100644
+--- a/tools/computer_use/schema.py
++++ b/tools/computer_use/schema.py
+@@ -17,7 +17,8 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
+     "name": "computer_use",
+     "description": (
+         "Drive the desktop in the background via cua-driver — screenshots, "
+-        "mouse, keyboard, scroll, drag — without stealing the user's cursor "
++        "mouse, keyboard, scroll, drag, and native registered-application "
++        "launch — without stealing the user's cursor "
+         "or keyboard focus. Supported on macOS, Windows, and Linux. "
+         "Preferred workflow: call with "
+         "action='capture' (mode='som' gives numbered element overlays), "
+@@ -45,6 +46,7 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
+                     "wait",
+                     "list_apps",
+                     "list_windows",
++                    "launch_app",
+                     "focus_app",
+                     "cua_browser_state",
+                     "cua_browser_prepare",
+@@ -88,7 +90,20 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
+                     "e.g. to see the wallpaper or click the taskbar. Note: "
+                     "capture is per-window; a single image cannot span "
+                     "multiple monitors, so on a multi-screen setup capture "
+-                    "one window or display at a time."
++                    "one window or display at a time. For action='launch_app', "
++                    "this is an exact registered display name and is mutually "
++                    "exclusive with app_id."
++                ),
++            },
++            "app_id": {
++                "type": "string",
++                "maxLength": 512,
++                "description": (
++                    "Only for action='launch_app': an exact application "
++                    "identifier from the current user's OS app registry. "
++                    "Provide exactly one of app (exact registered display "
++                    "name) or app_id. Arbitrary executable paths and shell "
++                    "commands are not accepted."
+                 ),
+             },
+             "pid": {
+diff --git a/tools/computer_use/tool.py b/tools/computer_use/tool.py
+index 31dad5b42e0aa3b656fc44b88e5ac80a0ba0a3f1..91650e1cfb0a45bedb3ee2a1490f7762f4c72c9d 100644
+--- a/tools/computer_use/tool.py
++++ b/tools/computer_use/tool.py
+@@ -47,6 +47,7 @@ import re
+ import struct
+ import sys
+ import threading
++import time
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+ from tools.computer_use.backend import (
+@@ -85,7 +86,7 @@ _SAFE_ACTIONS = frozenset({
+ # Actions that mutate user-visible state. Go through approval.
+ _DESTRUCTIVE_ACTIONS = frozenset({
+     "click", "double_click", "right_click", "middle_click",
+-    "drag", "scroll", "type", "key", "set_value", "focus_app",
++    "drag", "scroll", "type", "key", "set_value", "launch_app", "focus_app",
+     "cua_browser_prepare", "cua_browser_navigate", "cua_browser_click",
+     "cua_browser_type", "cua_browser_pointer", "cua_browser_dialog",
+     "cua_browser_set_input_files", "cua_browser_download",
+@@ -424,6 +425,15 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
+         self.calls.append(("list_windows", {}))
+         return []
+ 
++    def launch_app(self, **kw: Any) -> Dict[str, Any]:
++        self.calls.append(("launch_app", kw))
++        return {
++            "ok": False,
++            "status": "refused",
++            "code": "launch_app_unavailable",
++            "message": "No native application launcher is available.",
++        }
++
+     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
+         self.calls.append(("focus_app", {"app": app, "raise": raise_window}))
+         return ActionResult(ok=True, action="focus_app")
+@@ -437,6 +447,267 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
+ # Dispatch
+ # ---------------------------------------------------------------------------
+ 
++_MAX_LAUNCH_SELECTOR_CHARS = 512
++_MAX_LAUNCH_CATALOG_ROWS = 4096
++_MAX_LAUNCH_PATH_CHARS = 32768
++_MAX_LAUNCH_RESULT_WINDOWS = 16
++_MAX_LAUNCH_OBSERVED_ROWS = 4096
++_LAUNCH_VERIFY_ATTEMPTS = 5
++_LAUNCH_VERIFY_DELAY_SECONDS = 1.0
++
++
++def _launch_error(
++    code: str,
++    message: str,
++    *,
++    activation_count: Optional[int] = 0,
++    **extra: Any,
++) -> str:
++    payload: Dict[str, Any] = {
++        "ok": False,
++        "action": "launch_app",
++        "status": "refused" if code == "invalid_launch_selector" else code,
++        "code": code,
++        "message": message,
++    }
++    if activation_count is not None:
++        payload["activation_count"] = activation_count
++    payload.update(extra)
++    return json.dumps(payload)
++
++
++def _validated_launch_selector(args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
++    """Return ``(name, app_id, error_json)`` for the public XOR selector."""
++    name_raw = args.get("app")
++    app_id_raw = args.get("app_id")
++    name = name_raw.strip() if isinstance(name_raw, str) else ""
++    app_id = app_id_raw.strip() if isinstance(app_id_raw, str) else ""
++    if bool(name) == bool(app_id):
++        return None, None, _launch_error(
++            "invalid_launch_selector",
++            "launch_app requires exactly one of `app` or `app_id`.",
++        )
++    selector = name or app_id
++    if (
++        len(selector) > _MAX_LAUNCH_SELECTOR_CHARS
++        or "\x00" in selector
++        or "\r" in selector
++        or "\n" in selector
++    ):
++        return None, None, _launch_error(
++            "invalid_launch_selector",
++            "The application selector is malformed or exceeds the bounded length.",
++        )
++    return name or None, app_id or None, None
++
++
++def _catalog_aliases(row: Dict[str, Any], keys: Tuple[str, ...]) -> set[str]:
++    return {
++        value.strip().casefold()
++        for key in keys
++        if isinstance((value := row.get(key)), str) and value.strip()
++    }
++
++
++def _aumid_from_catalog_row(row: Dict[str, Any]) -> Optional[str]:
++    for key in ("aumid", "bundle_id", "bundleId", "app_id"):
++        value = row.get(key)
++        if isinstance(value, str) and "!" in value and value.strip():
++            return value.strip()
++    launch_path = row.get("launch_path")
++    if isinstance(launch_path, str):
++        normalized = launch_path.replace("/", "\\")
++        prefix = "shell:appsfolder\\"
++        if normalized.casefold().startswith(prefix):
++            candidate = normalized[len(prefix):].strip()
++            if "!" in candidate:
++                return candidate
++    return None
++
++
++def _resolve_launch_catalog_row(
++    catalog: Any,
++    *,
++    name: Optional[str],
++    app_id: Optional[str],
++) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
++    """Exact-match one current-user registry row; never substring-resolve."""
++    if not isinstance(catalog, list):
++        return None, _launch_error(
++            "app_catalog_unavailable",
++            "The OS application catalog returned an invalid response.",
++        )
++    if len(catalog) > _MAX_LAUNCH_CATALOG_ROWS:
++        return None, _launch_error(
++            "app_catalog_too_large",
++            "The OS application catalog exceeded the bounded resolution limit.",
++        )
++    needle = (name or app_id or "").casefold()
++    matches: List[Dict[str, Any]] = []
++    for row in catalog:
++        if not isinstance(row, dict):
++            continue
++        if name is not None:
++            aliases = _catalog_aliases(row, ("name", "display_name", "app_name"))
++        else:
++            aliases = _catalog_aliases(
++                row, ("aumid", "bundle_id", "bundleId", "app_id")
++            )
++            extracted = _aumid_from_catalog_row(row)
++            if extracted:
++                aliases.add(extracted.casefold())
++        if needle in aliases:
++            matches.append(row)
++
++    if not matches:
++        return None, _launch_error(
++            "not_found",
++            "No exact match exists in the current user's registered application catalog.",
++        )
++    if len(matches) != 1:
++        return None, _launch_error(
++            "ambiguous",
++            "The selector matches multiple registered applications; use the exact registry application id.",
++            candidate_count=min(len(matches), _MAX_LAUNCH_CATALOG_ROWS),
++        )
++    return matches[0], None
++
++
++def _catalog_launch_locator(row: Dict[str, Any]) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
++    """Freeze one trusted catalog locator for the native launch call."""
++    kind = str(row.get("kind") or "").strip().casefold()
++    aumid = _aumid_from_catalog_row(row)
++    launch_path = row.get("launch_path")
++    bundle_id = row.get("bundle_id") or row.get("bundleId")
++
++    if kind in {"uwp", "packaged"} or aumid is not None:
++        if not aumid or len(aumid) > _MAX_LAUNCH_SELECTOR_CHARS:
++            return None, _launch_error(
++                "invalid_catalog_entry",
++                "The packaged application catalog row has no valid activation id.",
++            )
++        return {"aumid": aumid}, None
++    if kind == "desktop":
++        if (
++            not isinstance(launch_path, str)
++            or not launch_path
++            or len(launch_path) > _MAX_LAUNCH_PATH_CHARS
++            or "\x00" in launch_path
++        ):
++            return None, _launch_error(
++                "invalid_catalog_entry",
++                "The desktop application catalog row has no valid frozen launch path.",
++            )
++        return {"launch_path": launch_path}, None
++    if isinstance(bundle_id, str) and bundle_id.strip():
++        return {"bundle_id": bundle_id.strip()}, None
++    if isinstance(launch_path, str) and launch_path and len(launch_path) <= _MAX_LAUNCH_PATH_CHARS:
++        return {"launch_path": launch_path}, None
++    catalog_name = row.get("name")
++    if isinstance(catalog_name, str) and catalog_name.strip():
++        # Non-Windows backends may expose only a registry-owned display name.
++        return {"name": catalog_name.strip()}, None
++    return None, _launch_error(
++        "invalid_catalog_entry",
++        "The matched application catalog row has no supported native launch locator.",
++    )
++
++
++def _positive_pid(value: Any) -> Optional[int]:
++    if isinstance(value, bool) or not isinstance(value, (int, str)):
++        return None
++    try:
++        pid = int(value)
++    except ValueError:
++        return None
++    return pid if pid > 0 else None
++
++
++def _bounded_windows_for_pid(rows: Any, pid: int) -> List[Dict[str, Any]]:
++    if not isinstance(rows, list) or len(rows) > _MAX_LAUNCH_OBSERVED_ROWS:
++        return []
++    windows: List[Dict[str, Any]] = []
++    for row in rows:
++        if len(windows) >= _MAX_LAUNCH_RESULT_WINDOWS:
++            break
++        if not isinstance(row, dict) or _positive_pid(row.get("pid")) != pid:
++            continue
++        window_id = _positive_pid(row.get("window_id"))
++        if window_id is None:
++            continue
++        windows.append({
++            "pid": pid,
++            "window_id": window_id,
++            "app_name": str(row.get("app_name") or "")[:512],
++            "title": str(row.get("title") or "")[:512],
++        })
++    return windows
++
++
++def _selected_catalog_row_observes_pid(
++    rows: Any,
++    pid: int,
++    *,
++    name: Optional[str],
++    app_id: Optional[str],
++) -> bool:
++    """Bind the observed pid to the exact catalog row the user selected."""
++    if not isinstance(rows, list) or len(rows) > _MAX_LAUNCH_OBSERVED_ROWS:
++        return False
++    selected, error = _resolve_launch_catalog_row(rows, name=name, app_id=app_id)
++    return bool(
++        error is None
++        and selected is not None
++        and selected.get("running") is not False
++        and _positive_pid(selected.get("pid")) == pid
++    )
++
++
++def _launch_result(
++    *,
++    row: Dict[str, Any],
++    pid: int,
++    already_running: bool,
++    activated: bool,
++    confirmed: bool,
++    windows: List[Dict[str, Any]],
++    verified_by: List[str],
++) -> str:
++    name = row.get("name")
++    app_id = _aumid_from_catalog_row(row)
++    payload: Dict[str, Any] = {
++        # A native launch receipt is only acceptance evidence.  Keep the
++        # conventional success bit false until the selected catalog row and a
++        # matching top-level window prove the visible effect.
++        "ok": confirmed,
++        "action": "launch_app",
++        "status": "confirmed" if confirmed else "accepted_unverified",
++        "confirmed": confirmed,
++        "effect": "confirmed" if confirmed else "unverifiable",
++        "accepted": True,
++        "already_running": already_running,
++        "activation_count": 1 if activated and confirmed else 0,
++        "activation_request_count": 1 if activated else 0,
++        "pid": pid,
++        "windows": windows[:_MAX_LAUNCH_RESULT_WINDOWS],
++        "verdict": {
++            "decision": "done" if confirmed else "verify_fresh_state",
++        },
++    }
++    if isinstance(name, str) and name.strip():
++        payload["app"] = name.strip()[:_MAX_LAUNCH_SELECTOR_CHARS]
++    if app_id:
++        payload["app_id"] = app_id[:_MAX_LAUNCH_SELECTOR_CHARS]
++    if verified_by:
++        payload["verified_by"] = verified_by
++    if not confirmed:
++        payload["message"] = (
++            "The native launcher accepted the request, but no matching top-level "
++            "window was observed within the bounded verification window."
++        )
++    return json.dumps(payload)
++
++
+ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
+     """Main entry point — dispatched by tools.registry.
+ 
+@@ -451,6 +722,11 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
+     session_id = str(kwargs.get("session_id") or "")
+ 
+     # Safety: validate actions before approval prompt.
++    if action == "launch_app":
++        _, _, selector_error = _validated_launch_selector(args)
++        if selector_error is not None:
++            return selector_error
++
+     if action in {"type", "cua_browser_type"}:
+         text = args.get("text", "")
+         pat = _is_blocked_type(text)
+@@ -616,6 +892,9 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
+         return f"key {args.get('keys', '')!r}{fg}"
+     if action == "focus_app":
+         return f"focus {args.get('app', '')!r}" + (" (raise)" if args.get("raise_window") else "")
++    if action == "launch_app":
++        selector = args.get("app") or args.get("app_id") or ""
++        return f"launch registered application {str(selector)[:60]!r}"
+     return action + fg
+ 
+ 
+@@ -648,6 +927,148 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
+         windows = backend.list_windows()
+         return json.dumps({"windows": windows, "count": len(windows)})
+ 
++    if action == "launch_app":
++        name, app_id, selector_error = _validated_launch_selector(args)
++        if selector_error is not None:
++            return selector_error
++
++        try:
++            catalog = backend.list_apps()
++        except Exception:
++            logger.exception("computer_use launch_app catalog lookup failed")
++            return _launch_error(
++                "app_catalog_unavailable",
++                "The current user's OS application catalog could not be read.",
++            )
++        row, resolution_error = _resolve_launch_catalog_row(
++            catalog, name=name, app_id=app_id,
++        )
++        if resolution_error is not None or row is None:
++            return resolution_error or _launch_error(
++                "not_found", "No exact registered application match was found."
++            )
++
++        pre_pid = _positive_pid(row.get("pid"))
++        pre_running = pre_pid is not None and row.get("running") is not False
++        if pre_running and pre_pid is not None:
++            try:
++                observed_windows = _bounded_windows_for_pid(
++                    backend.list_windows(), pre_pid,
++                )
++            except Exception:
++                observed_windows = []
++            if observed_windows:
++                return _launch_result(
++                    row=row,
++                    pid=pre_pid,
++                    already_running=True,
++                    activated=False,
++                    confirmed=True,
++                    windows=observed_windows,
++                    verified_by=["catalog_pid", "window"],
++                )
++
++        locator, locator_error = _catalog_launch_locator(row)
++        if locator_error is not None or locator is None:
++            return locator_error or _launch_error(
++                "invalid_catalog_entry",
++                "The matched catalog row has no supported launch locator.",
++            )
++        try:
++            receipt = backend.launch_app(**locator)
++        except Exception:
++            logger.exception("computer_use native launch_app call failed")
++            return _launch_error(
++                "launch_app_driver_error",
++                "The native application launcher failed before returning a receipt.",
++                activation_count=None,
++                activation_request_count=1,
++            )
++        if not isinstance(receipt, dict):
++            return _launch_error(
++                "invalid_launch_receipt",
++                "The native launcher returned an invalid receipt.",
++                activation_count=None,
++                activation_request_count=1,
++            )
++        if receipt.get("ok") is not True:
++            code = receipt.get("code")
++            message = receipt.get("message")
++            bounded_code = (
++                str(code)[:128]
++                if isinstance(code, str) and code
++                else "launch_app_failed"
++            )
++            return _launch_error(
++                bounded_code,
++                str(message)[:1000]
++                if isinstance(message, str) and message
++                else "The native launcher rejected the application launch.",
++                activation_count=0 if bounded_code == "launch_app_unavailable" else None,
++                activation_request_count=1,
++            )
++        receipt_pid = _positive_pid(receipt.get("pid"))
++        if receipt_pid is None:
++            return _launch_error(
++                "invalid_launch_receipt",
++                "The native launcher receipt did not contain a positive process id.",
++                activation_count=None,
++                activation_request_count=1,
++            )
++        expected_app_id = _aumid_from_catalog_row(row)
++        receipt_app_id = receipt.get("app_id")
++        if (
++            expected_app_id is not None
++            and isinstance(receipt_app_id, str)
++            and receipt_app_id.strip()
++            and receipt_app_id.strip().casefold() != expected_app_id.casefold()
++        ):
++            return _launch_error(
++                "invalid_launch_receipt",
++                "The native launcher receipt identified a different application.",
++                activation_count=None,
++                activation_request_count=1,
++            )
++
++        confirmed = False
++        observed_windows: List[Dict[str, Any]] = []
++        verified_by: List[str] = []
++        for attempt in range(_LAUNCH_VERIFY_ATTEMPTS):
++            if attempt:
++                time.sleep(_LAUNCH_VERIFY_DELAY_SECONDS)
++            try:
++                post_apps = backend.list_apps()
++            except Exception:
++                post_apps = []
++            try:
++                post_windows = backend.list_windows()
++            except Exception:
++                post_windows = []
++            pid_observed = _selected_catalog_row_observes_pid(
++                post_apps,
++                receipt_pid,
++                name=name,
++                app_id=app_id,
++            )
++            observed_windows = _bounded_windows_for_pid(post_windows, receipt_pid)
++            if pid_observed and "catalog_pid" not in verified_by:
++                verified_by.append("catalog_pid")
++            if observed_windows and "window" not in verified_by:
++                verified_by.append("window")
++            if pid_observed and observed_windows:
++                confirmed = True
++                break
++
++        return _launch_result(
++            row=row,
++            pid=receipt_pid,
++            already_running=pre_running,
++            activated=True,
++            confirmed=confirmed,
++            windows=observed_windows,
++            verified_by=verified_by,
++        )
++
+     if action == "focus_app":
+         app = args.get("app")
+         if not app:
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index de2a6e034670ac7113aee18899cadf12a0a54b9d..1d48b5c2db001848fc919065a1106a7d62fb041d 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -1247,6 +1247,56 @@ def _apply_windows_msys_bash_env_defaults(env: dict) -> None:
+     env.setdefault("MSYS2_ARG_CONV_EXCL", "*")
+ 
+ 
++_WINDOWS_GIT_BASH_START_SHIM = r'''if [ "$(type -t start 2>/dev/null)" = "file" ]; then
++function start {
++    local __hermes_start_arg
++    local -a __hermes_start_args=()
++
++    # Git Bash only quotes native argv values when quoting is needed.  Protect
++    # an unquoted ampersand from cmd.exe's command parser, while leaving an
++    # already-quoted value (one containing whitespace) untouched so the
++    # launched process receives the original value rather than a literal ^.
++    for __hermes_start_arg in "$@"; do
++        case "$__hermes_start_arg" in
++            *[[:space:]]*)
++                __hermes_start_args+=("$__hermes_start_arg")
++                ;;
++            *)
++                __hermes_start_args+=("${__hermes_start_arg//&/^&}")
++                ;;
++        esac
++    done
++
++    # Preserve cmd.exe's native title/target contract byte-for-byte.  Callers
++    # launching a quoted path supply the conventional empty title explicitly;
++    # a non-empty first quoted operand remains a real window title.
++    "$COMSPEC" /d /s /c start "${__hermes_start_args[@]}"
++}
++fi'''
++
++
++def _prepend_windows_git_bash_start_shim(command: str) -> str:
++    """Make Git Bash ``start`` execute reliably with path conversion off.
++
++    Git for Windows ships ``/usr/bin/start`` with ``cmd.exe //c start``.  The
++    double slash normally survives MSYS path conversion as ``/c``.  Hermes
++    deliberately disables that conversion so native Windows flags are not
++    mangled, which leaves ``//c`` literal: cmd.exe starts interactively,
++    consumes EOF, prints its banner, and exits zero without running ``start``.
++
++    When ``start`` still resolves to Git's executable shim, install a
++    per-command bash function that calls COMSPEC with native ``/d /s /c``
++    switches instead.  A user-defined alias or function from the session
++    snapshot wins unchanged.  This is a shell-level compatibility shim, not an
++    application catalogue: every target is forwarded under cmd.exe's native
++    title/target contract and the real cmd/start exit status remains the
++    command's exit status.
++    """
++    if not _IS_WINDOWS:
++        return command
++    return f"{_WINDOWS_GIT_BASH_START_SHIM}\n{command}"
++
++
+ def _path_env_key(run_env: dict) -> str | None:
+     """Return the PATH env key to update without altering Windows casing.
+ 
+@@ -1483,6 +1533,11 @@ class LocalEnvironment(BaseEnvironment):
+         """Rewrite native/mixed Windows paths before quoting for Git Bash."""
+         return _quote_bash_path(path)
+ 
++    def _wrap_command(self, command: str, cwd: str) -> str:
++        """Add Windows shell compatibility helpers after snapshot restore."""
++        command = _prepend_windows_git_bash_start_shim(command)
++        return super()._wrap_command(command, cwd)
++
+     def _run_bash(self, cmd_string: str, *, login: bool = False,
+                   timeout: int = 120,
+                   stdin_data: str | None = None) -> subprocess.Popen:

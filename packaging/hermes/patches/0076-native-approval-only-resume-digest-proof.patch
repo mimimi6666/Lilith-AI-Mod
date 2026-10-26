@@ -1,0 +1,127 @@
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index c0ba8a6..066c6c7 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -5582,6 +5582,64 @@ def _adopt_verified_native_config_digest_for_session(
+     )
+ 
+ 
++def _adopt_idle_approval_resume_digest(session: dict) -> None:
++    """Resume the same strict conversation after an exact approval-only save.
++
++    This is not a general stale-config escape hatch: tools.set creates the
++    marker only while all sessions are idle and the toolset is unchanged.
++    Other config mutations cannot produce or widen the prepared digest chain.
++    """
++    pending = session.get("_native_approval_resume_digest")
++    if not isinstance(pending, dict):
++        return
++    agent = session.get("agent")
++    if agent is None:
++        # Deferred construction already verifies the newest trusted snapshot.
++        return
++    from agent.identity_policy import (
++        adopt_verified_native_config_digest,
++        preflight_aia_agent_identity,
++    )
++    from hermes_cli.config import _CONFIG_LOCK
++
++    with session["history_lock"], _runtime_authority_lock(session), _CONFIG_LOCK:
++        if (session.get("running") or session.get("tool_started_at")
++                or session.get("queued_prompt") or session.get("queued_prompts")
++                or session.get("agent_build_started")
++                or _native_model_agent_has_active_children(agent)):
++            raise RuntimeError("approval resume requires an idle strict session")
++        previous, current = pending.get("previous"), pending.get("current")
++        if not isinstance(previous, str) or not isinstance(current, str):
++            raise RuntimeError("approval resume digest proof is incomplete")
++        receipt = preflight_aia_agent_identity(request_overrides={})
++        if not hmac.compare_digest(receipt.config_sha256, current):
++            raise RuntimeError("approval resume config changed after native receipt")
++        # A deferred agent may already have been built from the new snapshot.
++        state = _native_model_agent_digest_state(agent, previous, current)
++        if state == "old":
++            key = str(session.get("session_key") or "").strip()
++            db = getattr(agent, "_session_db", None) or _get_db()
++            if db is None or not key:
++                raise RuntimeError("approval resume database identity is unavailable")
++            row = db.get_session(key)
++            if row is not None:
++                _adopt_verified_native_config_digest_for_session(
++                    session, agent, previous, current,
++                )
++            else:
++                # Never pretend an existing conversation is an untouched draft.
++                if (getattr(agent, "_session_db_created", False)
++                        or session.get("history") or session.get("resume_session_id")
++                        or session.get("display_history_prefix")
++                        or session.get("inflight_turn")
++                        or session.get("history_version", 0) != 0):
++                    raise RuntimeError("approval resume durable conversation is missing")
++                adopt_verified_native_config_digest(
++                    agent, previous_config_sha256=previous, config_sha256=current,
++                )
++        session.pop("_native_approval_resume_digest", None)
++
++
+ def _persist_live_session_system_prompt(session: dict | None) -> None:
+     """Refresh the stored system prompt after a live runtime identity change."""
+     if not session:
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 0e69bd7..4648de7 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -1979,6 +1979,9 @@ def _(rid, params: dict) -> dict:
+                     )
+ 
+                 config = load_config()
++                prior_enabled = set(_get_platform_tools(
++                    config, platform, include_default_mcp_servers=False
++                ))
+                 approvals = config.get("approvals")
+                 if not isinstance(approvals, dict):
+                     approvals = {}
+@@ -2046,6 +2049,23 @@ def _(rid, params: dict) -> dict:
+                             ) from recovery_error
+                     raise mutation_error
+ 
++            # Record only this exact trusted, idle approval-only transition.
++            # The Runtime must accept the receipt before a client can resume;
++            # resume re-proves the complete strict snapshot before adoption.
++            for session in _sessions.values():
++                pending = session.pop("_native_approval_resume_digest", None)
++                if previous_sha256 is not None and prior_enabled == set(
++                    _get_platform_tools(saved, platform, include_default_mcp_servers=False)
++                ):
++                    first = previous_sha256
++                    if isinstance(pending, dict):
++                        if pending.get("current") != previous_sha256:
++                            continue
++                        first = pending.get("previous")
++                    session["_native_approval_resume_digest"] = {
++                        "previous": first, "current": config_sha256,
++                    }
++
+             return _ok(
+                 rid,
+                 {
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 7d9d5b2..6a57e3a 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -525,6 +525,7 @@ def _(rid, params: dict) -> dict:
+                         target, profile_home=profile_home
+                     )
+                     if live_draft is not None:
++                        _adopt_idle_approval_resume_digest(live_draft[1])
+                         payload = _live_session_payload(
+                             live_draft[0],
+                             live_draft[1],
+@@ -747,6 +748,7 @@ def _(rid, params: dict) -> dict:
+                             )
+                         current = _find_live_session_by_key(target)
+                         if current is not None:
++                            _adopt_idle_approval_resume_digest(current[1])
+                             # Rebind the caller's transport before a retry can emit
+                             # session.info.  A prior deferred worker may have died
+                             # outside the ordinary Exception rail and published a

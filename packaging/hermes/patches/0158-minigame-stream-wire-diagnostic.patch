@@ -1,0 +1,80 @@
+diff --git a/agent/minigame_context.py b/agent/minigame_context.py
+index 05a1f24..0006340 100644
+--- a/agent/minigame_context.py
++++ b/agent/minigame_context.py
+@@ -336,7 +336,7 @@ class GameContextDiagnosticObserver:
+         self._seen = set()
+         self._wire_lock = threading.Lock()
+         self._wire_closed = False
+-        self._wire = dict(route="other", mode="nonstream", unsupportedReason="none",
++        self._wire = dict(route="other", mode="not-observed", unsupportedReason="none",
+                           sdkRequests=0, wireRequests=0, firstSdk="not-observed",
+                           lastSdk="not-observed", firstWire="not-observed", lastWire="not-observed",
+                           anyMissing=False, anyUnknown=False, saturated=False)
+@@ -365,7 +365,7 @@ class GameContextDiagnosticObserver:
+     def wire_observe(self, boundary, presence):
+         self.wire_inspect(boundary, lambda: (presence, "none"))
+ 
+-    def wire_inspect(self, boundary, inspect):
++    def wire_inspect(self, boundary, inspect, *, mode=None):
+         """Reserve bounded inspection under the same close/count lock."""
+         with self._wire_lock:
+             if (self._wire_closed or int(time.time() * 1000) >= self._lease.expires_at_ms
+@@ -381,6 +381,16 @@ class GameContextDiagnosticObserver:
+                 presence, reason = "unknown", "body" if boundary == "Wire" else "none"
+             if presence not in {"present", "absent", "unknown"}:
+                 return
++            if boundary == "Sdk":
++                # This is the admitted SDK argument, not a remote transport
++                # claim. Count, presence and mode share the bounded prefix.
++                observed_mode = mode if mode in {"stream", "nonstream"} else "unknown"
++                previous_mode = self._wire["mode"]
++                self._wire["mode"] = (
++                    "unknown" if "unknown" in {previous_mode, observed_mode}
++                    else observed_mode if previous_mode == "not-observed"
++                    else previous_mode if previous_mode == observed_mode
++                    else "mixed")
+             if reason in {"route", "ownership", "hook", "body"} and self._wire["unsupportedReason"] == "none":
+                 self._wire["unsupportedReason"] = reason
+             if self._wire[key] == 0:
+@@ -547,7 +557,9 @@ def observe_wire_sdk_request(agent, client, request, send):
+     if not active:
+         return send()
+     try:
+-        observer.wire_inspect("Sdk", lambda: (_wire_presence(request, context), "none"))
++        stream = request.get("stream", False) if type(request) is dict else None
++        mode = "stream" if stream is True else "nonstream" if stream is False else "unknown"
++        observer.wire_inspect("Sdk", lambda: (_wire_presence(request, context), "none"), mode=mode)
+         http = _owned_wire_http_client(agent, client)
+         if http is None:
+             observer.wire_unsupported("ownership")
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index e7c8963..78a065d 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -3295,7 +3295,7 @@ def run_conversation(
+                     with bind_policy(for_agent(agent)), bind_wire_diagnostic(
+                             game_context_diagnostic, game_context, agent,
+                             supported=(agent.api_mode == "chat_completions"
+-                                       and agent.provider != "moa" and not _use_streaming)):
++                                       and agent.provider != "moa")):
+                         return _perform_api_call_bound(next_api_kwargs)
+ 
+                 from hermes_cli.middleware import run_llm_execution_middleware
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index d2dedd6..630e8d5 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -3588,9 +3588,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+             agent._touch_activity("waiting for provider response (streaming)")
+             from agent.usage_budget_native_dispatch import native_chat_dispatch_sync
+             from agent.paired_speech import observe_chat_sdk_request
++            from agent.minigame_context import observe_wire_sdk_request
+             return native_chat_dispatch_sync(
+                 request_client, stream_kwargs,
+-                lambda request: observe_chat_sdk_request(agent, request_client.chat.completions.create, request),
++                lambda request: observe_wire_sdk_request(agent, request_client, request,
++                    lambda: observe_chat_sdk_request(agent, request_client.chat.completions.create, request)),
+                 expected_handle=getattr(agent, "_usage_budget_handle", None),
+             )
+ 

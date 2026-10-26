@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Generated and checked against the native policy resolver, not UI ratios. -->
+    <EmbeddedResource Include="Assets\UsageBudgetReference.json"
+                      LogicalName="LilithRuntimeContracts.UsageBudgetReference.json" />
+    <EmbeddedResource Include="Assets\InformationStrategyReference.json"
+                      LogicalName="LilithRuntimeContracts.InformationStrategyReference.json" />
+  </ItemGroup>
+</Project>

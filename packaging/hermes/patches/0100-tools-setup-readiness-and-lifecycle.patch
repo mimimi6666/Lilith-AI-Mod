@@ -1,0 +1,2810 @@
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index 1f96919..9ff6bec 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -793,6 +793,14 @@ def _begin_tool_execution(
+             pass
+ 
+ 
++def _interrupted_tool_outcome(name: str, started: bool) -> tuple:
++    if started:
++        return ("unknown", "error", "tool_outcome_unknown",
++                f"[Stop requested — {name} had already started; its outcome is unknown and it may still be running. Do not retry automatically.]")
++    return ("none", "cancelled", "keyboard_interrupt",
++            f"[Tool execution cancelled — {name} was skipped due to user interrupt]")
++
++
+ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+     """Execute multiple tool calls concurrently using a thread pool.
+ 
+@@ -928,12 +936,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
+     # at the start-order gate exits immediately instead of waking up minutes
+     # later and dispatching a tool the turn has already reported as timed out.
+     batch_abandoned = threading.Event()
++    dispatched_indices: set[int] = set()
+     authorization_gate = _ConcurrentToolAuthorizationGate()
+ 
+     def _abandon_batch() -> None:
+         """Release every gate-parked worker so none dispatches post-abandon."""
+-        batch_abandoned.set()
+         with start_condition:
++            batch_abandoned.set()
+             start_condition.notify_all()
+ 
+     # The gate bound must sit UNDER the batch deadline, otherwise the deadline
+@@ -1065,6 +1074,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
+         try:
+             try:
+                 def _execute(next_args: dict[str, Any]) -> Any:
++                    with start_condition:
++                        if batch_abandoned.is_set():
++                            raise _BatchAbandoned(function_name)
++                        dispatched_indices.add(index)
+                     return agent._invoke_tool(
+                         function_name,
+                         next_args,
+@@ -1423,7 +1436,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
+         elif r is None:
+             # Tool was cancelled (interrupt) or thread didn't return
+             if agent._interrupt_requested:
+-                function_result = f"[Tool execution cancelled — {name} was skipped due to user interrupt]"
++                started = i in dispatched_indices
++                effect_disposition, stop_status, stop_error, function_result = _interrupted_tool_outcome(name, started)
+                 _emit_terminal_post_tool_call(
+                     agent,
+                     function_name=name,
+@@ -1431,9 +1445,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
+                     result=function_result,
+                     effective_task_id=effective_task_id,
+                     tool_call_id=getattr(tc, "id", "") or "",
+-                    status="cancelled",
+-                    error_type="keyboard_interrupt",
+-                    error_message="Tool execution cancelled by user interrupt",
++                    status=stop_status,
++                    error_type=stop_error,
++                    error_message=function_result,
+                     middleware_trace=list(middleware_trace),
+                 )
+             else:
+diff --git a/hermes_cli/curses_ui.py b/hermes_cli/curses_ui.py
+index 9a127d9..a6cee0f 100644
+--- a/hermes_cli/curses_ui.py
++++ b/hermes_cli/curses_ui.py
+@@ -859,7 +859,11 @@ def _radio_numbered_fallback(
+         if 0 <= idx < len(items):
+             return idx
+         return selected
+-    except (ValueError, KeyboardInterrupt, EOFError):
++    except EOFError:
++        # EOF is not a choice. Returning the default can re-enter the parent
++        # wizard indefinitely on headless Windows stdin (NUL).
++        raise SystemExit("Interactive input closed; setup cancelled.") from None
++    except (ValueError, KeyboardInterrupt):
+         return cancel_returns
+ 
+ 
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index cf9b2a8..5280921 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -493,7 +493,22 @@ def _require_tty(command_name: str) -> None:
+     curses or input() prompts that spin at 100% CPU when stdin is a pipe.
+     This guard prevents accidental non-interactive invocation.
+     """
+-    if not sys.stdin.isatty():
++    interactive = sys.stdin is not None and sys.stdin.isatty()
++    if interactive and os.name == "nt":
++        # The Windows NUL device reports isatty=True but reads EOF. Require a
++        # real console input handle rather than accidentally entering a wizard.
++        import ctypes
++        import msvcrt
++        from ctypes import wintypes
++        try:
++            mode = wintypes.DWORD()
++            get_mode = ctypes.WinDLL("kernel32", use_last_error=True).GetConsoleMode
++            get_mode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
++            get_mode.restype = wintypes.BOOL
++            interactive = bool(get_mode(msvcrt.get_osfhandle(sys.stdin.fileno()), ctypes.byref(mode)))
++        except (OSError, ValueError, AttributeError):
++            interactive = False
++    if not interactive:
+         print(
+             f"Error: 'hermes {command_name}' requires an interactive terminal.\n"
+             f"It cannot be run through a pipe or non-interactive subprocess.\n"
+diff --git a/hermes_cli/tools_config.py b/hermes_cli/tools_config.py
+index 7969222..ce99094 100644
+--- a/hermes_cli/tools_config.py
++++ b/hermes_cli/tools_config.py
+@@ -1647,6 +1647,15 @@ def _run_cua_driver_installer(
+ 
+ def _run_post_setup(post_setup_key: str):
+     """Run post-setup hooks for tools that need extra installation steps."""
++    from tools.native_tool_setup_tool import bound_setup_available
++    if bound_setup_available():
++        # Never let a generic pip/npm hook mutate the sealed application.
++        # This is an explicit CLI action, not a lazy check or a catalog read.
++        from tools.managed_tool_dependencies import install_provider_dependencies
++        result = install_provider_dependencies({"post_setup": post_setup_key}, lambda: False)
++        if result.get("status") not in {"installed", "already_ready"}:
++            raise RuntimeError("Managed dependency setup did not verify completion")
++        return
+     from hermes_constants import find_node_executable
+ 
+     if post_setup_key in {"agent_browser", "browserbase"}:
+@@ -2085,6 +2094,16 @@ def run_post_setup_command(args) -> int:
+     _print_info(f"Running post-setup hook: {key}")
+     try:
+         _run_post_setup(key)
++        predicate = _POST_SETUP_READY.get(key)
++        if key == "spotify":
++            predicate = _spotify_credentials_present
++        elif key == "xai_grok":
++            predicate = _xai_credentials_present
++        # A hook can print a warning and return normally. Its return is not
++        # evidence of installation/authentication; verify independently.
++        if predicate is None or not predicate():
++            _print_error("Post-setup finished without a verified ready dependency")
++            return 1
+     except Exception as exc:  # pragma: no cover — defensive
+         _print_error(f"Post-setup failed: {exc}")
+         return 1
+@@ -3306,6 +3325,11 @@ def _camofox_installed() -> bool:
+     return (PROJECT_ROOT / "node_modules" / "@askjo" / "camofox-browser").exists()
+ 
+ 
++def _fal_client_installed() -> bool:
++    from tools.managed_python_dependencies import fal_dependency_status
++    return fal_dependency_status() == "ready"
++
++
+ # post_setup_key -> predicate(): True when the install side-effect is already
+ # satisfied. Used by ``provider_readiness_status`` to decide whether a keyless
+ # post_setup row (KittenTTS, Piper, Local Browser, …) is honestly "ready" or
+@@ -3313,6 +3337,7 @@ def _camofox_installed() -> bool:
+ # performs before installing. ``xai_grok`` is intentionally absent — it is a
+ # credential bootstrap, not an install, and is handled as an auth check.
+ _POST_SETUP_READY: dict = {
++    "fal_client": _fal_client_installed,
+     "kittentts": lambda: _module_installed("kittentts"),
+     "piper": lambda: _module_installed("piper"),
+     "faster_whisper": lambda: _module_installed("faster_whisper"),
+@@ -3351,7 +3376,7 @@ def provider_readiness_status(
+     - ``"needs_auth"``  — needs a sign-in: Nous Portal login/entitlement for
+       managed Tool Gateway rows, or xAI Grok OAuth / XAI_API_KEY for
+       ``post_setup: "xai_grok"`` rows.
+-    - ``"needs_setup"`` — keyless row whose ``post_setup`` install hook has
++    - ``"needs_setup"`` — row whose ``post_setup`` install hook has
+       verifiably not run yet (see ``_POST_SETUP_READY``).
+ 
+     Keyless ≠ usable: this is the server-side truth the GUI "Ready" pill
+@@ -3359,15 +3384,13 @@ def provider_readiness_status(
+     zero-env-var row, including logged-out Nous Subscription rows).
+ 
+     ``features`` (a ``NousSubscriptionFeatures``) can be passed to avoid
+-    re-fetching portal state per row. ``is_active`` is the completed-setup
+-    fallback signal for post_setup hooks with no registered installed-check
+-    (selecting a row runs its hook, so the active row has been set up).
++    re-fetching portal state per row. ``is_active`` is retained for call-site
++    compatibility only: selection never proves an installation completed.
+     """
+     env_vars = provider.get("env_vars", [])
+     if env_vars:
+-        if all(get_env_value(e["key"]) for e in env_vars):
+-            return "ready"
+-        return "needs_keys"
++        if not all(get_env_value(e["key"]) for e in env_vars):
++            return "needs_keys"
+ 
+     managed_feature = provider.get("managed_nous_feature")
+     if provider.get("requires_nous_auth") or managed_feature:
+@@ -3410,11 +3433,8 @@ def provider_readiness_status(
+                 # provider is usable.  Fail closed so catalogs never
+                 # manufacture a Ready state from detector failure.
+                 return "needs_setup"
+-        # No reliable installed-check registered → treat the active-provider
+-        # signal as "setup completed" (selecting the row runs the hook).
+-        if is_active is None:
+-            is_active = _is_provider_active(provider, config)
+-        return "ready" if is_active else "needs_setup"
++        # Selection is configuration, never proof that an installer ran.
++        return "needs_setup"
+ 
+     return "ready"
+ 
+diff --git a/plugins/image_gen/fal/__init__.py b/plugins/image_gen/fal/__init__.py
+index face534..78f9bff 100644
+--- a/plugins/image_gen/fal/__init__.py
++++ b/plugins/image_gen/fal/__init__.py
+@@ -86,6 +86,7 @@ class FalImageGenProvider(ImageGenProvider):
+     def get_setup_schema(self) -> Dict[str, Any]:
+         return {
+             "name": "FAL.ai",
++            "post_setup": "fal_client",
+             "badge": "paid",
+             "tag": "Pick from flux-2-klein, flux-2-pro, gpt-image, nano-banana-2, nano-banana-pro, etc. — text-to-image & image editing",
+             "env_vars": [
+diff --git a/skills/productivity/docx/SKILL.md b/skills/productivity/docx/SKILL.md
+index 78b2f4d..ea09bf9 100644
+--- a/skills/productivity/docx/SKILL.md
++++ b/skills/productivity/docx/SKILL.md
+@@ -5,6 +5,7 @@ version: 1.1.0
+ author: Nous Research
+ license: MIT
+ platforms: [linux, macos, windows]
++required_python_modules: [docx]
+ metadata:
+   hermes:
+     tags: [word, docx, documents, office, templates, revisions, comments]
+diff --git a/skills/productivity/pdf/SKILL.md b/skills/productivity/pdf/SKILL.md
+index a10b25f..a4396d6 100644
+--- a/skills/productivity/pdf/SKILL.md
++++ b/skills/productivity/pdf/SKILL.md
+@@ -5,6 +5,7 @@ version: 1.0.0
+ author: Nous Research
+ license: MIT
+ platforms: [linux, macos, windows]
++required_python_modules: [pypdf, reportlab, pdfplumber]
+ metadata:
+   hermes:
+     tags: [pdf, documents, forms, reportlab, pypdf, pdfplumber]
+diff --git a/skills/productivity/powerpoint/SKILL.md b/skills/productivity/powerpoint/SKILL.md
+index 4d73a51..5bba954 100644
+--- a/skills/productivity/powerpoint/SKILL.md
++++ b/skills/productivity/powerpoint/SKILL.md
+@@ -5,6 +5,7 @@ version: 1.1.0
+ author: Nous Research
+ license: MIT
+ platforms: [linux, macos, windows]
++required_python_modules: [pptx]
+ metadata:
+   hermes:
+     tags: [pptx, powerpoint, presentations, slides, office, python-pptx]
+diff --git a/skills/productivity/xlsx/SKILL.md b/skills/productivity/xlsx/SKILL.md
+index f9e3544..1428f40 100644
+--- a/skills/productivity/xlsx/SKILL.md
++++ b/skills/productivity/xlsx/SKILL.md
+@@ -5,6 +5,7 @@ version: 1.1.0
+ author: Nous Research
+ license: MIT
+ platforms: [linux, macos, windows]
++required_python_modules: [openpyxl]
+ metadata:
+   hermes:
+     tags: [excel, spreadsheet, xlsx, csv, openpyxl, productivity]
+diff --git a/tests/tui_gateway/test_native_setup_selection.py b/tests/tui_gateway/test_native_setup_selection.py
+index e22aed2..beefa1e 100644
+--- a/tests/tui_gateway/test_native_setup_selection.py
++++ b/tests/tui_gateway/test_native_setup_selection.py
+@@ -329,14 +329,19 @@ def test_selected_provider_secure_fields_complete_once_without_reselection(monke
+     cards = []
+     def prompt(kind, data, **kwargs):
+         if kind == "clarify.request":
++            if "保留現有設定" in data.get("choices", []):
++                return "保留現有設定"
++            if "稍後安裝" in data.get("choices", []):
++                return "稍後安裝"
+             return tool._CONFIRM
+         assert kind == "secret.request"
+         cards.append(data["env_var"])
+         assert data["env_var"] == "CAMOFOX_URL"
+         return "http://localhost:9377"
+-    for _ in range(2):
++    for expected_saved in (["CAMOFOX_URL"], []):
+         result = tool.run_native_setup("browser", "configure", prompt=prompt, cancelled=lambda: False)
+-        assert result["status"] == "settings_saved", result
++        assert result["status"] == "manual_setup_required", result
++        assert result["saved_fields"] == expected_saved
+         assert "manager_request" not in result
+         assert result["providers"][0]["readiness"] == "needs_setup"
+         assert result["providers"][0]["dependency_status"] == "missing"
+@@ -366,7 +371,7 @@ def test_selected_provider_cannot_write_reserved_or_model_credentials(monkeypatc
+     assert (_home() / "config.yaml").read_bytes() == before
+ 
+ 
+-def test_selected_keyless_installer_reports_hook_without_repeat_selection(monkeypatch):
++def test_selected_keyless_installer_requires_explicit_human_confirmation(monkeypatch):
+     from tools import native_tool_setup_tool as tool
+     from hermes_cli import tools_config as tc
+     from hermes_cli.config import load_config
+@@ -375,9 +380,17 @@ def test_selected_keyless_installer_reports_hook_without_repeat_selection(monkey
+     provider = tc.TOOL_CATEGORIES["browser"]["providers"][0]
+     monkeypatch.setattr(tool, "bound_setup_available", lambda: True)
+     monkeypatch.setattr(tool, "_metadata", lambda *_: (load_config(), [provider]))
+-    result = tool.run_native_setup("browser", "configure", prompt=lambda *a, **k: pytest.fail("no installer card"), cancelled=lambda: False)
+-    assert result["status"] == "native_manager_required"
+-    assert result["reason"] == "native_setup_hook_required"
++    from tools import managed_tool_dependencies as dependencies
++    monkeypatch.setattr(dependencies, "dependency_status", lambda *_: "missing")
++    monkeypatch.setattr(dependencies, "install_provider_dependencies", lambda *a, **k: pytest.fail("No install without explicit human approval"))
++    prompts = []
++    def prompt(kind, data, **kwargs):
++        assert kind == "clarify.request"
++        prompts.append(data)
++        return "稍後安裝" if "稍後安裝" in data["choices"] else tool._CONFIRM
++    result = tool.run_native_setup("browser", "configure", prompt=prompt, cancelled=lambda: False)
++    assert result["dependency_installation"] == "deferred"
++    assert len(prompts) == 2
+     assert "manager_request" not in result
+     assert (_home() / "config.yaml").read_bytes() == before
+ 
+@@ -408,4 +421,4 @@ def test_isolated_complete_native_catalog_metadata_smoke(monkeypatch, native_set
+             assert set(provider) == fields
+             assert provider["readiness"] in {"ready", "needs_keys", "needs_auth", "needs_setup"}
+             assert provider["dependency_status"] in {"not_required", "ready", "missing", "unknown"}
+-            assert provider["setup_support"] in {"provider_selection", "secure_fields", "spotify_oauth", "native_manager_required", "no_setup_fields", "model_selection"}
++            assert provider["setup_support"] in {"provider_selection", "secure_fields", "spotify_oauth", "native_manager_required", "no_setup_fields", "model_selection", "dependency_setup"}
+diff --git a/tools/browser_tool.py b/tools/browser_tool.py
+index b831efb..676d0f9 100644
+--- a/tools/browser_tool.py
++++ b/tools/browser_tool.py
+@@ -125,6 +125,41 @@ _BROWSER_PASSTHROUGH_KEYS: tuple[str, ...] = (
+ )
+ 
+ 
++class _BrowserWaitInterrupted(Exception):
++    pass
++
++
++def _wait_browser_process(proc, timeout):
++    """Stop waiting promptly without claiming a daemon-side action rolled back."""
++    from tools.interrupt import is_interrupted
++    deadline = time.monotonic() + timeout
++    while proc.poll() is None:
++        if is_interrupted():
++            raise _BrowserWaitInterrupted()
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            raise subprocess.TimeoutExpired("browser command", timeout)
++        try:
++            proc.wait(timeout=min(0.1, remaining))
++        except subprocess.TimeoutExpired:
++            pass
++
++
++def _retire_browser_wait(proc, interrupted):
++    try:
++        proc.kill()
++        proc.wait(timeout=2)
++    except (OSError, subprocess.TimeoutExpired):
++        pass
++    return {
++        "success": False,
++        "error": ("Browser stop requested" if interrupted else "Browser command timed out")
++                 + "; the browser may already have accepted the action. Outcome unknown; do not retry automatically.",
++        "effect_disposition": "unknown",
++        "retryable": False,
++    }
++
++
+ def _build_browser_env() -> dict:
+     """Credential-scrubbed env for an agent-browser subprocess.
+ 
+@@ -140,6 +175,12 @@ def _build_browser_env() -> dict:
+     for _key in _BROWSER_PASSTHROUGH_KEYS:
+         if _key in os.environ:
+             env[_key] = os.environ[_key]
++    from tools.managed_tool_dependencies import managed_browser_paths
++    managed = managed_browser_paths()
++    if managed and managed.get("chrome"):
++        # Explicit caller/browser configuration still wins. This is the
++        # profile-owned dependency, never the player's normal Chrome profile.
++        env.setdefault("AGENT_BROWSER_EXECUTABLE_PATH", managed["chrome"])
+     return env
+ 
+ try:
+@@ -1308,11 +1349,11 @@ def _run_chrome_fallback_command(
+             os.close(stdout_fd)
+             os.close(stderr_fd)
+         try:
+-            proc.wait(timeout=timeout)
+-        except subprocess.TimeoutExpired:
+-            proc.kill()
+-            proc.wait()
+-            return {"success": False, "error": f"Chrome fallback '{cmd}' timed out"}
++            _wait_browser_process(proc, timeout)
++        except (_BrowserWaitInterrupted, subprocess.TimeoutExpired) as exc:
++            result = _retire_browser_wait(proc, isinstance(exc, _BrowserWaitInterrupted))
++            _unlink_command_output_files(stdout_path, stderr_path)
++            return result
+         try:
+             with open(stdout_path, "r", encoding="utf-8") as f:
+                 stdout = f.read().strip()
+@@ -2410,6 +2451,12 @@ def _find_agent_browser(*, validate: bool = True) -> str:
+         FileNotFoundError: If agent-browser is not installed
+     """
+     global _cached_agent_browser, _agent_browser_resolved
++    from tools.managed_tool_dependencies import managed_browser_paths
++    managed = managed_browser_paths()
++    if managed:
++        # Check before the old negative cache: an explicit setup can finish
++        # while this gateway remains alive. The helper performs no download.
++        return managed["cli"]
+     if _agent_browser_resolved:
+         if _cached_agent_browser is None:
+             raise FileNotFoundError(
+@@ -2885,10 +2932,13 @@ def _run_browser_command(
+             os.close(stderr_fd)
+ 
+         try:
+-            proc.wait(timeout=timeout)
++            _wait_browser_process(proc, timeout)
++        except _BrowserWaitInterrupted:
++            result = _retire_browser_wait(proc, True)
++            _unlink_command_output_files(stdout_path, stderr_path)
++            return result
+         except subprocess.TimeoutExpired:
+-            proc.kill()
+-            proc.wait()
++            result = _retire_browser_wait(proc, False)
+             stdout, stderr = _read_command_output_files(stdout_path, stderr_path)
+             _unlink_command_output_files(stdout_path, stderr_path)
+             if stderr and stderr.strip():
+@@ -2899,11 +2949,8 @@ def _run_browser_command(
+                 )
+             logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
+                            command, timeout, task_id, task_socket_dir)
+-            result = {
+-                "success": False,
+-                "error": _format_browser_timeout_error(command, timeout, stdout, stderr),
+-            }
+-            # Fall through to fallback check below
++            # No automatic Chrome replay after a potentially executed command.
++            return result
+         else:
+             with open(stdout_path, "r", encoding="utf-8") as f:
+                 stdout = f.read()
+@@ -5022,6 +5069,10 @@ def _chromium_installed() -> bool:
+     fail at runtime.
+     """
+     global _cached_chromium_installed
++    from tools.managed_tool_dependencies import managed_browser_paths
++    managed = managed_browser_paths()
++    if managed and managed.get("chrome"):
++        return True
+     if _cached_chromium_installed is not None:
+         return _cached_chromium_installed
+ 
+@@ -5086,6 +5137,11 @@ def _maybe_autoinstall_chromium() -> bool:
+     Returns True only when Chromium is present afterwards.
+     """
+     global _chromium_autoinstall_attempted
++    from tools.native_tool_setup_tool import bound_setup_available
++    if bound_setup_available():
++        # Managed installation requires the native human Install decision.
++        # A read/call must not silently install into the real Windows home.
++        return False
+     if _chromium_autoinstall_attempted:
+         return _chromium_installed()
+     _chromium_autoinstall_attempted = True
+diff --git a/tools/computer_use/cua_backend.py b/tools/computer_use/cua_backend.py
+index 3e7543a..10e7a26 100644
+--- a/tools/computer_use/cua_backend.py
++++ b/tools/computer_use/cua_backend.py
+@@ -1055,6 +1055,11 @@ class _AsyncBridge:
+ 
+     def run(self, coro, timeout: Optional[float] = 30.0) -> Any:
+         from agent.async_utils import safe_schedule_threadsafe
++        from tools.interrupt import is_interrupted
++        if is_interrupted():
++            if asyncio.iscoroutine(coro):
++                coro.close()
++            raise RuntimeError("Desktop operation cancelled before dispatch; no request was started.")
+         if not self._loop or not self._thread or not self._thread.is_alive():
+             if asyncio.iscoroutine(coro):
+                 coro.close()
+@@ -1062,7 +1067,24 @@ class _AsyncBridge:
+         fut = safe_schedule_threadsafe(coro, self._loop)
+         if fut is None:
+             raise RuntimeError("cua-driver bridge not started")
+-        return fut.result(timeout=timeout)
++        import time
++        deadline = None if timeout is None else time.monotonic() + timeout
++        while True:
++            if fut.done():
++                return fut.result()
++            if is_interrupted() or (deadline is not None and time.monotonic() >= deadline):
++                # Transport cancellation cannot roll back an operation already
++                # accepted by the driver. Never claim it was safely skipped.
++                fut.cancel()
++                raise TimeoutError(
++                    "Desktop operation wait stopped; cancellation requested, outcome unknown. Do not retry automatically."
++                ) from None
++            try:
++                return fut.result(timeout=0.1 if deadline is None else min(0.1, max(0.001, deadline - time.monotonic())))
++            except TimeoutError:
++                if fut.done():
++                    # A real tool exception, not this waiter's deadline.
++                    raise
+ 
+     def stop(self) -> None:
+         if self._loop and self._loop.is_running():
+diff --git a/tools/environments/base.py b/tools/environments/base.py
+index dbdb874..ded10d0 100644
+--- a/tools/environments/base.py
++++ b/tools/environments/base.py
+@@ -1195,11 +1195,13 @@ class BaseEnvironment(ABC):
+                             "tid=%s pid=%s iter=%d elapsed=%.1fs — killing process group",
+                             _tid, _pid, _iter_count, time.monotonic() - _activity_state["start"],
+                         )
+-                    self._kill_process(proc)
++                    cleanup_confirmed = self._kill_process(proc)
+                     drain_thread.join(timeout=2)
++                    cleanup_note = ("\n[Process cleanup could not be confirmed; effects may still be in progress. Do not retry automatically.]"
++                                    if cleanup_confirmed is False else "")
+                     return self._finalize_wait_result(
+                         output,
+-                        output.render(suffix="\n[Command interrupted]"),
++                        output.render(suffix="\n[Command interrupted]" + cleanup_note),
+                         130,
+                     )
+                 if time.monotonic() > deadline:
+@@ -1209,9 +1211,11 @@ class BaseEnvironment(ABC):
+                             "tid=%s pid=%s iter=%d timeout=%ss",
+                             _tid, _pid, _iter_count, timeout,
+                         )
+-                    self._kill_process(proc)
++                    cleanup_confirmed = self._kill_process(proc)
+                     drain_thread.join(timeout=2)
+                     timeout_msg = f"\n[Command timed out after {timeout}s]"
++                    if cleanup_confirmed is False:
++                        timeout_msg += "\n[Process cleanup could not be confirmed; effects may still be in progress. Do not retry automatically.]"
+                     return self._finalize_wait_result(
+                         output,
+                         output.render(suffix=timeout_msg).lstrip()
+@@ -1273,6 +1277,23 @@ class BaseEnvironment(ABC):
+                 pass  # cleanup is best-effort
+             raise
+ 
++        # A foreground wrapper is not the entire Windows operation. Retire its
++        # owned descendants before reporting completion; explicit background
++        # launches use process_registry and never receive this foreground job.
++        owned_job = getattr(proc, "_hermes_foreground_job", None)
++        foreground_descendants = False
++        foreground_cleanup_confirmed = True
++        if owned_job is not None:
++            try:
++                foreground_descendants = not owned_job.wait_empty(0.25)
++                foreground_cleanup_confirmed = (
++                    owned_job.terminate_and_wait(2.0) if foreground_descendants else True)
++            finally:
++                owned_job.close()
++                proc._hermes_foreground_job = None
++                proc._hermes_foreground_job_retired = True
++                proc._hermes_foreground_cleanup_confirmed = foreground_cleanup_confirmed
++
+         # Drain thread now exits promptly after bash does (~300ms idle
+         # check).  A short join is enough; a long one would be a bug since
+         # it means the non-blocking loop itself stopped cooperating.
+@@ -1301,7 +1322,14 @@ class BaseEnvironment(ABC):
+         if stdin_thread is not None:
+             stdin_thread.join(timeout=5)
+         rendered = output.render()
++        if foreground_descendants:
++            rendered += "\n[Foreground wrapper exited with descendants; use the explicit background option for persistent processes.]"
++        if not foreground_cleanup_confirmed:
++            rendered += "\n[Process cleanup could not be confirmed; do not retry automatically.]"
+         result = self._finalize_wait_result(output, rendered, proc.returncode)
++        if foreground_descendants or not foreground_cleanup_confirmed:
++            result["returncode"] = proc.returncode or 125
++            result["cleanup_confirmed"] = foreground_cleanup_confirmed
+         stdin_errors = getattr(proc, "_hermes_stdin_errors", None)
+         if stdin_errors:
+             err = str(stdin_errors[0])
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index fe4310d..e821825 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -721,7 +721,7 @@ def build_subprocess_env(
+     return env
+ 
+ 
+-def _find_bash() -> str:
++def _find_bash(*, probe_timeout: float = 15.0, diagnostics: bool = True) -> str:
+     """Find bash for command execution."""
+     if not _IS_WINDOWS:
+         return (
+@@ -777,7 +777,7 @@ def _find_bash() -> str:
+     # (``Directory \\drivers\\etc does not exist``) must not win over a
+     # healthy portable Git under %LOCALAPPDATA%\\hermes\\git.
+     for candidate in candidates:
+-        if _bash_starts(candidate):
++        if _bash_starts(candidate, timeout=probe_timeout):
+             if candidate != custom and custom and os.path.isfile(custom):
+                 logger.warning(
+                     "HERMES_GIT_BASH_PATH=%s fails to start; using %s instead",
+@@ -787,6 +787,10 @@ def _find_bash() -> str:
+             return candidate
+ 
+     if candidates:
++        if not diagnostics:
++            # Readiness uses the same probe cache, without a slow secondary
++            # PowerShell system-mitigation diagnostic on each catalog read.
++            return candidates[0]
+         probe_details = "\n".join(
+             detail
+             for candidate in candidates
+@@ -811,6 +815,7 @@ def _find_bash() -> str:
+ 
+ _bash_starts_cache: dict[str, bool] = {}
+ _bash_probe_details_cache: dict[str, str] = {}
++_bash_probe_retry_after: dict[str, float] = {}
+ _mandatory_aslr_enabled_cache: "bool | None" = None
+ 
+ _BASH_EXTERNAL_PROGRAM_PROBE = "/usr/bin/true; /usr/bin/cat --version >/dev/null"
+@@ -896,7 +901,7 @@ def _git_bash_aslr_help(bash: str, details: str = "") -> str:
+     )
+ 
+ 
+-def _bash_starts(bash: str) -> bool:
++def _bash_starts(bash: str, *, timeout: float = 15.0) -> bool:
+     """True if *bash* can launch external MSYS programs.
+ 
+     Uses ``--noprofile --norc`` so a broken login post-install
+@@ -908,13 +913,15 @@ def _bash_starts(bash: str) -> bool:
+     cached = _bash_starts_cache.get(bash)
+     if cached is not None:
+         return cached
++    if timeout < 15.0 and time.monotonic() < _bash_probe_retry_after.get(bash, 0.0):
++        return False
+ 
+     try:
+         result = subprocess.run(
+             [bash, "--noprofile", "--norc", "-c", _BASH_EXTERNAL_PROGRAM_PROBE],
+             capture_output=True,
+             text=True, encoding="utf-8", errors="replace",
+-            timeout=15,
++            timeout=timeout,
+             creationflags=windows_hide_flags() if _IS_WINDOWS else 0,
+         )
+         ok = result.returncode == 0
+@@ -922,6 +929,12 @@ def _bash_starts(bash: str) -> bool:
+             combined = f"{result.stdout or ''}{result.stderr or ''}"
+             _bash_probe_details_cache[bash] = combined.strip()[:2000]
+             logger.debug("bash probe failed for %s: %s", bash, combined.strip()[:200])
++    except subprocess.TimeoutExpired:
++        # A short UI-readiness deadline is not permanent evidence of a broken
++        # shell. Back off probes, but let real execution use its full budget.
++        _bash_probe_retry_after[bash] = time.monotonic() + 30.0
++        _bash_probe_details_cache[bash] = "Shell readiness probe did not finish within its deadline."
++        return False
+     except Exception as exc:
+         _bash_probe_details_cache[bash] = str(exc)[:2000]
+         logger.debug("bash probe error for %s: %s", bash, exc)
+@@ -1614,20 +1627,33 @@ class LocalEnvironment(BaseEnvironment):
+         _popen_cwd = self.cwd
+ 
+         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
++        foreground_job = None
++        if _IS_WINDOWS:
++            from tools.environments.windows_job import ForegroundWindowsJob, CREATE_SUSPENDED
++            foreground_job = ForegroundWindowsJob()
++            _popen_kwargs["creationflags"] |= CREATE_SUSPENDED
+ 
+-        proc = subprocess.Popen(
+-            args,
+-            text=True,
+-            env=run_env,
+-            encoding="utf-8",
+-            errors="replace",
+-            stdout=subprocess.PIPE,
+-            stderr=subprocess.STDOUT,
+-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+-            start_new_session=True,
+-            cwd=_popen_cwd,
+-            **_popen_kwargs,
+-        )
++        try:
++            proc = subprocess.Popen(
++                args,
++                text=True,
++                env=run_env,
++                encoding="utf-8",
++                errors="replace",
++                stdout=subprocess.PIPE,
++                stderr=subprocess.STDOUT,
++                stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
++                start_new_session=True,
++                cwd=_popen_cwd,
++                **_popen_kwargs,
++            )
++        except BaseException:
++            if foreground_job is not None:
++                foreground_job.close()
++            raise
++        if foreground_job is not None:
++            proc._hermes_foreground_job = foreground_job
++            foreground_job.attach_and_resume(proc)
+         if not _IS_WINDOWS:
+             try:
+                 proc._hermes_pgid = os.getpgid(proc.pid)
+@@ -1642,6 +1668,24 @@ class LocalEnvironment(BaseEnvironment):
+     def _kill_process(self, proc):
+         """Kill the entire process group (all children)."""
+ 
++        if getattr(proc, "_hermes_foreground_job_retired", False):
++            return getattr(proc, "_hermes_foreground_cleanup_confirmed", False)
++        owned_job = getattr(proc, "_hermes_foreground_job", None)
++        if owned_job is not None:
++            confirmed = False
++            try:
++                confirmed = owned_job.terminate_and_wait(2.0)
++                try:
++                    proc.wait(timeout=2.0)
++                except (subprocess.TimeoutExpired, OSError):
++                    confirmed = False
++                return confirmed
++            finally:
++                owned_job.close()
++                proc._hermes_foreground_job = None
++                proc._hermes_foreground_job_retired = True
++                proc._hermes_foreground_cleanup_confirmed = confirmed
++
+         def _group_alive(pgid: int) -> bool:
+             try:
+                 # POSIX-only: _IS_WINDOWS is handled before this helper is used.
+diff --git a/tools/environments/windows_job.py b/tools/environments/windows_job.py
+new file mode 100644
+--- /dev/null
++++ b/tools/environments/windows_job.py
+@@ -0,0 +1,164 @@
++"""Owned Windows foreground process trees, never a PID-wide cleanup sweep.
++
++The child must be created suspended. Assignment failure kills that exact
++Popen handle without ever allowing the unowned command to run. Background
++process_registry launches do not use this helper.
++"""
++from __future__ import annotations
++
++import ctypes
++from ctypes import wintypes
++import os
++import subprocess
++import time
++
++CREATE_SUSPENDED = 0x00000004
++
++
++class _BasicLimits(ctypes.Structure):
++    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong),
++                ("PerJobUserTimeLimit", ctypes.c_longlong),
++                ("LimitFlags", wintypes.DWORD),
++                ("MinimumWorkingSetSize", ctypes.c_size_t),
++                ("MaximumWorkingSetSize", ctypes.c_size_t),
++                ("ActiveProcessLimit", wintypes.DWORD),
++                ("Affinity", ctypes.c_size_t),
++                ("PriorityClass", wintypes.DWORD),
++                ("SchedulingClass", wintypes.DWORD)]
++
++
++class _IoCounters(ctypes.Structure):
++    _fields_ = [(name, ctypes.c_ulonglong) for name in
++                ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
++                 "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
++
++
++class _ExtendedLimits(ctypes.Structure):
++    _fields_ = [("BasicLimitInformation", _BasicLimits),
++                ("IoInfo", _IoCounters),
++                ("ProcessMemoryLimit", ctypes.c_size_t),
++                ("JobMemoryLimit", ctypes.c_size_t),
++                ("PeakProcessMemoryUsed", ctypes.c_size_t),
++                ("PeakJobMemoryUsed", ctypes.c_size_t)]
++
++
++class _Accounting(ctypes.Structure):
++    _fields_ = [("TotalUserTime", ctypes.c_longlong),
++                ("TotalKernelTime", ctypes.c_longlong),
++                ("ThisPeriodTotalUserTime", ctypes.c_longlong),
++                ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
++                ("TotalPageFaultCount", wintypes.DWORD),
++                ("TotalProcesses", wintypes.DWORD),
++                ("ActiveProcesses", wintypes.DWORD),
++                ("TotalTerminatedProcesses", wintypes.DWORD)]
++
++
++class _ThreadEntry(ctypes.Structure):
++    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
++                ("th32ThreadID", wintypes.DWORD), ("th32OwnerProcessID", wintypes.DWORD),
++                ("tpBasePri", wintypes.LONG), ("tpDeltaPri", wintypes.LONG),
++                ("dwFlags", wintypes.DWORD)]
++
++
++class ForegroundWindowsJob:
++    def __init__(self):
++        if os.name != "nt":
++            raise OSError("Windows foreground ownership is unavailable")
++        self._api = ctypes.WinDLL("kernel32", use_last_error=True)
++        signatures = {
++            "CreateJobObjectW": ([ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
++            "SetInformationJobObject": ([wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
++            "QueryInformationJobObject": ([wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p], wintypes.BOOL),
++            "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
++            "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
++            "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
++            "CreateToolhelp32Snapshot": ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
++            "Thread32First": ([wintypes.HANDLE, ctypes.POINTER(_ThreadEntry)], wintypes.BOOL),
++            "Thread32Next": ([wintypes.HANDLE, ctypes.POINTER(_ThreadEntry)], wintypes.BOOL),
++            "OpenThread": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
++            "ResumeThread": ([wintypes.HANDLE], wintypes.DWORD),
++        }
++        for name, (args, result) in signatures.items():
++            method = getattr(self._api, name)
++            method.argtypes, method.restype = args, result
++        self._handle = self._api.CreateJobObjectW(None, None)
++        if not self._handle:
++            raise OSError("Cannot create foreground process ownership")
++        limits = _ExtendedLimits()
++        limits.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE
++        if not self._api.SetInformationJobObject(self._handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
++            self.close()
++            raise OSError("Cannot configure foreground process ownership")
++
++    def attach_and_resume(self, proc):
++        try:
++            # Windows 8+ supports nested jobs. If the hosting job's restrictions
++            # prevent assignment, fail closed: never use BREAKAWAY or resume.
++            if not self._api.AssignProcessToJobObject(self._handle, int(proc._handle)):
++                raise OSError("Cannot own foreground process tree in this host")
++            snapshot = self._api.CreateToolhelp32Snapshot(0x00000004, 0)
++            if snapshot == ctypes.c_void_p(-1).value:
++                raise OSError("Cannot inspect suspended foreground thread")
++            try:
++                entry = _ThreadEntry()
++                entry.dwSize = ctypes.sizeof(entry)
++                found = self._api.Thread32First(snapshot, ctypes.byref(entry))
++                while found:
++                    if entry.th32OwnerProcessID == proc.pid:
++                        thread = self._api.OpenThread(0x0002, False, entry.th32ThreadID)
++                        if not thread:
++                            raise OSError("Cannot open suspended foreground thread")
++                        try:
++                            previous = self._api.ResumeThread(thread)
++                            if previous == 0xFFFFFFFF or previous != 1:
++                                raise OSError("Cannot resume owned foreground process")
++                        finally:
++                            self._api.CloseHandle(thread)
++                        return
++                    found = self._api.Thread32Next(snapshot, ctypes.byref(entry))
++                raise OSError("Suspended foreground thread is unavailable")
++            finally:
++                self._api.CloseHandle(snapshot)
++        except BaseException:
++            self.terminate_and_wait(2.0)
++            # Assignment can fail before the process belongs to our job.
++            try:
++                proc.kill()
++                proc.wait(timeout=2.0)
++            finally:
++                self.close()
++            raise
++
++    def active_processes(self):
++        if not self._handle:
++            return None
++        accounting = _Accounting()
++        if not self._api.QueryInformationJobObject(self._handle, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None):
++            return None
++        return accounting.ActiveProcesses
++
++    def terminate_and_wait(self, timeout=2.0):
++        if not self._handle:
++            return False
++        if not self._api.TerminateJobObject(self._handle, 130):
++            return self.active_processes() == 0
++        return self.wait_empty(timeout)
++
++    def wait_empty(self, timeout=0.25):
++        # Accounting can briefly lag a signalled process handle. Give normal
++        # exit a bounded drain before diagnosing a surviving descendant.
++        deadline = time.monotonic() + timeout
++        while time.monotonic() < deadline:
++            if self.active_processes() == 0:
++                return True
++            time.sleep(0.02)
++        return self.active_processes() == 0
++
++    def close(self):
++        handle, self._handle = self._handle, None
++        if handle:
++            self._api.CloseHandle(handle)
++
++    def __del__(self):
++        if getattr(self, "_handle", None):
++            self.close()
+diff --git a/tools/fal_common.py b/tools/fal_common.py
+index 27636f9..04e03fd 100644
+--- a/tools/fal_common.py
++++ b/tools/fal_common.py
+@@ -41,6 +41,9 @@ def import_fal_client() -> Any:
+ 
+     Raises :class:`ImportError` if the package is genuinely unavailable.
+     """
++    # Activation is read-only and never changes the lazy-install policy.
++    from tools.managed_python_dependencies import prepare_fal_import
++    prepare_fal_import()
+     try:
+         from tools.lazy_deps import ensure as _lazy_ensure
+         _lazy_ensure("image.fal", prompt=False)
+diff --git a/tools/image_generation_tool.py b/tools/image_generation_tool.py
+index c7c5ccb..e77e064 100644
+--- a/tools/image_generation_tool.py
++++ b/tools/image_generation_tool.py
+@@ -25,6 +25,7 @@ import logging
+ import os
+ import datetime
+ import threading
++import time
+ import uuid
+ from typing import Any, Dict, Optional
+ 
+@@ -72,6 +73,54 @@ from tools.tool_backend_helpers import (
+ 
+ logger = logging.getLogger(__name__)
+ 
++# One unresolved remote image operation is enough. Do not accumulate detached
++# workers or silently submit a second billable operation after an uncertain Stop.
++_image_operation_gate = threading.Lock()
++
++
++class _ImageOperationUnsettled(RuntimeError):
++    def __init__(self, message, effect_disposition="unknown"):
++        super().__init__(message)
++        self.effect_disposition = effect_disposition
++
++
++def _bounded_image_call(callback, timeout=300.0):
++    from tools.interrupt import is_interrupted
++    from tools.thread_context import propagate_context_to_thread
++    if is_interrupted():
++        raise _ImageOperationUnsettled("Image operation cancelled before dispatch; no request was started.", "none")
++    if not _image_operation_gate.acquire(blocking=False):
++        raise _ImageOperationUnsettled("A previous image operation has not settled; no new request was started.", "none")
++    done = threading.Event()
++    values = {}
++
++    def run():
++        try:
++            values["result"] = callback()
++        except BaseException as exc:
++            values["error"] = exc
++        finally:
++            _image_operation_gate.release()
++            done.set()
++
++    worker = threading.Thread(target=propagate_context_to_thread(run), daemon=True,
++                              name="bounded-image-operation")
++    try:
++        worker.start()
++    except BaseException:
++        _image_operation_gate.release()
++        raise
++    deadline = time.monotonic() + timeout
++    while not done.wait(0.1):
++        if is_interrupted() or time.monotonic() >= deadline:
++            raise _ImageOperationUnsettled(
++                "Image wait stopped; remote outcome unknown and generation may still be running or billable. "
++                "Cancellation is not confirmed. Do not retry automatically."
++            )
++    if "error" in values:
++        raise values["error"]
++    return values["result"]
++
+ 
+ # ---------------------------------------------------------------------------
+ # FAL model catalog
+@@ -724,11 +773,12 @@ def _get_managed_fal_client(managed_gateway):
+ 
+ def _submit_fal_request(model: str, arguments: Dict[str, Any]):
+     """Submit a FAL request using direct credentials or the managed queue gateway."""
+-    # Trigger the lazy import on first call. Idempotent.
+-    _load_fal_client()
+     request_headers = {"x-idempotency-key": str(uuid.uuid4())}
+     managed_gateway = _resolve_managed_fal_gateway()
+     if managed_gateway is None:
++        # The managed client factory owns its SDK loading. Resolve the direct
++        # SDK only in the direct branch, not before selecting the real client.
++        _load_fal_client()
+         return fal_client.submit(model, arguments=arguments, headers=request_headers)
+ 
+     managed_client = _get_managed_fal_client(managed_gateway)
+@@ -933,8 +983,8 @@ def _upscale_image(image_url: str, original_prompt: str) -> Optional[Dict[str, A
+             "enable_safety_checker": UPSCALER_SAFETY_CHECKER,
+         }
+ 
+-        handler = _submit_fal_request(UPSCALER_MODEL, arguments=upscaler_arguments)
+-        result = handler.get()
++        result = _bounded_image_call(
++            lambda: _submit_fal_request(UPSCALER_MODEL, arguments=upscaler_arguments).get())
+ 
+         if result and "image" in result:
+             upscaled_image = result["image"]
+@@ -953,6 +1003,10 @@ def _upscale_image(image_url: str, original_prompt: str) -> Optional[Dict[str, A
+         logger.error("Upscaler returned invalid response")
+         return None
+ 
++    except _ImageOperationUnsettled:
++        # A remotely pending upscale must not be swallowed as an ordinary
++        # fallback and presented as a completely settled image operation.
++        raise
+     except Exception as e:
+         logger.error("Error upscaling image: %s", e, exc_info=True)
+         return None
+@@ -1199,8 +1253,8 @@ def image_generate_tool(
+                 meta.get("display", model_id), model_id, prompt[:80],
+             )
+ 
+-        handler = _submit_fal_request(endpoint, arguments=arguments)
+-        result = handler.get()
++        result = _bounded_image_call(
++            lambda: _submit_fal_request(endpoint, arguments=arguments).get())
+ 
+         generation_time = (datetime.datetime.now() - start_time).total_seconds()
+ 
+@@ -1276,6 +1330,8 @@ def image_generate_tool(
+             "image": None,
+             "error": str(e),
+             "error_type": type(e).__name__,
++            **({"effect_disposition": e.effect_disposition, "retryable": False}
++               if isinstance(e, _ImageOperationUnsettled) else {}),
+         }
+ 
+         debug_call_data["error"] = error_msg
+@@ -1599,7 +1655,7 @@ def _dispatch_to_plugin_provider(
+             kwargs["reference_image_urls"] = norm_refs
+         if upscale is not None:
+             kwargs["upscale"] = bool(upscale)
+-        result = provider.generate(**kwargs)
++        result = _bounded_image_call(lambda: provider.generate(**kwargs))
+     except TypeError as exc:
+         # A provider whose generate() signature predates image_url support
+         # (third-party plugin not yet updated) — retry without the new kwargs
+@@ -1643,6 +1699,8 @@ def _dispatch_to_plugin_provider(
+             "image": None,
+             "error": f"Provider '{getattr(provider, 'name', '?')}' error: {exc}",
+             "error_type": "provider_exception",
++            **({"effect_disposition": exc.effect_disposition, "retryable": False}
++               if isinstance(exc, _ImageOperationUnsettled) else {}),
+         })
+     if not isinstance(result, dict):
+         return json.dumps({
+@@ -1747,7 +1805,7 @@ def _maybe_route_managed_krea(
+             kwargs["reference_image_urls"] = norm_refs
+         if upscale is not None:
+             kwargs["upscale"] = bool(upscale)
+-        result = provider.generate(**kwargs)
++        result = _bounded_image_call(lambda: provider.generate(**kwargs))
+     except Exception as exc:  # noqa: BLE001
+         logger.warning("Managed Krea routing failed: %s", exc)
+         return json.dumps({
+@@ -1755,6 +1813,8 @@ def _maybe_route_managed_krea(
+             "image": None,
+             "error": f"Managed Krea generation error: {exc}",
+             "error_type": "provider_exception",
++            **({"effect_disposition": exc.effect_disposition, "retryable": False}
++               if isinstance(exc, _ImageOperationUnsettled) else {}),
+         })
+     if not isinstance(result, dict):
+         return json.dumps({
+diff --git a/tools/managed_python_dependencies.py b/tools/managed_python_dependencies.py
+new file mode 100644
+--- /dev/null
++++ b/tools/managed_python_dependencies.py
+@@ -0,0 +1,445 @@
++"""Explicit human setup of the native pinned FAL SDK, never lazy installation.
++
++The caller owns the native provider and human Install confirmation. This module
++cannot select a package/version/source from tool arguments. Neither readiness
++nor activation downloads, changes configuration, calls FAL or runs pip.
++"""
++from __future__ import annotations
++
++import hashlib
++import importlib
++import importlib.metadata
++import importlib.util
++import json
++import os
++from pathlib import Path
++import re
++import shutil
++import stat
++import sys
++import sysconfig
++import threading
++import time
++import uuid
++
++from tools.managed_tool_dependencies import _SetupFailure, _check, _mkdir, _plain, _probe, _publish
++
++_FEATURE = "image.fal"
++_MODULE = "fal_client"
++_ROOT_ENV = "HERMES_LILITH_PYTHON_DEPENDENCIES_ROOT"
++_PIP_WHEEL = "pip-24.0-py3-none-any.whl"
++_MAX_FILES = 12000
++_MAX_BYTES = 256 * 1024 * 1024
++_lock = threading.Lock()
++_activation_lock = threading.RLock()
++_owned_paths = set()
++_activated_profiles = set()
++_active_profile_path = None
++_managed_seen = False
++
++
++def _specs():
++    # Native LAZY_DEPS remains the only package version authority. Restrict this
++    # explicit setup slice to the one audited FAL distribution, not all features.
++    from tools.lazy_deps import feature_specs
++
++    values = feature_specs(_FEATURE)
++    if (len(values) != 1 or not re.fullmatch(r"fal-client==[0-9]+(?:\.[0-9]+){1,3}", values[0])):
++        raise _SetupFailure("native_dependency_spec_rejected")
++    return tuple(values)
++
++
++def _abi():
++    return (f"{sys.version_info.major}.{sys.version_info.minor}:"
++            f"{sys.implementation.cache_tag}:{sysconfig.get_config_var('EXT_SUFFIX') or ''}")
++
++
++def _runtime_paths():
++    # Hermes' sealed interpreter and packages have one deployment layout.
++    executable = _plain(Path(sys.executable))
++    component = executable.parent.parent
++    core = _plain(component / "site-packages")
++    wheel = _plain(executable.parent / "Lib" / "ensurepip" / "_bundled" / _PIP_WHEEL)
++    for path in (executable, wheel):
++        info = path.stat()
++        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
++            raise _SetupFailure("sealed_python_required")
++    return executable, core, wheel
++
++
++def _root():
++    from hermes_constants import get_hermes_home
++
++    home = os.environ.get("HERMES_LILITH_BOUND_HOME", "")
++    raw = os.environ.get(_ROOT_ENV, "")
++    if not home or not raw or not Path(home).is_absolute() or not Path(raw).is_absolute():
++        raise _SetupFailure("managed_home_required")
++    bound = _plain(home)
++    root = _plain(raw, missing=True)
++    if (os.path.normcase(str(bound)) != os.path.normcase(os.path.abspath(get_hermes_home()))
++            or os.path.normcase(str(root)) != os.path.normcase(str(bound / "tools" / "dependencies"))):
++        raise _SetupFailure("managed_home_required")
++    return root
++
++
++def _destination():
++    version = f"python-{sys.version_info.major}.{sys.version_info.minor}"
++    identity = hashlib.sha256((_abi() + "\n" + "\n".join(_specs())).encode()).hexdigest()[:24]
++    return _root() / version / _FEATURE / identity
++
++
++def _normalize(name):
++    return re.sub(r"[-_.]+", "-", name).lower()
++
++
++def _core_versions(core):
++    result = {}
++    for dist in importlib.metadata.distributions(path=[str(core)]):
++        name, version = dist.metadata.get("Name", ""), dist.version
++        if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name)
++                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.!+_-]{0,127}", version)):
++            raise _SetupFailure("core_dependency_metadata_invalid")
++        key = _normalize(name)
++        if key in result:
++            raise _SetupFailure("core_dependency_metadata_invalid")
++        result[key] = version
++    if not result:
++        raise _SetupFailure("sealed_python_required")
++    return result
++
++
++def _tree_files(directory):
++    _plain(directory)
++    result, total = {}, 0
++    for base, dirs, files in os.walk(directory, followlinks=False):
++        for name in dirs + files:
++            path = _plain(Path(base) / name)
++            if name.casefold().endswith(".pth"):
++                raise _SetupFailure("dependency_pth_rejected")
++            if path.is_dir():
++                continue
++            info = path.stat()
++            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
++                raise _SetupFailure("unsafe_dependency_path")
++            total += info.st_size
++            if len(result) >= _MAX_FILES or total > _MAX_BYTES:
++                raise _SetupFailure("dependency_size_limit")
++            relative = path.relative_to(directory).as_posix()
++            result[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
++    if not result:
++        raise _SetupFailure("dependency_empty")
++    return result
++
++
++def _verified_target():
++    target = _destination()
++    receipt = _plain(target / "verified.json")
++    if receipt.stat().st_size > 2 * 1024 * 1024:
++        raise _SetupFailure("dependency_receipt_invalid")
++    data = json.loads(receipt.read_text(encoding="utf-8"))
++    if (set(data) != {"schema", "abi", "feature", "specs", "files", "core"}
++            or data["schema"] != 1 or data["abi"] != _abi() or data["feature"] != _FEATURE
++            or data["specs"] != list(_specs())):
++        raise _SetupFailure("dependency_receipt_invalid")
++    _, core, _ = _runtime_paths()
++    if data["core"] != _core_versions(core):
++        raise _SetupFailure("dependency_core_changed")
++    packages = _plain(target / "packages")
++    if data["files"] != _tree_files(packages):
++        raise _SetupFailure("dependency_integrity_failed")
++    return packages
++
++
++def _inside(origin, directory):
++    if not isinstance(origin, str) or not os.path.isabs(origin):
++        return False
++    value = os.path.normcase(os.path.abspath(origin))
++    root = os.path.normcase(os.path.abspath(directory))
++    return value.startswith(root + os.sep)
++
++
++def _revoke_owned_paths(keep=None):
++    global _active_profile_path
++    for value in tuple(_owned_paths):
++        if value == keep:
++            continue
++        while value in sys.path:
++            sys.path.remove(value)
++        _owned_paths.discard(value)
++    if _active_profile_path != keep:
++        _active_profile_path = None
++    importlib.invalidate_caches()
++
++
++def _loaded_profile_conflict(allowed):
++    # Removing sys.path cannot unload Python objects safely. A module from a
++    # previous/invalid profile (including SDK dependencies) requires restart.
++    for module in tuple(sys.modules.values()):
++        try:
++            origin = vars(module).get("__file__")
++        except TypeError:
++            continue
++        if any(root != allowed and _inside(origin, root) for root in _activated_profiles):
++            return True
++    return False
++
++
++def _assert_fal_import_location(packages):
++    expected = Path(packages) / _MODULE
++    for name, module in tuple(sys.modules.items()):
++        if name != _MODULE and not name.startswith(_MODULE + "."):
++            continue
++        try:
++            origin = vars(module).get("__file__")
++        except TypeError:
++            origin = None
++        if not _inside(origin, expected):
++            raise _SetupFailure("dependency_restart_required")
++    # Check the actual next import, not just metadata in the intended directory.
++    # A stale path, cached module or ambient package must not shadow that root.
++    spec = importlib.util.find_spec(_MODULE)
++    if spec is None or not _inside(spec.origin, expected):
++        raise _SetupFailure("dependency_import_source_rejected")
++
++
++def _sealed_fal_root():
++    try:
++        _, core, _ = _runtime_paths()
++        expected = _specs()[0].partition("==")[2]
++        if _core_versions(core).get("fal-client") != expected:
++            return None
++        module = _plain(core / _MODULE / "__init__.py")
++        if stat.S_ISREG(module.stat().st_mode) and module.stat().st_nlink == 1:
++            return core
++    except (OSError, ValueError, _SetupFailure):
++        pass
++    return None
++
++
++def activate_fal_dependencies():
++    """Activate one verified profile SDK; revoke owned paths on any failure."""
++    global _active_profile_path, _managed_seen
++    with _activation_lock:
++        _managed_seen = _managed_seen or bool(os.environ.get("HERMES_LILITH_BOUND_HOME") or os.environ.get(_ROOT_ENV))
++        try:
++            value = str(_verified_target())
++            if _loaded_profile_conflict(value):
++                raise _SetupFailure("dependency_restart_required")
++            _revoke_owned_paths(keep=value)
++            if value not in sys.path:
++                sys.path.append(value)
++                _owned_paths.add(value)
++                importlib.invalidate_caches()
++            _activated_profiles.add(value)
++            _active_profile_path = value
++            return True
++        except Exception:
++            _revoke_owned_paths()
++            return False
++
++
++def prepare_fal_import():
++    """Fail closed for managed SDKs, preserving untouched unmanaged imports.
++
++    Presentation/setup success is not import authority. Never continue through
++    lazy.ensure after a profile receipt or bound-home check failed. A genuinely
++    sealed FAL installation remains usable without a profile SDK receipt.
++    """
++    global _managed_seen
++    with _activation_lock:
++        if not (_managed_seen or os.environ.get("HERMES_LILITH_BOUND_HOME") or os.environ.get(_ROOT_ENV)):
++            return False
++        _managed_seen = True
++        try:
++            core = _sealed_fal_root()
++            if core is not None:
++                _revoke_owned_paths()
++                if _loaded_profile_conflict(None):
++                    raise _SetupFailure("dependency_restart_required")
++                _assert_fal_import_location(core)
++                return True
++            if not activate_fal_dependencies():
++                if _loaded_profile_conflict(None):
++                    raise _SetupFailure("dependency_restart_required")
++                raise _SetupFailure("dependency_integrity_failed")
++            _assert_fal_import_location(_active_profile_path)
++            return True
++        except _SetupFailure as error:
++            _revoke_owned_paths()
++            if error.code == "dependency_restart_required":
++                raise ImportError("FAL SDK source changed; restart the background service before retrying.") from None
++            raise ImportError("FAL SDK is unavailable or failed verification; use native tool setup.") from None
++        except Exception:
++            _revoke_owned_paths()
++            raise ImportError("FAL SDK verification failed; use native tool setup.") from None
++
++
++def fal_dependency_status():
++    """Local import metadata only: never import the SDK, install or call FAL."""
++    try:
++        executable, core, _ = _runtime_paths()
++        paths = [str(core)]
++        try:
++            paths.append(str(_verified_target()))
++        except (OSError, ValueError, _SetupFailure):
++            pass
++        expected = _specs()[0].partition("==")[2]
++        versions = [dist.version for dist in importlib.metadata.distributions(path=paths)
++                    if _normalize(dist.metadata.get("Name", "")) == "fal-client"]
++        if not versions or versions[0] != expected:
++            return "missing"
++        # Do not mutate sys.path in discovery: check only the explicit sealed or
++        # verified roots. Actual import validation was required before publish.
++        if not any((Path(path) / _MODULE / "__init__.py").is_file() for path in paths):
++            return "missing"
++        return "ready"
++    except Exception:
++        return "unknown"
++
++
++_PIP_BOOTSTRAP = r'''
++import os, runpy, sys
++from urllib.parse import urlsplit
++wheel, constraints, target, report, spec = sys.argv[1:]
++os.environ["PIP_CONFIG_FILE"] = os.devnull
++sys.path.insert(0, wheel)
++# Pinned pip uses its vendored requests Session for index, metadata and wheel
++# traffic, including redirects. Check every actual send, not only the original
++# index argument, so transitive direct URLs cannot contact another service.
++from pip._vendor.requests.sessions import Session
++original_send = Session.send
++def official_send(self, request, **kwargs):
++    uri = urlsplit(request.url)
++    if (uri.scheme != "https" or uri.hostname not in {"pypi.org", "files.pythonhosted.org"}
++            or uri.port not in {None, 443} or uri.username is not None or uri.password is not None):
++        raise RuntimeError("Dependency download origin rejected")
++    return original_send(self, request, **kwargs)
++Session.send = official_send
++sys.argv = ["pip", "--isolated", "--disable-pip-version-check", "--no-input", "install",
++            "--quiet", "--no-compile", "--no-cache-dir", "--only-binary=:all:",
++            "--index-url", "https://pypi.org/simple", "--retries", "0", "--timeout", "20",
++            "--constraint", constraints, "--target", target, "--report", report, spec]
++runpy.run_module("pip", run_name="__main__", alter_sys=True)
++'''
++
++_IMPORT_PROBE = r'''
++import importlib, importlib.metadata, json, sys
++core, target, version = sys.argv[1:]
++sys.path.extend([core, target])
++from packaging.requirements import Requirement
++from packaging.markers import default_environment
++from packaging.utils import canonicalize_name
++core_versions = {canonicalize_name(d.metadata["Name"]):d.version for d in importlib.metadata.distributions(path=[core])}
++staged = list(importlib.metadata.distributions(path=[target]))
++installed = {canonicalize_name(d.metadata["Name"]):d.version for d in staged}
++installed.update(core_versions)
++assert installed.get("fal-client") == version
++environment = default_environment()
++environment["extra"] = ""
++for dist in staged:
++    for text in dist.requires or []:
++        requirement = Requirement(text)
++        assert not requirement.url
++        if requirement.marker and not requirement.marker.evaluate(environment):
++            continue
++        actual = installed.get(canonicalize_name(requirement.name))
++        assert actual and requirement.specifier.contains(actual, prereleases=True)
++module = importlib.import_module("fal_client")
++assert callable(module.SyncClient) and callable(module.AsyncClient)
++print("lilith-fal-sdk-import-verified")
++'''
++
++
++def _verify_report(report):
++    if report.stat().st_size > 2 * 1024 * 1024:
++        raise _SetupFailure("dependency_report_invalid")
++    data = json.loads(report.read_text(encoding="utf-8"))
++    rows = data.get("install")
++    if not isinstance(rows, list) or not 1 <= len(rows) <= 128:
++        raise _SetupFailure("dependency_report_invalid")
++    for row in rows:
++        info = row.get("download_info", {})
++        url = info.get("url", "")
++        digest = info.get("archive_info", {}).get("hashes", {}).get("sha256", "")
++        if (not isinstance(url, str) or not re.fullmatch(r"https://files\.pythonhosted\.org/packages/[A-Za-z0-9_./+-]+\.whl", url)
++                or not re.fullmatch(r"[0-9a-f]{64}", digest)):
++            raise _SetupFailure("dependency_source_rejected")
++
++
++def _remove_stage(stage, parent):
++    if stage.parent != parent or not re.fullmatch(r"\.python-stage-[0-9a-f]{32}", stage.name):
++        return False
++    try:
++        _plain(stage)
++        for base, dirs, files in os.walk(stage, followlinks=False):
++            for name in dirs + files:
++                _plain(Path(base) / name)
++        shutil.rmtree(stage)
++        return True
++    except (OSError, _SetupFailure):
++        return False
++
++
++def install_fal_dependencies(cancelled):
++    """Only the human-confirmed native manager callback may call this installer."""
++    if os.name != "nt" or not callable(cancelled):
++        return {"status": "manual_setup_required", "verified": False}
++    if not _lock.acquire(blocking=False):
++        return {"status": "busy", "verified": False}
++    stage = parent = None
++    result = {"status": "failed", "code": "dependency_setup_failed", "verified": False}
++    try:
++        deadline = time.monotonic() + 300
++        _check(cancelled, deadline)
++        target = _destination()
++        executable, core, wheel = _runtime_paths()
++        if fal_dependency_status() == "ready":
++            return {"status": "already_ready", "verified": True}
++        if target.exists():
++            raise _SetupFailure("existing_dependency_requires_review")
++        parent = target.parent
++        _mkdir(parent)
++        if shutil.disk_usage(parent).free < 512 * 1024 * 1024:
++            raise _SetupFailure("insufficient_disk_space")
++        stage = parent / (".python-stage-" + uuid.uuid4().hex)
++        stage.mkdir(exist_ok=False)
++        _plain(stage)
++        constraints = _core_versions(core)
++        constraints_path = stage / "constraints.txt"
++        constraints_path.write_text("".join(f"{name}=={version}\n" for name, version in sorted(constraints.items())), encoding="utf-8")
++        package_root, report = stage / "packages", stage / "pip-report.json"
++        command = [str(executable), "-I", "-S", "-B", "-c", _PIP_BOOTSTRAP,
++                   str(wheel), str(constraints_path), str(package_root), str(report), _specs()[0]]
++        _probe(command, stage, cancelled, deadline)
++        _check(cancelled, deadline)
++        _verify_report(_plain(report))
++        files = _tree_files(package_root)
++        text = _probe([str(executable), "-I", "-S", "-B", "-c", _IMPORT_PROBE,
++                       str(core), str(package_root), _specs()[0].partition("==")[2]],
++                      stage, cancelled, min(deadline, time.monotonic() + 25))
++        if text.strip() != "lilith-fal-sdk-import-verified" or files != _tree_files(package_root):
++            raise _SetupFailure("dependency_probe_failed")
++        receipt = {"schema": 1, "abi": _abi(), "feature": _FEATURE, "specs": list(_specs()),
++                   "files": files, "core": constraints}
++        publish = stage / "published"
++        publish.mkdir()
++        package_root.rename(publish / "packages")
++        with (publish / "verified.json").open("x", encoding="utf-8") as stream:
++            json.dump(receipt, stream, sort_keys=True)
++        _check(cancelled, deadline)
++        _publish(publish, target)
++        if not activate_fal_dependencies() or fal_dependency_status() != "ready":
++            raise _SetupFailure("dependency_readback_failed")
++        result = {"status": "installed", "verified": True}
++    except _SetupFailure as exc:
++        result = {"status": "cancelled" if exc.code == "cancelled" else "failed", "code": exc.code, "verified": False}
++        if exc.code == "cleanup_unconfirmed":
++            result.update(effect_disposition="unknown", retryable=False)
++    except Exception:
++        result = {"status": "failed", "code": "dependency_setup_failed", "verified": False}
++    finally:
++        if (stage is not None and stage.exists() and result.get("code") != "cleanup_unconfirmed"
++                and not _remove_stage(stage, parent)):
++            result = {"status": "failed", "code": "staging_cleanup_incomplete", "verified": False, "retryable": False}
++        _lock.release()
++    return result
+diff --git a/tools/managed_tool_dependencies.py b/tools/managed_tool_dependencies.py
+new file mode 100644
+--- /dev/null
++++ b/tools/managed_tool_dependencies.py
+@@ -0,0 +1,465 @@
++"""Human-requested, profile-owned browser dependencies for managed Hermes.
++
++No package manager, configuration/secret writes or system-browser install.
++The caller owns native provider selection and explicit human confirmation.
++Readiness is local evidence, never an implicit download or network probe.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from pathlib import Path, PurePosixPath
++import platform
++import re
++import shutil
++import stat
++import subprocess
++import tarfile
++import threading
++import time
++import urllib.request
++import uuid
++import zipfile
++
++_VERSION = "0.26.0"
++_TARBALL = "https://registry.npmjs.org/agent-browser/-/agent-browser-0.26.0.tgz"
++_TARBALL_SHA512 = "a5da927e3c1b152a7eaa7c256f6836ddef705ef78839f322d7dc693c0f716546f3100529e96e180598fa61b8fccf833b5a471b1830d873ea032070edf51dc40d"
++_CLI_SHA256 = "540fc7d8b3ec8dea2f84df605492d5ca0e1921281adf8543dc0326109c851b2a"
++_CFT_MANIFEST = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
++_HOOKS = frozenset({"agent_browser", "browserbase"})
++_CHROME_FILES = ("chrome.exe", "chrome.dll", "chrome_elf.dll", "icudtl.dat", "resources.pak", "v8_context_snapshot.bin")
++_install_lock = threading.Lock()
++_verified_cache = {}
++
++
++class _SetupFailure(Exception):
++    def __init__(self, code):
++        self.code = code
++
++
++def _check(cancelled, deadline):
++    if cancelled():
++        raise _SetupFailure("cancelled")
++    if time.monotonic() >= deadline:
++        raise _SetupFailure("timeout")
++
++
++def _plain(path, *, missing=False):
++    """Reject reparse ancestors before every owned path operation."""
++    path = Path(os.path.abspath(path))
++    for item in (*reversed(path.parents), path):
++        try:
++            info = item.lstat()
++        except FileNotFoundError:
++            if missing:
++                continue
++            raise _SetupFailure("unsafe_dependency_path")
++        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
++            raise _SetupFailure("unsafe_dependency_path")
++        if item != path and not stat.S_ISDIR(info.st_mode):
++            raise _SetupFailure("unsafe_dependency_path")
++    return path
++
++
++def _root():
++    from hermes_constants import get_hermes_home
++
++    raw = os.environ.get("HERMES_LILITH_BOUND_HOME", "")
++    if not raw or not Path(raw).is_absolute():
++        raise _SetupFailure("managed_home_required")
++    bound = _plain(raw)
++    if os.path.normcase(str(bound)) != os.path.normcase(os.path.abspath(get_hermes_home())):
++        raise _SetupFailure("managed_home_required")
++    return _plain(bound / "tools" / "dependencies" / ("browser-" + _VERSION), missing=True)
++
++
++def _mkdir(path):
++    _plain(path, missing=True)
++    path.mkdir(parents=True, exist_ok=True)
++    _plain(path)
++
++
++def _fingerprint(path):
++    _plain(path)
++    value = path.stat()
++    if not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
++        raise _SetupFailure("unsafe_dependency_path")
++    return (str(path), value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
++
++
++def _sha(path, algorithm="sha256"):
++    digest = hashlib.new(algorithm)
++    with path.open("rb") as source:
++        for chunk in iter(lambda: source.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def managed_browser_paths():
++    """Verified CLI and optional Chrome paths; no external probes/writes."""
++    if os.name != "nt" or platform.machine().lower() not in {"amd64", "x86_64"}:
++        return None
++    try:
++        root = _root()
++        cli = root / "cli" / "agent-browser.exe"
++        key = _fingerprint(cli)
++        if _verified_cache.get("cli") != key:
++            if _sha(cli) != _CLI_SHA256:
++                return None
++            _verified_cache["cli"] = key
++        result = {"cli": str(cli)}
++        chrome = root / "chromium" / "chrome-win64" / "chrome.exe"
++        receipt = root / "chromium" / "verified.json"
++        try:
++            chrome_key = (_fingerprint(chrome), _fingerprint(receipt))
++            if receipt.stat().st_size > 4096:
++                return result
++            data = json.loads(receipt.read_text(encoding="utf-8"))
++            if (data.get("schema") != 1 or not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", data.get("version", ""))
++                    or not re.fullmatch(r"[0-9a-f]{64}", data.get("sha256", ""))):
++                return result
++            sizes = data.get("files")
++            if not isinstance(sizes, dict) or set(sizes) != set(_CHROME_FILES):
++                return result
++            for name in _CHROME_FILES:
++                size = sizes[name]
++                if not isinstance(size, int) or size < 1 or _fingerprint(chrome.parent / name)[3] != size:
++                    return result
++            if _verified_cache.get("chrome") != chrome_key:
++                if _sha(chrome) != data["sha256"]:
++                    return result
++                _verified_cache["chrome"] = chrome_key
++            result["chrome"] = str(chrome)
++        except (OSError, ValueError, _SetupFailure):
++            pass
++        return result
++    except (OSError, ValueError, _SetupFailure):
++        return None
++
++
++def dependency_status(provider):
++    if not isinstance(provider, dict):
++        return "unknown"
++    hook = provider.get("post_setup")
++    if hook is not None and not isinstance(hook, str):
++        return "unknown"
++    if hook == "fal_client":
++        from tools.managed_python_dependencies import fal_dependency_status
++        return fal_dependency_status()
++    if isinstance(hook, str) and hook in _HOOKS:
++        managed = managed_browser_paths()
++        if managed and (hook == "browserbase" or "chrome" in managed):
++            return "ready"
++    # Preserve native external installations and all other provider predicates.
++    # This function is the outer wrapper; never call _dependency_status here.
++    from tui_gateway.native_setup import _legacy_dependency_status
++    return _legacy_dependency_status(provider)
++
++
++class _NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, *args, **kwargs):
++        raise _SetupFailure("download_redirect_rejected")
++
++
++def _download(url, destination, maximum, cancelled, deadline, digest=None):
++    allowed = url in {_TARBALL, _CFT_MANIFEST} or re.fullmatch(
++        r"https://storage\.googleapis\.com/chrome-for-testing-public/\d+\.\d+\.\d+\.\d+/win64/chrome-win64\.zip", url)
++    if not allowed:
++        raise _SetupFailure("download_source_rejected")
++    _check(cancelled, deadline)
++    _plain(destination.parent)
++    request = urllib.request.Request(url, headers={"User-Agent": "Lilith-managed-browser-dependencies/1"})
++    # No redirects, proxy credentials, ambient cookies or authentication handlers.
++    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
++    hasher = hashlib.sha512() if digest else None
++    with opener.open(request, timeout=min(10.0, max(0.1, deadline - time.monotonic()))) as response:
++        if response.status != 200 or response.geturl() != url:
++            raise _SetupFailure("download_source_rejected")
++        length = response.headers.get("Content-Length")
++        if length and (not length.isdigit() or int(length) > maximum):
++            raise _SetupFailure("download_too_large")
++        size = 0
++        with destination.open("xb") as output:
++            while True:
++                _check(cancelled, deadline)
++                chunk = response.read(128 * 1024)
++                if not chunk:
++                    break
++                size += len(chunk)
++                if size > maximum:
++                    raise _SetupFailure("download_too_large")
++                output.write(chunk)
++                if hasher:
++                    hasher.update(chunk)
++    if not size or (length and size != int(length)):
++        raise _SetupFailure("download_incomplete")
++    if hasher and hasher.hexdigest() != digest:
++        raise _SetupFailure("download_integrity_failed")
++
++
++def _extract_cli(archive, destination, cancelled, deadline):
++    _mkdir(destination)
++    expected = {"package/bin/agent-browser-win32-x64.exe": "agent-browser.exe", "package/LICENSE": "LICENSE"}
++    seen = set()
++    with tarfile.open(archive, "r:gz") as source:
++        for index, member in enumerate(source):
++            _check(cancelled, deadline)
++            if index > 4096:
++                raise _SetupFailure("archive_limits_exceeded")
++            if member.name not in expected:
++                continue
++            if member.name in seen or not member.isfile() or member.size > 128 * 1024 * 1024:
++                raise _SetupFailure("archive_entry_rejected")
++            seen.add(member.name)
++            target = destination / expected[member.name]
++            _plain(target, missing=True)
++            with source.extractfile(member) as stream, target.open("xb") as output:
++                shutil.copyfileobj(stream, output, 128 * 1024)
++    if seen != set(expected) or _sha(destination / "agent-browser.exe") != _CLI_SHA256:
++        raise _SetupFailure("download_integrity_failed")
++
++
++def _extract_chrome(archive, destination, cancelled, deadline):
++    _mkdir(destination)
++    total = 0
++    names = set()
++    with zipfile.ZipFile(archive) as source:
++        members = source.infolist()
++        if len(members) > 8192:
++            raise _SetupFailure("archive_limits_exceeded")
++        for member in members:
++            _check(cancelled, deadline)
++            name = member.filename
++            raw_parts = name.rstrip("/").split("/")
++            parts = PurePosixPath(name).parts
++            unix_mode = member.external_attr >> 16
++            if (not parts or parts[0] != "chrome-win64" or any(p in {"", ".", ".."} or ":" in p or p.endswith((".", " "))
++                    or any(ord(c) < 32 for c in p) or re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", p) for p in raw_parts)
++                    or "\\" in name or name.startswith("/") or stat.S_ISLNK(unix_mode)
++                    or member.flag_bits & 1 or name.casefold() in names):
++                raise _SetupFailure("archive_entry_rejected")
++            names.add(name.casefold())
++            total += member.file_size
++            if total > 1024 * 1024 * 1024 or member.file_size > 512 * 1024 * 1024:
++                raise _SetupFailure("archive_limits_exceeded")
++            target = destination.joinpath(*parts)
++            _plain(target, missing=True)
++            if member.is_dir():
++                _mkdir(target)
++            else:
++                _mkdir(target.parent)
++                with source.open(member) as stream, target.open("xb") as output:
++                    while True:
++                        _check(cancelled, deadline)
++                        chunk = stream.read(128 * 1024)
++                        if not chunk:
++                            break
++                        output.write(chunk)
++    _fingerprint(destination / "chrome-win64" / "chrome.exe")
++
++
++def _probe(command, stage, cancelled, deadline, observer=None):
++    """Only exact freshly verified binaries; owned whole tree, no profile reuse."""
++    from tools.environments.windows_job import CREATE_SUSPENDED, ForegroundWindowsJob
++
++    env = {key: os.environ[key] for key in ("SystemRoot", "WINDIR", "COMSPEC") if key in os.environ}
++    env.update({"USERPROFILE": str(stage), "HOME": str(stage), "TEMP": str(stage), "TMP": str(stage),
++                "LOCALAPPDATA": str(stage / "local"), "APPDATA": str(stage / "roaming")})
++    output = stage / ("probe-" + uuid.uuid4().hex + ".txt")
++    job = ForegroundWindowsJob()
++    proc = None
++    try:
++        _check(cancelled, deadline)
++        with output.open("xb") as capture:
++            proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=capture, stderr=capture,
++                                    cwd=stage, env=env, creationflags=CREATE_SUSPENDED | subprocess.CREATE_NO_WINDOW)
++            job.attach_and_resume(proc)
++            while proc.poll() is None:
++                _check(cancelled, deadline)
++                if output.stat().st_size > 65536:
++                    raise _SetupFailure("probe_output_limit")
++                if observer is not None:
++                    observed = observer()
++                    if observed is not None:
++                        return observed
++                time.sleep(0.05)
++            if proc.returncode or not job.wait_empty(0.5):
++                raise _SetupFailure("dependency_probe_failed")
++        return output.read_text(encoding="utf-8", errors="replace")[:65536]
++    finally:
++        if proc is not None and not job.wait_empty(0.25):
++            if not job.terminate_and_wait(2):
++                job.close()
++                raise _SetupFailure("cleanup_unconfirmed")
++        if proc is not None:
++            proc.wait(timeout=2)
++        job.close()
++
++
++def _probe_chrome(chrome, stage, version, cancelled, deadline):
++    # Windows' GUI-subsystem chrome.exe ignores --version. Verify its actual
++    # loopback DevTools version in an isolated profile, then retire the entire
++    # owned process tree. No system profile, URL navigation or browser install.
++    profile = stage / "p"
++    port_file = profile / "DevToolsActivePort"
++    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
++
++    def observed():
++        try:
++            _fingerprint(port_file)
++            if port_file.stat().st_size > 256:
++                raise _SetupFailure("dependency_probe_failed")
++            port = port_file.read_text(encoding="ascii").splitlines()[0]
++            if not port.isdigit() or not 1 <= int(port) <= 65535:
++                raise _SetupFailure("dependency_probe_failed")
++            with opener.open("http://127.0.0.1:" + port + "/json/version", timeout=0.5) as response:
++                raw = response.read(16385)
++                if len(raw) > 16384:
++                    raise _SetupFailure("dependency_probe_failed")
++                data = json.loads(raw)
++                if data.get("Browser") not in {"Chrome/" + version, "HeadlessChrome/" + version}:
++                    raise _SetupFailure("dependency_probe_failed")
++                return version
++        except (FileNotFoundError, ConnectionError, TimeoutError, urllib.error.URLError):
++            return None
++        except _SetupFailure as exc:
++            if not port_file.exists():
++                return None
++            raise exc
++
++    return _probe([str(chrome), "--headless=new", "--no-first-run", "--no-default-browser-check",
++                   "--disable-background-networking", "--disable-component-update", "--disable-extensions",
++                   "--disable-sync", "--disable-gpu", "--remote-debugging-address=127.0.0.1",
++                   "--remote-debugging-port=0", "--user-data-dir=" + str(profile), "about:blank"],
++                  stage, cancelled, deadline, observed)
++
++
++def _remove_stage(stage, parent):
++    # This UUID directory was created exclusively by this invocation. Never
++    # recurse through junctions, or delete a destination/dependency/profile.
++    if stage.parent != parent or not re.fullmatch(r"\.browser-stage-[0-9a-f]{12}", stage.name):
++        return False
++    try:
++        _plain(stage)
++        for base, dirs, files in os.walk(stage, followlinks=False):
++            for name in dirs + files:
++                _plain(Path(base) / name)
++        shutil.rmtree(stage)
++        return True
++    except (OSError, _SetupFailure):
++        return False
++
++
++def _publish(source, destination):
++    _plain(source)
++    _plain(destination, missing=True)
++    if destination.exists():
++        raise _SetupFailure("existing_dependency_requires_review")
++    # On Windows rename does not replace an existing directory; a competing
++    # install is not overwritten. Both paths are on the same volume.
++    source.rename(destination)
++
++
++def can_install_provider_dependencies(provider):
++    """Whether this exact native hook has an automatic installer here.
++
++    Capability only, not selection, consent, readiness or authorization. The
++    setup card and dispatcher share this branch to avoid offering fake Install
++    actions for hooks that only have manual installation instructions.
++    """
++    hook = provider.get("post_setup") if isinstance(provider, dict) else None
++    if os.name != "nt" or not isinstance(hook, str):
++        return False
++    if hook == "fal_client":
++        return True
++    return hook in _HOOKS and platform.machine().lower() in {"amd64", "x86_64"}
++
++
++def install_provider_dependencies(provider, cancelled):
++    """Called only after native selection + human Install confirmation.
++
++    Returns closed/redacted codes, never local paths, exception text, URLs,
++    command output, credentials or claims about external API usability.
++    """
++    hook = provider.get("post_setup") if isinstance(provider, dict) else None
++    if not can_install_provider_dependencies(provider):
++        return {"status": "manual_setup_required", "verified": False}
++    if hook == "fal_client":
++        from tools.managed_python_dependencies import install_fal_dependencies
++        return install_fal_dependencies(cancelled)
++    if not callable(cancelled):
++        return {"status": "failed", "code": "cancellation_required", "verified": False}
++    if not _install_lock.acquire(blocking=False):
++        return {"status": "busy", "verified": False}
++    stage = root = None
++    result = {"status": "failed", "code": "dependency_setup_failed", "verified": False}
++    try:
++        deadline = time.monotonic() + 600
++        _check(cancelled, deadline)
++        root = _root()
++        if dependency_status(provider) == "ready":
++            return {"status": "already_ready", "verified": True}
++        _mkdir(root)
++        if shutil.disk_usage(root).free < 2 * 1024 * 1024 * 1024:
++            raise _SetupFailure("insufficient_disk_space")
++        stage = root / (".browser-stage-" + uuid.uuid4().hex[:12])
++        if len(str(stage / "p")) > 160:
++            raise _SetupFailure("dependency_path_too_long")
++        stage.mkdir(exist_ok=False)
++        _plain(stage)
++        paths = managed_browser_paths()
++        if not paths:
++            if (root / "cli").exists():
++                raise _SetupFailure("existing_dependency_requires_review")
++            tarball = stage / "agent-browser.tgz"
++            _download(_TARBALL, tarball, 64 * 1024 * 1024, cancelled, deadline, _TARBALL_SHA512)
++            _extract_cli(tarball, stage / "cli", cancelled, deadline)
++            text = _probe([str(stage / "cli" / "agent-browser.exe"), "--version"], stage, cancelled, min(deadline, time.monotonic() + 15))
++            if _VERSION not in text:
++                raise _SetupFailure("dependency_probe_failed")
++            _check(cancelled, deadline)
++            _publish(stage / "cli", root / "cli")
++        if hook == "agent_browser" and not (paths and paths.get("chrome")):
++            if (root / "chromium").exists():
++                raise _SetupFailure("existing_dependency_requires_review")
++            manifest = stage / "cft.json"
++            _download(_CFT_MANIFEST, manifest, 512 * 1024, cancelled, deadline)
++            stable = json.loads(manifest.read_text(encoding="utf-8"))["channels"]["Stable"]
++            version = stable["version"]
++            if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", version):
++                raise _SetupFailure("download_source_rejected")
++            url = "https://storage.googleapis.com/chrome-for-testing-public/" + version + "/win64/chrome-win64.zip"
++            if sum(row.get("platform") == "win64" and row.get("url") == url for row in stable["downloads"]["chrome"]) != 1:
++                raise _SetupFailure("download_source_rejected")
++            archive = stage / "chrome.zip"
++            _download(url, archive, 384 * 1024 * 1024, cancelled, deadline)
++            _extract_chrome(archive, stage / "chromium", cancelled, deadline)
++            chrome = stage / "chromium" / "chrome-win64" / "chrome.exe"
++            text = _probe_chrome(chrome, stage, version, cancelled, min(deadline, time.monotonic() + 15))
++            if version not in text:
++                raise _SetupFailure("dependency_probe_failed")
++            receipt = {"schema": 1, "version": version, "sha256": _sha(chrome),
++                       "files": {name: _fingerprint(chrome.parent / name)[3] for name in _CHROME_FILES}}
++            with (stage / "chromium" / "verified.json").open("x", encoding="utf-8") as stream:
++                json.dump(receipt, stream, sort_keys=True)
++            _check(cancelled, deadline)
++            _publish(stage / "chromium", root / "chromium")
++        paths = managed_browser_paths()
++        if not paths or (hook == "agent_browser" and not paths.get("chrome")):
++            raise _SetupFailure("dependency_readback_failed")
++        result = {"status": "installed", "verified": True}
++    except _SetupFailure as exc:
++        status = "cancelled" if exc.code == "cancelled" else "manual_setup_required" if exc.code == "dependency_path_too_long" else "failed"
++        result = {"status": status, "code": exc.code, "verified": False}
++        if exc.code == "cleanup_unconfirmed":
++            result["effect_disposition"] = "unknown"
++            result["retryable"] = False
++    except Exception:
++        result = {"status": "failed", "code": "dependency_setup_failed", "verified": False}
++    finally:
++        if (stage is not None and stage.exists() and result.get("effect_disposition") != "unknown"
++                and not _remove_stage(stage, root)):
++            result = {"status": "failed", "code": "staging_cleanup_incomplete", "verified": False, "retryable": False}
++        _install_lock.release()
++    return result
+diff --git a/tools/native_setup_locale.py b/tools/native_setup_locale.py
+new file mode 100644
+--- /dev/null
++++ b/tools/native_setup_locale.py
+@@ -0,0 +1,64 @@
++"""Product-owned setup cards only; identifiers and user input are never translated."""
++
++_TEXT = {
++    "zh-TW": {
++        "cancel": "取消設定", "confirm": "繼續設定", "keep": "保留現有設定",
++        "replace": "替換", "remove": "移除", "install": "安裝必要元件", "skip": "稍後安裝",
++        "choose": "要協助設定 {toolset} 的哪個供應商？這不會改變工具開關或核准模式。",
++        "confirm_setup": "協助設定 {toolset} / {provider}。資料只填入安全輸入卡，不會加入聊天；Spotify 登入由你在官方網頁完成。這不更改工具開關或核准模式。",
++        "existing": "{provider} 的 {key} 已有設定。要保留、替換或移除？不會顯示現有內容。移除僅限此莉莉絲設定檔。",
++        "value": "請輸入 {provider} 的 {key}。內容不會加入聊天紀錄。",
++        "default": "預設建議值：{value}",
++        "install_prompt": "{provider} 缺少必要元件。是否下載並安裝到莉莉絲專用工具目錄？不需要管理員權限，也不會更改工具開關。",
++        "next": "保存不等於已載入或 API 可用；請在原生工具設定確認啟用，再重新載入並實際測試。",
++        "failed": "設定未完成，未驗證可用。",
++        "center": "請從控制中心聊天室進行設定，才能顯示安全輸入／登入卡。",
++        "spotify": "請到 https://developer.spotify.com/dashboard 建立／開啟自己的 App，加入回呼網址 {redirect}，再在此輸入 Client ID（不是 Client Secret）。不要貼進聊天。",
++    },
++    "zh-CN": {
++        "cancel": "取消设置", "confirm": "继续设置", "keep": "保留现有设置",
++        "replace": "替换", "remove": "移除", "install": "安装必要组件", "skip": "稍后安装",
++        "choose": "要协助设置 {toolset} 的哪个提供商？这不会改变工具开关或批准模式。",
++        "confirm_setup": "协助设置 {toolset} / {provider}。资料只填入安全输入卡，不会加入聊天；Spotify 登录由你在官方网页完成。这不更改工具开关或批准模式。",
++        "existing": "{provider} 的 {key} 已有设置。要保留、替换或移除？不会显示现有内容。移除仅限此莉莉丝配置。",
++        "value": "请输入 {provider} 的 {key}。内容不会加入聊天记录。",
++        "default": "默认建议值：{value}",
++        "install_prompt": "{provider} 缺少必要组件。是否下载并安装到莉莉丝专用工具目录？不需要管理员权限，也不会更改工具开关。",
++        "next": "保存不等于已加载或 API 可用；请在原生工具设置确认启用，再重新加载并实际测试。",
++        "failed": "设置未完成，未验证可用。",
++        "center": "请从控制中心聊天室进行设置，才能显示安全输入／登录卡。",
++        "spotify": "请到 https://developer.spotify.com/dashboard 创建／打开自己的 App，加入回调网址 {redirect}，再在此输入 Client ID（不是 Client Secret）。不要贴进聊天。",
++    },
++    "ja-JP": {
++        "cancel": "設定をキャンセル", "confirm": "設定を続ける", "keep": "現在の設定を保持",
++        "replace": "置き換える", "remove": "削除する", "install": "必要なコンポーネントをインストール", "skip": "後でインストール",
++        "choose": "{toolset} のどのプロバイダーを設定しますか？ツールの有効化や承認モードは変更しません。",
++        "confirm_setup": "{toolset} / {provider} を設定します。値は安全な入力欄にのみ入力し、チャットには保存しません。Spotify は公式ページでご自身がログインします。ツールの有効化や承認モードは変更しません。",
++        "existing": "{provider} の {key} は設定済みです。保持、置換、削除のどれにしますか？現在の値は表示しません。削除対象はこのリリスのプロファイルのみです。",
++        "value": "{provider} の {key} を入力してください。チャット履歴には追加しません。",
++        "default": "推奨される既定値：{value}",
++        "install_prompt": "{provider} に必要なコンポーネントが不足しています。リリス専用のツールフォルダーへダウンロードしてインストールしますか？管理者権限は不要で、ツールの有効化設定も変更しません。",
++        "next": "保存済みでも読み込みや API の動作は未確認です。ツール設定で有効化を確認し、再読み込み後に実際の操作を試してください。",
++        "failed": "設定は完了しておらず、利用可能か未確認です。",
++        "center": "安全な入力・ログイン画面を表示するため、コントロールセンターのチャットから設定してください。",
++        "spotify": "https://developer.spotify.com/dashboard で自分の App を作成または開き、コールバック URL {redirect} を追加して、Client ID（Client Secret ではありません）をここに入力してください。チャットには貼り付けないでください。",
++    },
++    "en-US": {
++        "cancel": "Cancel setup", "confirm": "Continue setup", "keep": "Keep existing setting",
++        "replace": "Replace", "remove": "Remove", "install": "Install required components", "skip": "Install later",
++        "choose": "Which provider should be configured for {toolset}? This does not change tool enablement or approval mode.",
++        "confirm_setup": "Configure {toolset} / {provider}. Enter values only in the secure cards, not chat. Complete Spotify login yourself on its official page. Tool enablement and approval mode remain unchanged.",
++        "existing": "{provider} already has a setting for {key}. Keep, replace, or remove it? Its value is never displayed. Removal applies only to this Lilith profile.",
++        "value": "Enter {key} for {provider}. The value will not be added to chat history.",
++        "default": "Suggested default: {value}",
++        "install_prompt": "{provider} is missing required components. Download and install them in Lilith's dedicated tools folder? No administrator access is needed; tool enablement stays unchanged.",
++        "next": "Saved does not mean loaded or API-verified. Confirm enablement in native tool settings, reload, then test the actual tool.",
++        "failed": "Setup did not complete; availability is unverified.",
++        "center": "Use the Control Center chat to configure this integration so secure-input and login cards can be shown.",
++        "spotify": "Create or open your App at https://developer.spotify.com/dashboard, add callback URL {redirect}, then enter its Client ID here (not the Client Secret). Do not paste it into chat.",
++    },
++}
++
++
++def text(locale, message_key, **values):
++    return _TEXT.get(locale, _TEXT["en-US"])[message_key].format(**values)
+diff --git a/tools/native_tool_setup_tool.py b/tools/native_tool_setup_tool.py
+index 1fef710..0a1d9bb 100644
+--- a/tools/native_tool_setup_tool.py
++++ b/tools/native_tool_setup_tool.py
+@@ -2,20 +2,32 @@
+ 
+ This is deliberately not a configuration writer or a shell-command runner.
+ The model supplies only a native toolset name, never credentials or env names.
+-Tool enablement, provider selection in config, packages and MCP remain with
+-the existing native management transaction. Saved != loaded != API-verified.
++Tool enablement, provider selection in config and MCP remain with the existing
++native management transaction. Dependency installation uses only the bounded
++managed helper after a separate human confirmation. Saved != loaded != API-verified.
+ """
+ import json
+ import os
+ from pathlib import Path
+ import re
+ import threading
++from copy import deepcopy
++from tools.native_setup_locale import text as _text
+ 
+ _setup_lock = threading.Lock()
+ _CANCEL = "取消設定"
+ _CONFIRM = "繼續設定"
+ 
+ 
++def _canonical_toolsets():
++    from hermes_cli import tools_config as tc
++    import sys
++    return sorted({row[0] for row in tc._get_effective_configurable_toolsets()
++                   if tc._toolset_allowed_for_platform(row[0], "cli")
++                   and (not tc.TOOL_CATEGORIES.get(row[0], {}).get("platform_gate")
++                        or sys.platform in tc.TOOL_CATEGORIES[row[0]]["platform_gate"])})
++
++
+ def bound_setup_available():
+     from hermes_constants import get_hermes_home
+     bound = os.environ.get("HERMES_LILITH_BOUND_HOME", "")
+@@ -42,7 +54,7 @@ def _metadata(name):
+ def _support(provider):
+     # Unknown provider hooks are NOT commands to execute. Only this bounded
+     # metadata shape can be satisfied without altering config/provider policy.
+-    ordinary = {"name", "tag", "env_vars"}
++    ordinary = {"name", "tag", "badge", "env_vars", "post_setup"}
+     if provider.get("post_setup") == "spotify" and not (set(provider) - ordinary - {"post_setup"}):
+         return "spotify_oauth"
+     if set(provider) - ordinary:
+@@ -60,18 +72,18 @@ def _support(provider):
+     from hermes_cli.credential_lifecycle import _providers_for_env_var
+     if any(_providers_for_env_var(f["key"]) for f in fields):
+         return "native_manager_required"
+-    return "secure_fields" if fields else "no_setup_fields"
++    return "secure_fields" if fields else ("dependency_setup" if provider.get("post_setup") else "no_setup_fields")
+ 
+ 
+-def _snapshot(name, config, providers):
++def _snapshot(name, config, providers, locale="zh-TW"):
+     from hermes_cli import tools_config as tc
+     from hermes_cli.config import get_env_value
+     rows = []
+     for index, provider in enumerate(providers):
+         readiness = tc.provider_readiness_status(provider, config)
+-        from tui_gateway.native_setup import _dependency_status
++        from tools.managed_tool_dependencies import dependency_status
+ 
+-        dependency = _dependency_status(provider)
++        dependency = dependency_status(provider)
+         if readiness == "ready" and dependency in {"missing", "unknown"}:
+             readiness = "needs_setup"
+         rows.append({"index": index, "name": provider["name"],
+@@ -81,7 +93,7 @@ def _snapshot(name, config, providers):
+                                         if not get_env_value(f["key"])]})
+     return {"toolset": name, "enabled": name in tc._get_platform_tools(config, "cli", include_default_mcp_servers=False),
+             "providers": rows, "loaded_verified": False, "api_verified": False,
+-            "next_step": "設定完成後回到原生工具設定確認啟用，並重新載入／實際測試；本回報不代表 API 已可用。"}
++            "next_step": _text(locale, "next")}
+ 
+ 
+ def native_tool_setup_tool(toolset="", action="inspect", callback=None):
+@@ -97,23 +109,30 @@ def native_tool_setup_tool(toolset="", action="inspect", callback=None):
+         return json.dumps(callback(toolset, action), ensure_ascii=False)
+     except Exception:
+         # Exceptions from a provider may embed secrets or OAuth URLs.
+-        return json.dumps({"status": "setup_failed", "detail": "設定未完成，未驗證可用。"}, ensure_ascii=False)
++        return json.dumps({"status": "setup_failed", "detail": _text("en-US", "failed")}, ensure_ascii=False)
+ 
+ 
+-def run_native_setup(name, action, *, prompt, cancelled):
++def run_native_setup(name, action, *, prompt, cancelled, locale="zh-TW"):
+     """Gateway-only callback. prompt is the existing session-bound _block."""
+     if not bound_setup_available():
+         return {"status": "unavailable"}
++    from hermes_constants import get_hermes_home
++    origin_home = str(get_hermes_home().resolve())
++    owner_cancelled = cancelled
++    cancelled = lambda: (owner_cancelled() or not bound_setup_available()
++                         or str(get_hermes_home().resolve()) != origin_home)
+     metadata = _metadata(name)
+     if metadata is None:
+-        return {"status": "unknown_or_unsupported_toolset", "toolset": name}
++        return {"status": "unknown_or_unsupported_toolset", "toolset": name,
++                "available_toolsets": _canonical_toolsets()}
+     config, providers = metadata
+-    snapshot = _snapshot(name, config, providers)
++    snapshot = _snapshot(name, config, providers, locale)
+     if action == "inspect":
+         return {"status": "inspected", **snapshot}
+     if not _setup_lock.acquire(blocking=False):
+         return {"status": "setup_busy", "toolset": name}
+     saved = []
++    cancel, confirm = _text(locale, "cancel"), _text(locale, "confirm")
+     try:
+         if cancelled():
+             return {"status": "cancelled", "toolset": name}
+@@ -123,12 +142,12 @@ def run_native_setup(name, action, *, prompt, cancelled):
+         if len(providers) > 1:
+             choices = [f"{i + 1}. {p['name']}" for i, p in enumerate(providers)]
+             selection = prompt("clarify.request", {
+-                "question": f"要協助設定 {name} 的哪個供應商？這不會改變工具開關或核准模式。",
+-                "choices": choices + [_CANCEL]}, timeout=300)
++                "question": _text(locale, "choose", toolset=name),
++                "choices": choices + [cancel]}, timeout=300)
+             if cancelled() or selection not in choices:
+                 return {"status": "cancelled", "toolset": name}
+             index = choices.index(selection)
+-        provider = providers[index]
++        provider = deepcopy(providers[index])
+         support = _support(provider)
+         if support == "native_manager_required":
+             from tui_gateway.native_setup import setup_support, resolve_selection
+@@ -149,50 +168,33 @@ def run_native_setup(name, action, *, prompt, cancelled):
+                     # A human-selected native backend may still need fields.
+                     # Reuse the existing credential fence; never let selector,
+                     # installer or auth hooks become commands in this worker.
+-                    support = _support({key: provider[key] for key in
+-                                        ("name", "tag", "env_vars") if key in provider})
+-                    if support == "no_setup_fields":
+-                        support = "native_manager_required"
+-                        handoff["reason"] = "native_setup_hook_required"
+-                    elif support == "native_manager_required":
++                    support = _support(_credential_form(provider))
++                    if support == "native_manager_required":
+                         handoff["reason"] = "native_credential_manager_required"
+             if support == "native_manager_required":
+                 return {"status": support, **snapshot, **handoff}
+         if support == "no_setup_fields":
+             return {"status": "no_setup_fields", **snapshot}
+         answer = prompt("clarify.request", {
+-            "question": f"協助設定 {name} / {provider['name']}：必要資料請填在接下來的安全輸入卡；Spotify 登入會開啟官方網頁，由你完成。這不會更改工具開關或核准模式。",
+-            "choices": [_CONFIRM, _CANCEL]}, timeout=300)
+-        if cancelled() or answer != _CONFIRM:
++            "question": _text(locale, "confirm_setup", toolset=name, provider=provider["name"]),
++            "choices": [confirm, cancel]}, timeout=300)
++        if cancelled() or answer != confirm:
+             return {"status": "cancelled", "toolset": name}
+         if support == "spotify_oauth":
+-            result = _spotify_setup(prompt, cancelled)
++            result = _spotify_setup(prompt, cancelled, locale)
+         else:
+-            from hermes_cli.config import get_env_value, load_env, save_env_value
+-            for field in provider.get("env_vars", []):
+-                key = field["key"]
+-                if get_env_value(key):
+-                    continue  # No overwrite/rotation hidden inside setup.
+-                question = str(field.get("prompt") or key)
+-                if field.get("url"):
+-                    question += "\n" + str(field["url"])
+-                if field.get("default"):
+-                    question += "\n預設建議值：" + str(field["default"])
+-                value = prompt("secret.request", {"env_var": key, "prompt": question,
+-                    "metadata": {"toolset": name, "provider": provider["name"]}}, timeout=300)
+-                if cancelled() or not value:
+-                    return {"status": "cancelled", "toolset": name, "saved_fields": saved}
+-                if not isinstance(value, str) or not value.strip() or len(value) > 16384 or any(ord(c) < 32 for c in value):
+-                    return {"status": "invalid_input", "toolset": name, "saved_fields": saved}
+-                save_env_value(key, value)
+-                if load_env().get(key) != value:
+-                    return {"status": "persistence_failed", "toolset": name, "saved_fields": saved}
+-                saved.append(key)
+-            result = {"status": "settings_saved", "saved_fields": saved}
++            result = _configure_fields(name, provider, prompt, cancelled, locale)
++            saved = result.get("saved_fields", [])
++            if result["status"] not in {"settings_saved", "settings_removed", "unchanged", "no_setup_fields"}:
++                return {**snapshot, **result}
++            # A removed value must not be immediately requested again or used
++            # as a reason to install another backend in the same setup flow.
++            if not result.get("removed_fields"):
++                result = _configure_dependencies(name, provider, prompt, cancelled, locale, result)
+         updated = _metadata(name)
+         if updated is None:
+             return {**result, "status": "state_changed", "toolset": name}
+-        return {**_snapshot(name, *updated), **result}
++        return {**_snapshot(name, *updated, locale=locale), **result}
+     except Exception:
+         return {"status": "setup_failed", "toolset": name,
+                 "saved_fields": saved, "state_uncertain": True}
+@@ -200,7 +202,192 @@ def run_native_setup(name, action, *, prompt, cancelled):
+         _setup_lock.release()
+ 
+ 
+-def _spotify_setup(prompt, cancelled):
++def _credential_form(provider):
++    from tui_gateway.native_setup import _SELECTORS
++    # Remove only known selectors after the Runtime selected this provider.
++    # Unknown auth/override hooks remain fences, never invented setup code.
++    return {key: value for key, value in provider.items() if key not in _SELECTORS}
++
++
++def _provider_is_current(name, provider, fingerprint):
++    if not bound_setup_available():
++        return False
++    latest = _metadata(name)
++    if latest is None:
++        return False
++    config, providers = latest
++    matches = [p for p in providers if p.get("name") == provider["name"]]
++    if len(matches) != 1 or json.dumps(matches[0], sort_keys=True) != fingerprint:
++        return False
++    from tui_gateway.native_setup import setup_support
++    if setup_support(provider) == "provider_selection":
++        from hermes_cli.tools_config import _is_provider_active
++        if not _is_provider_active(matches[0], config):
++            return False
++    return _support(_credential_form(matches[0])) != "native_manager_required"
++
++
++class _SetupCancelled(Exception):
++    pass
++
++
++class _SetupChanged(Exception):
++    pass
++
++
++def _configure_fields(name, provider, prompt, cancelled, locale):
++    from hermes_cli import config, credential_lifecycle as lifecycle
++    from hermes_constants import get_hermes_home
++    from types import SimpleNamespace
++    fields = provider.get("env_vars", [])
++    if not fields:
++        return {"status": "no_setup_fields", "saved_fields": [], "removed_fields": []}
++    fingerprint = json.dumps(provider, sort_keys=True)
++    bound_home = str(get_hermes_home().resolve())
++    disk = config.load_env()
++    expected = {f["key"]: (disk.get(f["key"]), config.get_env_value(f["key"])) for f in fields}
++    updates, removals, kept = {}, [], []
++    for field in fields:
++        key = field["key"]
++        if cancelled():
++            return {"status": "cancelled", "saved_fields": [], "removed_fields": []}
++        existing = expected[key][1]
++        if existing:
++            choices = [_text(locale, choice) for choice in ("keep", "replace", "remove", "cancel")]
++            answer = prompt("clarify.request", {
++                "question": _text(locale, "existing", provider=provider["name"], key=key),
++                "choices": choices}, timeout=300)
++            if cancelled() or answer not in choices[:3]:
++                return {"status": "cancelled", "saved_fields": [], "removed_fields": []}
++            if answer == choices[0]:
++                kept.append(key)
++                continue
++            if answer == choices[2]:
++                # A process/managed source cannot be erased from the user's
++                # machine by deleting this profile's .env. Do not claim it can.
++                if not expected[key][0] or existing != expected[key][0]:
++                    return {"status": "external_credential_not_removed", "field": key,
++                            "saved_fields": [], "removed_fields": []}
++                removals.append(key)
++                continue
++        question = _text(locale, "value", provider=provider["name"], key=key)
++        if field.get("url"):
++            question += "\n" + str(field["url"])
++        if field.get("default"):
++            question += "\n" + _text(locale, "default", value=str(field["default"]))
++        value = prompt("secret.request", {"env_var": key, "prompt": question,
++            "metadata": {"toolset": name, "provider": provider["name"]}}, timeout=300)
++        if cancelled() or not value:
++            return {"status": "cancelled", "saved_fields": [], "removed_fields": []}
++        # Native save_env_value strips/logs non-ASCII characters. Refuse such
++        # input before that helper can expose even fragments or alter a secret.
++        if not isinstance(value, str) or not value.strip() or len(value) > 16384 or any(ord(c) < 32 or ord(c) > 126 for c in value):
++            return {"status": "invalid_input", "saved_fields": [], "removed_fields": []}
++        updates[key] = value
++    if not updates and not removals:
++        return {"status": "unchanged", "saved_fields": [], "removed_fields": [], "kept_fields": kept}
++
++    def current():
++        if str(get_hermes_home().resolve()) != bound_home or not _provider_is_current(name, provider, fingerprint):
++            return False
++        fresh = config.load_env()
++        return all(not lifecycle._providers_for_env_var(key)
++                   and (fresh.get(key), config.get_env_value(key)) == prior for key, prior in expected.items())
++
++    if cancelled():
++        return {"status": "cancelled", "saved_fields": [], "removed_fields": []}
++    if not current():
++        return {"status": "state_changed", "saved_fields": [], "removed_fields": []}
++
++    def commit():
++        if cancelled():
++            raise _SetupCancelled()
++        if not current():
++            raise _SetupChanged()
++        for key, value in updates.items():
++            if cancelled():
++                raise _SetupCancelled()
++            lifecycle.save_provider_env_credential(key, value, strict=True)
++        for key in removals:
++            if cancelled():
++                raise _SetupCancelled()
++            lifecycle.remove_provider_env_credential(key, strict=True, clear_models_cache=False)
++        persisted = config.load_env()
++        if any(persisted.get(key) != value for key, value in updates.items()) or any(key in persisted for key in removals):
++            raise RuntimeError("native setup persistence check failed")
++
++    saved_keys = list(updates)
++    try:
++        # Reuse native locking/snapshots/rollback, not a new secret store. This
++        # descriptor only identifies the exact non-model slots to snapshot;
++        # it is never registered as a provider or written to configuration.
++        descriptor = SimpleNamespace(slug="native-tool-setup", api_key_env_vars=tuple(expected))
++        lifecycle._run_provider_mutation_transaction(descriptor, commit)
++    except _SetupCancelled:
++        return {"status": "cancelled", "saved_fields": [], "removed_fields": [], "rollback": "verified"}
++    except _SetupChanged:
++        return {"status": "state_changed", "saved_fields": [], "removed_fields": [], "rollback": "verified"}
++    except Exception as error:
++        # The native helper raises a different error if rollback itself fails.
++        # Verify the affected fields without exposing any captured values.
++        try:
++            restored = config.load_env()
++            rollback_ok = (str(error) != "credential mutation failed and rollback was incomplete"
++                           and all(restored.get(key) == old[0] for key, old in expected.items()))
++        except Exception:
++            rollback_ok = False
++        return {"status": "persistence_failed", "saved_fields": [], "removed_fields": [],
++                "rollback": "verified" if rollback_ok else "unconfirmed", "state_uncertain": not rollback_ok}
++    finally:
++        updates.clear()  # Never return, log, or keep the entered values in cards.
++    return {"status": "settings_saved" if saved_keys else "settings_removed",
++            "saved_fields": saved_keys,
++            "removed_fields": removals, "kept_fields": kept}
++
++
++def _configure_dependencies(name, provider, prompt, cancelled, locale, result):
++    from tools.managed_tool_dependencies import (
++        can_install_provider_dependencies, dependency_status, install_provider_dependencies,
++    )
++    if cancelled():
++        return {**result, "status": "cancelled", "dependency_installation": "not_started"}
++    dependency = dependency_status(provider)
++    if dependency in {"ready", "not_required"}:
++        return result
++    if dependency == "unknown" or not can_install_provider_dependencies(provider):
++        return {**result, "status": "manual_setup_required", "dependency_status": dependency}
++    fingerprint = json.dumps(provider, sort_keys=True)
++    choice = prompt("clarify.request", {
++        "question": _text(locale, "install_prompt", provider=provider["name"]),
++        "choices": [_text(locale, "install"), _text(locale, "skip"), _text(locale, "cancel")]}, timeout=300)
++    if cancelled() or choice != _text(locale, "install"):
++        deferred = not cancelled() and choice == _text(locale, "skip")
++        return {**result, "status": "setup_incomplete" if deferred else "cancelled", "dependency_status": dependency,
++                "dependency_installation": "deferred" if deferred else "cancelled_before_start"}
++    if not _provider_is_current(name, provider, fingerprint):
++        return {**result, "status": "state_changed", "dependency_installation": "not_started"}
++    installed = install_provider_dependencies(provider, cancelled)
++    verified = dependency_status(provider)
++    if cancelled() or installed.get("status") == "cancelled":
++        status = "cancelled"
++    elif (installed.get("status") in {"installed", "already_ready"}
++          and installed.get("verified") is True and installed.get("effect_disposition") != "unknown"
++          and verified == "ready"):
++        # The native registry otherwise retains a failed dependency probe for
++        # up to 30 seconds. Invalidate observations only, not tool permissions
++        # or the active agent's offered definitions.
++        from tools.registry import invalidate_check_fn_cache
++        invalidate_check_fn_cache()
++        status = "dependencies_ready"
++    else:
++        # Assets may already be ready while process/staging cleanup failed.
++        # A readiness observation cannot turn an unsettled install into success.
++        status = "setup_incomplete"
++    return {**result, "status": status,
++            "dependency_status": verified, "dependency_result": installed}
++
++
++def _spotify_setup(prompt, cancelled, locale="zh-TW"):
+     from hermes_cli import auth
+     import uuid
+     import webbrowser
+@@ -222,8 +409,7 @@ def _spotify_setup(prompt, cancelled):
+             pass  # The same fixed URL is present in the user's input card.
+         client_id = prompt("secret.request", {
+             "env_var": "HERMES_SPOTIFY_CLIENT_ID",
+-            "prompt": "請到 https://developer.spotify.com/dashboard 建立／開啟自己的 App，加入回呼網址 "
+-                      + auth.DEFAULT_SPOTIFY_REDIRECT_URI + "，然後在此輸入 Client ID（不是 Client Secret）。不要貼進聊天。",
++            "prompt": _text(locale, "spotify", redirect=auth.DEFAULT_SPOTIFY_REDIRECT_URI),
+             "metadata": {"toolset": "spotify", "provider": "Spotify Web API"}}, timeout=300)
+     if cancelled() or not client_id:
+         return {"status": "cancelled"}
+@@ -287,9 +473,9 @@ def _spotify_setup(prompt, cancelled):
+ 
+ NATIVE_TOOL_SETUP_SCHEMA = {
+     "name": "native_tool_setup",
+-    "description": "Discover or request setup of a Hermes native integration (for example Spotify Web API), not desktop-app control. Use inspect first even when its actual tools are unavailable because credentials are missing. configure opens human-owned selection/secure-input cards and supported OAuth; NEVER ask for credentials in chat or guess terminal/config writes. Does not enable tools, change approval, select config providers or install packages. Respect cancelled/unsupported results; do not retry after decline. Saved/authenticated does not prove loaded tools or successful API calls.",
++    "description": "Discover or request setup of a Hermes native integration, not desktop-app control. Use inspect first even when its actual tools are unavailable. Unknown names return available_toolsets from native metadata. configure opens human-owned selection, secure-input, credential repair and supported dependency-install/OAuth cards; NEVER ask for credentials in chat or guess terminal/config writes. Does not enable tools, change approval or select config providers. Dependency installation requires a separate human confirmation. Respect cancelled/unsupported results; do not retry after decline. Saved/authenticated does not prove loaded tools or successful API calls.",
+     "parameters": {"type": "object", "properties": {
+-        "toolset": {"type": "string", "description": "Native toolset identifier, e.g. spotify or homeassistant."},
++        "toolset": {"type": "string", "description": "Exact native toolset identifier, e.g. image_gen (NOT image_generation), browser, web, spotify, homeassistant, tts or stt. Unknown identifiers return the current available_toolsets; use those names without guessing aliases."},
+         "action": {"type": "string", "enum": ["inspect", "configure"]}},
+         "required": ["toolset", "action"], "additionalProperties": False}}
+ 
+diff --git a/tools/skill_dependencies.py b/tools/skill_dependencies.py
+new file mode 100644
+--- /dev/null
++++ b/tools/skill_dependencies.py
+@@ -0,0 +1,36 @@
++"""Read-only, declarative local dependency observations for native skills.
++
++Metadata is untrusted: never import a named module or execute a command to
++check it. These observations describe this Hermes interpreter/host only, not
++a remote sandbox, another Python on PATH, or a successful document operation.
++"""
++import importlib.util
++import re
++import shutil
++
++
++def inspect_skill_dependencies(frontmatter):
++    result = {"required_commands": [], "missing_required_commands": [],
++              "required_python_modules": [], "missing_required_python_modules": [],
++              "dependency_environment": "hermes_host", "dependency_metadata_valid": True}
++    for field, pattern, probe in (
++        ("required_commands", r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,95}", shutil.which),
++        ("required_python_modules", r"[A-Za-z_][A-Za-z0-9_]{0,95}", importlib.util.find_spec),
++    ):
++        items = frontmatter.get(field, [])
++        if (not isinstance(items, list) or len(items) > 64
++                or any(not isinstance(value, str) or not re.fullmatch(pattern, value) for value in items)
++                or len(set(items)) != len(items)):
++            result["dependency_metadata_valid"] = False
++            continue
++        result[field] = items[:]
++        for value in items:
++            try:
++                present = bool(probe(value))
++            except Exception:
++                present = False
++            if not present:
++                result["missing_" + field].append(value)
++    result["dependency_setup_needed"] = (not result["dependency_metadata_valid"]
++        or bool(result["missing_required_commands"] or result["missing_required_python_modules"]))
++    return result
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+index 259a3cb..6e22507 100644
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -1130,6 +1130,9 @@ def _serve_plugin_skill(
+                 "Could not preprocess plugin skill %s:%s", namespace, bare, exc_info=True
+             )
+ 
++    from tools.skill_dependencies import inspect_skill_dependencies
++    dependencies = inspect_skill_dependencies(parsed_frontmatter)
++    setup_needed = dependencies["dependency_setup_needed"]
+     return json.dumps(
+         {
+             "success": True,
+@@ -1137,7 +1140,10 @@ def _serve_plugin_skill(
+             "content": f"{banner}{rendered_content}" if banner else rendered_content,
+             "description": description,
+             "linked_files": _plugin_skill_linked_files(skill_md.parent),
+-            "readiness_status": SkillReadinessStatus.AVAILABLE.value,
++            **dependencies,
++            "setup_needed": setup_needed,
++            "readiness_status": (SkillReadinessStatus.SETUP_NEEDED.value
++                                 if setup_needed else SkillReadinessStatus.AVAILABLE.value),
+         },
+         ensure_ascii=False,
+     )
+@@ -1745,7 +1751,9 @@ def skill_view(
+             capture_result,
+             env_snapshot=env_snapshot,
+         )
+-        setup_needed = bool(remaining_missing_required_envs)
++        from tools.skill_dependencies import inspect_skill_dependencies
++        dependencies = inspect_skill_dependencies(frontmatter)
++        setup_needed = bool(remaining_missing_required_envs) or dependencies["dependency_setup_needed"]
+ 
+         # Register available skill env vars so they pass through to sandboxed
+         # execution environments (execute_code, terminal).  Only vars that are
+@@ -1885,10 +1893,9 @@ def skill_view(
+             if linked_files
+             else None,
+             "required_environment_variables": required_env_vars,
+-            "required_commands": [],
++            **dependencies,
+             "missing_required_environment_variables": remaining_missing_required_envs,
+             "missing_credential_files": missing_cred_files,
+-            "missing_required_commands": [],
+             "setup_needed": setup_needed,
+             "setup_skipped": capture_result["setup_skipped"],
+             "readiness_status": SkillReadinessStatus.SETUP_NEEDED.value
+@@ -1922,7 +1929,13 @@ def skill_view(
+                 f"env ${env_name}" for env_name in remaining_missing_required_envs
+             ] + [
+                 f"file {path}" for path in missing_cred_files
++            ] + [
++                f"command {command}" for command in dependencies["missing_required_commands"]
++            ] + [
++                f"Python module {module}" for module in dependencies["missing_required_python_modules"]
+             ]
++            if not dependencies["dependency_metadata_valid"]:
++                missing_items.append("valid dependency metadata")
+             setup_note = _build_setup_note(
+                 SkillReadinessStatus.SETUP_NEEDED,
+                 missing_items,
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 8982e40..68e42fa 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -3952,6 +3952,12 @@ def check_terminal_requirements() -> bool:
+         env_type = config["env_type"]
+ 
+         if env_type == "local":
++            if os.name == "nt":
++                from tools.environments.local import _find_bash, _bash_starts
++                # Actual Git Bash/MSYS viability, not merely a Windows host.
++                # Shared per-path probes keep later catalog reads cheap.
++                bash = _find_bash(probe_timeout=1.0, diagnostics=False)
++                return _bash_starts(bash, timeout=1.0)
+             return True
+ 
+         elif env_type == "docker":
+diff --git a/tui_gateway/compute_host.py b/tui_gateway/compute_host.py
+index b4e1c28..762d0f0 100644
+--- a/tui_gateway/compute_host.py
++++ b/tui_gateway/compute_host.py
+@@ -790,7 +790,19 @@ class ComputeHost:
+         sid = str(frame.get("sid") or "")
+         key = str(frame.get("session_key") or sid)
+         session = server._sessions.get(sid)
++        ui_locale = frame.get("ui_locale")
++        if ui_locale == "":
++            ui_locale = None
++        if ui_locale is not None and (
++            not isinstance(ui_locale, str)
++            or ui_locale not in {"zh-TW", "zh-CN", "ja-JP", "en-US"}
++            or frame.get("source") != "lilith-runtime"
++            or (session is not None and session.get("source") != "lilith-runtime")
++        ):
++            raise ValueError("Invalid Workbench presentation locale")
+         if session is not None:
++            if ui_locale is not None:
++                session["ui_locale"] = ui_locale
+             session["transport"] = self._transport
+             if frame.get("cols") is not None:
+                 session["cols"] = int(frame.get("cols") or 80)
+@@ -893,6 +905,8 @@ class ComputeHost:
+                 "transport": self._transport,
+             }
+         session = server._sessions[sid]
++        if ui_locale is not None:
++            session["ui_locale"] = ui_locale
+         session["transport"] = self._transport
+         session["profile_home"] = profile_home or session.get("profile_home")
+         if isinstance(frame.get("attached_images"), list):
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 24313b5..3cd4e3d 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -330,6 +330,12 @@ def _(rid, params: dict) -> dict:
+     except Exception:
+         runtime_ingress_attested = False
+     source = str(session.get("source") or "")
++    ui_locale = params.get("ui_locale")
++    if ui_locale is not None:
++        if not isinstance(ui_locale, str) or ui_locale not in {"zh-TW", "zh-CN", "ja-JP", "en-US"}:
++            return _err(rid, 4004, "unsupported ui_locale")
++        if not runtime_ingress_attested or source != "lilith-runtime":
++            return _err(rid, 4030, "ui_locale requires the attested Workbench")
+     game_lineage_attested = (
+         source == "lilith-game"
+         and session.get("archived") is True
+@@ -419,6 +425,7 @@ def _(rid, params: dict) -> dict:
+             display_locale=display_locale,
+             human_input_origin=human_input_origin,
+             human_input_subject_id=human_input_subject_id,
++            ui_locale=ui_locale,
+         )
+         if busy_response is not None:
+             return busy_response
+@@ -465,6 +472,7 @@ def _(rid, params: dict) -> dict:
+                 display_locale=display_locale,
+                 human_input_origin=human_input_origin,
+                 human_input_subject_id=human_input_subject_id,
++                ui_locale=ui_locale,
+             )
+             session["last_active"] = time.time()
+             return _ok(rid, {"status": "queued"})
+@@ -723,6 +731,10 @@ def _(rid, params: dict) -> dict:
+                     for i in _history_user_indices(truncated)
+                 ]
+         session["running"] = True
++        if ui_locale is not None:
++            # Presentation metadata only. Never append it to model/user text,
++            # credentials or persisted history, or infer it from their content.
++            session["ui_locale"] = ui_locale
+         session["_turn_cancel_requested"] = False
+         session["last_active"] = time.time()
+         _start_inflight_turn(session, accepted_text)
+diff --git a/tui_gateway/native_setup.py b/tui_gateway/native_setup.py
+index 6b2f575..ceb94ac 100644
+--- a/tui_gateway/native_setup.py
++++ b/tui_gateway/native_setup.py
+@@ -54,6 +54,12 @@ def _providers(toolset, config, features=None):
+ 
+ 
+ def _dependency_status(provider):
++    from tools.managed_tool_dependencies import dependency_status
++
++    return dependency_status(provider)
++
++
++def _legacy_dependency_status(provider):
+     from hermes_cli import tools_config as tc
+ 
+     hook = provider.get("post_setup")
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 9b8341b..3c0e094 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2176,6 +2176,9 @@ def _compute_host_turn_frame(
+         "attached_images": attached_images,
+         "queued_prompt_generation": queued_prompt_generation,
+         "display_locale": display_locale or "",
++        # Private presentation metadata, never part of text/history or authority.
++        "ui_locale": session.get("ui_locale", "")
++        if session.get("source") == "lilith-runtime" else "",
+         "human_input_origin": human_input_origin or "",
+         "human_input_subject_id": human_input_subject_id or "",
+     }
+@@ -8754,10 +8757,12 @@ def _mirror_subagent_to_child_unscoped(event_type: str, payload: dict) -> None:
+ 
+ def _native_tool_setup_callback(sid: str, name: str, action: str):
+     from tools.native_tool_setup_tool import run_native_setup
++    from tools.native_setup_locale import text
+     session = _sessions.get(sid)
++    locale = (session or {}).get("ui_locale", "en-US")
+     if session and action == "configure" and session.get("source") != "lilith-runtime":
+         return {"status": "control_center_required",
+-                "detail": "請從控制中心聊天室進行設定，才能顯示真人安全輸入／登入卡。"}
++                "detail": text(locale, "center")}
+     agent = session.get("agent") if session else None
+     origin_turn = getattr(agent, "_current_turn_id", None)
+ 
+@@ -8776,7 +8781,7 @@ def _native_tool_setup_callback(sid: str, name: str, action: str):
+ 
+     return run_native_setup(name, action,
+         prompt=prompt,
+-        cancelled=cancelled)
++        cancelled=cancelled, locale=locale)
+ 
+ 
+ def _agent_cbs(sid: str, *, turn_id: Any = None) -> dict:
+@@ -11179,6 +11184,7 @@ def _enqueue_prompt(
+     display_locale: str | None = None,
+     human_input_origin: str | None = None,
+     human_input_subject_id: str | None = None,
++    ui_locale: str | None = None,
+ ) -> None:
+     """Stash a message to run as the very next turn once the live one ends.
+ 
+@@ -11195,6 +11201,8 @@ def _enqueue_prompt(
+         queued["image_paths"] = image_paths
+     if display_locale:
+         queued["display_locale"] = display_locale
++    if ui_locale is not None:
++        queued["ui_locale"] = ui_locale
+     if human_input_origin:
+         queued["human_input_origin"] = human_input_origin
+     if human_input_subject_id:
+@@ -11208,6 +11216,7 @@ def _enqueue_prompt(
+         and not existing.get("image_paths")
+         and not image_paths
+         and existing.get("display_locale") == display_locale
++        and existing.get("ui_locale") == ui_locale
+         and existing.get("human_input_origin") == human_input_origin
+         and existing.get("human_input_subject_id") == human_input_subject_id
+         and not session.get("queued_prompts")
+@@ -11266,6 +11275,7 @@ def _handle_busy_submit(
+     display_locale: str | None = None,
+     human_input_origin: str | None = None,
+     human_input_subject_id: str | None = None,
++    ui_locale: str | None = None,
+ ) -> dict | None:
+     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
+     a turn is in flight, instead of rejecting it with ``session busy``.
+@@ -11338,6 +11348,8 @@ def _handle_busy_submit(
+         try:
+             if agent.steer(plain_text):
+                 with session["history_lock"]:
++                    if ui_locale is not None:
++                        session["ui_locale"] = ui_locale
+                     session["last_active"] = time.time()
+                 return _ok(rid, {"status": "steered"})
+         except Exception:
+@@ -11357,6 +11369,8 @@ def _handle_busy_submit(
+         try:
+             if agent.redirect(plain_text):
+                 with session["history_lock"]:
++                    if ui_locale is not None:
++                        session["ui_locale"] = ui_locale
+                     _record_inflight_correction(session, plain_text)
+                     session["last_active"] = time.time()
+                 return _ok(rid, {"status": "redirected"})
+@@ -11381,6 +11395,7 @@ def _handle_busy_submit(
+             display_locale=display_locale,
+             human_input_origin=human_input_origin,
+             human_input_subject_id=human_input_subject_id,
++            ui_locale=ui_locale,
+         )
+         if mode != "queue":
+             # Re-read the owner at the queue transaction, rather than trusting
+@@ -11441,6 +11456,9 @@ def _claim_queued_prompt(
+             if not queued_prompts:
+                 session.pop("queued_prompts", None)
+             session["running"] = True
++            if queued.get("ui_locale") is not None:
++                # Apply only when this exact envelope becomes the active turn.
++                session["ui_locale"] = queued["ui_locale"]
+             if queued.get("transport") is not None:
+                 session["transport"] = queued["transport"]
+             _start_inflight_turn(session, queued["text"])

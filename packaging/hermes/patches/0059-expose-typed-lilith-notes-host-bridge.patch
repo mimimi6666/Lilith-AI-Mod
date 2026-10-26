@@ -1,0 +1,1340 @@
+diff --git a/tests/tui_gateway/test_lilith_host_bridge.py b/tests/tui_gateway/test_lilith_host_bridge.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b14b21b1a91672c78075d7b49d1e5b02a8063c0
+--- /dev/null
++++ b/tests/tui_gateway/test_lilith_host_bridge.py
+@@ -0,0 +1,504 @@
++from __future__ import annotations
++
++import threading
++
++import pytest
++
++from tui_gateway import lilith_host_bridge as bridge
++from tui_gateway import server
++from tui_gateway.transport import bind_transport, reset_transport
++
++
++SESSION_ID = "lilith-notes-session"
++TURN_ID = "1" * 32
++
++
++class CaptureTransport:
++    def __init__(self) -> None:
++        self.frames: list[dict] = []
++        self.written = threading.Event()
++
++    def write(self, obj: dict) -> bool:
++        self.frames.append(obj)
++        self.written.set()
++        return True
++
++    def close(self) -> None:
++        return None
++
++
++def _result(operation_id: str, *, text: str = "buy milk") -> dict:
++    return {
++        "version": 1,
++        "kind": "memo.result",
++        "operation_id": operation_id,
++        "succeeded": True,
++        "code": "ok",
++        "items": [
++            {
++                "memo_id": 7,
++                "text": text,
++                "memo_kind": "todo",
++                "date": "2026-09-01",
++                "created_time": "2026-09-01T08:00:00+08:00",
++                "updated_time": "2026-09-01T08:01:00+08:00",
++                "remind": True,
++                "remind_hour": 9,
++                "remind_minute": 30,
++                "repeat": "none",
++                "done": False,
++                "done_date": "",
++                "pinned": False,
++                "last_reminded_date": "",
++                "scratch_tier": "none",
++                "countdown": False,
++            }
++        ],
++    }
++
++
++@pytest.fixture(autouse=True)
++def _isolate_bridge_state():
++    previous_sessions = dict(server._sessions)
++    bridge._reset_pending_for_tests()
++    try:
++        yield
++    finally:
++        bridge._reset_pending_for_tests()
++        server._sessions.clear()
++        server._sessions.update(previous_sessions)
++
++
++def _start_request(monkeypatch, arguments: dict, *, timeout: float = 1.0):
++    transport = CaptureTransport()
++    session = {
++        "transport": transport,
++        "running": True,
++        "inflight_turn": {"turn_id": TURN_ID},
++    }
++    server._sessions[SESSION_ID] = session
++    monkeypatch.setattr(
++        "gateway.session_context.get_session_env",
++        lambda name, default="": SESSION_ID
++        if name == "HERMES_UI_SESSION_ID"
++        else default,
++    )
++    outcome: dict = {}
++
++    def run() -> None:
++        transport_token = bind_transport(transport)
++        session_token = server._current_runtime_session_record.set(session)
++        turn_token = server._current_turn_event_id.set(TURN_ID)
++        try:
++            outcome["result"] = bridge.request_notes(
++                arguments,
++                timeout_seconds=timeout,
++            )
++        except BaseException as exc:  # captured for assertions in the test thread
++            outcome["error"] = exc
++        finally:
++            server._current_turn_event_id.reset(turn_token)
++            server._current_runtime_session_record.reset(session_token)
++            reset_transport(transport_token)
++
++    worker = threading.Thread(target=run)
++    worker.start()
++    assert transport.written.wait(1.0)
++    return worker, transport, session, outcome
++
++
++def _complete(transport: CaptureTransport, event: dict, result: dict) -> dict:
++    params = event["params"]
++    return server.dispatch(
++        {
++            "jsonrpc": "2.0",
++            "id": "complete-1",
++            "method": "lilith.host.complete",
++            "params": {
++                "session_id": params["session_id"],
++                "turn_id": params["turn_id"],
++                "result": result,
++            },
++        },
++        transport=transport,
++    )
++
++
++def test_request_event_is_exact_turn_scoped_and_completion_round_trips(monkeypatch):
++    arguments = {
++        "action": "list",
++        "memo_kind": "todo",
++        "filter": "pending",
++        "limit": 25,
++    }
++    worker, transport, _session, outcome = _start_request(monkeypatch, arguments)
++
++    assert len(transport.frames) == 1
++    event = transport.frames[0]
++    operation_id = event["params"]["payload"]["operation_id"]
++    assert event == {
++        "jsonrpc": "2.0",
++        "method": "event",
++        "params": {
++            "type": "lilith.host.request",
++            "session_id": SESSION_ID,
++            "turn_id": TURN_ID,
++            "payload": {
++                "version": 1,
++                "kind": "lilith.notes.host-request",
++                "operation_id": operation_id,
++                "arguments": arguments,
++            },
++        },
++    }
++    assert len(operation_id) == 32 and operation_id == operation_id.lower()
++
++    completion_result = _result(operation_id)
++    response = _complete(transport, event, completion_result)
++    assert response == {
++        "jsonrpc": "2.0",
++        "id": "complete-1",
++        "result": {"accepted": True, "operation_id": operation_id},
++    }
++    worker.join(1.0)
++    assert not worker.is_alive()
++    assert outcome == {"result": completion_result}
++    assert bridge._pending_count() == 0
++    assert bridge._completion_receipt_count() == 1
++
++
++def test_exact_completion_retry_is_idempotently_accepted(monkeypatch):
++    worker, transport, _session, outcome = _start_request(
++        monkeypatch,
++        {"action": "get", "memo_id": 7},
++    )
++    event = transport.frames[0]
++    operation_id = event["params"]["payload"]["operation_id"]
++    result = _result(operation_id)
++
++    assert _complete(transport, event, result)["result"]["accepted"] is True
++    worker.join(1.0)
++    assert outcome == {"result": result}
++
++    duplicate = _complete(transport, event, result)
++    assert duplicate["result"] == {
++        "accepted": True,
++        "operation_id": operation_id,
++    }
++    assert bridge._completion_receipt_count() == 1
++
++
++def test_completion_receipt_rejects_any_authority_or_result_difference(monkeypatch):
++    worker, transport, _session, _outcome = _start_request(
++        monkeypatch,
++        {"action": "get", "memo_id": 7},
++    )
++    event = transport.frames[0]
++    operation_id = event["params"]["payload"]["operation_id"]
++    result = _result(operation_id)
++    assert _complete(transport, event, result)["result"]["accepted"] is True
++    worker.join(1.0)
++
++    wrong_transport = _complete(CaptureTransport(), event, result)
++    assert wrong_transport["error"]["code"] == bridge.LilithHostAuthorityError.rpc_code
++
++    wrong_session_event = {
++        "params": {**event["params"], "session_id": "other-session"}
++    }
++    wrong_session = _complete(transport, wrong_session_event, result)
++    assert wrong_session["error"]["code"] == bridge.LilithHostAuthorityError.rpc_code
++
++    wrong_turn_event = {"params": {**event["params"], "turn_id": "2" * 32}}
++    wrong_turn = _complete(transport, wrong_turn_event, result)
++    assert wrong_turn["error"]["code"] == bridge.LilithHostAuthorityError.rpc_code
++
++    conflicting_result = _complete(
++        transport,
++        event,
++        _result(operation_id, text="different terminal result"),
++    )
++    assert (
++        conflicting_result["error"]["code"]
++        == bridge.LilithHostAuthorityError.rpc_code
++    )
++
++    assert _complete(transport, event, result)["result"]["accepted"] is True
++    assert bridge._completion_receipt_count() == 1
++
++
++def test_completion_receipts_are_capacity_bounded(monkeypatch):
++    operation_ids: list[str] = []
++    for memo_id in range(1, bridge.MAX_COMPLETION_RECEIPTS + 2):
++        worker, transport, _session, _outcome = _start_request(
++            monkeypatch,
++            {"action": "get", "memo_id": memo_id},
++        )
++        event = transport.frames[0]
++        operation_id = event["params"]["payload"]["operation_id"]
++        operation_ids.append(operation_id)
++        assert (
++            _complete(transport, event, _result(operation_id))["result"]["accepted"]
++            is True
++        )
++        worker.join(1.0)
++
++    assert bridge._completion_receipt_count() == bridge.MAX_COMPLETION_RECEIPTS
++    assert operation_ids[0] not in bridge._completion_receipts
++    assert operation_ids[-1] in bridge._completion_receipts
++
++
++def test_completion_receipt_expires_and_reset_clears_it(monkeypatch):
++    now = [100.0]
++    monkeypatch.setattr(bridge.time, "monotonic", lambda: now[0])
++    worker, transport, _session, _outcome = _start_request(
++        monkeypatch,
++        {"action": "get", "memo_id": 7},
++    )
++    event = transport.frames[0]
++    operation_id = event["params"]["payload"]["operation_id"]
++    result = _result(operation_id)
++    assert _complete(transport, event, result)["result"]["accepted"] is True
++    worker.join(1.0)
++    assert bridge._completion_receipt_count() == 1
++
++    bridge._reset_pending_for_tests()
++    assert bridge._completion_receipt_count() == 0
++
++    worker, transport, _session, _outcome = _start_request(
++        monkeypatch,
++        {"action": "get", "memo_id": 8},
++    )
++    event = transport.frames[0]
++    operation_id = event["params"]["payload"]["operation_id"]
++    result = _result(operation_id)
++    assert _complete(transport, event, result)["result"]["accepted"] is True
++    worker.join(1.0)
++    now[0] += bridge.COMPLETION_RECEIPT_TTL_SECONDS + 0.001
++
++    expired = _complete(transport, event, result)
++    assert expired["error"]["code"] == bridge.LilithHostAuthorityError.rpc_code
++    assert bridge._completion_receipt_count() == 0
++
++
++def test_wrong_transport_cannot_complete_but_owner_still_can(monkeypatch):
++    worker, transport, _session, outcome = _start_request(
++        monkeypatch,
++        {"action": "get", "memo_id": 7},
++    )
++    event = transport.frames[0]
++    operation_id = event["params"]["payload"]["operation_id"]
++    wrong = CaptureTransport()
++
++    denied = _complete(wrong, event, _result(operation_id))
++    assert denied["error"]["code"] == bridge.LilithHostAuthorityError.rpc_code
++    assert bridge._pending_count() == 1
++
++    accepted = _complete(transport, event, _result(operation_id))
++    assert accepted["result"]["accepted"] is True
++    worker.join(1.0)
++    assert outcome["result"]["operation_id"] == operation_id
++
++
++def test_malformed_result_does_not_consume_pending_request(monkeypatch):
++    worker, transport, _session, outcome = _start_request(
++        monkeypatch,
++        {"action": "get", "memo_id": 7},
++    )
++    event = transport.frames[0]
++    operation_id = event["params"]["payload"]["operation_id"]
++    malformed = _result(operation_id)
++    malformed["arbitrary_host_output"] = "forbidden"
++
++    denied = _complete(transport, event, malformed)
++    assert denied["error"]["code"] == bridge.LilithHostProtocolError.rpc_code
++    assert bridge._pending_count() == 1
++
++    _complete(transport, event, _result(operation_id))
++    worker.join(1.0)
++    assert outcome["result"]["succeeded"] is True
++
++
++@pytest.mark.parametrize(
++    ("succeeded", "code"),
++    [(True, "runtime.memo_failed"), (False, "ok")],
++)
++def test_result_success_flag_and_code_must_agree(
++    monkeypatch,
++    succeeded,
++    code,
++):
++    worker, transport, _session, outcome = _start_request(
++        monkeypatch,
++        {"action": "get", "memo_id": 7},
++    )
++    event = transport.frames[0]
++    operation_id = event["params"]["payload"]["operation_id"]
++    malformed = _result(operation_id)
++    malformed["succeeded"] = succeeded
++    malformed["code"] = code
++
++    denied = _complete(transport, event, malformed)
++    assert denied["error"]["code"] == bridge.LilithHostProtocolError.rpc_code
++    assert bridge._pending_count() == 1
++
++    accepted = _complete(transport, event, _result(operation_id))
++    assert accepted["result"]["accepted"] is True
++    worker.join(1.0)
++    assert outcome["result"]["succeeded"] is True
++
++
++def test_session_transport_rebind_invalidates_pending_completion(monkeypatch):
++    worker, transport, session, outcome = _start_request(
++        monkeypatch,
++        {"action": "get", "memo_id": 7},
++        timeout=0.2,
++    )
++    event = transport.frames[0]
++    operation_id = event["params"]["payload"]["operation_id"]
++    session["transport"] = CaptureTransport()
++
++    denied = _complete(transport, event, _result(operation_id))
++    assert denied["error"]["code"] == bridge.LilithHostAuthorityError.rpc_code
++    worker.join(1.0)
++    assert isinstance(outcome.get("error"), bridge.LilithHostUnavailableError)
++    assert bridge._pending_count() == 0
++
++
++def test_timeout_clears_correlation_and_rejects_late_completion(monkeypatch):
++    worker, transport, _session, outcome = _start_request(
++        monkeypatch,
++        {"action": "list", "limit": 1},
++        timeout=0.02,
++    )
++    event = transport.frames[0]
++    operation_id = event["params"]["payload"]["operation_id"]
++    worker.join(1.0)
++    assert isinstance(outcome.get("error"), bridge.LilithHostUnavailableError)
++    assert bridge._pending_count() == 0
++
++    late = _complete(transport, event, _result(operation_id))
++    assert late["error"]["code"] == bridge.LilithHostAuthorityError.rpc_code
++
++
++@pytest.mark.parametrize(
++    "arguments",
++    [
++        {"action": "list", "query": "milk", "limit": 50},
++        {"action": "get", "memo_id": 1},
++        {"action": "create_scratch", "text": "idea", "scratch_tier": "important"},
++        {
++            "action": "create_todo",
++            "text": "buy milk",
++            "date": "2026-09-01",
++            "remind": True,
++            "remind_hour": 9,
++            "remind_minute": 30,
++            "repeat": "weekly",
++            "pinned": True,
++            "countdown": False,
++        },
++        {
++            "action": "update",
++            "memo_id": 1,
++            "expected_updated_time": "2026-09-01T08:01:00+08:00",
++            "text": "buy oat milk",
++        },
++        {
++            "action": "delete",
++            "memo_id": 1,
++            "expected_updated_time": "2026-09-01T08:01:00+08:00",
++        },
++        {
++            "action": "promote",
++            "memo_id": 1,
++            "expected_updated_time": "2026-09-01T08:01:00+08:00",
++            "date": "2026-09-02",
++        },
++        {
++            "action": "complete",
++            "memo_id": 1,
++            "expected_updated_time": "2026-09-01T08:01:00+08:00",
++            "done": True,
++            "date": "2026-09-01",
++        },
++    ],
++)
++def test_argument_contract_accepts_each_closed_notes_action(arguments):
++    assert bridge.normalize_notes_arguments(arguments) == arguments
++
++
++@pytest.mark.parametrize(
++    "arguments",
++    [
++        {"action": "execute", "command": "anything"},
++        {"action": "list", "path": "C:/"},
++        {"action": "list", "include_archived": False},
++        {"action": "get", "memo_id": True},
++        {"action": "create_todo", "text": "x", "date": "2026-02-31"},
++        {"action": "create_scratch", "text": "x", "scratch_tier": "none"},
++        {
++            "action": "create_todo",
++            "text": "x",
++            "remind": True,
++            "countdown": True,
++        },
++        {
++            "action": "update",
++            "memo_id": 1,
++            "expected_updated_time": "t",
++        },
++        {"action": "delete", "memo_id": 1},
++        {
++            "action": "complete",
++            "memo_id": 1,
++            "expected_updated_time": "t",
++        },
++        {
++            "action": "create_todo",
++            "text": "x",
++            "remind_hour": 9,
++        },
++    ],
++)
++def test_argument_contract_rejects_generic_or_incomplete_host_actions(arguments):
++    with pytest.raises(bridge.LilithHostProtocolError):
++        bridge.normalize_notes_arguments(arguments)
++
++
++def test_update_leaves_reminder_countdown_compatibility_to_game_state():
++    arguments = {
++        "action": "update",
++        "memo_id": 1,
++        "expected_updated_time": "2026-09-01T08:01:00+08:00",
++        "remind": True,
++        "countdown": True,
++    }
++    assert bridge.normalize_notes_arguments(arguments) == arguments
++
++
++def test_request_event_requires_a_canonical_turn(monkeypatch):
++    transport = CaptureTransport()
++    session = {
++        "transport": transport,
++        "running": True,
++        "inflight_turn": {"turn_id": TURN_ID},
++    }
++    server._sessions[SESSION_ID] = session
++    monkeypatch.setattr(
++        "gateway.session_context.get_session_env",
++        lambda name, default="": SESSION_ID,
++    )
++    transport_token = bind_transport(transport)
++    session_token = server._current_runtime_session_record.set(session)
++    try:
++        with pytest.raises(bridge.LilithHostProtocolError):
++            bridge.request_notes({"action": "list"}, timeout_seconds=0.01)
++    finally:
++        server._current_runtime_session_record.reset(session_token)
++        reset_transport(transport_token)
++    assert transport.frames == []
++
++
++def test_lilith_host_request_is_declared_turn_required():
++    assert "lilith.host.request" in server._TURN_REQUIRED_EVENT_TYPES
++    assert "lilith.host.complete" not in server._LONG_HANDLERS
+diff --git a/tui_gateway/lilith_host_bridge.py b/tui_gateway/lilith_host_bridge.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f5ba68d988683a03b3096a047080dc4ba92c7b3
+--- /dev/null
++++ b/tui_gateway/lilith_host_bridge.py
+@@ -0,0 +1,784 @@
++"""Turn-scoped, Notes-only host bridge for the Lilith Runtime.
++
++The bridge deliberately exposes one closed domain contract.  It does not
++accept method names, command lines, paths, or arbitrary host payloads.  A
++``lilith_notes`` plugin call emits one turn-bound ``lilith.host.request``
++event to the exact transport that owns the current gateway session, then
++waits for the same transport to answer through ``lilith.host.complete``.
++
++The game remains the sole owner of memo state.  Hermes keeps only bounded,
++process-local pending correlation plus a short-lived exact completion receipt
++so a lost JSON-RPC response can be retried without re-running a mutation.
++"""
++
++from __future__ import annotations
++
++import json
++import re
++import threading
++import time
++import uuid
++from dataclasses import dataclass, field
++from datetime import datetime
++from typing import Any
++
++
++PROTOCOL_VERSION = 1
++REQUEST_KIND = "lilith.notes.host-request"
++RESULT_KIND = "memo.result"
++HOST_REQUEST_TIMEOUT_SECONDS = 20.0
++MAX_PENDING_REQUESTS = 16
++COMPLETION_RECEIPT_TTL_SECONDS = 60.0
++MAX_COMPLETION_RECEIPTS = 32
++MAX_FRAME_BYTES = 512 * 1024
++MAX_TEXT_UTF8_BYTES = 32 * 1024
++MAX_QUERY_UTF8_BYTES = 512
++MAX_TIMESTAMP_UTF8_BYTES = 128
++MAX_CODE_UTF8_BYTES = 256
++MAX_ITEMS = 50
++
++_ACTIONS = frozenset(
++    {
++        "list",
++        "get",
++        "create_scratch",
++        "create_todo",
++        "update",
++        "delete",
++        "promote",
++        "complete",
++    }
++)
++_MUTATE_EXISTING_ACTIONS = frozenset(
++    {"update", "delete", "promote", "complete"}
++)
++_TARGET_ACTIONS = frozenset(
++    {"get", "update", "delete", "promote", "complete"}
++)
++_ALL_ARGUMENT_FIELDS = frozenset(
++    {
++        "action",
++        "memo_id",
++        "expected_updated_time",
++        "text",
++        "date",
++        "query",
++        "memo_kind",
++        "filter",
++        "scratch_tier",
++        "remind",
++        "remind_hour",
++        "remind_minute",
++        "repeat",
++        "done",
++        "pinned",
++        "countdown",
++        "limit",
++    }
++)
++_ACTION_FIELDS = {
++    "list": frozenset(
++        {
++            "action",
++            "query",
++            "memo_kind",
++            "filter",
++            "limit",
++        }
++    ),
++    "get": frozenset({"action", "memo_id"}),
++    "create_scratch": frozenset({"action", "text", "scratch_tier"}),
++    "create_todo": frozenset(
++        {
++            "action",
++            "text",
++            "date",
++            "remind",
++            "remind_hour",
++            "remind_minute",
++            "repeat",
++            "pinned",
++            "countdown",
++        }
++    ),
++    "update": frozenset(
++        {
++            "action",
++            "memo_id",
++            "expected_updated_time",
++            "text",
++            "date",
++            "scratch_tier",
++            "remind",
++            "remind_hour",
++            "remind_minute",
++            "repeat",
++            "pinned",
++            "countdown",
++        }
++    ),
++    "delete": frozenset({"action", "memo_id", "expected_updated_time"}),
++    "promote": frozenset(
++        {"action", "memo_id", "expected_updated_time", "date"}
++    ),
++    "complete": frozenset(
++        {"action", "memo_id", "expected_updated_time", "done", "date"}
++    ),
++}
++_UPDATE_FIELDS = frozenset(
++    {
++        "text",
++        "date",
++        "scratch_tier",
++        "remind",
++        "remind_hour",
++        "remind_minute",
++        "repeat",
++        "pinned",
++        "countdown",
++    }
++)
++_MEMO_ITEM_FIELDS = frozenset(
++    {
++        "memo_id",
++        "text",
++        "memo_kind",
++        "date",
++        "created_time",
++        "updated_time",
++        "remind",
++        "remind_hour",
++        "remind_minute",
++        "repeat",
++        "done",
++        "done_date",
++        "pinned",
++        "last_reminded_date",
++        "scratch_tier",
++        "countdown",
++    }
++)
++_RESULT_FIELDS = frozenset(
++    {"version", "kind", "operation_id", "succeeded", "code", "items"}
++)
++_OPERATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
++
++
++class LilithHostBridgeError(RuntimeError):
++    """Base error surfaced as a bounded tool failure."""
++
++    rpc_code = 4000
++
++
++class LilithHostProtocolError(LilithHostBridgeError):
++    """The caller supplied a malformed Notes contract."""
++
++    rpc_code = -32602
++
++
++class LilithHostAuthorityError(LilithHostBridgeError):
++    """The completion did not come from the exact owning turn transport."""
++
++    rpc_code = 4003
++
++
++class LilithHostUnavailableError(LilithHostBridgeError):
++    """The bounded host path was unavailable or timed out."""
++
++    rpc_code = 5032
++
++
++@dataclass
++class _PendingRequest:
++    operation_id: str
++    session_id: str
++    turn_id: str
++    transport: Any
++    session: dict
++    deadline: float
++    completed: threading.Event = field(default_factory=threading.Event)
++    result: dict | None = None
++    terminal_error: str = ""
++
++
++@dataclass(frozen=True)
++class _CompletionReceipt:
++    operation_id: str
++    session_id: str
++    turn_id: str
++    transport: Any
++    session: dict
++    result_bytes: bytes
++    expires_at: float
++
++
++_pending_lock = threading.Lock()
++_pending: dict[str, _PendingRequest] = {}
++_completion_receipts: dict[str, _CompletionReceipt] = {}
++
++
++def _bounded_text(
++    value: Any,
++    field_name: str,
++    maximum_utf8_bytes: int,
++    *,
++    permit_empty: bool = False,
++) -> str:
++    if not isinstance(value, str):
++        raise LilithHostProtocolError(f"{field_name} must be text")
++    if "\x00" in value or len(value.encode("utf-8")) > maximum_utf8_bytes:
++        raise LilithHostProtocolError(f"{field_name} exceeded its bound")
++    if not permit_empty and not value.strip():
++        raise LilithHostProtocolError(f"{field_name} must not be empty")
++    return value
++
++
++def _bounded_int(
++    value: Any,
++    field_name: str,
++    minimum: int,
++    maximum: int,
++) -> int:
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise LilithHostProtocolError(f"{field_name} must be an integer")
++    if value < minimum or value > maximum:
++        raise LilithHostProtocolError(f"{field_name} was outside its bound")
++    return value
++
++
++def _bounded_bool(value: Any, field_name: str) -> bool:
++    if not isinstance(value, bool):
++        raise LilithHostProtocolError(f"{field_name} must be boolean")
++    return value
++
++
++def _bounded_enum(value: Any, field_name: str, values: frozenset[str]) -> str:
++    if not isinstance(value, str) or value not in values:
++        raise LilithHostProtocolError(f"{field_name} was rejected")
++    return value
++
++
++def _bounded_date(value: Any, field_name: str) -> str:
++    text = _bounded_text(value, field_name, 10)
++    try:
++        parsed = datetime.strptime(text, "%Y-%m-%d")
++    except ValueError as exc:
++        raise LilithHostProtocolError(
++            f"{field_name} must use yyyy-MM-dd"
++        ) from exc
++    if parsed.strftime("%Y-%m-%d") != text:
++        raise LilithHostProtocolError(f"{field_name} must use yyyy-MM-dd")
++    return text
++
++
++def _require_frame_bound(value: Any, label: str) -> None:
++    try:
++        encoded = json.dumps(
++            value,
++            ensure_ascii=False,
++            separators=(",", ":"),
++            allow_nan=False,
++        ).encode("utf-8")
++    except (TypeError, ValueError) as exc:
++        raise LilithHostProtocolError(f"{label} was not JSON-safe") from exc
++    if not encoded or len(encoded) > MAX_FRAME_BYTES:
++        raise LilithHostProtocolError(f"{label} exceeded its bound")
++
++
++def normalize_notes_arguments(arguments: Any) -> dict:
++    """Validate and copy the exact ``LilithMemoProtocol`` argument body."""
++
++    if not isinstance(arguments, dict):
++        raise LilithHostProtocolError("notes arguments must be an object")
++    if not set(arguments).issubset(_ALL_ARGUMENT_FIELDS):
++        raise LilithHostProtocolError("notes arguments contain unsupported fields")
++
++    action = arguments.get("action")
++    if not isinstance(action, str) or action not in _ACTIONS:
++        raise LilithHostProtocolError("notes action was rejected")
++    if not set(arguments).issubset(_ACTION_FIELDS[action]):
++        raise LilithHostProtocolError(
++            f"notes action {action!r} received unsupported fields"
++        )
++
++    required = {"action"}
++    if action in _TARGET_ACTIONS:
++        required.add("memo_id")
++    if action in _MUTATE_EXISTING_ACTIONS:
++        required.add("expected_updated_time")
++    if action in {"create_scratch", "create_todo"}:
++        required.add("text")
++    if action == "complete":
++        required.add("done")
++    missing = required.difference(arguments)
++    if missing:
++        raise LilithHostProtocolError(
++            "notes arguments are missing: " + ", ".join(sorted(missing))
++        )
++    if action == "update" and not set(arguments).intersection(_UPDATE_FIELDS):
++        raise LilithHostProtocolError("notes update requires a changed field")
++
++    normalized = dict(arguments)
++    if "memo_id" in normalized:
++        normalized["memo_id"] = _bounded_int(
++            normalized["memo_id"], "memo_id", 1, 2_147_483_647
++        )
++    if "expected_updated_time" in normalized:
++        normalized["expected_updated_time"] = _bounded_text(
++            normalized["expected_updated_time"],
++            "expected_updated_time",
++            MAX_TIMESTAMP_UTF8_BYTES,
++        )
++    if "text" in normalized:
++        normalized["text"] = _bounded_text(
++            normalized["text"], "text", MAX_TEXT_UTF8_BYTES
++        )
++    if "date" in normalized:
++        normalized["date"] = _bounded_date(normalized["date"], "date")
++    if "query" in normalized:
++        normalized["query"] = _bounded_text(
++            normalized["query"],
++            "query",
++            MAX_QUERY_UTF8_BYTES,
++            permit_empty=True,
++        )
++    if "memo_kind" in normalized:
++        normalized["memo_kind"] = _bounded_enum(
++            normalized["memo_kind"],
++            "memo_kind",
++            frozenset({"all", "scratch", "todo"}),
++        )
++    if "filter" in normalized:
++        normalized["filter"] = _bounded_enum(
++            normalized["filter"],
++            "filter",
++            frozenset({"all", "pending", "done"}),
++        )
++    if "scratch_tier" in normalized:
++        normalized["scratch_tier"] = _bounded_enum(
++            normalized["scratch_tier"],
++            "scratch_tier",
++            frozenset({"normal", "important", "temporary"}),
++        )
++    if "repeat" in normalized:
++        normalized["repeat"] = _bounded_enum(
++            normalized["repeat"],
++            "repeat",
++            frozenset({"none", "daily", "weekly", "monthly", "yearly"}),
++        )
++    for field_name in (
++        "remind",
++        "done",
++        "pinned",
++        "countdown",
++    ):
++        if field_name in normalized:
++            normalized[field_name] = _bounded_bool(
++                normalized[field_name], field_name
++            )
++    if "remind_hour" in normalized:
++        normalized["remind_hour"] = _bounded_int(
++            normalized["remind_hour"], "remind_hour", 0, 23
++        )
++    if "remind_minute" in normalized:
++        normalized["remind_minute"] = _bounded_int(
++            normalized["remind_minute"], "remind_minute", 0, 59
++        )
++    if ("remind_hour" in normalized) != ("remind_minute" in normalized):
++        raise LilithHostProtocolError(
++            "remind_hour and remind_minute must be supplied together"
++        )
++    if "limit" in normalized:
++        normalized["limit"] = _bounded_int(
++            normalized["limit"], "limit", 1, MAX_ITEMS
++        )
++    if (
++        action == "create_todo"
++        and normalized.get("remind") is True
++        and normalized.get("countdown") is True
++    ):
++        raise LilithHostProtocolError(
++            "create_todo cannot enable reminder and countdown together"
++        )
++
++    _require_frame_bound(normalized, "notes arguments")
++    return normalized
++
++
++def _normalize_result_item(item: Any) -> dict:
++    if not isinstance(item, dict) or set(item) != _MEMO_ITEM_FIELDS:
++        raise LilithHostProtocolError("notes result item shape was rejected")
++    normalized = dict(item)
++    normalized["memo_id"] = _bounded_int(
++        normalized["memo_id"], "memo_id", 1, 2_147_483_647
++    )
++    normalized["text"] = _bounded_text(
++        normalized["text"], "text", MAX_TEXT_UTF8_BYTES
++    )
++    normalized["memo_kind"] = _bounded_enum(
++        normalized["memo_kind"],
++        "memo_kind",
++        frozenset({"scratch", "todo"}),
++    )
++    for field_name in (
++        "date",
++        "created_time",
++        "done_date",
++        "last_reminded_date",
++    ):
++        normalized[field_name] = _bounded_text(
++            normalized[field_name],
++            field_name,
++            MAX_TIMESTAMP_UTF8_BYTES,
++            permit_empty=True,
++        )
++    normalized["updated_time"] = _bounded_text(
++        normalized["updated_time"],
++        "updated_time",
++        MAX_TIMESTAMP_UTF8_BYTES,
++    )
++    normalized["remind_hour"] = _bounded_int(
++        normalized["remind_hour"], "remind_hour", 0, 23
++    )
++    normalized["remind_minute"] = _bounded_int(
++        normalized["remind_minute"], "remind_minute", 0, 59
++    )
++    normalized["repeat"] = _bounded_enum(
++        normalized["repeat"],
++        "repeat",
++        frozenset({"none", "daily", "weekly", "monthly", "yearly"}),
++    )
++    normalized["scratch_tier"] = _bounded_enum(
++        normalized["scratch_tier"],
++        "scratch_tier",
++        frozenset({"none", "normal", "important", "temporary"}),
++    )
++    for field_name in ("remind", "done", "pinned", "countdown"):
++        normalized[field_name] = _bounded_bool(
++            normalized[field_name], field_name
++        )
++    return normalized
++
++
++def normalize_notes_result(result: Any, operation_id: str) -> dict:
++    """Validate the exact ``LilithMemoResult`` JSON envelope."""
++
++    if not isinstance(result, dict) or set(result) != _RESULT_FIELDS:
++        raise LilithHostProtocolError("notes result shape was rejected")
++    if (
++        isinstance(result.get("version"), bool)
++        or result.get("version") != PROTOCOL_VERSION
++    ):
++        raise LilithHostProtocolError("notes result version was rejected")
++    if result.get("kind") != RESULT_KIND:
++        raise LilithHostProtocolError("notes result kind was rejected")
++    actual_operation_id = result.get("operation_id")
++    if (
++        not isinstance(actual_operation_id, str)
++        or not _OPERATION_ID_RE.fullmatch(actual_operation_id)
++        or actual_operation_id != operation_id
++    ):
++        raise LilithHostProtocolError("notes result operation identity was rejected")
++    succeeded = result.get("succeeded")
++    if not isinstance(succeeded, bool):
++        raise LilithHostProtocolError("notes result succeeded flag was rejected")
++    code = _bounded_text(result.get("code"), "code", MAX_CODE_UTF8_BYTES)
++    if succeeded != (code == "ok"):
++        raise LilithHostProtocolError(
++            "notes result success and code did not agree"
++        )
++    items = result.get("items")
++    if not isinstance(items, list) or len(items) > MAX_ITEMS:
++        raise LilithHostProtocolError("notes result items were rejected")
++    normalized_items = [_normalize_result_item(item) for item in items]
++    ids = [item["memo_id"] for item in normalized_items]
++    if len(set(ids)) != len(ids):
++        raise LilithHostProtocolError("notes result contains duplicate memo ids")
++    normalized = {
++        "version": PROTOCOL_VERSION,
++        "kind": RESULT_KIND,
++        "operation_id": operation_id,
++        "succeeded": succeeded,
++        "code": code,
++        "items": normalized_items,
++    }
++    _require_frame_bound(normalized, "notes result")
++    return normalized
++
++
++def _canonical_turn_id(value: Any) -> str:
++    try:
++        from agent.turn_identity import canonical_id
++
++        canonical = canonical_id(value)
++    except Exception:
++        canonical = ""
++    if not canonical or canonical != value:
++        raise LilithHostProtocolError("host turn identity was rejected")
++    return canonical
++
++
++def _session_id(value: Any) -> str:
++    return _bounded_text(value, "session_id", 240)
++
++
++def _expire_pending_locked(now: float) -> None:
++    for operation_id, pending in list(_pending.items()):
++        if pending.deadline > now:
++            continue
++        _pending.pop(operation_id, None)
++        pending.terminal_error = "Lilith Notes host request timed out"
++        pending.completed.set()
++
++
++def _canonical_result_bytes(result: dict) -> bytes:
++    return json.dumps(
++        result,
++        ensure_ascii=False,
++        separators=(",", ":"),
++        sort_keys=True,
++        allow_nan=False,
++    ).encode("utf-8")
++
++
++def _expire_completion_receipts_locked(now: float) -> None:
++    for operation_id, receipt in list(_completion_receipts.items()):
++        if receipt.expires_at > now:
++            continue
++        _completion_receipts.pop(operation_id, None)
++
++
++def _add_completion_receipt_locked(
++    pending: _PendingRequest,
++    result: dict,
++    now: float,
++) -> None:
++    _expire_completion_receipts_locked(now)
++    while len(_completion_receipts) >= MAX_COMPLETION_RECEIPTS:
++        oldest_operation_id = next(iter(_completion_receipts))
++        _completion_receipts.pop(oldest_operation_id, None)
++    _completion_receipts[pending.operation_id] = _CompletionReceipt(
++        operation_id=pending.operation_id,
++        session_id=pending.session_id,
++        turn_id=pending.turn_id,
++        transport=pending.transport,
++        session=pending.session,
++        result_bytes=_canonical_result_bytes(result),
++        expires_at=now + COMPLETION_RECEIPT_TTL_SECONDS,
++    )
++
++
++def _current_turn_authority() -> tuple[str, str, Any, dict]:
++    from gateway.session_context import get_session_env
++    from tui_gateway import server
++
++    session_id = _session_id(get_session_env("HERMES_UI_SESSION_ID", ""))
++    turn_id = _canonical_turn_id(server._current_turn_event_id.get())
++    transport = server.current_transport()
++    session = server._current_runtime_session_record.get()
++    if transport is None or not isinstance(session, dict):
++        raise LilithHostUnavailableError(
++            "Lilith Notes requires an active Runtime-owned turn"
++        )
++    with server._sessions_lock:
++        current = server._sessions.get(session_id)
++        inflight = session.get("inflight_turn")
++        if (
++            current is not session
++            or session.get("transport") is not transport
++            or not session.get("running")
++            or not isinstance(inflight, dict)
++            or inflight.get("turn_id") != turn_id
++        ):
++            raise LilithHostAuthorityError(
++                "Lilith Notes turn authority was not current"
++            )
++    return session_id, turn_id, transport, session
++
++
++def request_notes(
++    arguments: Any,
++    *,
++    timeout_seconds: float = HOST_REQUEST_TIMEOUT_SECONDS,
++) -> dict:
++    """Emit one validated Notes request and wait for its correlated result."""
++
++    normalized = normalize_notes_arguments(arguments)
++    if (
++        isinstance(timeout_seconds, bool)
++        or not isinstance(timeout_seconds, (int, float))
++        or timeout_seconds <= 0
++        or timeout_seconds > HOST_REQUEST_TIMEOUT_SECONDS
++    ):
++        raise LilithHostProtocolError("notes host timeout was rejected")
++    session_id, turn_id, transport, session = _current_turn_authority()
++    operation_id = uuid.uuid4().hex
++    pending = _PendingRequest(
++        operation_id=operation_id,
++        session_id=session_id,
++        turn_id=turn_id,
++        transport=transport,
++        session=session,
++        deadline=time.monotonic() + float(timeout_seconds),
++    )
++    with _pending_lock:
++        now = time.monotonic()
++        _expire_pending_locked(now)
++        _expire_completion_receipts_locked(now)
++        if len(_pending) >= MAX_PENDING_REQUESTS:
++            raise LilithHostUnavailableError(
++                "Lilith Notes host request capacity is exhausted"
++            )
++        _pending[operation_id] = pending
++
++    payload = {
++        "version": PROTOCOL_VERSION,
++        "kind": REQUEST_KIND,
++        "operation_id": operation_id,
++        "arguments": normalized,
++    }
++    _require_frame_bound(payload, "notes host request")
++    from tui_gateway import server
++
++    try:
++        emitted = server._emit("lilith.host.request", session_id, payload)
++    except Exception as exc:
++        with _pending_lock:
++            if _pending.get(operation_id) is pending:
++                _pending.pop(operation_id, None)
++        raise LilithHostUnavailableError(
++            "Lilith Notes host request could not be emitted"
++        ) from exc
++    if emitted is not True:
++        with _pending_lock:
++            if _pending.get(operation_id) is pending:
++                _pending.pop(operation_id, None)
++        raise LilithHostUnavailableError(
++            "Lilith Notes host request could not be emitted"
++        )
++
++    if not pending.completed.wait(float(timeout_seconds)):
++        with _pending_lock:
++            if _pending.get(operation_id) is pending:
++                _pending.pop(operation_id, None)
++                pending.terminal_error = "Lilith Notes host request timed out"
++            completed = pending.completed.is_set()
++        if completed:
++            pending.completed.wait(0)
++        else:
++            raise LilithHostUnavailableError(pending.terminal_error)
++    if pending.terminal_error:
++        raise LilithHostUnavailableError(pending.terminal_error)
++    if pending.result is None:
++        raise LilithHostUnavailableError(
++            "Lilith Notes host request ended without a result"
++        )
++    return pending.result
++
++
++def complete_notes_request(params: Any, transport: Any) -> dict:
++    """Accept one exact-transport completion for a pending Notes operation."""
++
++    if not isinstance(params, dict) or set(params) != {
++        "session_id",
++        "turn_id",
++        "result",
++    }:
++        raise LilithHostProtocolError("host completion shape was rejected")
++    session_id = _session_id(params.get("session_id"))
++    turn_id = _canonical_turn_id(params.get("turn_id"))
++    raw_result = params.get("result")
++    if not isinstance(raw_result, dict):
++        raise LilithHostProtocolError("host completion result was rejected")
++    operation_id = raw_result.get("operation_id")
++    if (
++        not isinstance(operation_id, str)
++        or not _OPERATION_ID_RE.fullmatch(operation_id)
++    ):
++        raise LilithHostProtocolError("host operation identity was rejected")
++    result = normalize_notes_result(raw_result, operation_id)
++
++    from tui_gateway import server
++
++    now = time.monotonic()
++    with server._sessions_lock:
++        with _pending_lock:
++            _expire_pending_locked(now)
++            _expire_completion_receipts_locked(now)
++            current_session = server._sessions.get(session_id)
++            receipt = _completion_receipts.get(operation_id)
++            if receipt is not None:
++                if (
++                    transport is None
++                    or transport is not receipt.transport
++                    or session_id != receipt.session_id
++                    or turn_id != receipt.turn_id
++                    or current_session is not receipt.session
++                    or receipt.session.get("transport") is not receipt.transport
++                    or _canonical_result_bytes(result) != receipt.result_bytes
++                ):
++                    raise LilithHostAuthorityError(
++                        "host completion receipt did not match"
++                    )
++                return {"accepted": True, "operation_id": operation_id}
++            pending = _pending.get(operation_id)
++            if pending is None:
++                raise LilithHostAuthorityError("host completion was not pending")
++            if (
++                transport is None
++                or transport is not pending.transport
++                or session_id != pending.session_id
++                or turn_id != pending.turn_id
++                or current_session is not pending.session
++                or pending.session.get("transport") is not pending.transport
++            ):
++                raise LilithHostAuthorityError("host completion authority was rejected")
++            _pending.pop(operation_id, None)
++            pending.result = result
++            _add_completion_receipt_locked(pending, result, now)
++            pending.completed.set()
++    return {"accepted": True, "operation_id": operation_id}
++
++
++def _pending_count() -> int:
++    """Test-only visibility into bounded process-local correlation state."""
++
++    with _pending_lock:
++        now = time.monotonic()
++        _expire_pending_locked(now)
++        _expire_completion_receipts_locked(now)
++        return len(_pending)
++
++
++def _completion_receipt_count() -> int:
++    """Test-only visibility into bounded completion replay state."""
++
++    with _pending_lock:
++        _expire_completion_receipts_locked(time.monotonic())
++        return len(_completion_receipts)
++
++
++def _reset_pending_for_tests() -> None:
++    """Wake and clear pending calls and receipts between focused unit tests."""
++
++    with _pending_lock:
++        values = list(_pending.values())
++        _pending.clear()
++        _completion_receipts.clear()
++        for pending in values:
++            pending.terminal_error = "Lilith Notes host request was reset"
++            pending.completed.set()
++
++
++__all__ = [
++    "COMPLETION_RECEIPT_TTL_SECONDS",
++    "HOST_REQUEST_TIMEOUT_SECONDS",
++    "LilithHostAuthorityError",
++    "LilithHostBridgeError",
++    "LilithHostProtocolError",
++    "LilithHostUnavailableError",
++    "complete_notes_request",
++    "normalize_notes_arguments",
++    "normalize_notes_result",
++    "request_notes",
++]
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 9df78447d0794ff3af4cb5cab9d39a9a7d2efb55..c1f9300f16eab3046f545e3be28b4a70d9645379 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -1842,6 +1842,7 @@ _TURN_REQUIRED_EVENT_TYPES = frozenset(
+         "clarify.request",
+         "mcp.setup.expire",
+         "mcp.setup.request",
++        "lilith.host.request",
+         "message.complete",
+         "message.delta",
+         "message.interim",
+@@ -2915,6 +2916,27 @@ def handle_request(req: dict) -> dict | None:
+     return fn(rid, params)
+ 
+ 
++@method("lilith.host.complete")
++def _complete_lilith_host_request(rid, params: dict) -> dict:
++    """Complete one exact, turn-scoped Lilith Notes host request.
++
++    The bridge owns the closed Notes schema and exact transport/session/turn
++    correlation.  This RPC is intentionally not a generic host-execution
++    route.
++    """
++
++    from tui_gateway.lilith_host_bridge import (
++        LilithHostBridgeError,
++        complete_notes_request,
++    )
++
++    try:
++        result = complete_notes_request(params, current_transport())
++    except LilithHostBridgeError as exc:
++        return _err(rid, exc.rpc_code, str(exc))
++    return _ok(rid, result)
++
++
+ def _current_session_steer_authority(
+     session_id: str,
+ ) -> tuple[Transport | None, dict | None]:

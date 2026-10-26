@@ -1,0 +1,1604 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 169451b..74785e5 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -582,6 +582,7 @@ def init_agent(
+     pass_session_id: bool = False,
+     requested_provider: str = None,
+     identity_preflight=None,
++    isolated_request: bool = False,
+ ):
+     """
+     Initialize the AI Agent.
+@@ -649,7 +650,23 @@ def init_agent(
+             request_overrides=request_overrides,
+         )
+ 
+-    _install_safe_stdio()
++    if type(isolated_request) is not bool:
++        raise ValueError("isolated_request must be a boolean")
++    if isolated_request and not (
++        identity_preflight.enabled and api_mode == "chat_completions"
++        and isinstance(api_key, str) and api_key and session_id
++        and skip_memory and skip_background_review and skip_context_files
++        and quiet_mode and session_db is None and not save_trajectories
++        and not verbose_logging and enabled_toolsets == ["lilith_leave_note"]
++        and not disabled_toolsets
++        and not checkpoints_enabled and not pass_session_id
++        and fallback_model is None and credential_pool is None
++        and type(max_iterations) is int and max_iterations == 1
++    ):
++        raise ValueError("isolated request requires a strict, non-persistent single-request configuration")
++    agent._isolated_request = isolated_request
++    if not isolated_request:
++        _install_safe_stdio()
+ 
+     _identity_policy = identity_preflight.policy
+     _identity_soul_content = identity_preflight.soul_content
+@@ -856,7 +873,7 @@ def init_agent(
+     # AIAgent is created for every gateway request, so without the guard
+     # each message leaks one OS thread and the process eventually exhausts
+     # the system thread limit (RuntimeError: can't start new thread).
+-    if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
++    if not isolated_request and (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
+             not _ra()._openrouter_prewarm_done.is_set():
+         _ra()._openrouter_prewarm_done.set()
+         threading.Thread(
+@@ -1001,7 +1018,7 @@ def init_agent(
+ 
+         from agent.agent_runtime_helpers import cache_ttl_means_disabled
+ 
+-        _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
++        _pc_cfg = (_agent_cfg if isolated_request else _load_pc_cfg()).get("prompt_caching", {}) or {}
+         _ttl = _pc_cfg.get("cache_ttl", "5m")
+         if _ttl in {"5m", "1h"}:
+             agent._cache_ttl = _ttl
+@@ -1150,7 +1167,8 @@ def init_agent(
+     # every client construction path below (Anthropic native, OpenAI-wire,
+     # router-based implicit auth) can apply it consistently.  Bedrock
+     # Claude uses its own timeout path and is not covered here.
+-    _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
++    _provider_timeout = (60.0 if isolated_request else
++        get_provider_request_timeout(agent.provider, agent.model))
+ 
+     if agent.api_mode == "anthropic_messages":
+         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
+@@ -1305,7 +1323,8 @@ def init_agent(
+             effective_base = base_url
+             if base_url_host_matches(effective_base, "openrouter.ai"):
+                 from agent.auxiliary_client import build_or_headers
+-                client_kwargs["default_headers"] = build_or_headers()
++                client_kwargs["default_headers"] = (build_or_headers(_agent_cfg.get("openrouter") or {})
++                    if isolated_request else build_or_headers())
+             elif base_url_host_matches(effective_base, "integrate.api.nvidia.com"):
+                 from agent.auxiliary_client import build_nvidia_nim_headers
+                 client_kwargs["default_headers"] = build_nvidia_nim_headers(effective_base)
+@@ -1473,7 +1492,7 @@ def init_agent(
+                 load_config,
+             )
+ 
+-            _cp_config = load_config()
++            _cp_config = _agent_cfg if isolated_request else load_config()
+             _cp_entries = get_compatible_custom_providers(_cp_config)
+             _cp_base_url = str(client_kwargs.get("base_url") or agent.base_url or "")
+             apply_custom_provider_tls_to_client_kwargs(
+@@ -1558,7 +1577,8 @@ def init_agent(
+     try:
+         from hermes_cli.plugins import discover_plugins
+ 
+-        discover_plugins()
++        if not isolated_request:
++            discover_plugins()
+     except Exception:
+         logger.warning("Plugin discovery failed during agent setup", exc_info=True)
+ 
+@@ -1646,7 +1666,8 @@ def init_agent(
+     try:
+         from gateway.session_context import set_current_session_id
+ 
+-        set_current_session_id(agent.session_id)
++        if not isolated_request:
++            set_current_session_id(agent.session_id)
+     except Exception:
+         # Preserve the root-agent legacy fallback, but never let delegated
+         # construction publish a child ID process-wide even if the ContextVar
+@@ -1657,13 +1678,14 @@ def init_agent(
+             delegated_child = is_delegated_child_context()
+         except Exception:
+             delegated_child = False
+-        if not delegated_child:
++        if not isolated_request and not delegated_child:
+             os.environ["HERMES_SESSION_ID"] = agent.session_id
+ 
+     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
+     hermes_home = get_hermes_home()
+     agent.logs_dir = hermes_home / "sessions"
+-    agent.logs_dir.mkdir(parents=True, exist_ok=True)
++    if not isolated_request:
++        agent.logs_dir.mkdir(parents=True, exist_ok=True)
+     # Per-session JSON snapshot writer (~/.hermes/sessions/session_{sid}.json)
+     # is opt-in via sessions.write_json_snapshots (default False).  state.db
+     # is canonical — the snapshot is only useful for external tooling that
+@@ -1671,8 +1693,8 @@ def init_agent(
+     agent._session_json_enabled = False
+     try:
+         from hermes_cli.config import load_config_readonly as _load_sess_cfg
+-        _sess_cfg = (_load_sess_cfg().get("sessions") or {})
+-        agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
++        _sess_cfg = ((_agent_cfg if isolated_request else _load_sess_cfg()).get("sessions") or {})
++        agent._session_json_enabled = not isolated_request and bool(_sess_cfg.get("write_json_snapshots", False))
+     except Exception:
+         pass
+     # logs_dir is retained unconditionally for request_dump_*.json (debug
+@@ -1737,14 +1759,14 @@ def init_agent(
+     # (state.db) or the JSON snapshot, regardless of session_id. Set on the
+     # background skill/memory review fork so its harness turn can't leak into
+     # the user's real session and hijack the next live turn. Default False.
+-    agent._persist_disabled = False
++    agent._persist_disabled = isolated_request
+     # Whether this agent owns session-scoped execution resources keyed by
+     # session_id (processes, terminal/browser sessions, and computer-use
+     # target/ref state). The primary agent owns them by default. Auxiliary
+     # agents that deliberately alias an existing live session_id must opt out
+     # before they run, otherwise their close() would tear down the primary
+     # agent's still-live execution state.
+-    agent._owns_session_tool_resources = True
++    agent._owns_session_tool_resources = not isolated_request
+     agent._session_init_model_config = {
+         "max_iterations": agent.max_iterations,
+         "reasoning_config": reasoning_config,
+@@ -1851,7 +1873,7 @@ def init_agent(
+     # So the built-in store is created unless memory is globally disabled, while
+     # the external-provider block below stays gated on skip_memory.
+     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
+-    if not skip_memory or _memory_toolset_requested:
++    if not isolated_request and (not skip_memory or _memory_toolset_requested):
+         try:
+             mem_config = _agent_cfg.get("memory", {})
+             agent._memory_enabled = mem_config.get("memory_enabled", False)
+@@ -2611,9 +2633,8 @@ def init_agent(
+     # AFTER the custom_providers branch so per-model overrides aren't lost.
+     agent._config_context_length = _config_context_length
+ 
+-    _lmstudio_runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
+-        _config_context_length
+-    )
++    _lmstudio_runtime_context_length = (None if isolated_request else
++        agent._ensure_lmstudio_runtime_loaded(_config_context_length))
+     if agent._lmstudio_load_was_unverified(_lmstudio_runtime_context_length):
+         _ra().logger.warning(
+             "LM Studio model activation was rejected or completed without a "
+@@ -2640,7 +2661,7 @@ def init_agent(
+     except Exception:
+         pass
+ 
+-    if _engine_name != "compressor":
++    if not isolated_request and _engine_name != "compressor":
+         # Try loading from plugins/context_engine/<name>/
+         try:
+             from plugins.context_engine import load_context_engine
+@@ -2685,7 +2706,9 @@ def init_agent(
+             )
+     # else: config says "compressor" — use built-in, don't auto-activate plugins
+ 
+-    if _selected_engine is not None:
++    if isolated_request:
++        agent.context_compressor = None
++    elif _selected_engine is not None:
+         agent.context_compressor = _selected_engine
+         # External engines own compaction policy: the host compression
+         # threshold (including the Codex gpt-5.5 autoraise above) only
+@@ -2921,7 +2944,7 @@ def init_agent(
+             agent._ollama_num_ctx = int(_ollama_num_ctx_override)
+         except (TypeError, ValueError):
+             _ra().logger.debug("Invalid ollama_num_ctx config value: %r", _ollama_num_ctx_override)
+-    if agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url):
++    if not isolated_request and agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url):
+         try:
+             # ``agent.api_key`` may be a callable (Entra token provider).
+             # Ollama detection makes a manual HTTP request and expects a
+@@ -2963,7 +2986,7 @@ def init_agent(
+     # suppresses the banner entirely without disabling the threshold autoraise.
+     _autoraise = getattr(agent, "_compression_threshold_autoraised", None) or {}
+     _show_autoraise_notice = (
+-        bool(_autoraise)
++        not isolated_request and bool(_autoraise)
+         and compression_enabled
+         and _codex_gpt55_autoraise_notice
+         and not _codex_gpt55_autoraise_notice_seen(_autoraise)
+@@ -3050,8 +3073,8 @@ def init_agent(
+         "compressor_base_url": getattr(_cc, "base_url", agent.base_url),
+         "compressor_api_key": getattr(_cc, "api_key", ""),
+         "compressor_provider": getattr(_cc, "provider", agent.provider),
+-        "compressor_context_length": _cc.context_length,
+-        "compressor_threshold_tokens": _cc.threshold_tokens,
++        "compressor_context_length": getattr(_cc, "context_length", 0),
++        "compressor_threshold_tokens": getattr(_cc, "threshold_tokens", 0),
+     }
+     if agent.api_mode == "anthropic_messages":
+         agent._primary_runtime.update({
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 3195b50..a0336f7 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -1028,7 +1028,7 @@ _OR_HEADERS_BASE = {
+ _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+ 
+ 
+-def _apply_user_default_headers(headers: dict | None) -> dict | None:
++def _apply_user_default_headers(headers: dict | None, *, config_snapshot: dict | None = None) -> dict | None:
+     """Merge user-configured ``model.default_headers`` onto resolved headers.
+ 
+     User values take precedence over provider/SDK defaults, mirroring the main
+@@ -1044,7 +1044,7 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
+     """
+     try:
+         from hermes_cli.config import cfg_get, load_config
+-        _cfg = load_config()
++        _cfg = config_snapshot if config_snapshot is not None else load_config()
+         user_headers = cfg_get(_cfg, "model", "default_headers")
+         # ``model.extra_headers`` is an accepted alias (matches the
+         # per-provider ``extra_headers`` key on providers/custom_providers
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index 2421da4..17f1310 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -804,7 +804,7 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
+ 
+ 
+ def _resolve_api_key_provider_secret(
+-    provider_id: str, pconfig: ProviderConfig
++    provider_id: str, pconfig: ProviderConfig, *, allow_pool: bool = True
+ ) -> tuple[str, str]:
+     """Resolve an API-key provider's token and indicate where it came from."""
+     if provider_id == "copilot":
+@@ -835,6 +835,9 @@ def _resolve_api_key_provider_secret(
+         if has_usable_secret(val):
+             return val, env_var
+ 
++    if not allow_pool:
++        return "", ""
++
+     # Fallback: try credential pool (e.g. zai key stored via auth.json)
+     try:
+         from agent.credential_pool import load_pool
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index 390ba78..ee65a12 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -1663,6 +1663,47 @@ def _resolve_explicit_runtime(
+     return None
+ 
+ 
++def resolve_isolated_static_runtime(*, config_snapshot: Dict[str, Any],
++    requested: str, target_model: str) -> Dict[str, Any]:
++    """Native, read-only subset for one isolated request; never select a pool.
++
++    Unsupported authority cannot be reinterpreted as an environment fallback.
++    Normal provider resolution is unchanged. This first subset deliberately
++    supports only built-in DeepSeek/Gemini static-key chat-completions routes.
++    """
++    from hermes_cli.config import is_provider_enabled
++    if not isinstance(config_snapshot, dict) or requested not in {"deepseek", "gemini"}:
++        raise ValueError("unsupported isolated native provider")
++    model_cfg = config_snapshot.get("model")
++    if (not isinstance(model_cfg, dict) or model_cfg.get("provider") != requested
++            or model_cfg.get("default") != target_model or not isinstance(target_model, str)
++            or not target_model.strip()):
++        raise ValueError("isolated native provider requires the complete current pair")
++    block = (config_snapshot.get("providers") or {}).get(requested)
++    if block is not None and (not isinstance(block, dict) or not is_provider_enabled(block)
++            or set(block) - {"enabled"}):
++        raise ValueError("isolated native provider override is unsupported")
++    if config_snapshot.get("custom_providers") or any(model_cfg.get(key) for key in
++            ("api_key", "key_env", "api_key_env", "credential_pool", "fallback")):
++        raise ValueError("isolated native custom credentials are unsupported")
++    # The normal route selects persisted pool credentials before API-key
++    # fallback. Reject that authority, do not silently choose another key.
++    if auth_mod.read_credential_pool(requested):
++        raise ValueError("isolated native credential pool is unsupported")
++    pconfig = PROVIDER_REGISTRY[requested]
++    key, source = auth_mod._resolve_api_key_provider_secret(requested, pconfig, allow_pool=False)
++    if not has_usable_secret(key):
++        raise ValueError("isolated native static credential is unavailable")
++    runtime = _resolve_explicit_runtime(provider=requested, requested_provider=requested,
++        model_cfg=model_cfg, explicit_api_key=key,
++        explicit_base_url=str(model_cfg.get("base_url") or ""), target_model=target_model)
++    if (runtime is None or runtime.get("api_mode") != "chat_completions"
++            or runtime.get("base_url") != pconfig.inference_base_url.rstrip("/")):
++        raise ValueError("isolated native API mode is unsupported")
++    runtime["source"] = source
++    return runtime
++
++
+ def resolve_runtime_provider(
+     *,
+     requested: Optional[str] = None,
+diff --git a/run_agent.py b/run_agent.py
+index d764af7..2885379 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -519,6 +519,7 @@ class AIAgent:
+         checkpoint_max_file_size_mb: int = 10,
+         pass_session_id: bool = False,
+         requested_provider: str = None,
++        isolated_request: bool = False,
+     ):
+         """Forwarder — see ``agent.agent_init.init_agent``."""
+         # First executable operation for every AIAgent: strict deployments
+@@ -621,6 +622,7 @@ class AIAgent:
+             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
+             pass_session_id=pass_session_id,
+             identity_preflight=_identity_preflight,
++            isolated_request=isolated_request,
+         )
+ 
+     def _get_session_db_for_recall(self):
+@@ -1417,6 +1419,8 @@ class AIAgent:
+         passed as a per-call ``timeout=`` kwarg, overriding the client-level
+         timeout the AIAgent.__init__ path configured.
+         """
++        if getattr(self, "_isolated_request", False):
++            return 60.0  # The isolated caller further clamps to its lease deadline.
+         cfg = get_provider_request_timeout(self.provider, self.model)
+         if cfg is not None:
+             return cfg
+@@ -4532,7 +4536,8 @@ class AIAgent:
+         # mark until exit.  This helper is a safe no-op on other allocators.
+         try:
+             from hermes_cli.mem_trim import trim_memory
+-            trim_memory(force=True, reason="agent close")
++            if not getattr(self, "_isolated_request", False):
++                trim_memory(force=True, reason="agent close")
+         except Exception:
+             pass
+ 
+@@ -6397,7 +6402,11 @@ class AIAgent:
+         from agent.auxiliary_client import (
+             _apply_user_default_headers as _merge_user_headers,
+         )
+-        merged = _merge_user_headers(self._client_kwargs.get("default_headers"))
++        if getattr(self, "_isolated_request", False):
++            merged = _merge_user_headers(self._client_kwargs.get("default_headers"),
++                config_snapshot=self._identity_config_snapshot)
++        else:
++            merged = _merge_user_headers(self._client_kwargs.get("default_headers"))
+         if merged:
+             self._client_kwargs["default_headers"] = merged
+ 
+@@ -8482,6 +8491,8 @@ class AIAgent:
+         moa_config: Optional[dict[str, Any]] = None,
+     ) -> Dict[str, Any]:
+         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
++        if getattr(self, "_isolated_request", False):
++            raise RuntimeError("isolated request agents cannot start a conversation")
+         from agent.aux_accounting import (
+             reset_accounting_context,
+             set_accounting_context,
+diff --git a/tests/agent/test_isolated_request_init.py b/tests/agent/test_isolated_request_init.py
+new file mode 100644
+index 0000000..b872006
+--- /dev/null
++++ b/tests/agent/test_isolated_request_init.py
+@@ -0,0 +1,181 @@
++"""Cold native construction retains identity without background side effects."""
++import hashlib
++import os
++import threading
++import time
++from pathlib import Path
++from unittest.mock import MagicMock
++
++import pytest
++import yaml
++
++from run_agent import AIAgent
++
++
++@pytest.fixture
++def cold(monkeypatch, tmp_path):
++    soul, persona = "PINNED SOUL\n", "LOCKED CUSTOM VOICE\n"
++    config = {"identity": {"require_soul": True, "suppress_kernel_help": True,
++        "personality_allowlist": ["lilith"], "locked_personality": "lilith",
++        "force_soul_for_children": True, "fingerprint": "A" * 64},
++        "display": {"personality": "lilith"}, "agent": {"system_prompt": "",
++            "personalities": {"lilith": {"system_prompt": persona}}},
++        "model": {"provider": "openrouter", "default": "fixture-model"},
++        "context": {"engine": "must-not-start"},
++        "memory": {"memory_enabled": True, "user_profile_enabled": True, "provider": "must-not-start"},
++        "sessions": {"write_json_snapshots": True}}
++    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8", newline="\n")
++    (tmp_path / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    for key, value in {"HERMES_HOME": str(tmp_path), "HERMES_IDENTITY_REQUIRED": "1",
++        "HERMES_IDENTITY_EXPECTED_FINGERPRINT": "A" * 64,
++        "HERMES_IDENTITY_EXPECTED_CONFIG_SHA256": hashlib.sha256((tmp_path / "config.yaml").read_bytes()).hexdigest(),
++        "HERMES_IDENTITY_EXPECTED_SOUL_SHA256": hashlib.sha256(soul.encode()).hexdigest(),
++        "HERMES_IDENTITY_EXPECTED_PERSONALITY_SHA256": hashlib.sha256(persona.encode()).hexdigest()}.items():
++        monkeypatch.setenv(key, value)
++    monkeypatch.setattr("run_agent.OpenAI", MagicMock())
++    definitions = MagicMock(return_value=[])
++    monkeypatch.setattr("run_agent.get_tool_definitions", definitions)
++    monkeypatch.setattr("run_agent.check_toolset_requirements", lambda *a, **k: {})
++    monkeypatch.setattr("run_agent._openrouter_prewarm_done", threading.Event())
++    effects = {}
++    for name in ("agent.agent_init.fetch_model_metadata", "hermes_cli.plugins.discover_plugins",
++                 "agent.agent_init.ContextCompressor", "tools.memory_tool.MemoryStore",
++                 "socket.create_connection"):
++        fake = MagicMock(side_effect=AssertionError("unexpected cold-init side effect " + name))
++        monkeypatch.setattr(name, fake)
++        effects[name] = fake
++    kwargs = dict(api_key="fixture-only-key", base_url="https://openrouter.ai/api/v1", provider="openrouter",
++        api_mode="chat_completions", model="fixture-model", session_id="a" * 32,
++        enabled_toolsets=["lilith_leave_note"], disabled_toolsets=[], max_iterations=1, quiet_mode=True,
++        skip_memory=True, skip_context_files=True, skip_background_review=True, isolated_request=True)
++    return kwargs, effects, definitions, tmp_path, soul, persona
++
++
++def test_cold_constructor_preserves_native_identity_and_has_no_adjacent_effects(cold, monkeypatch):
++    kwargs, effects, definitions, root, soul, persona = cold
++    before = {str(path.relative_to(root)): path.read_bytes() if path.is_file() else None for path in root.rglob("*")}
++    old_session = os.environ.get("HERMES_SESSION_ID")
++    directory_calls = []
++    mkdir = Path.mkdir
++    def trace_mkdir(path, *args, **kwargs):
++        if path == root / "sessions":
++            import traceback
++            directory_calls.append("".join(traceback.format_stack(limit=8)))
++        return mkdir(path, *args, **kwargs)
++    monkeypatch.setattr(Path, "mkdir", trace_mkdir)
++    agent = AIAgent(**kwargs)
++    try:
++        assert agent._identity_soul_content == soul and agent._identity_personality_prompt == persona
++        assert agent.provider == "openrouter" and agent.api_mode == "chat_completions"
++        assert agent._persist_disabled and not agent._session_json_enabled
++        assert agent.context_compressor is None and agent._session_db is None
++        assert agent._memory_store is None and agent._memory_manager is None
++        wire = agent._build_api_kwargs([{"role": "system", "content": soul + "\n" + persona},
++            {"role": "user", "content": "An isolated opportunity."}], tools_for_api=[])
++        assert wire["model"] == "fixture-model"
++        assert definitions.call_args.kwargs["enabled_toolsets"] == ["lilith_leave_note"]
++        assert all(not effect.called for effect in effects.values())
++        assert os.environ.get("HERMES_SESSION_ID") == old_session
++        assert not (root / "sessions").exists(), "\n".join(directory_calls)
++        assert {str(path.relative_to(root)): path.read_bytes() if path.is_file() else None for path in root.rglob("*")} == before
++        with pytest.raises(RuntimeError, match="cannot start a conversation"):
++            agent.run_conversation("not permitted")
++        assert agent._get_session_db_for_recall() is None
++    finally:
++        agent.close()
++    assert {str(path.relative_to(root)): path.read_bytes() if path.is_file() else None for path in root.rglob("*")} == before, "\n".join(directory_calls)
++
++
++def test_daily_factory_only_installs_note_tool_despite_other_enabled_native_tools(cold, monkeypatch):
++    from tui_gateway import daily_note as daily, server
++    kwargs, effects, definitions, root, _, _ = cold
++    monkeypatch.setattr(daily, "_config_proof", lambda: ("fixture", "A" * 64))
++    monkeypatch.setattr(server, "_load_cfg", lambda: {"model": {"provider": "openrouter", "default": "fixture-model"}})
++    monkeypatch.setattr(server, "_load_reasoning_config", lambda model: None)
++    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_isolated_static_runtime", lambda **kw: {
++        "provider": "openrouter", "api_mode": "chat_completions", "api_key": "fixture-only-key",
++        "base_url": "https://openrouter.ai/api/v1"})
++    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *a, **kw:
++        {"lilith_leave_note", "terminal", "mcp_untrusted", "memory", "delegate_task"})
++    task = daily._Task({"attempt_id": "a" * 32}, "zh-TW", object(), time.monotonic() + 30)
++    before = set(root.rglob("*"))
++    agent = daily._make_agent(task)
++    try:
++        assert agent._isolated_request and agent._skip_mcp_refresh
++        assert definitions.call_args.kwargs["enabled_toolsets"] == ["lilith_leave_note"]
++        assert all(not effect.called for effect in effects.values())
++    finally:
++        agent.close()
++    assert set(root.rglob("*")) == before
++
++
++@pytest.mark.parametrize("provider", ["deepseek", "gemini"])
++def test_static_native_resolution_reads_native_secrets_without_pool_or_config_initialization(cold, monkeypatch, provider):
++    from hermes_cli import runtime_provider as runtime, auth
++    from providers import get_provider_profile
++    _, _, _, root, _, _ = cold
++    (root / ".env").write_text("DEEPSEEK_API_KEY=fixture-profile-key\nGEMINI_API_KEY=fixture-profile-key\n", encoding="utf-8")
++    monkeypatch.setenv("DEEPSEEK_API_KEY", "stale-shell-key")
++    monkeypatch.setenv("GEMINI_API_KEY", "stale-shell-key")
++    monkeypatch.setattr(auth, "read_credential_pool", lambda provider: [])
++    monkeypatch.setattr(auth, "is_source_suppressed", lambda *a: False)
++    pool = MagicMock(side_effect=AssertionError("must not load/select/persist a pool"))
++    monkeypatch.setattr("agent.credential_pool.load_pool", pool)
++    monkeypatch.setattr(runtime, "load_config", MagicMock(side_effect=AssertionError("must not initialize config")))
++    monkeypatch.setattr("hermes_cli.config.load_config", MagicMock(side_effect=AssertionError("must not initialize config")))
++    cfg = {"model": {"provider": provider, "default": "fixture-model", "api_mode": "chat_completions"}}
++    before = {str(path.relative_to(root)): path.read_bytes() if path.is_file() else None for path in root.rglob("*")}
++    resolved = runtime.resolve_isolated_static_runtime(config_snapshot=cfg, requested=provider, target_model="fixture-model")
++    assert resolved["api_key"] == "fixture-profile-key" and resolved["provider"] == provider
++    assert resolved["api_mode"] == "chat_completions"
++    assert resolved["base_url"] == get_provider_profile(provider).base_url.rstrip("/")
++    assert not pool.called
++    assert {str(path.relative_to(root)): path.read_bytes() if path.is_file() else None for path in root.rglob("*")} == before
++
++
++@pytest.mark.parametrize("change", ["provider", "pair", "pool", "custom", "disabled", "override", "mode", "endpoint", "missing_key"])
++def test_static_native_resolution_rejects_unsupported_authority_without_alternate_credentials(cold, monkeypatch, change):
++    from hermes_cli import runtime_provider as runtime, auth
++    cfg = {"model": {"provider": "deepseek", "default": "fixture-model", "api_mode": "chat_completions"}}
++    requested = "deepseek"
++    monkeypatch.setattr(auth, "read_credential_pool", lambda p: [{"fixture": "pool"}] if change == "pool" else [])
++    monkeypatch.setattr(auth, "_resolve_api_key_provider_secret", lambda *a, **k: ("" if change == "missing_key" else "fixture-key", "native"))
++    pool = MagicMock(side_effect=AssertionError("must not select pool"))
++    monkeypatch.setattr("agent.credential_pool.load_pool", pool)
++    if change == "provider": requested = "openrouter"
++    elif change == "pair": cfg["model"]["default"] = "other"
++    elif change == "custom": cfg["custom_providers"] = [{"name": "custom"}]
++    elif change == "disabled": cfg["providers"] = {"deepseek": {"enabled": False}}
++    elif change == "override": cfg["providers"] = {"deepseek": {"api_key": "other"}}
++    elif change == "mode": cfg["model"]["api_mode"] = "anthropic_messages"
++    elif change == "endpoint": cfg["model"]["base_url"] = "https://unapproved.invalid/v1"
++    with pytest.raises(ValueError, match="isolated"):
++        runtime.resolve_isolated_static_runtime(config_snapshot=cfg, requested=requested, target_model="fixture-model")
++    assert not pool.called
++
++
++@pytest.mark.parametrize("key,value", [("skip_memory", False), ("skip_context_files", False),
++    ("skip_background_review", False), ("save_trajectories", True), ("session_db", object()),
++    ("checkpoints_enabled", True), ("pass_session_id", True), ("quiet_mode", False),
++    ("max_iterations", 2), ("credential_pool", object()), ("fallback_model", {}),
++    ("isolated_request", "true"), ("enabled_toolsets", ["terminal"]), ("verbose_logging", True)])
++def test_unsafe_isolated_constructor_arguments_fail_before_effects(cold, key, value):
++    kwargs, effects, definitions, root, _, _ = cold
++    kwargs[key] = value
++    with pytest.raises(ValueError, match="isolated"):
++        AIAgent(**kwargs)
++    assert not definitions.called and not (root / "sessions").exists()
++    assert all(not effect.called for effect in effects.values())
++
++
++def test_default_constructor_does_not_implicitly_enter_isolated_mode(cold, monkeypatch):
++    kwargs, _, _, _, _, _ = cold
++    kwargs.pop("isolated_request")
++    from agent import agent_init
++    original = agent_init.init_agent
++    captured = []
++    def stop(agent, **forwarded):
++        captured.append(forwarded["isolated_request"])
++    monkeypatch.setattr(agent_init, "init_agent", stop)
++    AIAgent(**kwargs)
++    assert captured == [False]
+diff --git a/tests/tui_gateway/test_daily_note.py b/tests/tui_gateway/test_daily_note.py
+new file mode 100644
+index 0000000..2699018
+--- /dev/null
++++ b/tests/tui_gateway/test_daily_note.py
+@@ -0,0 +1,527 @@
++"""One real native dispatch pipeline; providers and game transport are isolated."""
++import copy
++import json
++import threading
++import time
++import uuid
++import os
++import subprocess
++import sys
++from datetime import datetime, timedelta, timezone
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++
++from run_agent import AIAgent  # Warm-native cases; the cold case uses a fresh process.
++from agent import identity_policy
++from agent.transports.chat_completions import ChatCompletionsTransport
++from providers import get_provider_profile
++from tui_gateway import daily_note as daily, lilith_noteinbox_bridge as bridge, server
++from tui_gateway.transport import bind_transport, reset_transport
++
++NATIVE_FACTORY = daily._make_agent
++
++
++def timestamp(value):
++    return value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{value.microsecond:06d}0+00:00"
++
++
++def scope(seconds=30):
++    return {"profile_id": "local", **{key: uuid.uuid4().hex for key in daily.GUID_FIELDS},
++            "expires_at_utc": timestamp(datetime.now(timezone.utc) + timedelta(seconds=seconds))}
++
++
++ARGS = {"action": "deliver", "locale": "zh-TW", "text": "今天也記得好好休息。 —莉莉絲"}
++SCHEMA = {"type": "function", "function": {"name": "lilith_leave_note",
++    "description": "Save a native game image note.", "parameters": {"type": "object",
++    "properties": {"action": {"type": "string"}, "locale": {"type": "string"}, "text": {"type": "string"}},
++    "required": ["action", "locale"], "additionalProperties": False}}}
++
++
++def receipt(value, status="delivered"):
++    return {"version": 1, "kind": bridge.RESULT_KIND, "operation_id": value["operation_id"],
++        "delivery_id": value["delivery_id"], "status": status, "code": "ok" if status == "delivered" else "fixture.deferred",
++        "artifact": {"artifact_id": value["delivery_id"], "sha256": "A" * 64, "byte_length": 55,
++                     "completed_at_utc": timestamp(datetime.now(timezone.utc))} if status == "delivered" else None}
++
++
++class FakeAgent:
++    def __init__(self, provider="deepseek"):
++        self.provider = self.requested_provider = provider
++        self.model = "deepseek-v4-pro" if provider == "deepseek" else "gemini-3-flash"
++        self.base_url = get_provider_profile(provider).base_url
++        self.api_mode = "chat_completions"
++        self.api_key = "fixture-key-only"
++        self.auth_mode = "api_key"
++        self._client_kwargs = {"api_key": self.api_key, "base_url": self.base_url}
++        self.request_overrides = {}
++        self.reasoning_config = {"enabled": False}
++        self.max_tokens = 2048
++        self._ephemeral_max_output_tokens = None
++        self.enabled_toolsets = ["lilith_leave_note"]
++        self.disabled_toolsets = []
++        self._identity_soul_content = "SOUL"
++        self._identity_personality_prompt = "PERSONA"
++        self._identity_policy = SimpleNamespace(enabled=True)
++        self.calls, self.clients, self.closed_clients, self.aborted = [], [], [], []
++        self.closed = False
++        self.tool_calls = [SimpleNamespace(id="native-call", function=SimpleNamespace(
++            name="lilith_leave_note", arguments=json.dumps(ARGS, ensure_ascii=False)))]
++        self.on_request = lambda: None
++        self.on_client = lambda: None
++        self.run_conversation = MagicMock(side_effect=AssertionError("must not run chat"))
++
++    def _is_openrouter_url(self):
++        return False
++
++    def _build_api_kwargs(self, messages, tools_for_api):
++        return ChatCompletionsTransport().build_kwargs(model=self.model, messages=messages, tools=tools_for_api,
++            base_url=self.base_url, provider_profile=get_provider_profile(self.provider),
++            reasoning_config=self.reasoning_config, max_tokens=self.max_tokens, request_overrides=self.request_overrides)
++
++    def _create_request_openai_client(self, **kwargs):
++        assert self._client_kwargs["max_retries"] == 0
++        self.on_client()
++        def create(**wire):
++            self.calls.append(copy.deepcopy(wire))
++            self.on_request()
++            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
++                content="Model prose is never delivery evidence", tool_calls=self.tool_calls))], usage=None)
++        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
++        self.clients.append(client)
++        return client
++
++    def _close_request_openai_client(self, client, **kwargs):
++        self.closed_clients.append(client)
++
++    def _abort_request_openai_client(self, client, **kwargs):
++        self.aborted.append(client)
++
++    def close(self):
++        self.closed = True
++
++
++class Transport:
++    lilith_runtime_attested = True
++    _closed = False
++    def __init__(self):
++        self.frames = []
++        self.on_frame = lambda frame: None
++    def write(self, frame):
++        self.frames.append(copy.deepcopy(frame))
++        self.on_frame(frame)
++        return True
++
++
++@pytest.fixture
++def setup(monkeypatch):
++    assert daily._active is None
++    monkeypatch.setattr(daily, "_claims", {key: set() for key in daily._claims})
++    monkeypatch.setattr(daily, "_native_authority", lambda: True)
++    monkeypatch.setattr("socket.create_connection", MagicMock(side_effect=AssertionError("no network")))
++    for name in ("assert_scoped_identity_prompt", "assert_scoped_identity_provider_request",
++                 "assert_scoped_identity_request_messages", "enforce_scoped_turn_identity"):
++        monkeypatch.setattr(identity_policy, name, lambda *args, **kwargs: None)
++    monkeypatch.setattr(identity_policy, "policy_for_agent", lambda agent: agent._identity_policy)
++    agent, transport = FakeAgent(), Transport()
++    monkeypatch.setattr(daily, "_make_agent", lambda task: agent)
++    import model_tools
++    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kwargs: [SCHEMA])
++    control = {"approve": True, "handler_calls": 0}
++    def handler(name, args, **kwargs):
++        control["handler_calls"] += 1
++        assert name == "lilith_leave_note"
++        if control["approve"]:
++            return json.dumps(bridge.request_note(args), ensure_ascii=False)
++        return json.dumps({"status": "failed", "code": "approval_denied", "artifact": None})
++    monkeypatch.setattr(model_tools, "handle_function_call", handler)
++    transport.on_frame = lambda frame: daily.complete({"scope": frame["params"]["payload"]["scope"],
++        "result": receipt(frame["params"]["payload"]["scope"])}, transport)
++    yield agent, transport, control
++    if daily._active is not None:
++        daily._abort(daily._active)
++        assert daily._active.finished.wait(3)
++
++
++def invoke(transport, value=None):
++    return server.dispatch({"jsonrpc": "2.0", "id": "daily-rpc", "method": "lilith.daily_note.evaluate",
++                           "params": {"scope": value or scope(), "locale": "zh-TW"}}, transport=transport)
++
++
++def test_unsupported_native_route_returns_exact_no_effect_code_without_provider_dispatch(setup, monkeypatch):
++    agent, transport, control = setup
++    monkeypatch.setattr(daily, "_make_agent", NATIVE_FACTORY)
++    monkeypatch.setattr(daily, "_config_proof", lambda: ("fixture", "A" * 64))
++    monkeypatch.setattr(server, "_load_cfg", lambda: {"model": {"provider": "openrouter", "default": "fixture"}})
++    outcome = invoke(transport)
++    assert outcome["result"]["status"] == "no_effect"
++    assert outcome["result"]["code"] == "daily.unsupported_route"
++    assert not agent.calls and not transport.frames and control["handler_calls"] == 0
++
++
++@pytest.mark.parametrize("module", ["run_agent", "model_tools"])
++def test_incomplete_native_bootstrap_does_not_import_or_dispatch(setup, monkeypatch, module):
++    agent, transport, control = setup
++    monkeypatch.setitem(sys.modules, module, None)
++    outcome = invoke(transport)["result"]
++    assert outcome["status"] == "no_effect" and outcome["code"] == "daily.native_not_ready"
++    assert not agent.calls and not transport.frames and control["handler_calls"] == 0
++
++
++def test_fresh_python_daily_request_does_not_bootstrap_agent_plugins_or_profile(tmp_path):
++    program = r'''
++import builtins, json, sys, uuid
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++from tui_gateway import daily_note as daily
++assert "run_agent" not in sys.modules and "model_tools" not in sys.modules
++root = Path(__import__("os").environ["HERMES_HOME"])
++before = {str(p.relative_to(root)): p.read_bytes() if p.is_file() else None for p in root.rglob("*")}
++original = builtins.__import__
++def denied(name, *args, **kwargs):
++    if name in {"run_agent", "model_tools", "hermes_cli.plugins", "tools.approval"}:
++        raise AssertionError("cold daily must not import side-effect subsystems")
++    return original(name, *args, **kwargs)
++builtins.__import__ = denied
++daily._native_authority = lambda: True
++value = {"profile_id": "local", **{k: uuid.uuid4().hex for k in daily.GUID_FIELDS},
++    "expires_at_utc": (datetime.now(timezone.utc)+timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%S.%f")+"0+00:00"}
++class Transport:
++    lilith_runtime_attested = True
++    _closed = False
++    def write(self, frame): raise AssertionError("must not emit")
++result = daily.evaluate({"scope": value, "locale": "zh-TW"}, Transport())
++assert result["status"] == "no_effect" and result["code"] == "daily.native_not_ready"
++assert daily.evaluate({"scope": value, "locale": "zh-TW"}, Transport())["status"] == "unknown"
++assert "run_agent" not in sys.modules and "model_tools" not in sys.modules
++assert {str(p.relative_to(root)): p.read_bytes() if p.is_file() else None for p in root.rglob("*")} == before
++print(json.dumps({"status": result["status"], "code": result["code"], "no_profile_writes": True}))
++'''
++    environment = dict(os.environ, HERMES_HOME=str(tmp_path))
++    completed = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True,
++        timeout=20, env=environment)
++    assert completed.returncode == 0, completed.stderr
++    assert json.loads(completed.stdout)["code"] == "daily.native_not_ready"
++
++
++@pytest.mark.parametrize("provider", ["deepseek", "gemini"])
++def test_one_native_provider_request_and_exact_game_receipt(setup, monkeypatch, provider):
++    _, transport, control = setup
++    agent = FakeAgent(provider)
++    monkeypatch.setattr(daily, "_make_agent", lambda task: agent)
++    result = invoke(transport)["result"]
++    assert result["status"] == "completed" and result["result"]["status"] == "delivered"
++    assert len(agent.calls) == control["handler_calls"] == len(transport.frames) == 1
++    assert agent.calls[0]["tools"] == [SCHEMA]
++    assert agent.calls[0]["parallel_tool_calls"] is False
++    assert agent.closed and not agent.run_conversation.called
++    assert daily._daily_context.get() is None and daily._active is None
++
++
++@pytest.mark.parametrize("field", sorted(daily.SCOPE_FIELDS))
++def test_scope_exact_fields_reject_missing_before_any_model(setup, field):
++    agent, transport, _ = setup
++    value = scope()
++    del value[field]
++    assert "error" in invoke(transport, value)
++    assert not agent.calls and not transport.frames
++
++
++@pytest.mark.parametrize("change", ["unknown", "upper_guid", "empty_guid", "foreign_profile", "local_offset", "expired", "long"])
++def test_reject_invalid_scope_authority(setup, change):
++    agent, transport, _ = setup
++    value = scope()
++    if change == "unknown": value["path"] = "forbidden"
++    elif change == "upper_guid": value["operation_id"] = "A" * 32
++    elif change == "empty_guid": value["lease_id"] = "0" * 32
++    elif change == "foreign_profile": value["profile_id"] = "other"
++    elif change == "local_offset": value["expires_at_utc"] = value["expires_at_utc"].replace("+00:00", "+08:00")
++    elif change == "expired": value = scope(-1)
++    elif change == "long": value = scope(120)
++    assert "error" in invoke(transport, value)
++    assert not agent.calls and not transport.frames
++
++
++def test_workbench_transport_cannot_enter_daily(setup):
++    agent, transport, _ = setup
++    transport.lilith_runtime_attested = False
++    assert "error" in invoke(transport)
++    assert not agent.calls
++
++
++@pytest.mark.parametrize("which", ["attempt_id", "delivery_id", "operation_id", "lease_id"])
++def test_independent_identity_tombstones_burn_new_partner(setup, which):
++    agent, transport, _ = setup
++    original = scope()
++    assert invoke(transport, original)["result"]["status"] == "completed"
++    replay = scope()
++    replay[which] = original[which]
++    assert invoke(transport, replay)["result"]["status"] == "unknown"
++    replay[which] = uuid.uuid4().hex
++    assert invoke(transport, replay)["result"]["status"] == "unknown"
++    assert len(agent.calls) == 1
++
++
++@pytest.mark.parametrize("mode", ["silent", "status", "many", "foreign", "extra_id", "duplicate_key", "wrong_locale", "oversize"])
++def test_model_cannot_issue_extra_tools_or_host_metadata(setup, mode):
++    agent, transport, control = setup
++    call = agent.tool_calls[0]
++    if mode == "silent": agent.tool_calls = []
++    elif mode == "status": call.function.arguments = json.dumps({"action": "status", "locale": "zh-TW"})
++    elif mode == "many": agent.tool_calls.append(copy.deepcopy(call))
++    elif mode == "foreign": call.function.name = "terminal"
++    elif mode == "extra_id": call.function.arguments = json.dumps({**ARGS, "delivery_id": uuid.uuid4().hex})
++    elif mode == "duplicate_key": call.function.arguments = '{"action":"deliver","action":"status","locale":"zh-TW"}'
++    elif mode == "wrong_locale": call.function.arguments = json.dumps({**ARGS, "locale": "en"})
++    elif mode == "oversize": call.function.arguments = json.dumps({**ARGS, "text": "x" * 1201})
++    result = invoke(transport)["result"]
++    assert result["status"] == "no_effect" and result["result"] is None
++    assert not transport.frames and control["handler_calls"] == 0 and len(agent.calls) == 1
++
++
++def test_native_approval_denial_has_no_event_and_no_second_model(setup):
++    agent, transport, control = setup
++    control["approve"] = False
++    result = invoke(transport)["result"]
++    assert result["status"] == "no_effect" and result["result"] is None
++    assert control["handler_calls"] == len(agent.calls) == 1 and not transport.frames
++
++
++def test_handler_json_claim_is_not_receipt_evidence(setup, monkeypatch):
++    agent, transport, _ = setup
++    import model_tools
++    monkeypatch.setattr(model_tools, "handle_function_call", lambda *args, **kwargs: json.dumps({"status": "delivered"}))
++    result = invoke(transport)["result"]
++    assert result["status"] == "no_effect" and result["result"] is None and not transport.frames
++
++
++@pytest.mark.parametrize("field", sorted(daily.SCOPE_FIELDS))
++def test_completion_rejects_sibling_scope(setup, field):
++    _, transport, _ = setup
++    acks = []
++    def wrong_then_right(frame):
++        original = frame["params"]["payload"]["scope"]
++        wrong = dict(original)
++        wrong[field] = ("other" if field == "profile_id" else
++            timestamp(datetime.now(timezone.utc) + timedelta(seconds=29)) if field == "expires_at_utc" else uuid.uuid4().hex)
++        try:
++            acks.append(daily.complete({"scope": wrong, "result": receipt(wrong)}, transport)["accepted"])
++        except Exception:
++            acks.append(False)
++        daily.complete({"scope": original, "result": receipt(original)}, transport)
++    transport.on_frame = wrong_then_right
++    assert invoke(transport)["result"]["status"] == "completed"
++    assert acks == [False]
++
++
++def test_foreign_transport_and_forged_completion_time_rejected(setup):
++    _, transport, _ = setup
++    acks = []
++    def test_then_complete(frame):
++        value = frame["params"]["payload"]["scope"]
++        acks.append(daily.complete({"scope": value, "result": receipt(value)}, Transport())["accepted"])
++        for delta in (-120, 120):
++            result = receipt(value)
++            result["artifact"]["completed_at_utc"] = timestamp(datetime.now(timezone.utc) + timedelta(seconds=delta))
++            acks.append(daily.complete({"scope": value, "result": result}, transport)["accepted"])
++        daily.complete({"scope": value, "result": receipt(value)}, transport)
++    transport.on_frame = test_then_complete
++    assert invoke(transport)["result"]["status"] == "completed" and acks == [False] * 3
++
++
++def test_cancel_overtaking_evaluation_tombstones_scope(setup):
++    agent, transport, _ = setup
++    value = scope()
++    assert daily.cancel({"scope": value}, transport)["accepted"] is False
++    assert invoke(transport, value)["result"]["status"] == "unknown"
++    assert not agent.calls
++
++
++def test_cancelled_stuck_provider_retains_single_slot_and_never_late_emits(setup):
++    agent, transport, _ = setup
++    entered, release = threading.Event(), threading.Event()
++    def block():
++        entered.set()
++        assert release.wait(5)
++    agent.on_request = block
++    value, results = scope(), []
++    worker = threading.Thread(target=lambda: results.append(invoke(transport, value)))
++    worker.start()
++    assert entered.wait(3)
++    pending = daily._active
++    assert daily.cancel({"scope": value}, transport)["accepted"] is True
++    worker.join(3)
++    assert not worker.is_alive() and results[0]["result"]["status"] == "unknown"
++    busy = invoke(transport)["result"]
++    assert busy["status"] == "no_effect" and busy["code"] == "daily.busy"
++    release.set()
++    assert pending.finished.wait(3)
++    assert not transport.frames and len(agent.calls) == 1
++
++
++def test_event_then_cancel_is_unknown_never_no_effect(setup):
++    agent, transport, _ = setup
++    transport.on_frame = lambda frame: daily.cancel({"scope": frame["params"]["payload"]["scope"]}, transport)
++    result = invoke(transport)["result"]
++    assert result["status"] == "unknown" and result["result"] is None
++    assert len(transport.frames) == len(agent.calls) == 1
++
++
++def test_event_write_exception_is_unknown(setup):
++    _, transport, _ = setup
++    def fail(frame): raise OSError("fixture transport write uncertainty")
++    transport.on_frame = fail
++    assert invoke(transport)["result"]["status"] == "unknown"
++
++
++def test_current_native_route_drift_drops_provider_result(setup):
++    agent, transport, _ = setup
++    agent.on_request = lambda: setattr(agent, "model", "changed")
++    assert invoke(transport)["result"]["status"] == "no_effect"
++    assert not transport.frames
++
++
++def test_task_context_cannot_mutate_approved_arguments_or_reenter(setup, monkeypatch):
++    _, transport, _ = setup
++    import model_tools
++    rejected = []
++    def handler(name, args, **kwargs):
++        with pytest.raises(Exception): bridge.request_note({**args, "text": "changed"})
++        result = bridge.request_note(args)
++        with pytest.raises(Exception): bridge.request_note(args)
++        rejected.append(True)
++        return json.dumps(result)
++    monkeypatch.setattr(model_tools, "handle_function_call", handler)
++    assert invoke(transport)["result"]["status"] == "completed"
++    assert rejected == [True] and len(transport.frames) == 1
++
++
++def test_missing_registry_entry_cannot_generate(setup, monkeypatch):
++    agent, transport, _ = setup
++    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kwargs: [])
++    assert invoke(transport)["result"]["status"] == "no_effect" and not agent.calls
++
++
++def test_real_registry_dispatch_and_native_manual_approval_denies_without_event(setup, monkeypatch):
++    agent, transport, _ = setup
++    import model_tools
++    from tools.registry import registry
++    from tools import approval
++    # Restore the true dispatcher. The registered plugin callback calls the
++    # same native approval and bridge functions as the shipped image plugin.
++    monkeypatch.undo()
++    monkeypatch.setattr(daily, "_claims", {key: set() for key in daily._claims})
++    monkeypatch.setattr(daily, "_native_authority", lambda: True)
++    monkeypatch.setattr(daily, "_make_agent", lambda task: agent)
++    monkeypatch.setattr(identity_policy, "enforce_scoped_turn_identity", lambda *a, **k: None)
++    for name in ("assert_scoped_identity_prompt", "assert_scoped_identity_provider_request", "assert_scoped_identity_request_messages"):
++        monkeypatch.setattr(identity_policy, name, lambda *a, **k: None)
++    monkeypatch.setattr(identity_policy, "policy_for_agent", lambda value: value._identity_policy)
++    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kwargs: [SCHEMA])
++    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
++    monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: False)
++    monkeypatch.setattr(approval, "is_approved", lambda *args: False)
++    monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
++    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
++    observed = []
++    def native_handler(args, **kwargs):
++        decision = approval.request_tool_approval("lilith_leave_note", "Save one image note", rule_key="lilith_leave_note:deliver")
++        observed.append(decision)
++        if decision.get("approved") is not True:
++            return json.dumps({"status": "failed", "code": "approval_denied"})
++        return json.dumps(bridge.request_note(args))
++    registry.register(name="lilith_leave_note", toolset="lilith_leave_note", schema=SCHEMA["function"], handler=native_handler)
++    result = invoke(transport)["result"]
++    assert observed and observed[0]["status"] == "approval_required"
++    assert result["status"] == "no_effect" and not transport.frames and len(agent.calls) == 1
++
++
++@pytest.mark.parametrize("provider", ["gemini", "deepseek"])
++@pytest.mark.parametrize("status_code", [200, 429, 500])
++def test_native_http_transport_one_attempt_and_real_tool_schema(setup, monkeypatch, provider, status_code):
++    import httpx
++    from agent.gemini_native_adapter import GeminiNativeClient
++    from openai import OpenAI
++    _, transport, _ = setup
++    agent = FakeAgent(provider)
++    monkeypatch.setattr(daily, "_make_agent", lambda task: agent)
++    physical = []
++    def wire(request):
++        physical.append(request)
++        if status_code != 200:
++            return httpx.Response(status_code, json={"error": {"message": "fixture unavailable"}})
++        if provider == "gemini":
++            payload = {"candidates": [{"content": {"role": "model", "parts": [
++                {"functionCall": {"name": "lilith_leave_note", "args": ARGS}}]}, "finishReason": "STOP"}]}
++        else:
++            payload = {"id": "fixture", "object": "chat.completion", "created": 1, "model": agent.model,
++                "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {"role": "assistant",
++                    "content": None, "tool_calls": [{"id": "fixture-tool", "type": "function", "function": {
++                        "name": "lilith_leave_note", "arguments": json.dumps(ARGS)}}]}}]}
++        return httpx.Response(200, json=payload)
++    http = httpx.Client(transport=httpx.MockTransport(wire))
++    client = (GeminiNativeClient(api_key=agent.api_key, base_url=agent.base_url, http_client=http)
++        if provider == "gemini" else OpenAI(api_key=agent.api_key, base_url=agent.base_url, http_client=http, max_retries=0))
++    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **kwargs: client)
++    try:
++        result = invoke(transport)["result"]
++        assert result["status"] == ("completed" if status_code == 200 else "no_effect")
++        assert len(physical) == 1
++        body = json.loads(physical[0].content)
++        assert "lilith_leave_note" in json.dumps(body["tools"])
++        assert "SOUL" in physical[0].content.decode() and "PERSONA" in physical[0].content.decode()
++        assert "goal_id" not in physical[0].content.decode()
++    finally:
++        client.close()
++
++
++def test_config_and_toolset_change_after_model_never_enters_handler(setup, monkeypatch):
++    agent, transport, control = setup
++    proof = ["config-a"]
++    monkeypatch.setattr(daily, "_config_proof", lambda: proof[0])
++    def build(task):
++        task.config_proof = proof[0]
++        return agent
++    monkeypatch.setattr(daily, "_make_agent", build)
++    agent.on_request = lambda: proof.__setitem__(0, "config-b")
++    assert invoke(transport)["result"]["status"] == "no_effect"
++    assert not transport.frames and not control["handler_calls"]
++
++
++def test_capacity_exhaustion_never_evicts_or_calls_provider(setup, monkeypatch):
++    agent, transport, _ = setup
++    monkeypatch.setattr(daily, "MAX_CLAIMS", 1)
++    assert invoke(transport)["result"]["status"] == "completed"
++    for _ in range(3):
++        assert invoke(transport)["result"]["status"] == "unknown"
++    assert len(agent.calls) == 1 and all(len(values) == 1 for values in daily._claims.values())
++
++
++def test_deadline_cannot_wait_for_wedged_close_or_release_worker_early(setup, monkeypatch):
++    agent, transport, _ = setup
++    release, closing = threading.Event(), threading.Event()
++    agent.tool_calls = []
++    def close():
++        closing.set()
++        assert release.wait(4)
++    monkeypatch.setattr(agent, "close", close)
++    started = time.monotonic()
++    result = invoke(transport, scope(0.1))["result"]
++    assert time.monotonic() - started < 2
++    assert result["status"] == "unknown" and closing.is_set()
++    pending = daily._active
++    assert pending is not None
++    release.set()
++    assert pending.finished.wait(3) and not transport.frames
++
++
++def test_completion_accepts_truthful_already_emitted_receipt_after_cancel(setup):
++    _, transport, _ = setup
++    def stop_and_receipt(frame):
++        value = frame["params"]["payload"]["scope"]
++        assert daily.cancel({"scope": value}, transport)["accepted"]
++        assert daily.complete({"scope": value, "result": receipt(value)}, transport)["accepted"]
++    transport.on_frame = stop_and_receipt
++    result = invoke(transport)["result"]
++    assert result["status"] == "completed" and result["result"]["status"] == "delivered"
+diff --git a/tui_gateway/daily_note.py b/tui_gateway/daily_note.py
+new file mode 100644
+index 0000000..e8afc72
+--- /dev/null
++++ b/tui_gateway/daily_note.py
+@@ -0,0 +1,471 @@
++"""Runtime-owned, one-request daily note task; never a player conversation.
++
++The dedicated scope is host metadata, not model arguments. Only the registered
++image-note handler may emit one event. Native approval is unchanged. An emitted
++event (including a failed write) permanently removes no-effect authority.
++"""
++from __future__ import annotations
++
++import contextvars
++import copy
++import hashlib
++import json
++import re
++import sys
++import threading
++import time
++from dataclasses import dataclass, field
++from datetime import datetime, timezone
++
++from tui_gateway.lilith_host_bridge import LilithHostAuthorityError, LilithHostProtocolError
++from tui_gateway.lilith_noteinbox_bridge import normalize_note_arguments, normalize_note_result
++
++SCOPE_FIELDS = frozenset({"profile_id", "goal_id", "attempt_id", "delivery_id",
++    "operation_id", "runtime_generation", "game_epoch", "lease_id", "expires_at_utc"})
++GUID_FIELDS = SCOPE_FIELDS - {"profile_id", "expires_at_utc"}
++MAX_SECONDS = 60.0
++MAX_CLAIMS = 4096
++_ID = re.compile(r"[0-9a-f]{32}\Z")
++_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}(?:Z|\+00:00)\Z")
++_LOCALES = frozenset({"zh-TW", "zh-CN", "ja", "en"})
++_daily_context = contextvars.ContextVar("lilith_daily_note_capability", default=None)
++_lock = threading.RLock()
++_claims = {key: set() for key in ("attempt_id", "delivery_id", "operation_id", "lease_id")}
++_active = None
++
++
++def _utc_now():
++    return datetime.now(timezone.utc)
++
++
++def _timestamp(value):
++    if not isinstance(value, str) or not _UTC.fullmatch(value):
++        raise LilithHostProtocolError("daily timestamp must be canonical UTC")
++    try:
++        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
++    except ValueError as exc:
++        raise LilithHostProtocolError("daily timestamp is invalid") from exc
++    if parsed.year in {1, 9999}:
++        raise LilithHostProtocolError("daily timestamp is not finite")
++    return parsed
++
++
++def normalize_scope(value):
++    if not isinstance(value, dict) or set(value) != SCOPE_FIELDS or value["profile_id"] != "local":
++        raise LilithHostProtocolError("daily scope shape was rejected")
++    if any(not isinstance(value[k], str) or not _ID.fullmatch(value[k]) or
++           value[k] == "0" * 32 for k in GUID_FIELDS):
++        raise LilithHostProtocolError("daily identity was rejected")
++    _timestamp(value["expires_at_utc"])
++    return dict(value)
++
++
++def _require_transport(transport):
++    if (transport is None or getattr(transport, "lilith_runtime_attested", False) is not True
++            or getattr(transport, "_closed", False)):
++        raise LilithHostAuthorityError("daily task requires the attested Runtime transport")
++
++
++def _native_authority():
++    from agent.identity_policy import identity_lock_required_by_host, native_authority_dispatch_block_state
++    return identity_lock_required_by_host() and native_authority_dispatch_block_state() is None
++
++
++def _config_proof():
++    from hermes_cli.config import get_config_path
++    from tui_gateway import server
++    if server._native_model_default_transition_pending():
++        raise LilithHostAuthorityError("daily native model transition is pending")
++    path = get_config_path()
++    return str(path), hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++@dataclass
++class _Task:
++    scope: dict
++    locale: str
++    transport: object
++    deadline: float
++    cancelled: threading.Event = field(default_factory=threading.Event)
++    finished: threading.Event = field(default_factory=threading.Event)
++    completion: threading.Event = field(default_factory=threading.Event)
++    emitted: bool = False
++    emitted_at: datetime | None = None
++    tool_claimed: bool = False
++    arguments: dict | None = None
++    result: dict | None = None
++    code: str = "daily.no_tool"
++    agent: object = None
++    proof: object = None
++    owned_client: object = None
++    config_proof: object = None
++
++    def current(self):
++        _require_transport(self.transport)
++        if self.cancelled.is_set() or time.monotonic() >= self.deadline or not _native_authority():
++            raise LilithHostAuthorityError("daily task authority was revoked")
++        with _lock:
++            if _active is not self or self.finished.is_set():
++                raise LilithHostAuthorityError("daily task is no longer current")
++        if self.config_proof is not None and _config_proof() != self.config_proof:
++            raise LilithHostAuthorityError("daily native configuration changed")
++        if self.agent is not None:
++            from agent.identity_policy import enforce_scoped_turn_identity
++            enforce_scoped_turn_identity(self.agent)
++            if self.proof is not None and _agent_proof(self.agent) != self.proof:
++                raise LilithHostAuthorityError("daily native route changed")
++
++
++def _claim(scope):
++    duplicate = any(scope[key] in values for key, values in _claims.items())
++    full = any(scope[key] not in values and len(values) >= MAX_CLAIMS for key, values in _claims.items())
++    # Burn both sides of mismatched/replayed identities, including rejected busy
++    # requests. Never evict to let a different operation revive one occurrence.
++    for key, values in _claims.items():
++        if len(values) < MAX_CLAIMS:
++            values.add(scope[key])
++    return not (duplicate or full)
++
++
++def _outcome(task, *, unfinished=False):
++    with _lock:
++        if task.result is not None:
++            return {"scope": dict(task.scope), "status": "completed", "code": "daily.receipt",
++                    "result": copy.deepcopy(task.result)}
++        status = "unknown" if task.emitted or unfinished else "no_effect"
++        return {"scope": dict(task.scope), "status": status, "code": task.code, "result": None}
++
++
++def _abort(task):
++    # Revocation is synchronous; native socket cleanup must not extend the RPC
++    # deadline or release the global worker slot while the worker still runs.
++    task.cancelled.set()
++    task.completion.set()
++    def close_request():
++        try:
++            with _lock:
++                client, agent = task.owned_client, task.agent
++            if client is not None and agent is not None:
++                agent._abort_request_openai_client(client, reason="daily_note_cancelled")
++        except Exception:
++            pass
++    threading.Thread(target=close_request, daemon=True, name="daily-note-abort").start()
++
++
++def evaluate(params, transport):
++    global _active
++    if not isinstance(params, dict) or set(params) != {"scope", "locale"}:
++        raise LilithHostProtocolError("daily evaluate shape was rejected")
++    scope = normalize_scope(params["scope"])
++    locale = params["locale"]
++    if not isinstance(locale, str) or locale not in _LOCALES:
++        raise LilithHostProtocolError("daily locale was rejected")
++    _require_transport(transport)
++    seconds = (_timestamp(scope["expires_at_utc"]) - _utc_now()).total_seconds()
++    if not 0 < seconds <= MAX_SECONDS or not _native_authority():
++        raise LilithHostAuthorityError("daily task is expired or native authority is unavailable")
++    task = _Task(scope, locale, transport, time.monotonic() + min(seconds, MAX_SECONDS))
++    with _lock:
++        if not _claim(scope):
++            task.code = "daily.duplicate_or_capacity"
++            # A previous evaluation could have emitted. Never claim no effect.
++            return _outcome(task, unfinished=True)
++        if _active is not None:
++            task.code = "daily.busy"
++            return _outcome(task)
++        _active = task
++
++    def worker():
++        global _active
++        from tui_gateway.transport import bind_transport, reset_transport
++        token = bind_transport(transport)
++        capability = _daily_context.set(task)
++        try:
++            task.current()
++            _run_native_task(task)
++        except Exception:
++            # Never return exception text: it may contain credentials or note
++            # content. Whether dispatch occurred is a native control-flow fact.
++            if task.code == "daily.no_tool":
++                task.code = "daily.task_failed"
++        finally:
++            try:
++                _close_agent(task)
++            finally:
++                _daily_context.reset(capability)
++                reset_transport(token)
++                with _lock:
++                    task.arguments = None
++                    task.agent = None
++                    task.proof = None
++                    task.config_proof = None
++                    task.owned_client = None
++                    task.finished.set()
++                    if _active is task:
++                        _active = None
++    threading.Thread(target=worker, daemon=True, name="lilith-daily-note").start()
++    while not task.finished.wait(min(0.05, max(0.0, task.deadline - time.monotonic()))):
++        if task.cancelled.is_set() or time.monotonic() >= task.deadline:
++            task.code = "daily.cancelled_or_timeout"
++            _abort(task)
++            return _outcome(task, unfinished=True)
++        if not _native_authority() or getattr(transport, "_closed", False):
++            task.code = "daily.authority_lost"
++            _abort(task)
++            return _outcome(task, unfinished=True)
++    return _outcome(task)
++
++
++def has_daily_context():
++    return _daily_context.get() is not None
++
++
++def request_note(arguments):
++    """Called only by the actual registered note plugin after native approval."""
++    task = _daily_context.get()
++    if task is None:
++        raise LilithHostAuthorityError("no daily note capability")
++    normalized = normalize_note_arguments(arguments)
++    with _lock:
++        task.current()
++        if normalized != task.arguments or task.tool_claimed:
++            raise LilithHostAuthorityError("daily tool payload or once-only claim changed")
++        task.tool_claimed = True
++        # Seal BEFORE writing to the transport: a write exception is ambiguous.
++        task.emitted = True
++        task.emitted_at = _utc_now()
++    from tui_gateway import server
++    if server._emit("lilith.daily_note.tool", task.scope["attempt_id"],
++                    {"scope": dict(task.scope), "arguments": dict(normalized)}) is False:
++        raise LilithHostAuthorityError("daily event transport unavailable")
++    while not task.completion.wait(min(0.05, max(0.0, task.deadline - time.monotonic()))):
++        task.current()
++    with _lock:
++        if task.result is not None:
++            return copy.deepcopy(task.result)
++    raise LilithHostAuthorityError("daily completion unavailable")
++
++
++def complete(params, transport):
++    if not isinstance(params, dict) or set(params) != {"scope", "result"}:
++        raise LilithHostProtocolError("daily completion shape was rejected")
++    scope = normalize_scope(params["scope"])
++    _require_transport(transport)
++    result = normalize_note_result(params["result"], scope["operation_id"], scope["delivery_id"])
++    with _lock:
++        task = _active
++        accepted = bool(task is not None and task.scope == scope and task.transport is transport and task.emitted)
++        if accepted and result["artifact"] is not None:
++            completed = _timestamp(result["artifact"]["completed_at_utc"])
++            accepted = task.emitted_at <= completed <= _utc_now()
++        if accepted:
++            if task.result is not None:
++                accepted = task.result == result
++            else:
++                task.result = copy.deepcopy(result)
++                task.arguments = None
++                task.completion.set()
++    return {"scope": scope, "accepted": accepted}
++
++
++def cancel(params, transport):
++    if not isinstance(params, dict) or set(params) != {"scope"}:
++        raise LilithHostProtocolError("daily cancellation shape was rejected")
++    scope = normalize_scope(params["scope"])
++    _require_transport(transport)
++    with _lock:
++        task = _active
++        accepted = bool(task is not None and task.scope == scope and task.transport is transport)
++        # A cancel may overtake evaluation on the request pool. Tombstone it.
++        _claim(scope)
++        if accepted:
++            task.code = "daily.cancelled"
++            task.cancelled.set()
++            task.completion.set()
++    if accepted:
++        _abort(task)
++    return {"scope": scope, "accepted": accepted}
++
++
++def _agent_proof(agent):
++    keys = ("provider", "requested_provider", "model", "base_url", "api_mode", "api_key",
++            "auth_mode", "_client_kwargs", "request_overrides")
++    value = {key: getattr(agent, key, None) for key in keys}
++    value.update({key: val for key, val in vars(agent).items() if key.startswith("_identity_")})
++    return copy.deepcopy(value)
++
++
++def _make_agent(task):
++    from tui_gateway import server
++    from hermes_cli.runtime_provider import resolve_isolated_static_runtime
++    from hermes_cli.tools_config import _get_platform_tools
++    from run_agent import AIAgent
++    task.config_proof = _config_proof()
++    config = server._load_cfg()
++    model_config = config.get("model") or {}
++    model, provider = model_config.get("default"), model_config.get("provider")
++    try:
++        runtime = resolve_isolated_static_runtime(config_snapshot=config, requested=provider, target_model=model)
++    except Exception:
++        task.code = "daily.unsupported_route"
++        raise LilithHostAuthorityError("daily native provider mode is unsupported") from None
++    if (runtime.get("api_mode") != "chat_completions" or
++            not isinstance(runtime.get("api_key"), str) or not runtime["api_key"] or
++            runtime.get("provider") in {None, "", "auto", "moa", "copilot-acp"}):
++        task.code = "daily.unsupported_route"
++        raise LilithHostAuthorityError("daily native provider mode is unsupported")
++    # Registry discovery belongs to native startup. Daily initialization may
++    # only inspect its already-loaded registry and current native tool policy.
++    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
++    if "lilith_leave_note" not in enabled:
++        raise LilithHostAuthorityError("daily note tool is disabled by the native profile")
++    agent = AIAgent(model=model, provider=runtime.get("provider"), requested_provider=provider,
++        api_mode=runtime.get("api_mode"), api_key=runtime.get("api_key"), base_url=runtime.get("base_url"),
++        credential_pool=None, fallback_model=None, max_iterations=1, max_tokens=2048,
++        reasoning_config=server._load_reasoning_config(model),
++        enabled_toolsets=["lilith_leave_note"], disabled_toolsets=[], quiet_mode=True, save_trajectories=False,
++        platform="lilith-daily-note", session_id=task.scope["attempt_id"], session_db=None,
++        skip_context_files=True, load_soul_identity=True, skip_memory=True, skip_background_review=True,
++        isolated_request=True)
++    agent._persist_disabled = True
++    agent._session_json_enabled = False
++    agent._end_session_on_close = False
++    agent._skip_mcp_refresh = True
++    agent.compression_enabled = False
++    return agent
++
++
++def _close_agent(task):
++    # No resources are borrowed from the foreground; this is a unique task ID.
++    agent = task.agent
++    if agent is None:
++        return
++    try:
++        agent.close()
++    except Exception:
++        pass
++    from tools.approval import clear_session
++    clear_session(task.scope["attempt_id"])
++
++
++def _strict_json(text):
++    if not isinstance(text, str) or len(text) > 8192:
++        raise LilithHostProtocolError("daily tool arguments were oversized")
++    def pairs(items):
++        result = {}
++        for key, value in items:
++            if key in result:
++                raise ValueError("duplicate tool argument")
++            result[key] = value
++        return result
++    return json.loads(text, object_pairs_hook=pairs, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
++
++
++def _run_native_task(task):
++    # Importing run_agent/model_tools from an entirely cold process performs
++    # normal native dotenv/tool/plugin discovery. Daily must not trigger it.
++    # A fresh agent is supported only after the normal native bootstrap loaded
++    # both modules. This is an explicit unfinished cold-boot integration seam.
++    if (not callable(getattr(sys.modules.get("run_agent"), "AIAgent", None)) or
++            not callable(getattr(sys.modules.get("model_tools"), "handle_function_call", None))):
++        task.code = "daily.native_not_ready"
++        return
++    from agent.identity_policy import (assert_scoped_identity_prompt, assert_scoped_identity_provider_request,
++        assert_scoped_identity_request_messages, policy_for_agent)
++    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
++    from model_tools import get_tool_definitions, handle_function_call
++    from gateway.session_context import set_session_vars, clear_session_vars
++    from tools.approval import set_current_session_key, reset_current_session_key
++    from hermes_cli.plugins import set_thread_tool_whitelist, clear_thread_tool_whitelist
++
++    agent = _make_agent(task)
++    task.agent = agent
++    task.proof = _agent_proof(agent)
++    task.current()
++    if not policy_for_agent(agent).enabled or agent.api_mode != "chat_completions":
++        raise LilithHostAuthorityError("daily strict identity is unavailable")
++    definitions = get_tool_definitions(enabled_toolsets=agent.enabled_toolsets,
++        disabled_toolsets=agent.disabled_toolsets, quiet_mode=True, skip_tool_search_assembly=True)
++    schemas = [copy.deepcopy(item) for item in definitions if item.get("function", {}).get("name") == "lilith_leave_note"]
++    if len(schemas) != 1:
++        raise LilithHostAuthorityError("daily native tool registry is unavailable")
++    soul, persona = agent._identity_soul_content, agent._identity_personality_prompt
++    if not isinstance(soul, str) or not soul.strip() or not isinstance(persona, str) or not persona.strip():
++        raise LilithHostAuthorityError("daily native persona is unavailable")
++    system = soul.strip() + "\n\n" + persona.strip()
++    assert_scoped_identity_prompt(agent, system, label="daily note identity")
++    messages = [{"role": "system", "content": system}, {"role": "user", "content":
++        "This is an isolated daily note opportunity, not a player message. If appropriate, "
++        "use lilith_leave_note once to write a short natural personal note in " + task.locale +
++        ". Use only known facts; do not invent recent events or claim delivery. You may remain silent. "
++        "There is no follow-up model turn. Only the actual tool receipt can prove delivery."}]
++    request_agent = copy.copy(agent)
++    request_agent.request_overrides = copy.deepcopy(agent.request_overrides)
++    request_agent._client_kwargs = {**agent._client_kwargs, "max_retries": 0}
++    request_agent._ephemeral_max_output_tokens = None
++    request_agent.max_tokens = 2048
++    api_kwargs = request_agent._build_api_kwargs(messages, tools_for_api=schemas)
++    api_kwargs.update(stream=False, timeout=max(0.001, task.deadline - time.monotonic()), parallel_tool_calls=False)
++    if agent.provider == "openrouter" or agent._is_openrouter_url():
++        api_kwargs.setdefault("extra_body", {}).setdefault("provider", {})["allow_fallbacks"] = False
++    assert_scoped_identity_request_messages(agent, messages, expected_system_prompt=system)
++    assert_scoped_identity_provider_request(agent, api_kwargs, expected_system_prompt=system, label="daily provider request")
++
++    def make_client(reason, *, kind="openai"):
++        task.current()
++        if kind != "openai":
++            raise LilithHostAuthorityError("unsupported daily transport")
++        client = request_agent._create_request_openai_client(reason=reason, api_kwargs=api_kwargs)
++        with _lock:
++            task.owned_client = client
++        task.current()
++        return client
++
++    task.current()
++    response = _dispatch_nonstreaming_api_request(request_agent, api_kwargs, make_client=make_client, physical_attempt_limit=1)
++    task.current()
++    choices = getattr(response, "choices", None)
++    if not isinstance(choices, list) or len(choices) != 1:
++        raise LilithHostProtocolError("daily provider choice was rejected")
++    calls = getattr(choices[0].message, "tool_calls", None)
++    if not calls:
++        task.code = "daily.model_silent"
++        return
++    if not isinstance(calls, list) or len(calls) != 1 or calls[0].function.name != "lilith_leave_note":
++        raise LilithHostProtocolError("daily task permits one registered note tool only")
++    arguments = normalize_note_arguments(_strict_json(calls[0].function.arguments))
++    if arguments["locale"] != task.locale:
++        raise LilithHostProtocolError("daily model cannot change the host locale")
++    # A new evaluation never knows a previous receipt; reconciliation belongs
++    # to Runtime and never invokes another model/provider request.
++    if arguments["action"] != "deliver":
++        task.code = "daily.no_delivery_requested"
++        return
++    task.arguments = arguments
++    context = set_session_vars(session_key=task.scope["attempt_id"], session_id=task.scope["attempt_id"],
++        source="lilith-daily-note", cwd="", ui_session_id="", cron_session="")
++    approval = set_current_session_key(task.scope["attempt_id"])
++    set_thread_tool_whitelist({"lilith_leave_note"}, deny_msg_fmt="Daily note denied tool: {tool_name}")
++    try:
++        task.current()
++        # Keep the true native plugin/approval/middleware path. Its returned
++        # text cannot produce a receipt; only complete() writes task.result.
++        handle_function_call("lilith_leave_note", arguments, task_id=task.scope["attempt_id"],
++            session_id=task.scope["attempt_id"], tool_call_id=str(getattr(calls[0], "id", "")),
++            enabled_toolsets=agent.enabled_toolsets, disabled_toolsets=agent.disabled_toolsets)
++        task.code = "daily.tool_returned"
++    finally:
++        clear_thread_tool_whitelist()
++        reset_current_session_key(approval)
++        clear_session_vars(context)
++
++
++def register(server):
++    for name, callback in (("evaluate", evaluate), ("complete", complete), ("cancel", cancel)):
++        def handler(rid, params, callback=callback):
++            from tui_gateway.lilith_host_bridge import LilithHostBridgeError
++            try:
++                return server._ok(rid, callback(params, server.current_transport()))
++            except LilithHostBridgeError as exc:
++                return server._err(rid, exc.rpc_code, str(exc))
++        server.method("lilith.daily_note." + name)(handler)
+diff --git a/tui_gateway/lilith_noteinbox_bridge.py b/tui_gateway/lilith_noteinbox_bridge.py
+index 6c4bfe7..ce5fe22 100644
+--- a/tui_gateway/lilith_noteinbox_bridge.py
++++ b/tui_gateway/lilith_noteinbox_bridge.py
+@@ -211,6 +211,10 @@ def _expire_locked(now: float) -> None:
+ def request_note(
+     arguments: Any, *, timeout_seconds: float = HOST_REQUEST_TIMEOUT_SECONDS
+ ) -> dict:
++    from tui_gateway import daily_note
++
++    if daily_note.has_daily_context():
++        return daily_note.request_note(arguments)
+     normalized = normalize_note_arguments(arguments)
+     if (
+         type(timeout_seconds) not in (int, float)
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index c2056be..4610867 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2967,6 +2967,10 @@ def _complete_lilith_host_request(rid, params: dict) -> dict:
+     return _ok(rid, result)
+ 
+ 
++from tui_gateway import daily_note as _daily_note_methods
++_daily_note_methods.register(sys.modules[__name__])
++
++
+ def _current_session_steer_authority(
+     session_id: str,
+ ) -> tuple[Transport | None, dict | None]:

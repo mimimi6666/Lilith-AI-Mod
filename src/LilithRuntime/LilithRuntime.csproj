@@ -1,0 +1,63 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>LilithRuntime</AssemblyName>
+    <RootNamespace>LilithRuntime</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="Assets\PlayerSave\**\*"
+          Exclude="Assets\PlayerSave\**\__pycache__\**\*;Assets\PlayerSave\**\*.pyc"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <EmbeddedResource Include="Assets\HermesComponentAuthority.v1.json"
+                      LogicalName="LilithRuntime.HermesComponentAuthority.v1.json" />
+    <None Include="Assets\IdentityPackage\v1\**\*"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="Assets\IdentityPackage\v2\**\*"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="Assets\IdentityPackage\v3\**\*"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="Assets\IdentityPackage\v4\**\*"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="Assets\IdentityPackage\v5\**\*"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="Assets\IdentityPackage\v6\**\*"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="Assets\IdentityPackage\v7\**\*"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="Assets\IdentityPackage\v8\**\*"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="Assets\IdentityPackage\v9\**\*"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="Assets\Plugins\lilith_relationship\**\*"
+          Exclude="Assets\Plugins\lilith_relationship\**\__pycache__\**\*;Assets\Plugins\lilith_relationship\**\*.pyc"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="Assets\Plugins\lilith_leave_note\**\*"
+          Exclude="Assets\Plugins\lilith_leave_note\**\__pycache__\**\*;Assets\Plugins\lilith_leave_note\**\*.pyc"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="Assets\Plugins\lilith_notes\**\*"
+          Exclude="Assets\Plugins\lilith_notes\**\__pycache__\**\*;Assets\Plugins\lilith_notes\**\*.pyc"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\LilithRuntimeContracts\LilithRuntimeContracts.csproj" />
+    <ProjectReference Include="..\LilithRuntimeProviderBridge\LilithRuntimeProviderBridge.csproj" />
+    <Compile Include="..\LilithRuntimeConfiguration\D046GameControlPreferences.cs" Link="Configuration\D046GameControlPreferences.cs" />
+  </ItemGroup>
+</Project>

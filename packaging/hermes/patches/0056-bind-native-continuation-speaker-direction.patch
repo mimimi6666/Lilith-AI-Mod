@@ -1,0 +1,128 @@
+diff --git a/tests/tui_gateway/test_native_assistant_extension.py b/tests/tui_gateway/test_native_assistant_extension.py
+index 3ea54bbaaeeeb6311ed68ffd17761cb22793e23b..3abb5efd98745b08e7c438df685315746129300d 100644
+--- a/tests/tui_gateway/test_native_assistant_extension.py
++++ b/tests/tui_gateway/test_native_assistant_extension.py
+@@ -227,11 +227,18 @@ def test_reply_is_one_model_attempt_one_primary_assistant_and_no_user_row(
+     )
+     assert canonical_perception in sent[0]["content"]
+     assert "A non-empty continuation is required" in sent[0]["content"]
++    assert "preceding utterance from Lilith to the player" in sent[0]["content"]
++    assert "Keep the speaker and addressee fixed" in sent[0]["content"]
++    assert "The player has not replied" in sent[0]["content"]
++    assert "only the player can answer it" in sent[0]["content"]
++    assert "do not answer for the player" in sent[0]["content"]
++    assert "invent the player's response, feelings, or state" in sent[0]["content"]
+     assert '{"text":"the continuation"}' in sent[0]["content"]
+     assert sent[-1]["role"] == "user"
+     assert sent[-1]["content"] == (
+-        "Host control: write the required native continuation now and return "
+-        "exactly one required JSON object with non-empty text."
++        "Host control: Lilith remains the speaker addressing the player, and "
++        "the player has not replied. Write the required native continuation "
++        "now and return exactly one required JSON object with non-empty text."
+     )
+     assert all(
+         canonical_perception not in message.get("content", "")
+@@ -284,6 +291,54 @@ def test_reply_is_one_model_attempt_one_primary_assistant_and_no_user_row(
+     assert not any(item[0] == "message.user" for item in emitted)
+ 
+ 
++def test_native_question_keeps_lilith_as_speaker_and_player_as_addressee():
++    class _Agent:
++        _cached_system_prompt = "You are Lilith."
++        ephemeral_system_prompt = ""
++
++        @staticmethod
++        def _sanitize_api_messages(messages):
++            return messages
++
++        @staticmethod
++        def _drop_thinking_only_and_merge_users(messages):
++            return messages
++
++        @staticmethod
++        def _copy_reasoning_content_for_api(_source, _projected):
++            return None
++
++    perception = _extend_params()["perception"] | {
++        "trigger": "GamePlayRest",
++        "text": "玩得累了嗎？",
++    }
++    messages = server._native_assistant_extension_model_messages(
++        _Agent(),
++        [
++            {
++                "role": "assistant",
++                "content": perception["text"],
++                "display_kind": "native_assistant_event",
++            }
++        ],
++        perception,
++    )
++
++    system = messages[0]["content"]
++    assert "only the player can answer it" in system
++    assert "do not answer for the player" in system
++    assert "Continue Lilith's own concern, invitation, or observation" in system
++    assert messages[-1] == {
++        "role": "user",
++        "content": (
++            "Host control: Lilith remains the speaker addressing the player, "
++            "and the player has not replied. Write the required native "
++            "continuation now and return exactly one required JSON object with "
++            "non-empty text."
++        ),
++    }
++
++
+ def test_fresh_agent_builds_identity_prompt_before_extension_dispatch(
+     extension_session,
+ ):
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 7a3ed2a32a9aa98a2d78c3d20998d6091dd7efe0..ed181728ca9743bce57628b1d0feb31179ff2271 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -14300,14 +14300,22 @@ def _native_assistant_extension_model_messages(
+     )
+     native_instruction = (
+         "You are writing Lilith's required natural continuation after an "
+-        "official line she has just spoken. The native perception below is "
+-        "Lilith's own just-perceived and already-spoken event; it is not a "
+-        "player or user message. A non-empty continuation is required whenever "
+-        "this route is invoked; do not choose silence. Be restrained. Do not "
+-        "repeat or paraphrase the official line. Add only one short, natural "
+-        "follow-up in Lilith's established voice, chosen semantically without "
+-        "mechanical keyword or length rules. Return JSON only, with exactly "
+-        "this field: {\"text\":\"the continuation\"}.\n\n"
++        "official line she has just spoken to the player. The native perception "
++        "below is Lilith's own just-perceived and already-spoken event; its "
++        "text field is the preceding utterance from Lilith to the player, not a "
++        "player or user message. Keep the speaker and addressee fixed: you are "
++        "Lilith, and the player is the person you are addressing. The player "
++        "has not replied. Never treat or answer Lilith's official line as if "
++        "the player said or asked it. If that line asks the player a question, "
++        "only the player can answer it: do not answer for the player, switch "
++        "roles, or invent the player's response, feelings, or state. Continue "
++        "Lilith's own concern, invitation, or observation instead. A non-empty "
++        "continuation is required whenever this route is invoked; do not choose "
++        "silence. Be restrained. Do not repeat or paraphrase the official line. "
++        "Add only one short, natural follow-up in Lilith's established voice, "
++        "chosen semantically without mechanical keyword or length rules. Return "
++        "JSON only, with exactly this field: "
++        "{\"text\":\"the continuation\"}.\n\n"
+         "Canonical host-owned native perception JSON:\n"
+         + canonical_perception
+     )
+@@ -14366,8 +14374,10 @@ def _native_assistant_extension_model_messages(
+         {
+             "role": "user",
+             "content": (
+-                "Host control: write the required native continuation now and "
+-                "return exactly one required JSON object with non-empty text."
++                "Host control: Lilith remains the speaker addressing the player, "
++                "and the player has not replied. Write the required native "
++                "continuation now and return exactly one required JSON object "
++                "with non-empty text."
+             ),
+         }
+     )

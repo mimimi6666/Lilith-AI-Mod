@@ -1,0 +1,675 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index a0336f7..4b8e7b9 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -5416,8 +5416,9 @@ def _retry_same_provider_sync(
+     if frozen_client is not None:
+         retry_client, retry_model = frozen_client
+         effective_provider = resolved_provider
+-    elif task == "vision":
++    elif task in ("vision", "video"):
+         effective_provider, retry_client, retry_model = resolve_vision_provider_client(
++            task=task,
+             provider=resolved_provider,
+             model=final_model,
+             base_url=resolved_base_url,
+@@ -5503,8 +5504,9 @@ async def _retry_same_provider_async(
+     if frozen_client is not None:
+         retry_client, retry_model = frozen_client
+         effective_provider = resolved_provider
+-    elif task == "vision":
++    elif task in ("vision", "video"):
+         effective_provider, retry_client, retry_model = resolve_vision_provider_client(
++            task=task,
+             provider=resolved_provider,
+             model=final_model,
+             base_url=resolved_base_url,
+@@ -7879,6 +7881,7 @@ def resolve_vision_provider_client(
+     api_key: Optional[str] = None,
+     async_mode: bool = False,
+     main_runtime: Optional[Dict[str, Any]] = None,
++    task: str = "vision",
+ ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
+     """Resolve the client actually used for vision tasks.
+ 
+@@ -7887,11 +7890,13 @@ def resolve_vision_provider_client(
+     backends, so users can intentionally force experimental providers. Auto mode
+     stays conservative and only tries vision backends known to work today.
+     """
++    if task not in {"vision", "video"}:
++        raise ValueError("unsupported multimodal auxiliary task")
+     runtime = _refresh_stale_main_runtime_credentials(
+         _normalize_main_runtime(main_runtime)
+     )
+     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
+-        "vision", provider, model, base_url, api_key
++        task, provider, model, base_url, api_key
+     )
+     requested = _normalize_vision_provider(requested)
+ 
+@@ -8680,7 +8685,7 @@ def _capture_frozen_auxiliary_task_client(
+             _normalize_aux_provider(provider),
+             base_url,
+             api_key,
+-            is_vision=task == "vision",
++            is_vision=task in ("vision", "video"),
+         )
+         frozen_headers = _apply_user_default_headers(frozen_headers) or {}
+     headers_payload = json.dumps(
+@@ -8716,7 +8721,7 @@ def _capture_frozen_auxiliary_task_client(
+         base_url=base_url,
+         api_key=api_key,
+         api_mode=api_mode,
+-        is_vision=task == "vision",
++        is_vision=task in ("vision", "video"),
+         default_headers=frozen_headers,
+     )
+     capability = _FrozenAuxiliaryTaskClient(
+@@ -9318,7 +9323,7 @@ _aux_sem_lock = threading.Lock()
+ 
+ def _get_task_max_concurrency(task: Optional[str]) -> Optional[int]:
+     """Return ``auxiliary.<task>.max_concurrency`` as a positive int, or None."""
+-    if not task or task == "vision":
++    if not task or task in ("vision", "video"):
+         # Vision already uses this key for its encode/resize CPU worker pool;
+         # its LLM calls deliberately remain concurrent.
+         return None
+@@ -10402,8 +10407,9 @@ def _call_llm_impl(
+     )
+     if frozen_client is not None:
+         client, final_model = frozen_client
+-    elif task == "vision":
++    elif task in ("vision", "video"):
+         effective_provider, client, final_model = resolve_vision_provider_client(
++            task=task,
+             provider=resolved_provider if resolved_provider != "auto" else provider,
+             model=resolved_model or model,
+             base_url=resolved_base_url or base_url,
+@@ -10427,6 +10433,7 @@ def _call_llm_impl(
+                 resolved_provider,
+             )
+             effective_provider, client, final_model = resolve_vision_provider_client(
++                task=task,
+                 provider="auto",
+                 model=resolved_model,
+                 async_mode=False,
+@@ -10753,7 +10760,7 @@ def _call_llm_impl(
+         )
+         if _is_model_not_found_error(first_err) and _heal_is_nous:
+             healed_model = _refresh_nous_recommended_model(
+-                vision=(task == "vision"), stale_model=kwargs.get("model"))
++                vision=(task in ("vision", "video")), stale_model=kwargs.get("model"))
+             if healed_model and healed_model != kwargs.get("model"):
+                 logger.warning(
+                     "Auxiliary %s: model %r no longer in Nous catalog; "
+@@ -10790,7 +10797,7 @@ def _call_llm_impl(
+                 api_key=resolved_api_key,
+                 api_mode=resolved_api_mode,
+                 main_runtime=main_runtime,
+-                is_vision=(task == "vision"),
++                is_vision=(task in ("vision", "video")),
+             )
+             if refreshed_client is not None:
+                 logger.info(
+@@ -10826,7 +10833,7 @@ def _call_llm_impl(
+                 api_key=resolved_api_key,
+                 api_mode=resolved_api_mode,
+                 main_runtime=main_runtime,
+-                is_vision=(task == "vision"),
++                is_vision=(task in ("vision", "video")),
+             )
+             if refreshed_client is not None:
+                 logger.info("Auxiliary %s: refreshed Nous runtime credentials after 401, retrying",
+@@ -11265,8 +11272,9 @@ async def _async_call_llm_impl(
+     )
+     if frozen_client is not None:
+         client, final_model = frozen_client
+-    elif task == "vision":
++    elif task in ("vision", "video"):
+         effective_provider, client, final_model = resolve_vision_provider_client(
++            task=task,
+             provider=resolved_provider if resolved_provider != "auto" else provider,
+             model=resolved_model or model,
+             base_url=resolved_base_url or base_url,
+@@ -11290,6 +11298,7 @@ async def _async_call_llm_impl(
+                 resolved_provider,
+             )
+             effective_provider, client, final_model = resolve_vision_provider_client(
++                task=task,
+                 provider="auto",
+                 model=resolved_model,
+                 async_mode=True,
+@@ -11333,7 +11342,7 @@ async def _async_call_llm_impl(
+                 )
+                 if fb_client is not None:
+                     client, final_model = _to_async_client(
+-                        fb_client, fb_model or "", is_vision=(task == "vision")
++                        fb_client, fb_model or "", is_vision=(task in ("vision", "video"))
+                     )
+                     resolved_provider = fb_label or resolved_provider
+                     effective_provider = resolved_provider
+@@ -11533,7 +11542,7 @@ async def _async_call_llm_impl(
+         )
+         if _is_model_not_found_error(first_err) and _heal_is_nous:
+             healed_model = _refresh_nous_recommended_model(
+-                vision=(task == "vision"), stale_model=kwargs.get("model"))
++                vision=(task in ("vision", "video")), stale_model=kwargs.get("model"))
+             if healed_model and healed_model != kwargs.get("model"):
+                 logger.warning(
+                     "Auxiliary %s (async): model %r no longer in Nous catalog; "
+@@ -11569,7 +11578,7 @@ async def _async_call_llm_impl(
+                 base_url=resolved_base_url,
+                 api_key=resolved_api_key,
+                 api_mode=resolved_api_mode,
+-                is_vision=(task == "vision"),
++                is_vision=(task in ("vision", "video")),
+             )
+             if refreshed_client is not None:
+                 logger.info(
+@@ -11604,7 +11613,7 @@ async def _async_call_llm_impl(
+                 base_url=resolved_base_url,
+                 api_key=resolved_api_key,
+                 api_mode=resolved_api_mode,
+-                is_vision=(task == "vision"),
++                is_vision=(task in ("vision", "video")),
+             )
+             if refreshed_client is not None:
+                 logger.info("Auxiliary %s (async): refreshed Nous runtime credentials after 401, retrying",
+@@ -11785,7 +11794,7 @@ async def _async_call_llm_impl(
+             if fb_client is not None:
+                 # Convert sync fallback client to async
+                 async_fb, async_fb_model = _to_async_client(
+-                    fb_client, fb_model or "", is_vision=(task == "vision")
++                    fb_client, fb_model or "", is_vision=(task in ("vision", "video"))
+                 )
+                 _record_route_info(
+                     route_info,
+@@ -11807,7 +11816,7 @@ async def _async_call_llm_impl(
+                     resolved_provider, task, reason="stale fallback credential")
+                 if fb_client is not None:
+                     async_fb, async_fb_model = _to_async_client(
+-                        fb_client, fb_model or "", is_vision=(task == "vision")
++                        fb_client, fb_model or "", is_vision=(task in ("vision", "video"))
+                     )
+                     _record_route_info(
+                         route_info,
+diff --git a/tests/tools/test_video_analyze.py b/tests/tools/test_video_analyze.py
+index 49f9663..3def087 100644
+--- a/tests/tools/test_video_analyze.py
++++ b/tests/tools/test_video_analyze.py
+@@ -253,7 +253,7 @@ class TestHandleVideoAnalyze:
+             result.close()
+ 
+ 
+-    def test_falls_back_to_vision_model_env(self, tmp_path, monkeypatch):
++    def test_vision_model_env_cannot_override_video_route(self, tmp_path, monkeypatch):
+         monkeypatch.setenv("AUXILIARY_VIDEO_MODEL", "")
+         monkeypatch.setenv("AUXILIARY_VISION_MODEL", "google/gemini-flash")
+ 
+@@ -263,7 +263,8 @@ class TestHandleVideoAnalyze:
+                 _handle_video_analyze({"video_url": "/tmp/test.mp4", "question": "test"})
+             )
+             args = mock_tool.call_args[0]
+-            assert args[2] == "google/gemini-flash"
++            assert len(args) == 2
++            assert "model" not in mock_tool.call_args.kwargs
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/tests/tui_gateway/test_native_media_setup.py b/tests/tui_gateway/test_native_media_setup.py
+new file mode 100644
+index 0000000..c46646d
+--- /dev/null
++++ b/tests/tui_gateway/test_native_media_setup.py
+@@ -0,0 +1,94 @@
++from copy import deepcopy
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from tui_gateway import native_media_setup as media
++from tui_gateway import native_setup as setup
++
++
++@pytest.fixture
++def inventory(monkeypatch):
++    monkeypatch.setattr("hermes_cli.inventory.build_aux_picker_rows", lambda **kw: [
++        {"slug": "google", "models": ["movie", "image", "text", "unknown", "paid"], "unavailable_models": ["paid"]},
++        {"slug": "bad\nprovider", "models": ["movie"]}])
++    monkeypatch.setattr("agent.models_dev.get_model_info", lambda provider, model, **kw:
++        None if model == "unknown" else SimpleNamespace(input_modalities={
++            "movie": ("text", "image", "video"), "image": ("text", "image"),
++            "text": ("text",), "paid": ("image", "video")}[model]))
++
++
++def test_media_catalog_excludes_unknown_text_only_and_unavailable_models(inventory):
++    video = media.auxiliary_providers("video", {})
++    image = media.auxiliary_providers("vision", {})
++    assert video == [{"name": "auto", "auxiliary_task": "video", "media_models": ["auto"]},
++                     {"name": "google", "auxiliary_task": "video", "media_models": ["movie"]}]
++    assert image[1]["media_models"] == ["movie", "image"]
++
++
++def test_auxiliary_selection_is_a_mapping_change_not_a_writer(inventory, monkeypatch):
++    from hermes_cli import tools_config as tc  # import aliases before patching their owner
++    config = {"auxiliary": {"vision": {"provider": "unchanged", "model": "image"},
++                            "video": {"base_url": "old", "api_key": "old", "timeout": 190}},
++              "approvals": {"mode": "smart"}, "platform_toolsets": {"cli": ["memory"]}}
++    before = deepcopy(config)
++    selection = {"toolset": "video", "provider": "google", "model": "movie"}
++    monkeypatch.setattr("hermes_cli.config.save_config", lambda *a, **k: pytest.fail("adapter must not save"))
++    monkeypatch.setattr(tc, "save_config", lambda *a, **k: pytest.fail("adapter must not save"))
++    setup.apply_selection(selection, config)
++    setup.verify_selection(selection, config)
++    assert config["auxiliary"]["video"] == {"provider": "google", "model": "movie", "timeout": 190}
++    assert config["auxiliary"]["vision"] == before["auxiliary"]["vision"]
++    assert config["approvals"] == before["approvals"]
++    assert config["platform_toolsets"] == before["platform_toolsets"]
++
++
++@pytest.mark.parametrize("change", [{"model": "text"}, {"model": "unknown"}, {"model": "paid"},
++    {"model": "../arbitrary"}, {"model": ""}, {"model": "movie\n"}, {"base_url": "https://invalid"}])
++def test_rejected_model_is_no_effect(inventory, change):
++    config = {"auxiliary": {"video": {"provider": "auto", "model": "auto"}}}
++    before = deepcopy(config)
++    with pytest.raises(ValueError):
++        setup.apply_selection({"toolset": "video", "provider": "google", "model": "movie", **change}, config)
++    assert config == before
++
++
++def test_generation_model_comes_from_native_plugin_catalog(monkeypatch):
++    monkeypatch.setattr("hermes_cli.tools_config._plugin_image_gen_catalog", lambda name: ({"native-model": {}}, "native-model"))
++    assert media.model_metadata("image_gen", {"image_gen_plugin_name": "fal"}, {}) == (["native-model"], "native-model")
++    with pytest.raises(ValueError):
++        media.validate_model({"toolset": "image_gen", "model": "chat-model"}, {"image_gen_plugin_name": "fal"}, {})
++
++
++def test_video_client_never_inherits_vision_config(monkeypatch):
++    from agent import auxiliary_client as aux
++    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: {"provider": "explicit-video" if task == "video" else "wrong-vision", "model": task + "-model"})
++    monkeypatch.setattr(aux, "_normalize_main_runtime", lambda _: {})
++    monkeypatch.setattr(aux, "_refresh_stale_main_runtime_credentials", lambda runtime: runtime)
++    calls = []
++    # Stop at the routing boundary: no SDK, credential or provider request.
++    def resolve(task, *args):
++        calls.append(task)
++        raise RuntimeError("test route reached")
++    monkeypatch.setattr(aux, "_resolve_task_provider_model", resolve)
++    with pytest.raises(RuntimeError, match="test route reached"):
++        aux.resolve_vision_provider_client(task="video")
++    assert calls == ["video"]
++
++
++def test_video_execution_and_retries_keep_video_task():
++    import ast
++    from pathlib import Path
++    import agent.auxiliary_client as aux
++    import tools.vision_tools as vision
++    tree = ast.parse(Path(aux.__file__).read_text(encoding="utf-8"))
++    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
++             and n.func.id == "resolve_vision_provider_client"]
++    assert len(calls) == 6
++    assert all(any(k.arg == "task" and isinstance(k.value, ast.Name) and k.value.id == "task"
++                   for k in n.keywords) for n in calls)
++    video = next(n for n in ast.parse(Path(vision.__file__).read_text(encoding="utf-8")).body
++                 if isinstance(n, ast.AsyncFunctionDef) and n.name == "video_analyze_tool")
++    assert any(isinstance(n, ast.Dict) and any(isinstance(k, ast.Constant) and k.value == "task"
++               and isinstance(v, ast.Constant) and v.value == "video" for k, v in zip(n.keys, n.values)) for n in ast.walk(video))
+diff --git a/tests/tui_gateway/test_native_setup_selection.py b/tests/tui_gateway/test_native_setup_selection.py
+index e384043..e22aed2 100644
+--- a/tests/tui_gateway/test_native_setup_selection.py
++++ b/tests/tui_gateway/test_native_setup_selection.py
+@@ -8,6 +8,46 @@ from copy import deepcopy
+ import pytest
+ import yaml
+ 
++@pytest.mark.parametrize("scenario", ["valid", "unknown_model", "active", "bad_readback"])
++def test_auxiliary_model_uses_existing_config_transaction(monkeypatch, scenario):
++    from tui_gateway import native_media_setup as media, native_setup as setup
++    from hermes_cli import tools_config as tc
++
++    config = _config()
++    config["model"] = {"provider": "main", "default": "main-model"}
++    config["auxiliary"] = {"vision": {"provider": "vision", "model": "image-model"},
++                           "video": {"provider": "old", "model": "old-video"}}
++    before = _write_config(config)
++    monkeypatch.setattr(media, "auxiliary_providers", lambda task, cfg: [
++        {"name": "video-provider", "auxiliary_task": task, "media_models": ["video-model"]}])
++    monkeypatch.setattr(media, "auxiliary_ready", lambda task: False)
++    monkeypatch.setattr(tc, "_run_post_setup", lambda *_: pytest.fail("no subprocess or installer"))
++    if scenario == "active":
++        server._sessions["busy"] = {"history_lock": threading.RLock(), "running": True}
++    if scenario == "bad_readback":
++        monkeypatch.setattr(setup, "verify_selection", lambda *a: (_ for _ in ()).throw(RuntimeError("bad readback")))
++    params = _params()
++    params["setup_selection"] = {"toolset": "video", "provider": "video-provider",
++                                 "model": "unknown" if scenario == "unknown_model" else "video-model"}
++    response = _set(params)
++    raw = (_home() / "config.yaml").read_bytes()
++    if scenario != "valid":
++        assert "error" in response
++        assert raw == before
++        return
++    assert "error" not in response, response
++    assert response["result"]["setup_selection"] == params["setup_selection"]
++    assert response["result"]["config_sha256"] == hashlib.sha256(raw).hexdigest()
++    saved = yaml.safe_load(raw)
++    assert saved["auxiliary"]["video"] == {"provider": "video-provider", "model": "video-model"}
++    assert saved["auxiliary"]["vision"] == config["auxiliary"]["vision"]
++    for key in ("model", "platform_toolsets", "approvals", "mcp_servers"):
++        assert saved[key] == config[key]
++    selected = setup.setup_providers("video", saved, features=_logged_out_features())[0]
++    assert selected["selected"] and selected["current_model"] == "video-model"
++    assert selected["readiness"] == "needs_setup"  # selection alone is not live readiness
++
++
+ import tui_gateway.server as server
+ from tests.tui_gateway.test_tools_policy_rpc import (
+     _attest_strict_host, _clean_gateway_sessions, _home,
+@@ -358,7 +398,14 @@ def test_isolated_complete_native_catalog_metadata_smoke(monkeypatch, native_set
+         assert len(providers) <= 64
+         assert len({provider["name"] for provider in providers}) == len(providers)
+         for provider in providers:
+-            assert set(provider) == {"name", "readiness", "setup_support", "selected", "dependency_status"}
++            fields = {"name", "readiness", "setup_support", "selected", "dependency_status"}
++            if "models" in provider:
++                fields |= {"models", "current_model"}
++                assert isinstance(provider["current_model"], str)
++                assert len(provider["models"]) <= 256
++                assert len(provider["models"]) == len(set(provider["models"]))
++                assert all(isinstance(model, str) and model for model in provider["models"])
++            assert set(provider) == fields
+             assert provider["readiness"] in {"ready", "needs_keys", "needs_auth", "needs_setup"}
+             assert provider["dependency_status"] in {"not_required", "ready", "missing", "unknown"}
+-            assert provider["setup_support"] in {"provider_selection", "secure_fields", "spotify_oauth", "native_manager_required", "no_setup_fields"}
++            assert provider["setup_support"] in {"provider_selection", "secure_fields", "spotify_oauth", "native_manager_required", "no_setup_fields", "model_selection"}
+diff --git a/tools/vision_tools.py b/tools/vision_tools.py
+index 85b3f71..8722717 100644
+--- a/tools/vision_tools.py
++++ b/tools/vision_tools.py
+@@ -1677,6 +1677,7 @@ def check_video_requirements() -> bool:
+                 _resolve_task_provider_model("video")
+             )
+             provider, client, resolved_model = resolve_vision_provider_client(
++                task="video",
+                 provider=requested,
+                 model=model,
+                 base_url=base_url,
+@@ -2110,7 +2111,7 @@ async def video_analyze_tool(
+         try:
+             from hermes_cli.config import cfg_get, load_config
+             _cfg = load_config()
+-            _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
++            _vision_cfg = cfg_get(_cfg, "auxiliary", "video", default={})
+             _vt = _vision_cfg.get("timeout")
+             if _vt is not None:
+                 vision_timeout = max(float(_vt), 180.0)
+@@ -2121,7 +2122,7 @@ async def video_analyze_tool(
+             pass
+ 
+         call_kwargs = {
+-            "task": "vision",
++            "task": "video",
+             "messages": messages,
+             "temperature": vision_temperature,
+             "max_tokens": 4000,
+@@ -2248,20 +2249,9 @@ def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
+         "including visual content, motion, audio cues, text overlays, and scene "
+         f"transitions. Then answer the following question:\n\n{question}"
+     )
+-    # Prefer config.yaml auxiliary.video.model (falling back to vision);
+-    # env vars are a legacy override.
+-    model = None
+-    try:
+-        from hermes_cli.config import cfg_get, load_config
+-        _cfg = load_config()
+-        _vmodel = cfg_get(_cfg, "auxiliary", "video", "model") or cfg_get(_cfg, "auxiliary", "vision", "model")
+-        if _vmodel:
+-            model = str(_vmodel).strip() or None
+-    except Exception:
+-        pass
+-    if not model:
+-        model = os.getenv("AUXILIARY_VIDEO_MODEL", "").strip() or os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+-    return video_analyze_tool(video_url, full_prompt, model, task_id=kw.get("task_id"))
++    # The same auxiliary.video resolver owns readiness and execution. Do not
++    # reintroduce a vision-model or environment override after its capability check.
++    return video_analyze_tool(video_url, full_prompt, task_id=kw.get("task_id"))
+ 
+ 
+ registry.register(
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 5dbcc1d..be0a835 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -1757,6 +1757,8 @@ def _(rid, params: dict) -> dict:
+         discover_builtin_tools()
+ 
+         def category_readiness(toolset_name: str, providers: list) -> str:
++            if toolset_name in {"vision", "video"} and providers:
++                return "ready" if any(p["selected"] and p["readiness"] == "ready" for p in providers) else "needs_setup"
+             category = TOOL_CATEGORIES.get(toolset_name)
+             if not category:
+                 return (
+diff --git a/tui_gateway/native_media_setup.py b/tui_gateway/native_media_setup.py
+new file mode 100644
+index 0000000..e62cd5e
+--- /dev/null
++++ b/tui_gateway/native_media_setup.py
+@@ -0,0 +1,110 @@
++"""Model metadata and transaction-owned mappings for native media tools.
++
++Uses the same auxiliary inventory and generation-plugin catalogs as Hermes'
++interactive pickers. No credentials, URLs, subprocesses or config writer.
++"""
++import re
++
++
++def _model_id(value):
++    return (isinstance(value, str) and bool(value) and value == value.strip()
++            and len(value.encode("utf-8")) <= 1024
++            and not any(ord(c) < 32 or ord(c) == 127 for c in value))
++
++
++def _auxiliary_config(config, task):
++    auxiliary = config.get("auxiliary", {})
++    if not isinstance(auxiliary, dict):
++        raise ValueError("native auxiliary configuration is not a mapping")
++    current = auxiliary.get(task, {})
++    if not isinstance(current, dict):
++        raise ValueError("native auxiliary task configuration is not a mapping")
++    return current
++
++
++def auxiliary_providers(toolset, config):
++    from hermes_cli.inventory import build_aux_picker_rows
++    from agent.models_dev import get_model_info
++
++    _auxiliary_config(config, toolset)
++    rows = [{"name": "auto", "auxiliary_task": toolset, "media_models": ["auto"]}]
++    modality = "video" if toolset == "video" else "image"
++    # Do not probe a custom URL through this UI. Use the existing configured
++    # inventory and cached modality metadata, never a model-name heuristic.
++    inventory = build_aux_picker_rows(max_models=256)
++    for row in inventory:
++        slug = row.get("slug")
++        if not isinstance(slug, str) or not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,256}", slug) or slug == "auto":
++            continue
++        unavailable = set(row.get("unavailable_models") or [])
++        models = []
++        for model in row.get("models", []):
++            if not _model_id(model) or model in unavailable or model in models:
++                continue
++            info = get_model_info(slug, model, allow_network=False)
++            if info is not None and modality in {str(m).lower() for m in info.input_modalities}:
++                models.append(model)
++        if models:
++            rows.append({"name": slug, "auxiliary_task": toolset, "media_models": models[:256]})
++    return rows[:64]
++
++
++def model_metadata(toolset, provider, config):
++    task = provider.get("auxiliary_task")
++    if task:
++        current = _auxiliary_config(config, task)
++        return provider["media_models"], str(current.get("model") or "auto")
++    if toolset not in {"image_gen", "video_gen"}:
++        return None
++    from hermes_cli import tools_config as tc
++    plugin = provider.get(toolset + "_plugin_name")
++    if provider.get("managed_nous_feature") == toolset:
++        plugin = "fal"
++    if not plugin:
++        return None
++    catalog, default = (tc._plugin_image_gen_catalog(plugin) if toolset == "image_gen"
++                        else tc._plugin_video_gen_catalog(plugin))
++    models = [model for model in catalog if _model_id(model)]
++    current = config.get(toolset, {})
++    if not isinstance(current, dict) or len(models) > 256:
++        return [], ""
++    return models, str(current.get("model") or default or "")
++
++
++def auxiliary_selected(provider, config):
++    task = provider["auxiliary_task"]
++    current = _auxiliary_config(config, task)
++    return (not current.get("base_url") and not current.get("api_key")
++            and str(current.get("provider") or "auto") == provider["name"])
++
++
++def auxiliary_ready(toolset):
++    from tools.vision_tools import check_vision_requirements, check_video_requirements
++    return check_video_requirements() if toolset == "video" else check_vision_requirements()
++
++
++def validate_model(selection, provider, config):
++    model = selection.get("model")
++    if provider.get("auxiliary_task") and model is None:
++        raise ValueError("auxiliary setup requires an explicit model choice")
++    if model is None:
++        return
++    metadata = model_metadata(selection["toolset"], provider, config)
++    if not _model_id(model) or metadata is None or model not in metadata[0]:
++        raise ValueError("model is not in the current native media catalog")
++
++
++def apply_model(selection, provider, config):
++    model = selection.get("model")
++    if model is None:
++        return
++    task = provider.get("auxiliary_task")
++    if task:
++        section = config.setdefault("auxiliary", {}).setdefault(task, {})
++        # Same explicit-provider transition as the native vision picker. A
++        # previous endpoint override must never redirect the selected provider.
++        for key in ("base_url", "api_key", "key_env", "api_key_env", "api_mode"):
++            section.pop(key, None)
++        section.update(provider=provider["name"], model=model)
++    else:
++        config.setdefault(selection["toolset"], {})["model"] = model
+diff --git a/tui_gateway/native_setup.py b/tui_gateway/native_setup.py
+index 9b29701..6b2f575 100644
+--- a/tui_gateway/native_setup.py
++++ b/tui_gateway/native_setup.py
+@@ -19,7 +19,7 @@ _READINESS = frozenset({"ready", "needs_setup", "needs_auth", "needs_keys"})
+ 
+ 
+ def validate_selection_shape(selection):
+-    if not isinstance(selection, dict) or set(selection) != {"toolset", "provider"}:
++    if not isinstance(selection, dict) or set(selection) not in ({"toolset", "provider"}, {"toolset", "provider", "model"}):
+         raise ValueError("setup_selection requires exactly toolset and provider")
+     name, provider = selection["toolset"], selection["provider"]
+     if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,95}", name):
+@@ -27,7 +27,11 @@ def validate_selection_shape(selection):
+     if (not isinstance(provider, str) or not provider or provider != provider.strip()
+             or len(provider) > 256 or any(ord(c) < 32 for c in provider)):
+         raise ValueError("invalid setup provider")
+-    return {"toolset": name, "provider": provider}
++    if "model" in selection:
++        from tui_gateway.native_media_setup import _model_id
++        if not _model_id(selection["model"]):
++            raise ValueError("invalid native model choice")
++    return {"toolset": name, "provider": provider, **({"model": selection["model"]} if "model" in selection else {})}
+ 
+ 
+ def _providers(toolset, config, features=None):
+@@ -37,6 +41,9 @@ def _providers(toolset, config, features=None):
+         return []
+     if not tc._toolset_allowed_for_platform(toolset, "cli"):
+         return []
++    if toolset in {"vision", "video"}:
++        from tui_gateway.native_media_setup import auxiliary_providers
++        return auxiliary_providers(toolset, config)
+     category = tc.TOOL_CATEGORIES.get(toolset)
+     if not category:
+         return []
+@@ -69,6 +76,8 @@ def _dependency_status(provider):
+ 
+ 
+ def setup_support(provider):
++    if provider.get("auxiliary_task") in {"vision", "video"}:
++        return "model_selection"
+     if any(provider.get(key) for key in _SELECTORS):
+         return "provider_selection"
+     from tools.native_tool_setup_tool import _support
+@@ -91,6 +100,14 @@ def setup_providers(toolset, config, *, features=None):
+             validate_selection_shape({"toolset": toolset, "provider": provider["name"]})
+         except ValueError:
+             continue
++        from tui_gateway.native_media_setup import auxiliary_selected, auxiliary_ready, model_metadata
++        if provider.get("auxiliary_task"):
++            selected = auxiliary_selected(provider, config)
++            models, current = model_metadata(toolset, provider, config)
++            rows.append({"name": provider["name"], "readiness": "ready" if selected and auxiliary_ready(toolset) else "needs_setup",
++                         "setup_support": "model_selection", "selected": selected, "dependency_status": "not_required",
++                         "models": models, "current_model": current if selected else ""})
++            continue
+         try:
+             selected = bool(tc._is_provider_active(provider, config))
+         except Exception:
+@@ -112,6 +129,9 @@ def setup_providers(toolset, config, *, features=None):
+             "setup_support": setup_support(provider), "selected": selected,
+             "dependency_status": dependency,
+         })
++        metadata = model_metadata(toolset, provider, config)
++        if metadata is not None:
++            rows[-1].update(models=metadata[0], current_model=metadata[1] if selected else "")
+     return rows
+ 
+ 
+@@ -125,9 +145,11 @@ def resolve_selection(selection, config):
+     if len(providers) > 64:
+         raise ValueError("native provider catalog exceeds the management protocol bound")
+     matches = [row for row in providers if row.get("name") == selection["provider"]]
+-    if len(matches) != 1 or setup_support(matches[0]) != "provider_selection":
++    if len(matches) != 1 or setup_support(matches[0]) not in {"provider_selection", "model_selection"}:
+         raise ValueError("native provider selection is unavailable")
+     provider = matches[0]
++    from tui_gateway.native_media_setup import validate_model
++    validate_model(selection, provider, config)
+     feature = provider.get("managed_nous_feature")
+     if feature or provider.get("requires_nous_auth"):
+         account = features.account_info
+@@ -146,8 +168,11 @@ def apply_selection(selection, config):
+     """Mutate only the transaction-owned mapping with the native selector."""
+     from hermes_cli.tools_config import apply_provider_selection
+ 
+-    resolve_selection(selection, config)
+-    apply_provider_selection(selection["toolset"], selection["provider"], config)
++    provider = resolve_selection(selection, config)
++    if not provider.get("auxiliary_task"):
++        apply_provider_selection(selection["toolset"], selection["provider"], config)
++    from tui_gateway.native_media_setup import apply_model
++    apply_model(selection, provider, config)
+ 
+ 
+ def verify_selection(selection, config):
+@@ -157,5 +182,7 @@ def verify_selection(selection, config):
+     provider = resolve_selection(selection, config)
+     expected = deepcopy(config)
+     apply_selection(selection, expected)
+-    if expected != config or not _is_provider_active(provider, config):
++    from tui_gateway.native_media_setup import auxiliary_selected
++    selected = auxiliary_selected(provider, config) if provider.get("auxiliary_task") else _is_provider_active(provider, config)
++    if expected != config or not selected:
+         raise RuntimeError("native provider selection readback did not match")

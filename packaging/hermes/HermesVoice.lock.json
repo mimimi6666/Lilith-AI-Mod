@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "component": "hermes-native-voice",
+  "version": "v3-win-x64-cp311-hermes-0.20.1",
+  "target": {
+    "os": "windows",
+    "architecture": "x86_64",
+    "pythonAbi": "cp311",
+    "hermesVersion": "0.20.1"
+  },
+  "sourcePayload": {
+    "relativePath": "artifacts/d046b9-voice-payload-staging/v1-win-x64-cp311-hermes-0.20.1",
+    "manifestSha256": "3AE91EB100715CC6D4FEA2E9850BB1F56A54CEFB9E23665C2070E00BB6048CB8",
+    "requirementsSha256": "DEE0B01FCD69F93C624FEDD2FF311D22A5619D1034C94505D073075771D0A36E",
+    "offlineHashLocked": true
+  },
+  "packages": {
+    "av": "17.0.0",
+    "ctranslate2": "4.7.1",
+    "faster-whisper": "1.2.1",
+    "filelock": "3.24.3",
+    "flatbuffers": "25.12.19",
+    "fsspec": "2026.2.0",
+    "hf-xet": "1.5.2",
+    "huggingface-hub": "1.24.0",
+    "numpy": "2.4.3",
+    "onnxruntime": "1.27.0",
+    "sounddevice": "0.5.5",
+    "tokenizers": "0.22.2"
+  },
+  "model": {
+    "repository": "Systran/faster-whisper-base",
+    "revision": "ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66",
+    "relativePath": "models/Systran/faster-whisper-base/ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66",
+    "modelBinSha256": "D01C3014881C9C6F3133C182F3D2887EB6CA1C789A7538C5C007196857A0A6A9"
+  },
+  "installedClosure": {
+    "candidateRelativePath": "artifacts/d046b9-voice-component-clean/v3-win-x64-cp311-hermes-0.20.1",
+    "topLevelEntries": [
+      "licenses",
+      "models",
+      "site-packages"
+    ],
+    "entryCount": 2289,
+    "fileCount": 2066,
+    "directoryCount": 223,
+    "fileBytes": 387502074,
+    "canonicalization": "UTF-8 header lilith-hermes-voice-closure-v1\\n; ordinal relative POSIX paths; D\\t<path>\\n for directories; F\\t<path>\\t<byte-length>\\t<uppercase-sha256>\\n for files",
+    "sha256": "130ECF3B2818829AF22774696231CF868308581184EE50B8100D1E52F9F89656",
+    "reparsePointsAllowed": false
+  },
+  "productLayout": {
+    "relativeRootPath": "Components/voice/v3-win-x64-cp311-hermes-0.20.1",
+    "pythonPathRelativePath": "site-packages",
+    "modelRelativePath": "models/Systran/faster-whisper-base/ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66",
+    "inPlaceVenvMutation": false,
+    "lazyInstalls": false,
+    "autoUpdate": false
+  },
+  "appLocalRuntime": {
+    "version": "14.44.35211.0",
+    "source": "https://aka.ms/vs/17/release/vc_redist.x64.exe",
+    "sourceSha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b"
+  }
+}

@@ -1,0 +1,440 @@
+diff --git a/hermes_state.py b/hermes_state.py
+index 91ece6f..30d6b7a 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -84,6 +84,64 @@ from hermes_state_portability import SessionPortabilityMixin
+ from hermes_state_schema import SessionSchemaMixin
+ from hermes_state_search import SessionSearchMixin
+ 
++
++_COMPACTION_DISPLAY_PROVENANCE = "hermes_compaction_display_v1"
++_DISPLAY_HISTORY_ROW_LIMIT = 20_000
++
++
++def _display_canonical_metadata(metadata):
++    # Reactions and other presentation annotations can change independently on
++    # an original row. They are not immutable message correlation.
++    metadata = metadata if isinstance(metadata, dict) else {}
++    keys = (
++        "hermes_turn_id", "hermes_message_id", "hermes_message_kind",
++        "hermes_user_message_id", "hermes_turn_origin", "hermes_turn_origin_kind",
++        "hermes_profile_memory_human_origin", "hermes_profile_memory_subject_id",
++    )
++    return tuple((key, metadata.get(key)) for key in keys if key in metadata)
++
++
++def _display_tool_calls(value):
++    if not value:
++        return None
++    if isinstance(value, str):
++        try:
++            return json.loads(value)
++        except (TypeError, ValueError) as exc:
++            raise HistoryProjectionError("history_tool_linkage_invalid") from exc
++    return value
++
++
++def _display_tools_are_subset(original, rewritten):
++    """Allow only the compressor's ordered removal of orphaned calls."""
++    original, rewritten = _display_tool_calls(original), _display_tool_calls(rewritten)
++    if not rewritten:
++        return True
++    if not isinstance(original, list) or not isinstance(rewritten, list):
++        return False
++    position = 0
++    for call in rewritten:
++        while position < len(original) and original[position] != call:
++            position += 1
++        if position >= len(original):
++            return False
++        position += 1
++    return True
++
++
++class HistoryProjectionError(ValueError):
++    """A bounded display read failed; this never changes model/session authority."""
++
++    def __init__(self, code: str):
++        self.code = code
++        super().__init__(code)
++
++
++class _DisplayHistory(list):
++    def __init__(self, messages, hidden_row_ids=()):
++        super().__init__(messages)
++        self.hidden_row_ids = frozenset(hidden_row_ids)
++
+ try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
+     import psutil
+ except ImportError:  # pragma: no cover - stripped/scaffold installs only
+@@ -9782,6 +9840,68 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         staged_messages = [dict(message) for message in compacted_messages]
+ 
+         def _do(conn):
++            # Only the normal compaction writer may add these receipts. Never
++            # mutate old rows or infer a source from text, order or timestamps.
++            # Existing canonical correlation and tool linkage must survive a
++            # model-context rewrite unchanged.
++            for message in staged_messages:
++                metadata = dict(self._decode_display_metadata(message.get("display_metadata")) or {})
++                metadata.pop(_COMPACTION_DISPLAY_PROVENANCE, None)
++                source_id = message.get("_row_id")
++                source = None
++                if isinstance(source_id, int) and not isinstance(source_id, bool):
++                    source = conn.execute(
++                        "SELECT id, session_id, role, tool_call_id, tool_calls, tool_name, "
++                        "display_metadata, active, compacted FROM messages WHERE id = ?",
++                        (source_id,),
++                    ).fetchone()
++                    if (source is None or source["session_id"] != session_id
++                            or not (source["active"] or source["compacted"])):
++                        raise HistoryProjectionError("history_compaction_origin_invalid")
++                    original_metadata = self._decode_display_metadata(source["display_metadata"]) or {}
++                    original_metadata.pop(_COMPACTION_DISPLAY_PROVENANCE, None)
++                    original_tools = json.loads(source["tool_calls"]) if source["tool_calls"] else None
++                    proposed_tools = message.get("tool_calls")
++                    if isinstance(proposed_tools, str):
++                        proposed_tools = json.loads(proposed_tools)
++                    if (source["role"] != message.get("role")
++                            or source["tool_call_id"] != message.get("tool_call_id")
++                            or source["tool_name"] != message.get("tool_name")
++                            or not _display_tools_are_subset(original_tools, proposed_tools)
++                            or _display_canonical_metadata(original_metadata)
++                            != _display_canonical_metadata(metadata)):
++                        raise HistoryProjectionError("history_compaction_origin_conflict")
++                if source is not None:
++                    prior = self._decode_display_metadata(source["display_metadata"]) or {}
++                    prior = prior.get(_COMPACTION_DISPLAY_PROVENANCE)
++                    if prior is not None and not (
++                        prior == {"kind": "summary"}
++                        or isinstance(prior, dict) and set(prior) == {"kind", "origin_row_id"}
++                        and prior.get("kind") == "replica"
++                        and isinstance(prior.get("origin_row_id"), int)
++                        and not isinstance(prior.get("origin_row_id"), bool)
++                        and 0 < prior["origin_row_id"] < source_id
++                    ):
++                        raise HistoryProjectionError("history_provenance_invalid")
++                    if prior == {"kind": "summary"}:
++                        metadata[_COMPACTION_DISPLAY_PROVENANCE] = {"kind": "summary"}
++                    else:
++                        metadata[_COMPACTION_DISPLAY_PROVENANCE] = {
++                            "kind": "replica", "origin_row_id": source_id,
++                        }
++                elif message.get("_compressed_summary") is True:
++                    # A standalone host-created handoff has no original row.
++                    # A real user imitating its text never acquires this flag.
++                    from agent.turn_identity import durable_message_id, message_turn_id
++                    if (durable_message_id(message) or message_turn_id(message)
++                            or message.get("role") not in {"user", "assistant"}
++                            or any(message.get(key) for key in ("tool_calls", "tool_call_id", "tool_name"))):
++                        raise HistoryProjectionError("history_compaction_origin_missing")
++                    metadata[_COMPACTION_DISPLAY_PROVENANCE] = {"kind": "summary"}
++                if metadata:
++                    message["display_metadata"] = metadata
++                else:
++                    message.pop("display_metadata", None)
+             patched_model_config = None
+             if model_config_patch is not None:
+                 # on_missing="raise": a prune/compaction must not commit
+@@ -10357,7 +10477,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             if row["display_metadata"]:
+                 decoded = self._decode_display_metadata(row["display_metadata"])
+                 if decoded is not None:
+-                    msg["display_metadata"] = decoded
++                    # Display provenance is a storage/read-model receipt, not
++                    # another model-facing prompt or turn-identity field.
++                    had_provenance = _COMPACTION_DISPLAY_PROVENANCE in decoded
++                    decoded.pop(_COMPACTION_DISPLAY_PROVENANCE, None)
++                    if decoded or not had_provenance:
++                        msg["display_metadata"] = decoded
+             if row["timestamp"]:
+                 msg["timestamp"] = row["timestamp"]
+             if row["tool_call_id"]:
+@@ -10508,6 +10633,150 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+         )
+         return model_history, display_history
+ 
++    def get_display_resume_conversations(
++        self, session_id: str, *, mark_persisted: bool = False,
++        ancestors_only: bool = False,
++    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
++        """Opt-in bounded display projection; the legacy/model reader is unchanged.
++
++        Read a single snapshot including withdrawal *identities*, never their
++        bodies. Model rows remain the active tip. Display rows may additionally
++        use compaction originals, with exact identity/provenance reconciliation.
++        No schema change, repair write, text matching or model call is involved.
++        """
++        from agent.turn_identity import canonical_id
++
++        with self._read_ctx() as conn:
++            conn.execute("SAVEPOINT display_history_snapshot")
++            try:
++                chain, seen, current = [], set(), session_id
++                for _ in range(100):
++                    if not current:
++                        break
++                    if current in seen:
++                        raise HistoryProjectionError("history_lineage_invalid")
++                    seen.add(current)
++                    chain.append(current)
++                    parent = conn.execute(
++                        "SELECT parent_session_id FROM sessions WHERE id = ?", (current,)
++                    ).fetchone()
++                    current = parent[0] if parent else None
++                if current:
++                    raise HistoryProjectionError("history_lineage_too_large")
++                chain.reverse()
++                chain = chain or [session_id]
++                placeholders = ",".join("?" for _ in chain)
++                # The raw-row ceiling also includes tombstones and retained
++                # replicas. Repeated compaction cannot bypass the display cap.
++                fields = []
++                metadata_fields = {"id", "role", "tool_call_id", "tool_name",
++                                   "display_kind", "display_metadata"}
++                for field in self._CONVERSATION_ROW_COLUMNS.split(", "):
++                    fields.append(field if field in metadata_fields else
++                                  f"CASE WHEN active = 1 OR compacted = 1 THEN {field} END AS {field}")
++                rows = conn.execute(
++                    f"SELECT session_id, active, compacted, {', '.join(fields)} FROM messages "
++                    f"WHERE session_id IN ({placeholders}) ORDER BY id LIMIT ?",
++                    (*chain, _DISPLAY_HISTORY_ROW_LIMIT + 1),
++                ).fetchall()
++                if len(rows) > _DISPLAY_HISTORY_ROW_LIMIT:
++                    raise HistoryProjectionError("history_projection_too_large")
++            finally:
++                conn.execute("RELEASE SAVEPOINT display_history_snapshot")
++
++        tip = [row for row in rows if row["session_id"] == session_id and row["active"]]
++        model = self._rows_to_conversation(
++            tip, session_id=session_id, include_ancestors=False,
++            repair_alternation=True, include_row_ids=True, mark_persisted=mark_persisted,
++        )
++        by_id = {row["id"]: row for row in rows}
++        metadata = {row["id"]: self._decode_display_metadata(row["display_metadata"]) or {}
++                    for row in rows}
++        groups, origins = {}, {}
++        unknown = divergence = 0
++        for row in rows:
++            meta = metadata[row["id"]]
++            receipt = meta.get(_COMPACTION_DISPLAY_PROVENANCE)
++            if receipt is not None:
++                if not isinstance(receipt, dict):
++                    raise HistoryProjectionError("history_provenance_invalid")
++                if receipt == {"kind": "summary"}:
++                    origins[row["id"]] = None
++                    continue
++                origin_id = receipt.get("origin_row_id")
++                if (set(receipt) != {"kind", "origin_row_id"} or receipt.get("kind") != "replica"
++                        or not isinstance(origin_id, int) or isinstance(origin_id, bool)
++                        or origin_id >= row["id"]):
++                    raise HistoryProjectionError("history_provenance_invalid")
++                original = by_id.get(origin_id)
++                if (original is None or original["session_id"] != row["session_id"]
++                        or original["role"] != row["role"]
++                        or any(original[key] != row[key] for key in ("tool_call_id", "tool_name"))
++                        or not _display_tools_are_subset(original["tool_calls"], row["tool_calls"])
++                        or _display_canonical_metadata(metadata[origin_id]) != _display_canonical_metadata(meta)
++                        or origin_id not in origins or origins[origin_id] is None):
++                    raise HistoryProjectionError("history_provenance_conflict")
++                origins[row["id"]] = origins[origin_id]
++            else:
++                origins[row["id"]] = row["id"]
++            turn = canonical_id(meta.get("hermes_turn_id"))
++            message = canonical_id(meta.get("hermes_message_id"))
++            key = ("canonical", turn, message) if turn and message else ("row", origins[row["id"]])
++            groups.setdefault(key, []).append(row)
++
++        selected = []
++        for key, copies in groups.items():
++            # An edit/rewind withdraws a whole canonical revision. Do not reach
++            # across that boundary to an older compacted original. A subsequent
++            # restored/reinserted active revision is independently eligible.
++            tombstone = max((row["id"] for row in copies if not row["active"] and not row["compacted"]), default=-1)
++            eligible = [row for row in copies if row["id"] > tombstone and (row["active"] or row["compacted"])]
++            if not eligible:
++                continue
++            original = eligible[0]
++            for copy in eligible[1:]:
++                typed_replica = _COMPACTION_DISPLAY_PROVENANCE in metadata[copy["id"]]
++                immutable = ("role", "tool_call_id", "tool_name", "display_kind")
++                if (any(original[field] != copy[field] for field in immutable)
++                        or (not _display_tools_are_subset(original["tool_calls"], copy["tool_calls"])
++                            if typed_replica else _display_tool_calls(original["tool_calls"]) != _display_tool_calls(copy["tool_calls"]))
++                        or _display_canonical_metadata(metadata[original["id"]])
++                        != _display_canonical_metadata(metadata[copy["id"]])):
++                    raise HistoryProjectionError("history_identity_conflict")
++                if not typed_replica:
++                    # Legacy copies lack a durable rewrite receipt. All other
++                    # content/semantics fields must agree, and an archived
++                    # original must exist, before choosing that original.
++                    fields = ("api_content", "reasoning", "reasoning_content", "reasoning_details",
++                              "codex_reasoning_items", "codex_message_items", "finish_reason", "effect_disposition")
++                    ancestor_replay = (
++                        original["session_id"] != copy["session_id"]
++                        and chain.index(original["session_id"]) < chain.index(copy["session_id"])
++                        and original["content"] == copy["content"]
++                    )
++                    if (not (original["compacted"] or ancestor_replay)
++                            or any(original[field] != copy[field] for field in fields)):
++                        raise HistoryProjectionError("history_identity_conflict")
++                    if original["content"] != copy["content"]:
++                        divergence += 1
++            if key[0] == "row" and _COMPACTION_DISPLAY_PROVENANCE not in metadata[original["id"]]:
++                unknown += 1
++            if not ancestors_only or original["session_id"] != session_id:
++                selected.append(original)
++        selected.sort(key=lambda row: row["id"])
++        if unknown:
++            logger.info("history_legacy_provenance_unknown count=%d", unknown)
++        if divergence:
++            logger.warning("history_legacy_content_divergence count=%d", divergence)
++        display = self._rows_to_conversation(
++            selected, session_id=session_id, include_ancestors=False,
++            repair_alternation=False, include_row_ids=True,
++        )
++        return model, _DisplayHistory(display, (row_id for row_id, origin in origins.items() if origin is None))
++
++    def get_display_conversation(self, session_id: str, *, ancestors_only: bool = False):
++        return self.get_display_resume_conversations(session_id, ancestors_only=ancestors_only)[1]
++
+     def get_resume_message_count(self, session_id: str) -> int:
+         """Count active rows that a full resume would materialize."""
+         session_ids = self._session_lineage_root_to_tip(session_id)
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 6152f84..370c990 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -915,8 +915,8 @@ def _(rid, params: dict) -> dict:
+                     )
+                     display_history = []
+                 else:
+-                    raw_history, display_history = db.get_resume_conversations(
+-                        target, mark_persisted=True
++                    raw_history, display_history = _display_resume_conversations(
++                        db, target, mark_persisted=True
+                     )
+             except Exception as e:
+                 if lease is not None:
+@@ -925,7 +925,7 @@ def _(rid, params: dict) -> dict:
+             # Display keeps the full transcript; the model-fed history drops a
+             # dangling/interrupted tool-call tail so a session killed mid-loop does
+             # not replay the unanswered call forever (#29086).
+-            prefix = [] if omit_messages else db.get_ancestor_display_prefix(target)
++            prefix = [] if omit_messages else _ancestor_visible_history(db, target)
+             history = sanitize_replay_history(raw_history)
+             # Restore the model/provider/reasoning/tier this chat last used so the
+             # deferred build (and the info below) match the eager path — without them
+@@ -1027,8 +1027,8 @@ def _(rid, params: dict) -> dict:
+                 )
+                 display_history = []
+             else:
+-                raw_history, display_history = db.get_resume_conversations(
+-                    target, mark_persisted=True
++                raw_history, display_history = _display_resume_conversations(
++                    db, target, mark_persisted=True
+                 )
+             # The display transcript keeps every row so the user still sees their
+             # full history.  The model-fed history is sanitized: a session whose
+@@ -1038,7 +1038,7 @@ def _(rid, params: dict) -> dict:
+             # session in #29086.  The messaging gateway already strips this; this is
+             # the WebUI/TUI resume path picking up the same cleanup.
+             display_history_prefix = (
+-                [] if omit_messages else db.get_ancestor_display_prefix(target)
++                [] if omit_messages else _ancestor_visible_history(db, target)
+             )
+             history = sanitize_replay_history(raw_history)
+             messages = [] if omit_messages else _history_to_messages(display_history)
+@@ -2906,16 +2906,27 @@ def _(rid, params: dict) -> dict:
+             )
+             model_history = list(session.get("history", []))
+             history = list(model_history)
++            live_history = list(session.get("display_history_prefix") or []) + history
+     authoritative_read = False
+     if session.get("session_key"):
+         with _session_db(session) as db:
++            if db is None and any(
++                message.get("_db_persisted") or message.get("_row_id") is not None
++                for message in live_history if isinstance(message, dict)
++            ):
++                return _err(rid, 5000, "history_projection_unavailable")
+             if db is not None:
+                 try:
+-                    model_history, history = db.get_resume_conversations(
+-                        session["session_key"], mark_persisted=True
++                    model_history, history = _display_resume_conversations(
++                        db, session["session_key"], mark_persisted=True
+                     )
++                    history = _reconcile_display_with_live(history, live_history)
+                     authoritative_read = True
+-                except Exception:
++                except Exception as exc:
++                    if callable(getattr(type(db), "get_display_resume_conversations", None)):
++                        from hermes_state import HistoryProjectionError
++                        code = exc.code if isinstance(exc, HistoryProjectionError) else "history_projection_unavailable"
++                        return _err(rid, 5000, code)
+                     pass
+     if initial_latch is not None and not authoritative_read:
+         return _err(
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 2361c5a..108acd3 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -12666,6 +12666,10 @@ def _reconcile_display_with_live(
+     eager resume + REST payloads), and a not-yet-flushed live turn is not
+     dropped.
+     """
++    hidden = getattr(db_display, "hidden_row_ids", frozenset())
++    if hidden:
++        in_memory = [message for message in in_memory
++                     if message.get("_row_id", message.get("row_id")) not in hidden]
+     if not db_display:
+         return in_memory
+     if not in_memory:
+@@ -12713,6 +12717,22 @@ def _reconcile_display_with_live(
+     return db_display
+ 
+ 
++def _display_resume_conversations(db, key, *, mark_persisted=False):
++    reader = getattr(type(db), "get_display_resume_conversations", None)
++    if callable(reader):
++        return reader(db, key, mark_persisted=mark_persisted)
++    # Older adapters/test doubles retain their original contract. An available
++    # native display reader that fails must never fall back to model context.
++    return db.get_resume_conversations(key, mark_persisted=mark_persisted)
++
++
++def _ancestor_visible_history(db, key):
++    reader = getattr(type(db), "get_display_conversation", None)
++    if callable(reader):
++        return reader(db, key, ancestors_only=True)
++    return db.get_ancestor_display_prefix(key)
++
++
+ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> list[dict]:
+     """Return the user-visible DISPLAY projection for a live/warm session.
+ 
+@@ -12731,7 +12751,23 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) ->
+     fails.
+     """
+     key = session.get("session_key")
++    if db is None and key and any(
++        message.get("_db_persisted") or message.get("_row_id") is not None
++        for message in in_memory_fallback if isinstance(message, dict)
++    ):
++        from hermes_state import HistoryProjectionError
++        raise HistoryProjectionError("history_projection_unavailable")
+     if db is not None and key:
++        reader = getattr(type(db), "get_display_conversation", None)
++        if callable(reader):
++            from hermes_state import HistoryProjectionError
++            try:
++                display = reader(db, key)
++                return _reconcile_display_with_live(display, in_memory_fallback)
++            except HistoryProjectionError:
++                raise
++            except Exception as exc:
++                raise HistoryProjectionError("history_projection_unavailable") from exc
+         try:
+             display = db.get_messages_as_conversation(key, include_ancestors=True, include_row_ids=True)
+             return _reconcile_display_with_live(display, in_memory_fallback)

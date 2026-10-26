@@ -1,0 +1,29 @@
+diff --git a/tests/tui_gateway/test_native_assistant_extension.py b/tests/tui_gateway/test_native_assistant_extension.py
+index 5522853..05616e2 100644
+--- a/tests/tui_gateway/test_native_assistant_extension.py
++++ b/tests/tui_gateway/test_native_assistant_extension.py
+@@ -1601,6 +1601,8 @@ def test_foreground_proactive_is_one_assistant_reply_without_user_row(
+     assert "not a player or user message" in sent[0]["content"]
+     assert "Never claim to see the screen" in sent[0]["content"]
+     assert "game result" in sent[0]["content"]
++    assert "Ground the sentence explicitly" in sent[0]["content"]
++    assert "generic presence or reassurance" in sent[0]["content"]
+     assert sent[-1]["role"] == "user"
+     assert "foreground observation is not a player message" in sent[-1]["content"]
+ 
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index bbca8a4..9df7844 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -14310,7 +14310,10 @@ def _native_assistant_extension_model_messages(
+             "observation time. Never claim to see the screen, window title, "
+             "document, tab, code, media, game result, score, performance, "
+             "emotion, or intent. Do not imply continuous surveillance. Address "
+-            "the player as Lilith in the requested locale. A non-empty reply is "
++            "the player as Lilith in the requested locale. Ground the sentence "
++            "explicitly in application_name or its broad category so it could not "
++            "fit every application, while staying within that coarse observation. "
++            "Do not give only a generic presence or reassurance line. A non-empty reply is "
+             "required whenever this route is invoked; do not choose silence. "
+             "Write exactly one short, warm sentence in Lilith's established "
+             "voice, without a list or explanation. Return JSON only, with "

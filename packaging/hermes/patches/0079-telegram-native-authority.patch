@@ -1,0 +1,228 @@
+diff --git a/agent/onboarding.py b/agent/onboarding.py
+index 148fbcc..b836b47 100644
+--- a/agent/onboarding.py
++++ b/agent/onboarding.py
+@@ -3,8 +3,9 @@ Contextual first-touch onboarding hints.
+ 
+ Instead of blocking first-run questionnaires, show a one-time hint the *first*
+ time a user hits a behavior fork — message-while-running, first long-running
+-tool, etc.  Each hint is shown once per install (tracked in ``config.yaml`` under
+-``onboarding.seen.<flag>``) and then never again.
++tool, etc. Unmanaged installs track hints in ``config.yaml`` under
++``onboarding.seen.<flag>``. Managed/identity-locked profiles instead use bounded,
++non-authoritative per-flag state files, without changing pinned configuration.
+ 
+ Keep this module tiny and dependency-free so both the CLI and gateway can import
+ it without pulling in heavy modules.
+@@ -13,6 +14,8 @@ it without pulling in heavy modules.
+ from __future__ import annotations
+ 
+ import logging
++import json
++import stat
+ from pathlib import Path
+ from typing import Any, Mapping, Optional
+ 
+@@ -210,16 +213,83 @@ def _get_seen_dict(config: Mapping[str, Any]) -> Mapping[str, Any]:
+ 
+ def is_seen(config: Mapping[str, Any], flag: str) -> bool:
+     """Return True if the user has already been shown this first-touch hint."""
+-    return bool(_get_seen_dict(config).get(flag))
++    if bool(_get_seen_dict(config).get(flag)):
++        return True
++    try:
++        path = _managed_hint_state_path(flag)
++        return path is not None and _hint_state_seen(path)
++    except Exception:
++        return False  # hints are not configuration or execution authority
++
++
++def _check_hint_state_path(path: Path) -> None:
++    """Best-effort hint persistence must not follow a link to player data."""
++    for item in (path, *path.parents):
++        try:
++            info = item.lstat()
++        except FileNotFoundError:
++            continue
++        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
++            raise ValueError("onboarding state cannot use symlinks or reparse points")
++
++
++def _managed_hint_state_path(flag: str, config_path: Optional[Path] = None) -> Optional[Path]:
++    from hermes_cli.config import is_managed
++    from agent.identity_policy import identity_lock_required_by_host
++    from hermes_constants import get_hermes_home
++
++    if not (is_managed() or identity_lock_required_by_host()):
++        return None
++    if flag not in (BUSY_INPUT_FLAG, TOOL_PROGRESS_FLAG, OPENCLAW_RESIDUE_FLAG, PROFILE_BUILD_FLAG):
++        raise ValueError("unknown onboarding flag")
++    home = get_hermes_home().absolute()
++    if config_path is not None and Path(config_path).absolute() != home / "config.yaml":
++        raise ValueError("onboarding config does not belong to the active profile")
++    path = home / "state" / "onboarding-v1" / (flag + ".json")
++    _check_hint_state_path(path)
++    return path
++
++
++def _hint_state_seen(path: Path) -> bool:
++    if not path.exists():
++        return False
++    if not path.is_file() or path.stat().st_size > 256:
++        return False
++    with path.open("rb") as stream:
++        raw = stream.read(257)
++    if len(raw) > 256:
++        return False
++    state = json.loads(raw.decode("utf-8"))
++    return (isinstance(state, dict) and set(state) == {"schema_version", "seen"}
++            and type(state["schema_version"]) is int and state["schema_version"] == 1
++            and state["seen"] is True)
+ 
+ 
+ def mark_seen(config_path: Path, flag: str) -> bool:
+-    """Persist ``onboarding.seen.<flag> = True`` to ``config_path``.
++    """Persist a seen hint; managed profiles use state, never ``config_path``.
+ 
+     Uses the atomic YAML writer so a concurrent process can't observe a
+     partially-written file.  Returns True on success, False on any error
+     (including the config file being absent — onboarding is best-effort).
+     """
++    # A first-touch hint can fire while a model/tool turn is running. On managed
++    # profiles it must NEVER mutate config.yaml (a pinned identity authority).
++    # One small file per fixed flag avoids cross-process read/modify/write loss;
++    # a failed hint write is harmless and must not fall back to the config writer.
++    try:
++        state_path = _managed_hint_state_path(flag, config_path)
++        if state_path is not None:
++            if _hint_state_seen(state_path):
++                return True
++            from utils import atomic_json_write
++            state_path.parent.mkdir(parents=True, exist_ok=True)
++            _check_hint_state_path(state_path)
++            atomic_json_write(state_path, {"schema_version": 1, "seen": True})
++            return _hint_state_seen(state_path)
++    except Exception as e:
++        logger.debug("onboarding: failed to persist managed hint %s: %s", flag, type(e).__name__)
++        return False
++
+     try:
+         import yaml
+         from hermes_cli.config import atomic_config_write
+diff --git a/gateway/run.py b/gateway/run.py
+index be0fd55..6b0bf07 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -19407,6 +19407,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_human_origin=persist_user_human_origin,
+                 persist_user_human_subject_id=persist_user_human_subject_id,
+                 message_type=event.message_type,
++                lilith_shared_session_id=lilith_shared_session_id,
+             )
+             _turn_seconds = time.monotonic() - _turn_started_monotonic
+ 
+@@ -21427,6 +21428,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         user_config: dict,
+         source: "SessionSource",
+         platform_key: str,
++        *,
++        lilith_shared_session_id: Optional[str] = None,
++        session_id: Optional[str] = None,
+     ) -> list:
+         """Resolve enabled toolsets for an agent run, honoring per-source overrides.
+ 
+@@ -21440,6 +21444,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         """
+         from hermes_cli.tools_config import _get_platform_tools
+ 
++        # The trusted pre-dispatch bridge binds authenticated Telegram traffic
++        # to the same durable game conversation under the profile turn lease.
++        # Carry that binding explicitly; never infer it from text, public event
++        # metadata, platform alone, or the mere existence of a session file.
++        from agent.identity_policy import identity_lock_required_by_host
++        if (type(lilith_shared_session_id) is str and lilith_shared_session_id
++                and lilith_shared_session_id == session_id
++                and source.platform == Platform.TELEGRAM and platform_key == "telegram"
++                and identity_lock_required_by_host()
++                and self._is_user_authorized(source) is True):
++            # Resolve the *same* player selection as F7/Control Center, then
++            # retain the native destination-platform restrictions. This is an
++            # in-memory projection, not a second setting/permission store.
++            selected = _get_platform_tools(user_config, "cli")
++            cfg = dict(user_config)
++            pts = dict(cfg.get("platform_toolsets") or {})
++            pts[platform_key] = sorted(selected)
++            cfg["platform_toolsets"] = pts
++            return sorted(selected & _get_platform_tools(cfg, platform_key))
++
+         override = None
+         try:
+             adapter = self._adapter_for_source(source)
+@@ -26824,6 +26848,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         persist_user_human_origin: Optional[str] = None,
+         persist_user_human_subject_id: Optional[str] = None,
+         message_type: Optional[str] = None,
++        lilith_shared_session_id: Optional[str] = None,
+     ) -> Dict[str, Any]:
+         """Profile-scoping wrapper around the agent run.
+ 
+@@ -26846,6 +26871,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_human_origin=persist_user_human_origin,
+                 persist_user_human_subject_id=persist_user_human_subject_id,
+                 message_type=message_type,
++                lilith_shared_session_id=lilith_shared_session_id,
+             )
+ 
+         profile_home = self._resolve_profile_home_for_source(source)
+@@ -26861,6 +26887,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_human_origin=persist_user_human_origin,
+                 persist_user_human_subject_id=persist_user_human_subject_id,
+                 message_type=message_type,
++                lilith_shared_session_id=lilith_shared_session_id,
+             )
+ 
+     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
+@@ -27006,6 +27033,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         persist_user_human_origin: Optional[str] = None,
+         persist_user_human_subject_id: Optional[str] = None,
+         message_type: Optional[str] = None,
++        lilith_shared_session_id: Optional[str] = None,
+     ) -> Dict[str, Any]:
+         """
+         Run the agent with the given message and context.
+@@ -27054,7 +27082,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         platform_key = _platform_config_key(source.platform)
+ 
+         enabled_toolsets = self._resolve_enabled_toolsets_for_source(
+-            user_config, source, platform_key
++            user_config, source, platform_key,
++            lilith_shared_session_id=lilith_shared_session_id, session_id=session_id,
+         )
+         agent_cfg_local = user_config.get("agent") or {}
+         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+@@ -28555,6 +28584,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     event_message_id=next_message_id,
+                     channel_prompt=next_channel_prompt,
+                     message_type=next_message_type,
++                    lilith_shared_session_id=lilith_shared_session_id,
+                 )
+                 return _preserve_queued_followup_history_offset(result, followup_result)
+         finally:
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 49fd695..d00de5c 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -3167,6 +3167,13 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
+     """
+     from utils import atomic_yaml_write
+ 
++    # Automatic callers (onboarding, platform metadata, slash commands) are not
++    # authenticated native management transactions. They must not silently
++    # invalidate a running host's pinned config/receipt. The TUI management
++    # transaction has its own serialized, attested round-trip writer.
++    from agent.identity_policy import identity_lock_required_by_host
++    if is_managed() or identity_lock_required_by_host():
++        raise PermissionError("managed configuration requires the native management transaction")
+     require_readable_config_before_write(config_path)
+     atomic_yaml_write(config_path, data, **kwargs)
+ 

@@ -1,0 +1,948 @@
+diff --git a/acp_adapter/tools.py b/acp_adapter/tools.py
+index bb997dc..20103de 100644
+--- a/acp_adapter/tools.py
++++ b/acp_adapter/tools.py
+@@ -677,6 +677,16 @@ def _format_memory_result(result: Optional[str], args: Optional[Dict[str, Any]])
+             lines.append("Matches:")
+             lines.extend(f"- {_truncate_text(str(m), 160)}" for m in matches[:5])
+         return "\n".join(lines)
++    if data.get("staged") is True:
++        lines = [f"⏳ Memory {action} awaiting approval ({target})", "Not saved yet."]
++        if data.get("message"):
++            lines.append(str(data.get("message")))
++        return "\n".join(lines)
++    if data.get("committed") is False:
++        lines = [f"○ Memory {action} not committed ({target})"]
++        if data.get("message"):
++            lines.append(str(data.get("message")))
++        return "\n".join(lines)
+     lines = [f"✅ Memory {action} saved ({target})"]
+     if data.get("message"):
+         lines.append(str(data.get("message")))
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index ec9abdb..169451b 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1840,6 +1840,7 @@ def init_agent(
+     agent._memory_store = None
+     agent._memory_enabled = False
+     agent._user_profile_enabled = False
++    agent._authoritative_user_profile_writes = False
+     agent._memory_nudge_interval = 10
+     agent._turns_since_memory = 0
+     agent._iters_since_skill = 0
+@@ -1855,6 +1856,9 @@ def init_agent(
+             mem_config = _agent_cfg.get("memory", {})
+             agent._memory_enabled = mem_config.get("memory_enabled", False)
+             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
++            agent._authoritative_user_profile_writes = bool(
++                str(mem_config.get("user_profile_write_authority") or "").strip()
++            )
+             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
+             if agent._memory_enabled or agent._user_profile_enabled:
+                 from tools.memory_tool import MemoryStore
+@@ -1863,6 +1867,8 @@ def init_agent(
+                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                 )
+                 agent._memory_store.load_from_disk()
++                if agent._authoritative_user_profile_writes:
++                    agent._memory_store.set_user_profile_writes_enabled(False)
+         except Exception:
+             pass  # Memory is optional -- don't break agent init
+     
+@@ -1944,6 +1950,15 @@ def init_agent(
+                     # delivered on a different path (see the platform=="cli"
+                     # block), and the indicator no-ops when it's absent.
+                     agent._memory_manager.initialize_all(**_init_kwargs)
++                    agent._authoritative_user_profile_writes = (
++                        agent._authoritative_user_profile_writes
++                        or agent._memory_manager.has_authoritative_user_profile_provider()
++                    )
++                    if (
++                        agent._authoritative_user_profile_writes
++                        and agent._memory_store is not None
++                    ):
++                        agent._memory_store.set_user_profile_writes_enabled(False)
+                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
+                 else:
+                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index c90785f..6f3db51 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -3064,6 +3064,36 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
+         def _execute(next_args: dict) -> Any:
+             target = next_args.get("target", "memory")
+             operations = next_args.get("operations")
++            intercepted = None
++            if target == "user" and agent._memory_manager:
++                intercepted = agent._memory_manager.intercept_user_profile_write(
++                    next_args,
++                    build_metadata=lambda: agent._build_memory_write_metadata(
++                        task_id=effective_task_id,
++                        tool_call_id=tool_call_id,
++                    ),
++                )
++            elif target == "user" and getattr(
++                agent,
++                "_authoritative_user_profile_writes",
++                False,
++            ):
++                # Background-review forks deliberately have no external
++                # provider manager, but inherit the parent's authority bit.
++                # Fail closed here; this also covers an explicitly configured
++                # authority whose provider failed to initialize.
++                intercepted = json.dumps({
++                    "success": False,
++                    "done": True,
++                    "committed": False,
++                    "code": "memory.authoritative_provider_unavailable",
++                    "error": (
++                        "The authoritative user-profile provider is unavailable; "
++                        "no profile write was made and USER.md was not changed."
++                    ),
++                })
++            if intercepted is not None:
++                return _finish_agent_tool(intercepted, next_args)
+             from tools.memory_tool import memory_tool as _memory_tool
+             result = _memory_tool(
+                 action=next_args.get("action"),
+diff --git a/agent/background_review.py b/agent/background_review.py
+index a4c9c4a..aa3efd8 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -515,7 +515,11 @@ def summarize_background_review_actions(
+         # Defensively normalize everything through a dict-typed alias so
+         # the rest of the function can stay terse without per-call
+         # ``isinstance`` guards (#59437).
+-        if not isinstance(data, dict) or not data.get("success"):
++        if (
++            not isinstance(data, dict)
++            or not data.get("success")
++            or data.get("committed") is False
++        ):
+             continue
+         message = data.get("message", "")
+         detail = call_details.get(tcid) or {}
+@@ -888,6 +892,11 @@ def _run_review_in_thread(
+             review_agent._memory_store = agent._memory_store
+             review_agent._memory_enabled = agent._memory_enabled
+             review_agent._user_profile_enabled = agent._user_profile_enabled
++            review_agent._authoritative_user_profile_writes = getattr(
++                agent,
++                "_authoritative_user_profile_writes",
++                False,
++            )
+             review_agent._memory_nudge_interval = 0
+             review_agent._skill_nudge_interval = 0
+             # PERSISTENCE ISOLATION (the curator-takeover root cause): the fork
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 6be449a..fc37ae0 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -1477,6 +1477,17 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
+     if tool_name == "memory":
+         action = args.get("action", "?")
+         target = args.get("target", "?")
++        try:
++            memory_result = json.loads(content) if content else {}
++        except (json.JSONDecodeError, TypeError):
++            memory_result = {}
++        if isinstance(memory_result, dict):
++            if memory_result.get("staged") is True:
++                return f"[memory] {action} on {target} awaiting approval; not committed"
++            if memory_result.get("committed") is False:
++                return f"[memory] {action} on {target} not committed"
++            if memory_result.get("success") is False:
++                return f"[memory] {action} on {target} failed"
+         return f"[memory] {action} on {target}"
+ 
+     if tool_name == "todo":
+diff --git a/agent/display.py b/agent/display.py
+index 2880cec..b2e74f3 100644
+--- a/agent/display.py
++++ b/agent/display.py
+@@ -1503,6 +1503,13 @@ def _get_cute_tool_message(
+     if tool_name == "session_search":
+         return _wrap(f"┊ 🔍 recall    \"{_trunc(args.get('query', ''), 35)}\"  {dur}")
+     if tool_name == "memory":
++        memory_result = safe_json_loads(result) if result else None
++        if (
++            isinstance(memory_result, dict)
++            and memory_result.get("committed") is False
++        ):
++            state = "review deferred" if memory_result.get("success") is True else "not saved"
++            return _wrap(f"┊ 🧠 memory    {state}  {dur}")
+         action = args.get("action", "?")
+         target = args.get("target", "")
+         if action == "add":
+diff --git a/agent/memory_manager.py b/agent/memory_manager.py
+index 6ac5557..a5af9f2 100644
+--- a/agent/memory_manager.py
++++ b/agent/memory_manager.py
+@@ -481,6 +481,91 @@ class MemoryManager:
+                 return p
+         return None
+ 
++    def has_authoritative_user_profile_provider(self) -> bool:
++        """Return whether the external provider exclusively owns profile writes."""
++
++        for provider in self._providers:
++            if provider.name == "builtin":
++                continue
++            try:
++                if provider.owns_user_profile_writes():
++                    return True
++            except Exception:
++                logger.warning(
++                    "Memory provider '%s' failed its user-profile authority check",
++                    provider.name,
++                    exc_info=True,
++                )
++                # An authority check that fails must not silently hand the same
++                # data to USER.md. Registration is limited to one external
++                # provider, so fail closed for the active provider.
++                return True
++        return False
++
++    def intercept_user_profile_write(
++        self,
++        tool_args: Dict[str, Any],
++        *,
++        build_metadata: Optional[Callable[[], Dict[str, Any]]] = None,
++    ) -> Optional[Any]:
++        """Route ``memory(target='user')`` to an authoritative provider.
++
++        ``None`` means no provider claimed the write and preserves the normal
++        built-in USER.md path. Once a provider claims authority, every error and
++        empty response fails closed so a provider outage cannot create a second,
++        unmanaged profile copy.
++        """
++
++        if str(tool_args.get("target") or "memory") != "user":
++            return None
++
++        for provider in self._providers:
++            if provider.name == "builtin":
++                continue
++            try:
++                owns_writes = provider.owns_user_profile_writes()
++            except Exception:
++                logger.warning(
++                    "Memory provider '%s' failed its user-profile authority check",
++                    provider.name,
++                    exc_info=True,
++                )
++                return tool_error(
++                    "The authoritative user-profile memory is unavailable; no built-in profile write was made.",
++                    success=False,
++                )
++            if not owns_writes:
++                continue
++
++            try:
++                metadata = dict(build_metadata() if build_metadata else {})
++                result = provider.handle_user_profile_write(
++                    dict(tool_args),
++                    metadata=metadata,
++                )
++            except Exception:
++                logger.warning(
++                    "Memory provider '%s' failed an authoritative user-profile write",
++                    provider.name,
++                    exc_info=True,
++                )
++                return tool_error(
++                    "The authoritative user-profile memory is unavailable; no built-in profile write was made.",
++                    success=False,
++                )
++            if result is None:
++                logger.warning(
++                    "Memory provider '%s' claimed user-profile writes but returned no result",
++                    provider.name,
++                )
++                return tool_error(
++                    "The authoritative user-profile memory declined the write; no built-in profile write was made.",
++                    success=False,
++                )
++            return result
++
++        return None
++
+     # -- System prompt -------------------------------------------------------
+ 
+     def build_system_prompt(self) -> str:
+@@ -1225,7 +1310,11 @@ class MemoryManager:
+                 return False
+         if not isinstance(result, dict):
+             return False
+-        return result.get("success") is True and result.get("staged") is not True
++        return (
++            result.get("success") is True
++            and result.get("staged") is not True
++            and result.get("committed") is not False
++        )
+ 
+     def notify_memory_tool_write(
+         self,
+diff --git a/agent/memory_provider.py b/agent/memory_provider.py
+index 1333c03..6c6a934 100644
+--- a/agent/memory_provider.py
++++ b/agent/memory_provider.py
+@@ -28,6 +28,8 @@ Optional hooks (override to opt in):
+   on_session_switch(new_session_id, **kwargs) — mid-process session_id rotation
+   on_pre_compress(messages) -> str       — extract before context compression
+   on_memory_write(action, target, content, metadata=None) — mirror built-in memory writes
++  owns_user_profile_writes() -> bool — claim exclusive USER.md-style profile writes
++  handle_user_profile_write(args, metadata=None) — handle a claimed profile write
+   on_delegation(task, result, **kwargs)  — parent-side observation of subagent work
+   backup_paths() -> list[str]            — extra on-disk paths to include in `hermes backup`
+ """
+@@ -436,6 +438,34 @@ class MemoryProvider(ABC):
+         Use to mirror built-in memory writes to your backend.
+         """
+ 
++    def owns_user_profile_writes(self) -> bool:
++        """Return whether this provider exclusively owns user-profile writes.
++
++        The default keeps Hermes' built-in ``USER.md`` behavior unchanged.
++        A provider returning ``True`` must also implement
++        :meth:`handle_user_profile_write`; the memory manager routes
++        ``memory(target="user")`` to that method before the built-in store can
++        mutate. This prevents two independently managed profile authorities
++        from retaining the same fact with incompatible hide/delete semantics.
++        """
++
++        return False
++
++    def handle_user_profile_write(
++        self,
++        args: Dict[str, Any],
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> Optional[Any]:
++        """Handle one intercepted ``memory(target="user")`` tool call.
++
++        Return a tool result when :meth:`owns_user_profile_writes` is ``True``.
++        Returning ``None`` from an authoritative provider is treated as a
++        fail-closed error; it never falls back to ``USER.md``. Non-authoritative
++        providers are not called.
++        """
++
++        return None
++
+     def backup_paths(self) -> List[str]:
+         """Return extra on-disk paths this provider stores OUTSIDE HERMES_HOME.
+ 
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index bb01fb6..e4185ba 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -1819,6 +1819,38 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+             def _execute(next_args: dict) -> Any:
+                 target = next_args.get("target", "memory")
+                 operations = next_args.get("operations")
++                intercepted = None
++                if target == "user" and agent._memory_manager:
++                    intercepted = agent._memory_manager.intercept_user_profile_write(
++                        next_args,
++                        build_metadata=lambda: agent._build_memory_write_metadata(
++                            task_id=effective_task_id,
++                            tool_call_id=getattr(tool_call, "id", None),
++                        ),
++                    )
++                elif target == "user" and getattr(
++                    agent,
++                    "_authoritative_user_profile_writes",
++                    False,
++                ):
++                    # Background-review forks deliberately have no external
++                    # provider manager, but inherit the parent's authority bit.
++                    # Their legacy USER.md maintenance must therefore fail
++                    # closed instead of creating a second profile copy. This
++                    # also covers an explicitly configured authority whose
++                    # provider failed to initialize.
++                    intercepted = json.dumps({
++                        "success": False,
++                        "done": True,
++                        "committed": False,
++                        "code": "memory.authoritative_provider_unavailable",
++                        "error": (
++                            "The authoritative user-profile provider is unavailable; "
++                            "no profile write was made and USER.md was not changed."
++                        ),
++                    })
++                if intercepted is not None:
++                    return intercepted
+                 from tools.memory_tool import memory_tool as _memory_tool
+                 result = _memory_tool(
+                     action=next_args.get("action"),
+diff --git a/agent/turn_summary.py b/agent/turn_summary.py
+index f4440af..c1c8850 100644
+--- a/agent/turn_summary.py
++++ b/agent/turn_summary.py
+@@ -193,6 +193,20 @@ class TurnSummaryCollector:
+         # Internal/pseudo tools (``_thinking``) are not user-visible work.
+         if tool_name.startswith("_"):
+             return
++        if tool_name == "memory":
++            payload = result
++            if isinstance(payload, str):
++                try:
++                    import json
++
++                    payload = json.loads(payload)
++                except Exception:
++                    payload = None
++            # An authoritative provider can defer evaluation until the exact
++            # turn is durably persisted. Do not summarize that acknowledgement
++            # as "updated memory" before any profile fact actually exists.
++            if isinstance(payload, dict) and payload.get("committed") is False:
++                return
+ 
+         group = _VERB_GROUPS.get(tool_name)
+         if group is None:
+diff --git a/tools/memory_tool.py b/tools/memory_tool.py
+index d77aa9e..0a5d28a 100644
+--- a/tools/memory_tool.py
++++ b/tools/memory_tool.py
+@@ -172,6 +172,35 @@ class MemoryStore:
+         # Per-turn counter of failed at-capacity consolidation attempts; reset
+         # at each turn boundary by reset_consolidation_failures() (#42405).
+         self._consolidation_failures = 0
++        # External providers may claim the user-profile write authority while
++        # leaving legacy USER.md entries readable. The default preserves
++        # upstream behavior for profiles without such a provider.
++        self._user_profile_writes_enabled = True
++
++    def set_user_profile_writes_enabled(self, enabled: bool) -> None:
++        """Enable or disable mutations of the built-in ``USER.md`` store."""
++
++        self._user_profile_writes_enabled = bool(enabled)
++
++    @property
++    def user_profile_writes_enabled(self) -> bool:
++        """Whether the built-in ``USER.md`` store may currently mutate."""
++
++        return self._user_profile_writes_enabled
++
++    def _disabled_write_response(self, target: str) -> Optional[Dict[str, Any]]:
++        if target != "user" or self._user_profile_writes_enabled:
++            return None
++        return {
++            "success": False,
++            "done": True,
++            "committed": False,
++            "code": "memory.authoritative_user_profile_required",
++            "error": (
++                "The active external provider owns user-profile memory. "
++                "The built-in USER.md store was not changed."
++            ),
++        }
+ 
+     def reset_consolidation_failures(self) -> None:
+         """Reset the per-turn consolidation-failure counter (call at turn start)."""
+@@ -389,6 +418,9 @@ class MemoryStore:
+ 
+     def add(self, target: str, content: str) -> Dict[str, Any]:
+         """Append a new entry. Returns error if it would exceed the char limit."""
++        disabled = self._disabled_write_response(target)
++        if disabled is not None:
++            return disabled
+         content = content.strip()
+         if not content:
+             return {"success": False, "error": "Content cannot be empty."}
+@@ -448,6 +480,9 @@ class MemoryStore:
+ 
+     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
+         """Find entry containing old_text substring, replace it with new_content."""
++        disabled = self._disabled_write_response(target)
++        if disabled is not None:
++            return disabled
+         old_text = old_text.strip()
+         new_content = new_content.strip()
+         if not old_text:
+@@ -519,6 +554,9 @@ class MemoryStore:
+ 
+     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
+         """Remove the entry containing old_text substring."""
++        disabled = self._disabled_write_response(target)
++        if disabled is not None:
++            return disabled
+         old_text = old_text.strip()
+         if not old_text:
+             return {"success": False, "error": "old_text cannot be empty."}
+@@ -572,6 +610,9 @@ class MemoryStore:
+         the net result would exceed the char limit, NOTHING is written and an
+         error is returned describing the first failure plus the live state.
+         """
++        disabled = self._disabled_write_response(target)
++        if disabled is not None:
++            return disabled
+         if not operations:
+             return {"success": False, "error": "operations list is empty."}
+ 
+@@ -894,25 +935,41 @@ def load_on_disk_store() -> "MemoryStore":
+     / ``memory.user_char_limit`` overrides — so an approval applied without a live
+     agent enforces the SAME caps as one applied with one.
+ 
+-    Falls back to the built-in defaults if config can't be loaded, so this can
+-    never raise on a missing/unreadable config.
++    Falls back to the built-in defaults if an *unpinned* config can't be loaded.
++    A Runtime-pinned managed config is an authority boundary: if it cannot be
++    authenticated, the caller must fail closed instead of constructing a store
++    that could write USER.md without the configured profile provider.
+     """
+     memory_char_limit = 2200
+     user_char_limit = 1375
++    user_profile_write_authority = ""
+     try:
+         from hermes_cli.config import load_config
+ 
+         mem_cfg = (load_config() or {}).get("memory", {}) or {}
+         memory_char_limit = int(mem_cfg.get("memory_char_limit", memory_char_limit))
+         user_char_limit = int(mem_cfg.get("user_char_limit", user_char_limit))
++        user_profile_write_authority = str(
++            mem_cfg.get("user_profile_write_authority") or ""
++        ).strip()
+     except Exception:
+-        pass  # config optional — fall back to defaults rather than break /memory
++        from hermes_cli.managed_scope import managed_config_integrity_required
++
++        if managed_config_integrity_required():
++            raise
++        # Unpinned standalone config remains optional for compatibility.
++        pass
+ 
+     store = MemoryStore(
+         memory_char_limit=memory_char_limit,
+         user_char_limit=user_char_limit,
+     )
+     store.load_from_disk()
++    if user_profile_write_authority:
++        # A no-live-agent approval/registry path must obey the same profile
++        # authority as a live AIAgent. Otherwise an old staged write could
++        # recreate USER.md behind the external provider's management surface.
++        store.set_user_profile_writes_enabled(False)
+     return store
+ 
+ 
+@@ -967,7 +1024,8 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
+         origin=wa.current_origin(),
+     )
+     return json.dumps(
+-        {"success": True, "staged": True, "pending_id": record["id"],
++        {"success": True, "staged": True, "committed": False,
++         "pending_id": record["id"],
+          "message": decision.message},
+         ensure_ascii=False,
+     )
+@@ -1014,7 +1072,8 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
+         origin=wa.current_origin(),
+     )
+     return json.dumps(
+-        {"success": True, "staged": True, "pending_id": record["id"],
++        {"success": True, "staged": True, "committed": False,
++         "pending_id": record["id"],
+          "message": decision.message},
+         ensure_ascii=False,
+     )
+@@ -1082,6 +1141,14 @@ def memory_tool(
+     if target not in {"memory", "user"}:
+         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+ 
++    # Enforce a configured external profile authority before the approval
++    # gate. This keeps rejected USER.md data out of pending-write files and
++    # covers direct registry, slash-command, and no-live-agent callers in
++    # addition to the normal AIAgent interception path.
++    disabled = store._disabled_write_response(target)
++    if disabled is not None:
++        return json.dumps(disabled, ensure_ascii=False)
++
+     # --- Batch path -------------------------------------------------------
+     if operations:
+         if not isinstance(operations, list):
+@@ -1242,7 +1309,3 @@ registry.register(
+     check_fn=check_memory_requirements,
+     emoji="🧠",
+ )
+-
+-
+-
+-
+diff --git a/tests/acp/test_tools.py b/tests/acp/test_tools.py
+index 75dbed6..fe4d57d 100644
+--- a/tests/acp/test_tools.py
++++ b/tests/acp/test_tools.py
+@@ -195,6 +195,38 @@ class TestBuildToolComplete:
+         assert "total 42" in content_item.content.text
+         assert result.raw_output is None
+ 
++    def test_deferred_profile_memory_is_not_reported_as_saved(self):
++        result = build_tool_complete(
++            "tc-memory-deferred",
++            "memory",
++            '{"success":true,"done":true,"committed":false,'
++            '"message":"No profile fact was committed."}',
++            function_args={"action": "add", "target": "user"},
++        )
++
++        text = result.content[0].content.text
++        assert result.status == "completed"
++        assert "not committed" in text
++        assert "No profile fact was committed." in text
++        assert "saved" not in text
++        assert "✅" not in text
++
++    def test_staged_memory_is_reported_as_awaiting_approval(self):
++        result = build_tool_complete(
++            "tc-memory-staged",
++            "memory",
++            '{"success":true,"done":true,"staged":true,'
++            '"message":"Approval required."}',
++            function_args={"action": "add", "target": "user"},
++        )
++
++        text = result.content[0].content.text
++        assert result.status == "completed"
++        assert "awaiting approval" in text
++        assert "Not saved yet." in text
++        assert "saved (" not in text
++        assert "✅" not in text
++
+ 
+ 
+ 
+diff --git a/tests/agent/test_context_compressor.py b/tests/agent/test_context_compressor.py
+index 164f54a..925f367 100644
+--- a/tests/agent/test_context_compressor.py
++++ b/tests/agent/test_context_compressor.py
+@@ -18,6 +18,24 @@ from agent.context_compressor import (
+ from hermes_state import SessionDB
+ 
+ 
++@pytest.mark.parametrize(
++    ("content", "expected"),
++    [
++        ('{"success":true,"staged":true}', "awaiting approval; not committed"),
++        ('{"success":true,"committed":false}', "not committed"),
++        ('{"success":false,"error":"no"}', "failed"),
++        ('{"success":true}', "[memory] add on user"),
++    ],
++)
++def test_memory_summary_preserves_write_outcome(content, expected):
++    summary = _summarize_tool_result(
++        "memory",
++        '{"action":"add","target":"user"}',
++        content,
++    )
++    assert expected in summary
++
++
+ class StubProviderError(Exception):
+     def __init__(self, message, *, status_code=None, response=None):
+         super().__init__(message)
+diff --git a/tests/agent/test_memory_provider.py b/tests/agent/test_memory_provider.py
+index 1dd85ff..5f41e40 100644
+--- a/tests/agent/test_memory_provider.py
++++ b/tests/agent/test_memory_provider.py
+@@ -97,6 +97,22 @@ class MetadataMemoryProvider(FakeMemoryProvider):
+         self.memory_writes.append((action, target, content, metadata or {}))
+ 
+ 
++class AuthoritativeMemoryProvider(FakeMemoryProvider):
++    """Provider that exclusively owns user-profile writes."""
++
++    def __init__(self, result=None):
++        super().__init__(name="authoritative")
++        self.result = result
++        self.profile_write_calls = []
++
++    def owns_user_profile_writes(self):
++        return True
++
++    def handle_user_profile_write(self, args, metadata=None):
++        self.profile_write_calls.append((args, metadata or {}))
++        return self.result
++
++
+ class MessagesMemoryProvider(FakeMemoryProvider):
+     """Provider that opts into completed-turn message context."""
+ 
+@@ -204,6 +220,85 @@ class TestMemoryManager:
+ 
+         provider.on_persisted_turn.assert_called_once()
+ 
++    def test_user_profile_write_without_authority_passes_through(self):
++        mgr = MemoryManager()
++        mgr.add_provider(FakeMemoryProvider("legacy"))
++
++        assert mgr.has_authoritative_user_profile_provider() is False
++        assert mgr.intercept_user_profile_write({"action": "add", "target": "user"}) is None
++
++    def test_authoritative_user_profile_write_is_routed_once(self):
++        expected = json.dumps({
++            "success": True,
++            "committed": False,
++            "eligible_for_post_turn_review": True,
++        })
++        provider = AuthoritativeMemoryProvider(expected)
++        mgr = MemoryManager()
++        mgr.add_provider(provider)
++
++        result = mgr.intercept_user_profile_write(
++            {"action": "add", "target": "user", "content": "stable preference"},
++            build_metadata=lambda: {"session_id": "session-a"},
++        )
++
++        assert result == expected
++        assert mgr.has_authoritative_user_profile_provider() is True
++        assert provider.profile_write_calls == [(
++            {"action": "add", "target": "user", "content": "stable preference"},
++            {"session_id": "session-a"},
++        )]
++
++    def test_authoritative_provider_empty_result_fails_closed(self):
++        provider = AuthoritativeMemoryProvider(None)
++        mgr = MemoryManager()
++        mgr.add_provider(provider)
++
++        result = json.loads(mgr.intercept_user_profile_write({
++            "action": "add",
++            "target": "user",
++            "content": "must not fall back",
++        }))
++
++        assert result["success"] is False
++        assert "no built-in profile write" in result["error"]
++
++    def test_authoritative_provider_exception_fails_closed_without_content_echo(self):
++        provider = AuthoritativeMemoryProvider()
++        provider.handle_user_profile_write = MagicMock(side_effect=RuntimeError("boom"))
++        mgr = MemoryManager()
++        mgr.add_provider(provider)
++
++        result = json.loads(mgr.intercept_user_profile_write({
++            "action": "add",
++            "target": "user",
++            "content": "private-value-must-not-echo",
++        }))
++
++        assert result["success"] is False
++        assert "private-value-must-not-echo" not in json.dumps(result)
++
++    def test_non_user_target_is_never_intercepted(self):
++        provider = AuthoritativeMemoryProvider("unexpected")
++        mgr = MemoryManager()
++        mgr.add_provider(provider)
++
++        assert mgr.intercept_user_profile_write({
++            "action": "add",
++            "target": "memory",
++            "content": "agent note",
++        }) is None
++        assert provider.profile_write_calls == []
++
++    def test_deferred_memory_result_is_not_a_committed_write(self):
++        assert MemoryManager._memory_tool_result_succeeded({
++            "success": True,
++            "committed": False,
++        }) is False
++        assert MemoryManager._memory_tool_result_succeeded({
++            "success": True,
++        }) is True
++
+ 
+ 
+ 
+diff --git a/tests/agent/test_turn_summary.py b/tests/agent/test_turn_summary.py
+index c9c868e..9bea7e3 100644
+--- a/tests/agent/test_turn_summary.py
++++ b/tests/agent/test_turn_summary.py
+@@ -108,6 +108,18 @@ def test_begin_resets_previous_turn():
+     assert collector.render(0.5) == ""
+ 
+ 
++def test_deferred_memory_is_not_reported_as_updated():
++    collector = TurnSummaryCollector()
++    collector.begin()
++    collector.record_tool(
++        "memory",
++        result='{"success":true,"committed":false}',
++    )
++
++    assert collector.tally.total_tools == 0
++    assert collector.render(0.5) == ""
++
++
+ 
+ 
+ 
+diff --git a/tests/run_agent/test_background_review_summary.py b/tests/run_agent/test_background_review_summary.py
+index 1ba0035..554db10 100644
+--- a/tests/run_agent/test_background_review_summary.py
++++ b/tests/run_agent/test_background_review_summary.py
+@@ -92,6 +92,23 @@ def test_empty_inputs():
+     assert _summarize(None, None) == []
+ 
+ 
++def test_deferred_memory_is_not_reported_as_updated():
++    review_messages = [
++        _tool_msg(
++            "call_deferred",
++            {
++                "success": True,
++                "committed": False,
++                "eligible_for_post_turn_review": True,
++                "message": "No profile fact was committed by this tool call.",
++                "target": "user",
++            },
++        ),
++    ]
++
++    assert _summarize(review_messages, []) == []
++
++
+ 
+ 
+ def test_removed_or_replaced_relabels_by_target():
+diff --git a/tests/tools/test_memory_tool.py b/tests/tools/test_memory_tool.py
+index d3fd4d1..8524090 100644
+--- a/tests/tools/test_memory_tool.py
++++ b/tests/tools/test_memory_tool.py
+@@ -6,6 +6,8 @@ from pathlib import Path
+ 
+ from tools.memory_tool import (
+     MemoryStore,
++    apply_memory_pending,
++    load_on_disk_store,
+     memory_tool,
+     _scan_memory_content,
+ )
+@@ -120,6 +122,114 @@ class TestMemoryStoreAdd:
+         assert result["target"] == "user"
+ 
+ 
++class TestExternalUserProfileAuthority:
++    def test_single_batch_and_pending_user_writes_leave_files_unchanged(
++        self, store, monkeypatch
++    ):
++        assert store.add("memory", "existing agent note")["success"] is True
++        assert store.add("user", "legacy player fact")["success"] is True
++        memory_path = store._path_for("memory")
++        user_path = store._path_for("user")
++        before_memory = memory_path.read_bytes()
++        before_user = user_path.read_bytes()
++        store.set_user_profile_writes_enabled(False)
++
++        def approval_must_not_run(*args, **kwargs):
++            raise AssertionError("disabled USER.md writes must not reach approval staging")
++
++        monkeypatch.setattr(
++            "tools.write_approval.evaluate_gate",
++            approval_must_not_run,
++        )
++
++        results = [
++            json.loads(memory_tool(
++                action="add",
++                target="user",
++                content="new player fact",
++                store=store,
++            )),
++            json.loads(memory_tool(
++                target="user",
++                operations=[{"action": "add", "content": "batch player fact"}],
++                store=store,
++            )),
++            apply_memory_pending(
++                {"action": "remove", "target": "user", "old_text": "legacy"},
++                store,
++            ),
++        ]
++
++        assert all(result["success"] is False for result in results)
++        assert all(result.get("committed") is False for result in results)
++        assert memory_path.read_bytes() == before_memory
++        assert user_path.read_bytes() == before_user
++
++    def test_disabling_user_profile_does_not_disable_agent_memory(self, store):
++        store.set_user_profile_writes_enabled(False)
++
++        result = json.loads(memory_tool(
++            action="add",
++            target="memory",
++            content="agent environment note",
++            store=store,
++        ))
++
++        assert result["success"] is True
++        assert "agent environment note" in store.memory_entries
++
++    def test_no_live_agent_store_honors_configured_authority(
++        self, tmp_path, monkeypatch
++    ):
++        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
++        monkeypatch.setattr(
++            "hermes_cli.config.load_config",
++            lambda: {
++                "memory": {
++                    "memory_char_limit": 500,
++                    "user_char_limit": 300,
++                    "user_profile_write_authority": "authoritative-provider",
++                }
++            },
++        )
++        (tmp_path / "USER.md").write_text("legacy player fact", encoding="utf-8")
++
++        on_disk = load_on_disk_store()
++        before = (tmp_path / "USER.md").read_bytes()
++        result = json.loads(memory_tool(
++            action="add",
++            target="user",
++            content="must stay external",
++            store=on_disk,
++        ))
++
++        assert on_disk.user_profile_writes_enabled is False
++        assert result["success"] is False
++        assert (tmp_path / "USER.md").read_bytes() == before
++
++    @pytest.mark.parametrize("pin", ["", "0" * 64])
++    def test_pinned_config_load_failure_never_constructs_writable_user_store(
++        self, tmp_path, monkeypatch, pin
++    ):
++        from hermes_cli.managed_scope import ManagedConfigIntegrityError
++
++        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
++        monkeypatch.setenv("HERMES_MANAGED_CONFIG_SHA256", pin)
++        monkeypatch.setattr(
++            "hermes_cli.config.load_config",
++            lambda: (_ for _ in ()).throw(ManagedConfigIntegrityError("drift")),
++        )
++        user_path = tmp_path / "USER.md"
++        user_path.write_text("legacy player fact", encoding="utf-8")
++        before = user_path.read_bytes()
++
++        with pytest.raises(ManagedConfigIntegrityError, match="drift"):
++            load_on_disk_store()
++
++        assert user_path.read_bytes() == before
++
++
++class TestMemoryStoreAddRemainder:
+     def test_overflow_returns_consolidation_context(self, store):
+         store.add("memory", "x" * 490)
+         result = store.add("memory", "this will exceed the limit")
+diff --git a/tests/tools/test_write_approval.py b/tests/tools/test_write_approval.py
+index a0e2c57..3366d72 100644
+--- a/tests/tools/test_write_approval.py
++++ b/tests/tools/test_write_approval.py
+@@ -92,6 +92,8 @@ def test_cli_memory_approve_without_live_agent_uses_fresh_store(hermes_home, cap
+     staging = MemoryStore(); staging.load_from_disk()
+     r = json.loads(memory_tool("add", "memory", "remember the launch date", store=staging))
+     assert r.get("pending_id"), r
++    assert r.get("staged") is True
++    assert r.get("committed") is False
+     assert wa.pending_count("memory") == 1
+ 
+     # Bare CLI handler with no live agent → store resolves to None pre-fix.

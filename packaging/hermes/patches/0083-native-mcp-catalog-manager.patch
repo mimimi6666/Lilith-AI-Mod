@@ -1,0 +1,525 @@
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 4def8ee..5dbcc1d 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -1728,6 +1728,7 @@ def _(rid, params: dict) -> dict:
+         from tools.approval import _get_approval_mode
+         from tools.registry import discover_builtin_tools, registry
+         from tui_gateway.native_setup import setup_providers
++        from tui_gateway.native_mcp_setup import mcp_catalog
+ 
+         platform = "cli"
+         config = load_config()
+@@ -1831,6 +1832,7 @@ def _(rid, params: dict) -> dict:
+                 "enabled_toolsets": sorted(enabled),
+                 "toolsets": rows,
+                 "new_session_required": False,
++                "mcp_catalog": mcp_catalog(config),
+             },
+         )
+     except Exception as e:
+@@ -1848,12 +1850,12 @@ def _(rid, params: dict) -> dict:
+ 
+     required = {"enabled_toolsets", "approval_mode"}
+     if not isinstance(params, dict) or set(params) not in (
+-        required, required | {"setup_selection"},
++        required, required | {"setup_selection"}, required | {"mcp_setup"},
+     ):
+         return _err(
+             rid,
+             -32602,
+-            "tools.set requires enabled_toolsets and approval_mode, with optional setup_selection",
++            "tools.set requires enabled_toolsets and approval_mode, with one optional setup_selection or mcp_setup",
+         )
+ 
+     requested_raw = params.get("enabled_toolsets")
+@@ -1884,6 +1886,15 @@ def _(rid, params: dict) -> dict:
+             setup_selection = validate_selection_shape(params["setup_selection"])
+         except ValueError as exc:
+             return _err(rid, -32602, str(exc))
++    mcp_setup = None
++    if "mcp_setup" in params:
++        from tui_gateway.native_mcp_setup import validate_mcp_setup_shape
++
++        try:
++            mcp_setup = validate_mcp_setup_shape(params["mcp_setup"])
++        except ValueError as exc:
++            return _err(rid, -32602, str(exc))
++    native_setup_change = setup_selection is not None or mcp_setup is not None
+     native_mutation_token = None
+     try:
+         from agent.identity_policy import (
+@@ -1972,20 +1983,26 @@ def _(rid, params: dict) -> dict:
+                     config, platform, include_default_mcp_servers=False
+                 ))
+                 approvals = config.get("approvals")
+-                if setup_selection is not None:
+-                    from tui_gateway.native_setup import apply_selection, verify_selection
+-
++                expected_mcp_servers = None
++                if native_setup_change:
+                     prior_mode = _normalize_approval_mode(
+                         approvals.get("mode", "manual") if isinstance(approvals, dict)
+                         else "manual"
+                     )
+                     if requested != prior_enabled & valid or approval_mode != prior_mode:
+-                        return _err(rid, -32602, "provider selection cannot change toolsets or approval mode")
++                        return _err(rid, -32602, "native setup cannot change toolsets or approval mode")
+                     try:
+-                        apply_selection(setup_selection, config)
++                        if setup_selection is not None:
++                            from tui_gateway.native_setup import apply_selection, verify_selection
++
++                            apply_selection(setup_selection, config)
++                        else:
++                            from tui_gateway.native_mcp_setup import apply_mcp_setup, verify_mcp_setup
++
++                            expected_mcp_servers = apply_mcp_setup(mcp_setup, config)
+                     except ValueError as exc:
+                         return _err(rid, -32602, str(exc))
+-                if setup_selection is None:
++                if not native_setup_change:
+                     if not isinstance(approvals, dict):
+                         approvals = {}
+                         config["approvals"] = approvals
+@@ -1996,10 +2013,10 @@ def _(rid, params: dict) -> dict:
+                     # The native helper performs the one fail-closed atomic
+                     # config save. Approval mode is already in this same
+                     # mapping, so both authorities commit in one replacement.
+-                    if setup_selection is None:
++                    if not native_setup_change:
+                         _save_platform_tools(config, platform, requested)
+                     else:
+-                        # Provider selection must not clear no_mcp or rewrite
++                        # Native setup must not clear no_mcp or rewrite
+                         # platform-toolset/known-toolset enablement bookkeeping.
+                         from hermes_cli.tools_config import save_config
+ 
+@@ -2025,12 +2042,15 @@ def _(rid, params: dict) -> dict:
+                         raise RuntimeError(
+                             "native config verification did not reproduce the requested policy"
+                         )
+-                    if setup_selection is not None:
++                    if native_setup_change:
+                         if prior_enabled != set(_get_platform_tools(
+                             saved, platform, include_default_mcp_servers=False,
+                         )):
+-                            raise RuntimeError("provider selection changed native tool availability policy")
+-                        verify_selection(setup_selection, saved)
++                            raise RuntimeError("native setup changed native tool availability policy")
++                        if setup_selection is not None:
++                            verify_selection(setup_selection, saved)
++                        else:
++                            verify_mcp_setup(mcp_setup, saved, expected_mcp_servers)
+ 
+                     config_sha256 = commit_host_config_digest_rotation(
+                         previous_sha256
+@@ -2070,7 +2090,7 @@ def _(rid, params: dict) -> dict:
+             # resume re-proves the complete strict snapshot before adoption.
+             for session in _sessions.values():
+                 pending = session.pop("_native_approval_resume_digest", None)
+-                if setup_selection is None and previous_sha256 is not None and prior_enabled == set(
++                if not native_setup_change and previous_sha256 is not None and prior_enabled == set(
+                     _get_platform_tools(saved, platform, include_default_mcp_servers=False)
+                 ):
+                     first = previous_sha256
+@@ -2091,6 +2111,7 @@ def _(rid, params: dict) -> dict:
+                     "config_sha256": config_sha256,
+                     "new_session_required": True,
+                     **({"setup_selection": setup_selection} if setup_selection is not None else {}),
++                    **({"mcp_setup": mcp_setup} if mcp_setup is not None else {}),
+                 },
+             )
+         finally:
+diff --git a/tui_gateway/native_mcp_setup.py b/tui_gateway/native_mcp_setup.py
+new file mode 100644
+--- /dev/null
++++ b/tui_gateway/native_mcp_setup.py
+@@ -0,0 +1,140 @@
++"""Bounded, non-secret projection of Hermes' bundled MCP catalog.
++
++This module never installs, connects, authenticates, reloads, or saves. The
++player-owned tools.set transaction alone persists its pure config mutation.
++"""
++from copy import deepcopy
++from dataclasses import asdict
++import hashlib
++import json
++import re
++
++
++def validate_mcp_setup_shape(selection):
++    if not isinstance(selection, dict) or set(selection) != {
++        "catalog_entry", "catalog_sha256", "enabled",
++    }:
++        raise ValueError("mcp_setup requires catalog_entry, catalog_sha256 and enabled")
++    name, digest = selection["catalog_entry"], selection["catalog_sha256"]
++    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", name):
++        raise ValueError("invalid MCP catalog entry")
++    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
++        raise ValueError("invalid MCP catalog digest")
++    if type(selection["enabled"]) is not bool:
++        raise ValueError("MCP enabled must be a boolean")
++    return dict(selection)
++
++
++def _catalog():
++    from hermes_cli.mcp_catalog import list_catalog
++
++    entries = list_catalog()
++    names = [entry.name for entry in entries]
++    if len(entries) > 64 or len(set(names)) != len(names):
++        raise ValueError("native MCP catalog is unbounded or ambiguous")
++    return entries
++
++
++def _digest(entry):
++    # Bind every native parsed manifest field (including defaults and install
++    # recipe), not a machine-local path or any profile credential/state.
++    definition = asdict(entry)
++    definition.pop("manifest_path", None)
++    canonical = json.dumps(definition, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
++    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
++
++
++def _registration_supported(entry):
++    return (
++        entry.transport.type == "http" and entry.install is None
++        and entry.auth.type in {"none", "oauth"} and not entry.auth.env
++        and not entry.auth.provider and not entry.auth.scopes and not entry.auth.env_var
++    )
++
++
++def _core_config(entry):
++    from hermes_cli.mcp_catalog import _build_server_config
++    from hermes_cli.mcp_security import validate_mcp_server_entry
++
++    if not _registration_supported(entry):
++        raise ValueError("MCP entry requires an external installation or setup flow")
++    config = _build_server_config(entry, None)
++    if validate_mcp_server_entry(entry.name, config):
++        raise ValueError("native MCP security validation rejected the catalog entry")
++    return config
++
++
++def _matches(entry, registered):
++    if not isinstance(registered, dict) or not _registration_supported(entry):
++        return False
++    # Preserve user tool filters, but never overwrite a custom URL, auth,
++    # headers, process, timeout, or other target-affecting configuration.
++    core = {key: value for key, value in registered.items() if key not in {"enabled", "tools"}}
++    return core == _core_config(entry)
++
++
++def mcp_catalog(config):
++    servers = config.get("mcp_servers") or {}
++    if not isinstance(servers, dict):
++        raise ValueError("native mcp_servers must be a mapping")
++    rows = []
++    for entry in _catalog():
++        registered = servers.get(entry.name)
++        enabled = registered.get("enabled", True) if isinstance(registered, dict) else False
++        # Match the native catalog's legacy boolish read semantics; mutation
++        # accepts a real bool and writes a canonical bool only for this entry.
++        if isinstance(enabled, str):
++            enabled = enabled.lower() in {"true", "1", "yes"}
++        rows.append({
++            "name": entry.name, "description": entry.description,
++            "transport": entry.transport.type, "url": entry.transport.url or "",
++            "auth": entry.auth.type,
++            "required_fields": [field.name for field in entry.auth.env if field.required],
++            "catalog_sha256": _digest(entry),
++            "setup_support": "catalog_registration" if _registration_supported(entry)
++                else "external_install_required",
++            "registered": entry.name in servers, "enabled": bool(enabled),
++            "config_matches_catalog": _matches(entry, registered),
++        })
++    return rows
++
++
++def _resolve(selection):
++    selection = validate_mcp_setup_shape(selection)
++    matches = [entry for entry in _catalog() if entry.name == selection["catalog_entry"]]
++    if len(matches) != 1 or _digest(matches[0]) != selection["catalog_sha256"]:
++        raise ValueError("MCP catalog changed or the exact entry is unavailable")
++    entry = matches[0]
++    _core_config(entry)
++    return selection, entry
++
++
++def apply_mcp_setup(selection, config):
++    selection, entry = _resolve(selection)
++    servers = config.get("mcp_servers", {})
++    if not isinstance(servers, dict):
++        raise ValueError("native mcp_servers must be a mapping")
++    candidate = deepcopy(servers)
++    if entry.name in candidate:
++        if not _matches(entry, candidate[entry.name]):
++            raise ValueError("existing MCP configuration differs from this catalog entry; nothing changed")
++        server = candidate[entry.name]
++    else:
++        server = _core_config(entry)
++        defaults = entry.tools.default_enabled
++        if defaults is not None:
++            server["tools"] = {"include": list(defaults)}
++        candidate[entry.name] = server
++    server["enabled"] = selection["enabled"]
++    config["mcp_servers"] = candidate
++    return deepcopy(candidate)
++
++
++def verify_mcp_setup(selection, config, expected_servers=None):
++    selection, entry = _resolve(selection)
++    servers = config.get("mcp_servers")
++    server = servers.get(entry.name) if isinstance(servers, dict) else None
++    if not _matches(entry, server) or server.get("enabled") is not selection["enabled"]:
++        raise RuntimeError("MCP config readback did not reproduce the selected catalog registration")
++    if expected_servers is not None and servers != expected_servers:
++        raise RuntimeError("MCP config readback changed a peer entry or tool filter")
+diff --git a/tests/tui_gateway/test_native_mcp_setup.py b/tests/tui_gateway/test_native_mcp_setup.py
+new file mode 100644
+--- /dev/null
++++ b/tests/tui_gateway/test_native_mcp_setup.py
+@@ -0,0 +1,242 @@
++"""MCP catalog registration is one native idle config transaction, not install."""
++from copy import deepcopy
++from dataclasses import replace
++import hashlib
++import json
++import os
++import threading
++
++import pytest
++import yaml
++
++import tui_gateway.server as server
++from tui_gateway import native_mcp_setup as setup
++from tests.tui_gateway.test_tools_policy_rpc import (
++    _attest_strict_host, _clean_gateway_sessions, _home,
++    _logged_out_features, _strict_config, _write_config,
++)
++
++
++@pytest.fixture(autouse=True)
++def metadata_and_no_side_effects(monkeypatch):
++    from hermes_cli import mcp_catalog, mcp_config, tools_config as tc
++    from tools import mcp_tool
++
++    monkeypatch.setattr(tc, "get_nous_subscription_features", lambda *a, **k: _logged_out_features())
++    for builder in ("_plugin_browser_providers", "_plugin_web_search_providers",
++                    "_plugin_image_gen_providers", "_plugin_video_gen_providers", "_plugin_tts_providers"):
++        monkeypatch.setattr(tc, builder, lambda: [])
++    def forbidden(*args, **kwargs):
++        pytest.fail("catalog registration must never install, probe, authenticate, or reload")
++    for name in ("install_entry", "_probe_tools", "_do_git_install", "_run_bootstrap"):
++        monkeypatch.setattr(mcp_catalog, name, forbidden)
++    for name in ("_save_mcp_server", "cmd_mcp_add", "cmd_mcp_login", "_probe_single_server"):
++        monkeypatch.setattr(mcp_config, name, forbidden)
++    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", forbidden)
++
++
++def _config():
++    return {
++        "platform_toolsets": {"cli": ["memory", "no_mcp"], "telegram": ["memory"]},
++        "approvals": {"mode": "manual", "timeout": 123},
++        "mcp_servers": {"preserved": {"command": "example", "enabled": False,
++                                       "tools": {"exclude": ["sensitive"]}}},
++    }
++
++
++def _params(name="linear", enabled=False):
++    from hermes_cli.config import load_config
++    from hermes_cli import tools_config as tc
++
++    config = load_config()
++    valid = {name for name, _, _ in tc._get_effective_configurable_toolsets()
++             if name not in tc._CONFIG_ONLY_TOOLSETS and tc._toolset_allowed_for_platform(name, "cli")}
++    enabled_tools = tc._get_platform_tools(config, "cli", include_default_mcp_servers=False) & valid
++    row = next(row for row in setup.mcp_catalog(config) if row["name"] == name)
++    return {"enabled_toolsets": sorted(enabled_tools), "approval_mode": "manual",
++            "mcp_setup": {"catalog_entry": name, "catalog_sha256": row["catalog_sha256"],
++                          "enabled": enabled}}
++
++
++def _set(params=None):
++    return server._methods["tools.set"]("mcp-setup", _params() if params is None else params)
++
++
++def test_catalog_reports_four_http_registrations_without_claiming_connection():
++    _write_config(_config())
++    response = server._methods["tools.catalog"]("catalog", {})
++    assert "error" not in response, response
++    rows = response["result"]["mcp_catalog"]
++    assert len(rows) == 5
++    supported = {row["name"] for row in rows if row["setup_support"] == "catalog_registration"}
++    assert supported == {"linear", "figma", "comfy-cloud", "unreal-engine"}
++    for row in rows:
++        assert set(row) == {"name", "description", "transport", "url", "auth", "required_fields",
++                            "catalog_sha256", "setup_support", "registered", "enabled", "config_matches_catalog"}
++        assert not row["registered"] and not row["enabled"] and not row["config_matches_catalog"]
++        assert len(row["catalog_sha256"]) == 64 and row["catalog_sha256"].islower()
++    n8n = next(row for row in rows if row["name"] == "n8n")
++    assert n8n["auth"] == "api_key" and n8n["transport"] == "stdio"
++    assert n8n["required_fields"] == ["N8N_BASE_URL", "N8N_API_KEY"]
++    assert n8n["setup_support"] == "external_install_required"
++
++
++@pytest.mark.parametrize("name", ["linear", "figma", "comfy-cloud", "unreal-engine"])
++@pytest.mark.parametrize("enabled", [False, True])
++def test_http_registration_is_one_save_exact_readback_and_preserves_policy(monkeypatch, name, enabled):
++    from hermes_cli import tools_config as tc
++    from hermes_cli.mcp_catalog import get_entry
++
++    config = _config()
++    _write_config(config)
++    saves = []
++    original = tc.save_config
++    monkeypatch.setattr(tc, "save_config", lambda cfg: (saves.append(deepcopy(cfg)), original(cfg))[1])
++    params = _params(name, enabled)
++    response = _set(params)
++    assert "error" not in response, response
++    result = response["result"]
++    assert result["mcp_setup"] == params["mcp_setup"]
++    assert "setup_selection" not in result
++    assert result["enabled_toolsets"] == params["enabled_toolsets"]
++    assert result["approval_mode"] == "manual" and result["new_session_required"] is True
++    raw = (_home() / "config.yaml").read_bytes()
++    assert result["config_sha256"] == hashlib.sha256(raw).hexdigest()
++    saved = yaml.safe_load(raw)
++    assert len(saves) == 1
++    assert saved["platform_toolsets"] == config["platform_toolsets"]
++    assert saved["approvals"] == config["approvals"]
++    assert saved["mcp_servers"]["preserved"] == config["mcp_servers"]["preserved"]
++    registered = saved["mcp_servers"][name]
++    assert registered["enabled"] is enabled
++    assert registered["url"] == get_entry(name).transport.url
++    defaults = get_entry(name).tools.default_enabled
++    if defaults is not None:
++        assert registered["tools"] == {"include": defaults}
++    else:
++        assert "tools" not in registered
++    row = next(row for row in setup.mcp_catalog(saved) if row["name"] == name)
++    assert row["registered"] and row["config_matches_catalog"] and row["enabled"] is enabled
++
++
++def test_existing_catalog_registration_preserves_all_user_filters():
++    config = _config()
++    filters = {"include": ["custom"], "exclude": ["private"], "prompts": False, "resources": False}
++    config["mcp_servers"]["linear"] = {"url": "https://mcp.linear.app/mcp", "auth": "oauth",
++                                        "enabled": False, "tools": filters}
++    _write_config(config)
++    assert "error" not in _set(_params(enabled=True))
++    saved = yaml.safe_load((_home() / "config.yaml").read_bytes())
++    assert saved["mcp_servers"]["linear"]["tools"] == filters
++    assert "error" not in _set(_params(enabled=False))
++    assert yaml.safe_load((_home() / "config.yaml").read_bytes())["mcp_servers"]["linear"]["tools"] == filters
++
++
++@pytest.mark.parametrize("change", [
++    {"approval_mode": "off"}, {"enabled_toolsets": []},
++    {"setup_selection": {"toolset": "browser", "provider": "Camofox"}},
++    {"mcp_setup": None},
++    {"mcp_setup": {"catalog_entry": "linear", "catalog_sha256": "a" * 64, "enabled": False}},
++    {"mcp_setup": {"catalog_entry": "../linear", "catalog_sha256": "a" * 64, "enabled": False}},
++    {"mcp_setup": {"catalog_entry": "linear", "catalog_sha256": "A" * 64, "enabled": False}},
++    {"mcp_setup": {"catalog_entry": "linear", "catalog_sha256": "a" * 64, "enabled": "true"}},
++    {"mcp_setup": {"catalog_entry": "linear", "catalog_sha256": "a" * 64, "enabled": True, "url": "https://example.invalid"}},
++])
++def test_invalid_stale_or_mixed_request_never_writes(change):
++    before = _write_config(_config())
++    response = _set({**_params(), **change})
++    assert response["error"]["code"] == -32602, response
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++@pytest.mark.parametrize("core", [
++    {"url": "https://example.invalid"}, {"auth": "none"}, {"headers": {"Authorization": "do-not-expose"}},
++    {"command": "injected"}, {"timeout": 500},
++])
++def test_existing_custom_server_conflict_is_preserved_without_secret_projection(core):
++    config = _config()
++    config["mcp_servers"]["linear"] = {"url": "https://mcp.linear.app/mcp", "auth": "oauth", **core}
++    before = _write_config(config)
++    rows = setup.mcp_catalog(config)
++    row = next(row for row in rows if row["name"] == "linear")
++    assert row["registered"] and not row["config_matches_catalog"]
++    assert "do-not-expose" not in json.dumps(rows)
++    response = _set()
++    assert response["error"]["code"] == -32602
++    assert "do-not-expose" not in json.dumps(response)
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_stdio_install_is_not_started():
++    before = _write_config(_config())
++    assert _set(_params("n8n"))["error"]["code"] == -32602
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_active_turn_rejects_before_config_write():
++    before = _write_config(_config())
++    server._sessions["busy"] = {"history_lock": threading.RLock(), "running": True}
++    assert _set()["error"]["code"] == 4090
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_readback_failure_restores_exact_bytes(monkeypatch):
++    before = _write_config(_config())
++    def bad_readback(*args, **kwargs):
++        raise RuntimeError("bad readback")
++    monkeypatch.setattr(setup, "verify_mcp_setup", bad_readback)
++    assert "error" in _set()
++    assert (_home() / "config.yaml").read_bytes() == before
++
++
++def test_peer_or_filter_readback_corruption_rejects():
++    config = _config()
++    _write_config(config)
++    params = _params()["mcp_setup"]
++    expected = setup.apply_mcp_setup(params, config)
++    config["mcp_servers"]["preserved"]["enabled"] = True
++    with pytest.raises(RuntimeError, match="peer entry or tool filter"):
++        setup.verify_mcp_setup(params, config, expected)
++
++
++def test_registration_rotates_strict_digest_but_never_reuses_approval_only_session(monkeypatch):
++    import agent.identity_policy as identity
++
++    soul, personality = "Lilith soul.\n", "You are Lilith.\n"
++    config = _strict_config(personality)
++    config.update(_config())
++    before = _write_config(config)
++    (_home() / "SOUL.md").write_text(soul, encoding="utf-8", newline="\n")
++    _attest_strict_host(monkeypatch, before, soul, personality)
++    session = {"history_lock": threading.RLock(), "running": False,
++               "_native_approval_resume_digest": {"previous": "a" * 64, "current": "b" * 64}}
++    server._sessions["idle"] = session
++    result = _set()
++    assert "error" not in result, result
++    digest = result["result"]["config_sha256"]
++    assert os.environ["HERMES_IDENTITY_EXPECTED_CONFIG_SHA256"] == digest
++    assert identity.preflight_aia_agent_identity(request_overrides={}).config_sha256 == digest
++    assert "_native_approval_resume_digest" not in session
++
++
++def test_catalog_digest_binds_semantic_manifest_not_path(monkeypatch):
++    from hermes_cli.mcp_catalog import get_entry
++
++    entry = get_entry("linear")
++    assert setup._digest(entry) == setup._digest(replace(entry, manifest_path=entry.manifest_path.parent))
++    assert setup._digest(entry) != setup._digest(replace(entry, description="Changed"))
++    config = _config()
++    _write_config(config)
++    params = _params()
++    monkeypatch.setattr(setup, "_catalog", lambda: [replace(entry, description="Changed")])
++    assert _set(params)["error"]["code"] == -32602
++
++
++def test_native_security_guard_rejection_remains_enforced(monkeypatch):
++    from hermes_cli import mcp_security
++
++    before = _write_config(_config())
++    params = _params()
++    monkeypatch.setattr(mcp_security, "validate_mcp_server_entry", lambda *a: ["blocked"])
++    assert _set(params)["error"]["code"] == -32602
++    assert (_home() / "config.yaml").read_bytes() == before

@@ -1,0 +1,379 @@
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 6f3db51cdf3dec61fac66a6e70538c61fb976dd8..d1ed815d1f622f90159161d7f21e94e98780c98a 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -3046,27 +3046,30 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
+                 from hermes_state import format_session_db_unavailable
+                 return _finish_agent_tool(json.dumps({"success": False, "error": format_session_db_unavailable()}), next_args)
+             from tools.session_search_tool import session_search as _session_search
+-            return _finish_agent_tool(
+-                _session_search(
+-                    query=next_args.get("query", ""),
+-                    role_filter=next_args.get("role_filter"),
+-                    limit=next_args.get("limit", 3),
+-                    session_id=next_args.get("session_id"),
+-                    around_message_id=next_args.get("around_message_id"),
+-                    window=next_args.get("window", 5),
+-                    sort=next_args.get("sort"),
+-                    db=session_db,
+-                    current_session_id=agent.session_id,
+-                ),
+-                next_args,
++            result = _session_search(
++                query=next_args.get("query", ""),
++                role_filter=next_args.get("role_filter"),
++                limit=next_args.get("limit", 3),
++                session_id=next_args.get("session_id"),
++                around_message_id=next_args.get("around_message_id"),
++                window=next_args.get("window", 5),
++                sort=next_args.get("sort"),
++                db=session_db,
++                current_session_id=agent.session_id,
+             )
++            if agent._memory_manager:
++                result = agent._memory_manager.filter_session_search_result(
++                    next_args,
++                    result,
++                )
++            return _finish_agent_tool(result, next_args)
+     elif function_name == "memory":
+         def _execute(next_args: dict) -> Any:
+             target = next_args.get("target", "memory")
+             operations = next_args.get("operations")
+             intercepted = None
+-            if target == "user" and agent._memory_manager:
+-                intercepted = agent._memory_manager.intercept_user_profile_write(
++            if agent._memory_manager:
++                intercepted = agent._memory_manager.intercept_memory_write(
+                     next_args,
+                     build_metadata=lambda: agent._build_memory_write_metadata(
+                         task_id=effective_task_id,
+diff --git a/agent/memory_manager.py b/agent/memory_manager.py
+index a5af9f2688b9a2d2f633814b7ed8fd9576d248b9..b15e46882213ff7bba23af5c255de8d7bae776e3 100644
+--- a/agent/memory_manager.py
++++ b/agent/memory_manager.py
+@@ -566,6 +566,106 @@ class MemoryManager:
+ 
+         return None
+ 
++    def intercept_memory_write(
++        self,
++        tool_args: Dict[str, Any],
++        *,
++        build_metadata: Optional[Callable[[], Dict[str, Any]]] = None,
++    ) -> Optional[Any]:
++        """Run provider pre-write policy, then preserve USER.md authority.
++
++        A provider may reject or reroute a model write before either built-in
++        memory file changes. ``target=user`` still fails closed through the
++        existing authoritative handler when no general interception occurred.
++        """
++
++        metadata: Optional[Dict[str, Any]] = None
++        for provider in self._providers:
++            if provider.name == "builtin":
++                continue
++            try:
++                owns_writes = provider.owns_user_profile_writes()
++            except Exception:
++                logger.warning(
++                    "Memory provider '%s' failed its user-profile authority check",
++                    provider.name,
++                    exc_info=True,
++                )
++                return tool_error(
++                    "The authoritative user-profile memory is unavailable; no built-in memory write was made.",
++                    success=False,
++                )
++            if not owns_writes:
++                continue
++            try:
++                if metadata is None:
++                    metadata = dict(build_metadata() if build_metadata else {})
++                result = provider.intercept_memory_write(
++                    dict(tool_args),
++                    metadata=dict(metadata),
++                )
++            except Exception:
++                logger.warning(
++                    "Memory provider '%s' failed its pre-write policy",
++                    provider.name,
++                    exc_info=True,
++                )
++                return tool_error(
++                    "The authoritative user-profile memory could not validate this write; no built-in memory write was made.",
++                    success=False,
++                )
++            if result is not None:
++                return result
++            break
++
++        if str(tool_args.get("target") or "memory") != "user":
++            return None
++        return self.intercept_user_profile_write(
++            tool_args,
++            build_metadata=(lambda: dict(metadata or {})),
++        )
++
++    def filter_session_search_result(
++        self,
++        tool_args: Dict[str, Any],
++        result: str,
++    ) -> str:
++        """Apply the authoritative profile provider's transcript boundary."""
++
++        filtered = result
++        for provider in self._providers:
++            if provider.name == "builtin":
++                continue
++            try:
++                if not provider.owns_user_profile_writes():
++                    continue
++                candidate = provider.filter_session_search_result(
++                    dict(tool_args),
++                    filtered,
++                )
++            except Exception:
++                logger.warning(
++                    "Memory provider '%s' failed its session-search filter",
++                    provider.name,
++                    exc_info=True,
++                )
++                return tool_error(
++                    "Session history was withheld because player-profile visibility could not be verified.",
++                    success=False,
++                )
++            if not isinstance(candidate, str):
++                logger.warning(
++                    "Memory provider '%s' returned an invalid session-search result",
++                    provider.name,
++                )
++                return tool_error(
++                    "Session history was withheld because player-profile visibility could not be verified.",
++                    success=False,
++                )
++            filtered = candidate
++            break
++        return filtered
++
+     # -- System prompt -------------------------------------------------------
+ 
+     def build_system_prompt(self) -> str:
+diff --git a/agent/memory_provider.py b/agent/memory_provider.py
+index 6c6a934e2d6f8cddccf0b965c03090e0f789cdfd..2940d1408cf1978314bceaa5c3842fe7346c089d 100644
+--- a/agent/memory_provider.py
++++ b/agent/memory_provider.py
+@@ -30,6 +30,8 @@ Optional hooks (override to opt in):
+   on_memory_write(action, target, content, metadata=None) — mirror built-in memory writes
+   owns_user_profile_writes() -> bool — claim exclusive USER.md-style profile writes
+   handle_user_profile_write(args, metadata=None) — handle a claimed profile write
++  intercept_memory_write(args, metadata=None) — reject/reroute a misclassified built-in write
++  filter_session_search_result(args, result) — enforce provider recall visibility on transcripts
+   on_delegation(task, result, **kwargs)  — parent-side observation of subagent work
+   backup_paths() -> list[str]            — extra on-disk paths to include in `hermes backup`
+ """
+@@ -466,6 +468,37 @@ class MemoryProvider(ABC):
+ 
+         return None
+ 
++    def intercept_memory_write(
++        self,
++        args: Dict[str, Any],
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> Optional[Any]:
++        """Optionally replace one built-in ``memory`` tool result.
++
++        This hook runs before any built-in memory file is changed. Returning
++        ``None`` preserves normal behavior; any other value becomes the tool
++        result and the built-in write is skipped. It lets an authoritative
++        profile provider reject a player fact that the model accidentally
++        labelled ``target="memory"`` without disabling legitimate agent
++        environment notes.
++        """
++
++        return None
++
++    def filter_session_search_result(
++        self,
++        args: Dict[str, Any],
++        result: str,
++    ) -> str:
++        """Apply provider visibility rules to one transcript-search result.
++
++        The default is identity. MemoryManager invokes this only for an
++        external provider that claims user-profile write authority, so legacy
++        providers and ordinary Hermes session search remain unchanged.
++        """
++
++        return result
++
+     def backup_paths(self) -> List[str]:
+         """Return extra on-disk paths this provider stores OUTSIDE HERMES_HOME.
+ 
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index e4185baeb20be792c3b5a860e6286f662f8f5255..e1bd8514424432e41c4f8f081a0123a052bddcdc 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -1791,7 +1791,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+                     from hermes_state import format_session_db_unavailable
+                     return json.dumps({"success": False, "error": format_session_db_unavailable()})
+                 from tools.session_search_tool import session_search as _session_search
+-                return _session_search(
++                result = _session_search(
+                     query=next_args.get("query", ""),
+                     role_filter=next_args.get("role_filter"),
+                     limit=next_args.get("limit", 3),
+@@ -1802,6 +1802,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+                     db=session_db,
+                     current_session_id=agent.session_id,
+                 )
++                if agent._memory_manager:
++                    result = agent._memory_manager.filter_session_search_result(
++                        next_args,
++                        result,
++                    )
++                return result
+             function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                 agent,
+                 function_name=function_name,
+@@ -1820,8 +1826,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+                 target = next_args.get("target", "memory")
+                 operations = next_args.get("operations")
+                 intercepted = None
+-                if target == "user" and agent._memory_manager:
+-                    intercepted = agent._memory_manager.intercept_user_profile_write(
++                if agent._memory_manager:
++                    intercepted = agent._memory_manager.intercept_memory_write(
+                         next_args,
+                         build_metadata=lambda: agent._build_memory_write_metadata(
+                             task_id=effective_task_id,
+diff --git a/tests/agent/test_memory_provider.py b/tests/agent/test_memory_provider.py
+index 5f41e40385bafc906fc5c8a99277c815de0df420..5c8f5642e415684bb1ed216b39c898f406cb8e11 100644
+--- a/tests/agent/test_memory_provider.py
++++ b/tests/agent/test_memory_provider.py
+@@ -100,10 +100,14 @@ class MetadataMemoryProvider(FakeMemoryProvider):
+ class AuthoritativeMemoryProvider(FakeMemoryProvider):
+     """Provider that exclusively owns user-profile writes."""
+ 
+-    def __init__(self, result=None):
++    def __init__(self, result=None, *, intercept_result=None, search_result=None):
+         super().__init__(name="authoritative")
+         self.result = result
++        self.intercept_result = intercept_result
++        self.search_result = search_result
+         self.profile_write_calls = []
++        self.intercept_calls = []
++        self.search_filter_calls = []
+ 
+     def owns_user_profile_writes(self):
+         return True
+@@ -112,6 +116,14 @@ class AuthoritativeMemoryProvider(FakeMemoryProvider):
+         self.profile_write_calls.append((args, metadata or {}))
+         return self.result
+ 
++    def intercept_memory_write(self, args, metadata=None):
++        self.intercept_calls.append((args, metadata or {}))
++        return self.intercept_result
++
++    def filter_session_search_result(self, args, result):
++        self.search_filter_calls.append((args, result))
++        return result if self.search_result is None else self.search_result
++
+ 
+ class MessagesMemoryProvider(FakeMemoryProvider):
+     """Provider that opts into completed-turn message context."""
+@@ -249,6 +261,75 @@ class TestMemoryManager:
+             {"session_id": "session-a"},
+         )]
+ 
++    def test_authoritative_provider_can_reject_misrouted_agent_memory(self):
++        expected = json.dumps({
++            "success": False,
++            "committed": False,
++            "code": "memory.player_profile_target_required",
++        })
++        provider = AuthoritativeMemoryProvider(intercept_result=expected)
++        mgr = MemoryManager()
++        mgr.add_provider(provider)
++        args = {
++            "action": "add",
++            "target": "memory",
++            "content": "player likes tea",
++        }
++
++        result = mgr.intercept_memory_write(
++            args,
++            build_metadata=lambda: {"session_id": "session-a"},
++        )
++
++        assert result == expected
++        assert provider.intercept_calls == [(args, {"session_id": "session-a"})]
++        assert provider.profile_write_calls == []
++
++    def test_normal_agent_memory_passes_through_provider_prewrite_policy(self):
++        provider = AuthoritativeMemoryProvider(result="unexpected")
++        mgr = MemoryManager()
++        mgr.add_provider(provider)
++        args = {
++            "action": "add",
++            "target": "memory",
++            "content": "runtime is installed on Windows",
++        }
++
++        assert mgr.intercept_memory_write(args) is None
++        assert provider.intercept_calls == [(args, {})]
++        assert provider.profile_write_calls == []
++
++    def test_session_search_result_is_filtered_by_authoritative_provider(self):
++        protected = json.dumps({
++            "success": True,
++            "mode": "protected",
++            "results": [],
++        })
++        provider = AuthoritativeMemoryProvider(search_result=protected)
++        mgr = MemoryManager()
++        mgr.add_provider(provider)
++        args = {"query": "drink preference"}
++        raw = json.dumps({"success": True, "results": [{"content": "old"}]})
++
++        assert mgr.filter_session_search_result(args, raw) == protected
++        assert provider.search_filter_calls == [(args, raw)]
++
++    def test_session_search_filter_failure_withholds_history(self):
++        provider = AuthoritativeMemoryProvider()
++        provider.filter_session_search_result = MagicMock(
++            side_effect=RuntimeError("boom")
++        )
++        mgr = MemoryManager()
++        mgr.add_provider(provider)
++
++        result = json.loads(mgr.filter_session_search_result(
++            {"query": "player preference"},
++            json.dumps({"success": True, "results": [{"content": "private"}]}),
++        ))
++
++        assert result["success"] is False
++        assert "private" not in json.dumps(result)
++
+     def test_authoritative_provider_empty_result_fails_closed(self):
+         provider = AuthoritativeMemoryProvider(None)
+         mgr = MemoryManager()
+diff --git a/tools/session_search_tool.py b/tools/session_search_tool.py
+index 540f5de9f643e824dc83d9a70d9b97f38a6d6c1d..c2fa608e18400ca81d72e3d9395cbb56c113bb45 100644
+--- a/tools/session_search_tool.py
++++ b/tools/session_search_tool.py
+@@ -996,6 +996,14 @@ SESSION_SEARCH_SCHEMA = {
+         "and why before falling back to session history. Do not conclude 'not found' "
+         "or 'no prior correspondence' from session_search alone when a direct source "
+         "was provided.\n\n"
++        "CURRENT PLAYER PROFILE LIMIT\n\n"
++        "  Conversation history records what was said at the time; it is not authority "
++        "for a player's current preference, identity, routine, boundary, or relationship "
++        "fact. When system context or a filtered result reports a player-profile forget, "
++        "correction, rejection, expiry, or non-recallable boundary, do not reconstruct the "
++        "protected value from earlier messages, assistant claims, titles, snippets, or "
++        "summaries. If no active profile fact answers a present-profile question, state "
++        "that the current value is unknown.\n\n"
+         "FOUR CALLING SHAPES\n\n"
+         "  1) DISCOVERY — pass `query`:\n"
+         "     session_search(query=\"auth refactor\", limit=3)\n"

@@ -1,0 +1,156 @@
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index d8950e1..f5bc859 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -1886,6 +1886,7 @@ _TURN_CONTEXTUAL_EVENT_TYPES = frozenset(
+ _SESSION_EVENT_TYPES = frozenset(
+     {
+         "background.complete",
++        "cron.complete",
+         "preview.restart.complete",
+         "preview.restart.start",
+         "rollback.restored",
+@@ -13191,15 +13192,16 @@ def _project_cron_completion_notification(
+ 
+     A cron result is untrusted model/tool output.  The scheduler already
+     force-redacts and bounds the typed queue payload; parse it again here at the
+-    session boundary, then project the safe presentation as an assistant
+-    timeline event.  This function deliberately never calls
++    session boundary, then project the safe presentation through Lilith's
++    session-scoped ``cron.complete`` event.  Unlike ``message.*``, that
++    event is valid while the chat is idle and does not claim a user-created turn
++    identity.  This function deliberately never calls
+     ``_run_prompt_submit``, never marks the session running, and never appends
+     the untrusted text to live or durable model history.  It therefore cannot
+     borrow the user's model, tools, approvals, turn budget, or influence a
+     later real user turn.
+     """
+ 
+-    from agent.turn_identity import new_message_id
+     from tools.process_registry import (
+         CRON_COMPLETION_EVENT_TYPE,
+         CRON_COMPLETION_SCHEMA,
+@@ -13213,15 +13215,6 @@ def _project_cron_completion_notification(
+     if not visible_text:
+         return False
+ 
+-    turn_id = new_message_id()
+-    assistant_message_id = new_message_id(excluding=(turn_id,))
+-    display_metadata = {
+-        "cron_notification_schema": CRON_COMPLETION_SCHEMA,
+-        "cron_execution_id": notification.execution_id,
+-        "cron_job_id": notification.job_id,
+-        "cron_success": notification.success,
+-    }
+-
+     # The caller already proved exact live-session ownership. Re-check the
+     # registry edge immediately before emitting so a close racing this
+     # projection wins cleanly and leaves the result only in cron storage.
+@@ -13232,30 +13225,21 @@ def _project_cron_completion_notification(
+         ):
+             return False
+ 
+-    payload = {
+-        "text": visible_text,
+-        "status": "complete",
+-        "display_kind": "cron_completion",
+-        "display_metadata": display_metadata,
+-    }
+-    try:
+-        payload["rendered"] = render_message(
+-            visible_text,
+-            int(session.get("cols", 80)),
+-        )
+-    except Exception:
+-        pass
+-    with _turn_event_scope(turn_id, assistant_message_id):
++    # ``cron.complete`` is a display-only, session-scoped Lilith protocol event.
++    # It keeps Runtime's strict turn-correlation gate intact: a timer
++    # notification is not a model response and must never fabricate a pending
++    # prompt/turn just to be shown.
++    return bool(
+         _emit(
+-            "message.start",
++            "cron.complete",
+             sid,
+             {
+-                "display_kind": "cron_completion",
+-                "display_metadata": display_metadata,
++                "schema": CRON_COMPLETION_SCHEMA,
++                "success": notification.success,
++                "text": visible_text,
+             },
+         )
+-        _emit("message.complete", sid, payload)
+-    return True
++    )
+ 
+ 
+ # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds too so
+diff --git a/tests/tui_gateway/test_delegation_session_lifecycle.py b/tests/tui_gateway/test_delegation_session_lifecycle.py
+index ead8068..74e04db 100644
+--- a/tests/tui_gateway/test_delegation_session_lifecycle.py
++++ b/tests/tui_gateway/test_delegation_session_lifecycle.py
+@@ -163,8 +163,10 @@ def test_shutdown_drain_projects_exact_cron_completion_without_agent_or_history(
+ 
+     assert isolated_queue.empty()
+     assert model_turns == []
+-    assert [item[0] for item in emitted] == ["message.start", "message.complete"]
++    assert [item[0] for item in emitted] == ["cron.complete"]
+     assert emitted[-1][1] == "tab-a"
++    assert emitted[-1][2]["schema"] == "lilith.cron.completion.v1"
++    assert emitted[-1][2]["success"] is True
+     assert injection in emitted[-1][2]["text"]
+     # Presentation-only: a later real user turn receives the exact prior model
+     # history, with neither the malicious body nor an assistant→assistant row.
+@@ -181,6 +183,50 @@ def test_shutdown_drain_projects_exact_cron_completion_without_agent_or_history(
+     ]
+ 
+ 
++def test_cron_completion_uses_session_scoped_typed_event(monkeypatch):
++    from tools.process_registry import build_cron_completion_notification
++
++    session = {
++        "session_key": "durable-a",
++        "_finalized": False,
++    }
++    event = build_cron_completion_notification(
++        execution_id="exec-a",
++        job_id="job-a",
++        job_name="timer",
++        success=True,
++        result="time is up",
++        session_key="durable-a",
++        origin_ui_session_id="tab-a",
++    )
++    assert event is not None
++    frames = []
++    monkeypatch.setattr(server, "write_json", lambda frame: frames.append(frame) or True)
++
++    with patch.dict(server._sessions, {"tab-a": session}, clear=True):
++        assert server._project_cron_completion_notification(
++            "tab-a",
++            session,
++            event,
++        ) is True
++
++    assert frames == [
++        {
++            "jsonrpc": "2.0",
++            "method": "event",
++            "params": {
++                "type": "cron.complete",
++                "session_id": "tab-a",
++                "payload": {
++                    "schema": "lilith.cron.completion.v1",
++                    "success": True,
++                    "text": 'Scheduled job "timer" completed.\ntime is up',
++                },
++            },
++        }
++    ]
++
++
+ class TestInterruptForSession:
+     def _seed_record(self, delegation_id, session_key="", origin_ui_session_id="", status="running"):
+         fn = MagicMock()

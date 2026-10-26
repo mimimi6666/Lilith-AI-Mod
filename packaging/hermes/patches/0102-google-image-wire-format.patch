@@ -1,0 +1,65 @@
+diff --git a/plugins/image_gen/google/__init__.py b/plugins/image_gen/google/__init__.py
+index ffb7d84..f30e199 100644
+--- a/plugins/image_gen/google/__init__.py
++++ b/plugins/image_gen/google/__init__.py
+@@ -29,7 +29,11 @@ _MODELS = {
+     "gemini-2.5-flash-image": ("Nano Banana — Gemini 2.5 Flash Image (legacy)", 3),
+ }
+ _ENDPOINT = "https://generativelanguage.googleapis.com/v1/models/"
+-_ASPECTS = {"landscape": "16:9", "square": "1:1", "portrait": "9:16"}
++_ASPECTS = {
++    "landscape": "ASPECT_RATIO_SIXTEEN_BY_NINE",
++    "square": "ASPECT_RATIO_ONE_BY_ONE",
++    "portrait": "ASPECT_RATIO_NINE_BY_SIXTEEN",
++}
+ _MIME = {"image/png": ("PNG", "png"), "image/jpeg": ("JPEG", "jpg"),
+          "image/webp": ("WEBP", "webp")}
+ _MAX_INPUT = 12 * 1024 * 1024  # Leaves room in the official 20 MB inline request cap.
+@@ -258,7 +262,7 @@ class GoogleImageGenProvider(ImageGenProvider):
+             return fail("auth_required", "The Google AI Studio credential is no longer available.")
+         image_config = {"aspectRatio": _ASPECTS[aspect]}
+         if model != "gemini-2.5-flash-image":
+-            image_config["imageSize"] = "1K"
++            image_config["imageSize"] = "IMAGE_SIZE_ONE_K"
+         payload = {"contents": [{"role": "user", "parts": parts}],
+                    "generationConfig": {"candidateCount": 1, "responseModalities": ["TEXT", "IMAGE"],
+                                         "responseFormat": {"image": image_config}}}
+diff --git a/tests/tools/test_google_native_image.py b/tests/tools/test_google_native_image.py
+index df96ff0..b096a6f 100644
+--- a/tests/tools/test_google_native_image.py
++++ b/tests/tools/test_google_native_image.py
+@@ -243,10 +243,15 @@ def test_readiness_failed_provider_is_not_ready(monkeypatch):
+ 
+ 
+ @pytest.mark.parametrize("model", list(google._MODELS))
+-def test_official_request_response_no_credentials_or_model_fallback(monkeypatch, tmp_path, model):
++@pytest.mark.parametrize("aspect,wire_aspect", [
++    ("landscape", "ASPECT_RATIO_SIXTEEN_BY_NINE"),
++    ("square", "ASPECT_RATIO_ONE_BY_ONE"),
++    ("portrait", "ASPECT_RATIO_NINE_BY_SIXTEEN"),
++])
++def test_official_request_response_no_credentials_or_model_fallback(monkeypatch, tmp_path, model, aspect, wire_aspect):
+     monkeypatch.setenv("GEMINI_BASE_URL", "https://not-google.invalid/collect")
+     calls = mocked_call(monkeypatch)
+-    result = google.GoogleImageGenProvider().generate("a tree", "portrait", model=model)
++    result = google.GoogleImageGenProvider().generate("a tree", aspect, model=model)
+     assert result["success"] is True and result["provider"] == "google" and result["model"] == model
+     assert len(calls) == 1
+     (url,), kwargs = calls[0]
+@@ -256,8 +261,14 @@ def test_official_request_response_no_credentials_or_model_fallback(monkeypatch,
+     payload = kwargs["json"]
+     assert payload["contents"] == [{"role": "user", "parts": [{"text": "a tree"}]}]
+     assert payload["generationConfig"]["responseModalities"] == ["TEXT", "IMAGE"]
+-    assert payload["generationConfig"]["responseFormat"]["image"]["aspectRatio"] == "9:16"
+-    assert ("imageSize" in payload["generationConfig"]["responseFormat"]["image"]) == (model != "gemini-2.5-flash-image")
++    # The v1 wire schema (not SDK-facing values) has enum strings here:
++    # https://generativelanguage.googleapis.com/$discovery/rest?version=v1
++    # ImageConfig's ratios/1K do not apply to ResponseFormatConfig.image.
++    wire_image = {"aspectRatio": wire_aspect}
++    if model != "gemini-2.5-flash-image":
++        wire_image["imageSize"] = "IMAGE_SIZE_ONE_K"
++    assert payload["generationConfig"]["responseFormat"] == {"image": wire_image}
++    assert "imageConfig" not in payload["generationConfig"]
+     assert KEY not in json.dumps(result) and KEY not in json.dumps(payload)
+     path = Path(result["image"])
+     assert path.parent == tmp_path / "cache/images"

@@ -1,0 +1,112 @@
+diff --git a/run_agent.py b/run_agent.py
+index a205c4f..742a938 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -2077,6 +2077,27 @@ class AIAgent:
+             return None
+         if not self._session_db:
+             return None
++        # Some conversation exits flush directly before the shared
++        # ``_persist_session`` finalizer runs (completed text, tool-call and
++        # verification-stop paths).  Durable turn identity must therefore be
++        # attached at this SQLite chokepoint, not only by the later JSON/session
++        # snapshot path.  Otherwise the direct flush commits an unscoped row
++        # and stamps ``_db_persisted`` on its live dict; the finalizer can add
++        # metadata in memory but the append-only DB correctly refuses to write
++        # that row a second time.  Reusing the canonical stamper keeps early
++        # and final writes idempotent and preserves its legacy/partial-claim
++        # fail-closed rules.
++        from agent.turn_identity import stamp_turn_messages
++
++        stamp_turn_messages(
++            messages,
++            user_index=getattr(self, "_persist_user_message_idx", None),
++            turn_id=getattr(self, "_current_turn_id", ""),
++            user_message_id=getattr(self, "_current_user_message_id", ""),
++            assistant_message_id=getattr(
++                self, "_current_assistant_message_id", ""
++            ),
++        )
+         # Persist user-message override (#48677 chokepoint): historically this
+         # mutated the live `messages` list in place, which — on the early
+         # crash-resilience persist that runs BEFORE the API call is built —
+diff --git a/tests/run_agent/test_81641_text_turn_incremental_persistence.py b/tests/run_agent/test_81641_text_turn_incremental_persistence.py
+index 271ce4b..84ca495 100644
+--- a/tests/run_agent/test_81641_text_turn_incremental_persistence.py
++++ b/tests/run_agent/test_81641_text_turn_incremental_persistence.py
+@@ -173,3 +173,75 @@ class TestCompletedTextTurnIncrementalPersistence:
+             "finalize_turn's _persist_session must still run so the failed "
+             "flush gets retried."
+         )
++
++    def test_claimed_message_identity_survives_real_sqlite_reopen(
++        self,
++        loop_agent,
++        tmp_path,
++    ):
++        """A real text turn must cold-resume with its accepted identities.
++
++        This drives the actual ``run_conversation`` completion path, including
++        its pre-finalizer direct flush, through a real SessionDB.  Reopening a
++        new DB handle is essential: assertions against the live message dict
++        would pass after finalization even when SQLite had already committed
++        the assistant row with empty ``display_metadata``.
++        """
++        from hermes_state import SessionDB
++        from tests.run_agent.test_run_agent import _mock_response
++        from tui_gateway import server
++
++        turn_id = "a" * 32
++        user_message_id = "b" * 32
++        assistant_message_id = "c" * 32
++        answer = "The durable answer."
++        db_path = tmp_path / "state.db"
++
++        db = SessionDB(db_path=db_path)
++        loop_agent._session_db = db
++        loop_agent._owns_session_db = False
++        loop_agent._session_db_created = False
++        loop_agent._ensure_db_session()
++        loop_agent._relay_pending_turn_id = turn_id
++        loop_agent._relay_pending_user_message_id = user_message_id
++        loop_agent._relay_pending_assistant_message_id = assistant_message_id
++        loop_agent.client.chat.completions.create.side_effect = [
++            _mock_response(content=answer, finish_reason="stop"),
++        ]
++
++        with (
++            patch.object(loop_agent, "_save_trajectory"),
++            patch.object(loop_agent, "_cleanup_task_resources"),
++        ):
++            result = loop_agent.run_conversation("persist this turn")
++
++        assert result["final_response"] == answer
++        session_id = loop_agent.session_id
++        db.close()
++
++        reopened = SessionDB(db_path=db_path)
++        try:
++            history = reopened.get_messages_as_conversation(
++                session_id,
++                include_row_ids=True,
++            )
++            projected = server._history_to_messages(history)
++        finally:
++            reopened.close()
++
++        user = next(item for item in projected if item["role"] == "user")
++        assistant = next(
++            item
++            for item in projected
++            if item["role"] == "assistant" and item.get("text") == answer
++        )
++        assert (user["turn_id"], user["message_id"], user["message_kind"]) == (
++            turn_id,
++            user_message_id,
++            "user",
++        )
++        assert (
++            assistant["turn_id"],
++            assistant["message_id"],
++            assistant["message_kind"],
++        ) == (turn_id, assistant_message_id, "primary")
